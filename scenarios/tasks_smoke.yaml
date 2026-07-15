@@ -1,0 +1,32 @@
+name: calee-tasks-smoke
+tags: [tasks, smoke, tablet]
+requires_state: logged_in_tablet
+default_timeout_seconds: 20
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Let home screen settle
+    action: sleep
+    seconds: 3
+
+  - name: Open Tasks if present
+    action: tap_if_present
+    text: Tasks
+
+  - name: Let tasks screen settle
+    action: sleep
+    seconds: 2
+
+  - name: Capture tasks screen
+    action: screenshot
+    screenshot_name: 00_tasks_screen
+    compare: false
+
+  - name: Assert tasks screen content
+    action: assert_any_text
+    texts: [Tasks, To-Do, "Add Task"]
+
+  - name: Assert no crash/error dialog is showing
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]

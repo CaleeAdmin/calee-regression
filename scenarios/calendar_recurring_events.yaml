@@ -1,0 +1,48 @@
+name: calee-calendar-recurring-events
+tags: [calendar, recurring, tablet]
+requires_state: logged_in_tablet
+default_timeout_seconds: 20
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Let home screen settle
+    action: sleep
+    seconds: 3
+
+  - name: Open Calendar if present
+    action: tap_if_present
+    text: Calendar
+
+  - name: Let calendar settle
+    action: sleep
+    seconds: 2
+
+  # This scenario is most valuable once test-data fixtures with known recurring
+  # events exist on the prepared demo account — see docs/TEST_DATA_RESET_CONTRACT.md
+  # and docs/CALENDAR_BIG_CHANGE_COVERAGE.md.
+  - name: Open a recurring event if one is visible
+    action: tap_if_present
+    text: Repeat
+
+  - name: Let event detail settle
+    action: sleep
+    seconds: 1.5
+
+  - name: Capture recurring event detail
+    action: screenshot
+    screenshot_name: 00_recurring_event_detail
+    compare: false
+
+  # Wrapped in "optional": no recurring fixture event may exist yet, which is a
+  # reason to skip this assertion, not fail the scenario.
+  - name: Assert recurring-event indicators are present
+    action: optional
+    step:
+      name: Assert recurrence field labels
+      action: assert_any_text
+      texts: [Repeat, Recurring, Every, Weekly, Monthly]
+
+  - name: Assert no crash/error dialog is showing
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]

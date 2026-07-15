@@ -1,0 +1,44 @@
+name: framework-tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package with dev dependencies
+        run: pip install -e '.[dev]'
+
+      - name: Run pytest
+        run: python -m pytest
+
+      - name: Validate all scenario files parse cleanly
+        run: |
+          python -c "
+          from calee_regression import suites
+          from calee_regression.runner import load_scenario
+
+          failures = []
+          for name in suites.all_suite_names():
+              for path in suites.resolve_suite(name):
+                  try:
+                      load_scenario(path)
+                  except Exception as exc:
+                      failures.append(f'{path}: {exc}')
+
+          if failures:
+              print('Scenario validation failed:')
+              for f in failures:
+                  print(f' - {f}')
+              raise SystemExit(1)
+
+          print('All scenario files parsed cleanly.')
+          "

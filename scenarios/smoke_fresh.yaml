@@ -1,0 +1,20 @@
+name: calee-smoke-fresh
+tags: [smoke, fresh, emulator]
+requires_state: fresh
+default_timeout_seconds: 20
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Let first screen settle
+    action: sleep
+    seconds: 2
+
+  - name: Capture initial screen
+    action: screenshot
+    screenshot_name: 00_initial_screen
+    compare: false
+
+  - name: Assert login or onboarding screen
+    action: assert_any_text
+    texts: [Calee, Sign, Scan, Login, Start]

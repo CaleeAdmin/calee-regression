@@ -1,0 +1,30 @@
+name: calee-weather-system-messages
+tags: [weather, system, tablet]
+requires_state: logged_in_tablet
+default_timeout_seconds: 20
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Let home screen settle
+    action: sleep
+    seconds: 3
+
+  - name: Capture home screen
+    action: screenshot
+    screenshot_name: 00_home_screen
+    compare: false
+
+  # Weather widget visibility may depend on config/permissions, so this is optional.
+  - name: Assert weather indicators are present
+    action: optional
+    step:
+      name: Assert weather widget content
+      action: assert_any_text
+      texts: ["°", Weather, Forecast, Temperature]
+
+  # A system/error banner appearing unexpectedly during a smoke run is itself a
+  # signal worth catching, so this check is a hard fail_if_text.
+  - name: Assert no unexpected system message banner
+    action: fail_if_text
+    texts: ["Sync failed", "Update required", "No connection", "Error"]
