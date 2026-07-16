@@ -8,6 +8,7 @@ can't back up) without needing a real device, Appium server, or backend.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from click.testing import CliRunner
@@ -15,6 +16,20 @@ from click.testing import CliRunner
 from calee_regression import appium_lifecycle, cli, preflight
 from calee_regression.fixture_bridge import FixtureBridgeError
 from calee_regression.models import DoctorCheck, EXIT_BLOCKED, EXIT_INVALID_CONFIG, EXIT_SUCCESS
+
+_RUN_ID_RE = re.compile(r"Run ID: (\S+)")
+
+
+def _run_id_from_output(output: str) -> str:
+    match = _RUN_ID_RE.search(output)
+    assert match, f"prepare did not print a Run ID:\n{output}"
+    return match.group(1)
+
+
+def _environment_report(tmp_path, output: str) -> dict:
+    run_id = _run_id_from_output(output)
+    path = tmp_path / "reports" / "runs" / run_id / "environment" / "results.json"
+    return json.loads(path.read_text())
 
 
 @pytest.fixture(autouse=True)
@@ -26,11 +41,11 @@ def _appium_already_healthy(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_environment_status_path(tmp_path, monkeypatch):
-    # _environment_status_path() defaults to the real repo's reports/ dir
-    # (correct for an actual tester run) -- redirect it under tmp_path so
-    # these tests never write into this checkout's working tree.
-    monkeypatch.setattr(cli, "_environment_status_path", lambda: tmp_path / "environment-status-latest.json")
+def _isolate_repo_root(tmp_path, monkeypatch):
+    # REPO_ROOT drives where the run workspace (reports/runs/<run-id>/) is
+    # created -- redirect it under tmp_path so these tests never write into
+    # this checkout's working tree.
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
 
 
 _CONFIG_YAML = """
@@ -63,6 +78,9 @@ def test_prepare_blocks_on_preflight_error(tmp_path, monkeypatch):
     result = runner.invoke(cli.main, ["prepare", "--config", _config_path(tmp_path)])
     assert result.exit_code == EXIT_BLOCKED
     assert "not ready" in result.output.lower()
+    report = _environment_report(tmp_path, result.output)
+    assert report["status"] == "blocked"
+    assert any("adb not found" in d for d in report["detail"])
 
 
 def test_prepare_succeeds_with_skip_fixture(tmp_path, monkeypatch):
@@ -71,6 +89,8 @@ def test_prepare_succeeds_with_skip_fixture(tmp_path, monkeypatch):
     result = runner.invoke(cli.main, ["prepare", "--config", _config_path(tmp_path), "--skip-fixture"])
     assert result.exit_code == EXIT_SUCCESS
     assert "skipped" in result.output.lower()
+    report = _environment_report(tmp_path, result.output)
+    assert report["status"] == "pass"
 
 
 def test_prepare_blocks_without_fixture_credentials_configured(tmp_path, monkeypatch):
@@ -87,6 +107,8 @@ def test_prepare_blocks_without_fixture_credentials_configured(tmp_path, monkeyp
     assert result.exit_code == EXIT_BLOCKED
     assert "blocked" in result.output.lower()
     assert "fixture credentials are not configured" in result.output.lower()
+    report = _environment_report(tmp_path, result.output)
+    assert report["status"] == "blocked"
 
 
 def test_prepare_resets_and_verifies_fixture_when_credentials_given(tmp_path, monkeypatch):
@@ -115,12 +137,13 @@ def test_prepare_resets_and_verifies_fixture_when_credentials_given(tmp_path, mo
     assert calls == ["reset", "verify"]  # verify must run after a successful reset
     assert "secret" not in result.output  # never expose the password
 
-    status_path = cli._environment_status_path()
-    status = json.loads(status_path.read_text())
+    status = _environment_report(tmp_path, result.output)
+    assert status["status"] == "pass"
     assert status["fixtureVersion"] == "regression-fixture-v1"
     assert status["fixtureResetStatus"] == "ok"
     assert status["fixtureVerificationStatus"] == "ok"
     assert status["targetEnvironment"] == "https://hub-dev.calee.com.au"
+    assert "runId" in status
     assert "secret" not in json.dumps(status)
     assert "demo@example.com" not in json.dumps(status)
 
@@ -144,6 +167,8 @@ def test_prepare_blocks_when_fixture_reset_fails(tmp_path, monkeypatch):
     )
     assert result.exit_code == EXIT_BLOCKED
     assert "blocked" in result.output.lower()
+    report = _environment_report(tmp_path, result.output)
+    assert report["status"] == "blocked"
 
 
 def test_prepare_blocks_when_fixture_verification_fails_after_successful_reset(tmp_path, monkeypatch):
@@ -168,7 +193,8 @@ def test_prepare_blocks_when_fixture_verification_fails_after_successful_reset(t
     assert result.exit_code == EXIT_BLOCKED
     assert "verification failed" in result.output.lower()
 
-    status = json.loads(cli._environment_status_path().read_text())
+    status = _environment_report(tmp_path, result.output)
+    assert status["status"] == "blocked"
     assert status["fixtureResetStatus"] == "ok"
     assert status["fixtureVerificationStatus"] == "blocked"
 
@@ -208,5 +234,33 @@ def test_prepare_rejects_unknown_suite_name(tmp_path, monkeypatch):
     result = runner.invoke(
         cli.main,
         ["prepare", "--config", _config_path(tmp_path), "--allow-no-fixture", "--suite", "not-a-real-suite"],
+    )
+    assert result.exit_code == EXIT_INVALID_CONFIG
+
+
+def test_prepare_with_explicit_run_id_uses_it_verbatim(tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight, "run_doctor", lambda cfg: [DoctorCheck("adb_available", "ok", "found")])
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["prepare", "--config", _config_path(tmp_path), "--skip-fixture", "--run-id", "release-test-fixed-id"],
+    )
+    assert result.exit_code == EXIT_SUCCESS
+    assert "Run ID: release-test-fixed-id" in result.output
+    report_path = tmp_path / "reports" / "runs" / "release-test-fixed-id" / "environment" / "results.json"
+    assert report_path.is_file()
+    manifest_path = tmp_path / "reports" / "runs" / "release-test-fixed-id" / "run-manifest.json"
+    assert manifest_path.is_file()
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["runId"] == "release-test-fixed-id"
+    assert manifest["exitCodes"]["environment"] == EXIT_SUCCESS
+
+
+def test_prepare_rejects_invalid_run_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight, "run_doctor", lambda cfg: [DoctorCheck("adb_available", "ok", "found")])
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["prepare", "--config", _config_path(tmp_path), "--skip-fixture", "--run-id", "not valid!"],
     )
     assert result.exit_code == EXIT_INVALID_CONFIG

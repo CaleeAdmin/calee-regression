@@ -18,12 +18,24 @@ from calee_regression.consolidated_report import (
     ManualCheck,
     build_release_report,
     component_from_build_version_match,
+    component_from_environment_report,
     decide_status,
     write_html,
     write_json,
     write_junit,
     write_release_bundle,
 )
+
+PASSING_ENVIRONMENT_REPORT = {
+    "runId": "release-20260716-000000-abc123",
+    "status": "pass",
+    "detail": ["Environment and fixture ready."],
+}
+BLOCKED_ENVIRONMENT_REPORT = {
+    "runId": "release-20260716-000000-abc123",
+    "status": "blocked",
+    "detail": ["Fixture verification failed: HTTP 500"],
+}
 
 PASSING_TABLET_REPORT = {
     "passed_count": 10, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
@@ -72,6 +84,7 @@ def test_decide_status_basic_cases():
 
 def test_all_components_pass_and_manual_checks_pass_yields_overall_pass():
     report = build_release_report(
+        environment=PASSING_ENVIRONMENT_REPORT,
         tablet=PASSING_TABLET_REPORT,
         mobile_api=PASSING_API_REPORT,
         manual_checks=ALL_PASSED_MANUAL_CHECKS,
@@ -80,6 +93,50 @@ def test_all_components_pass_and_manual_checks_pass_yields_overall_pass():
         ios_mandatory=False,
     )
     assert report.overall_status == STATUS_PASS
+
+
+def test_environment_component_unit_pass_and_blocked():
+    passed = component_from_environment_report("env", PASSING_ENVIRONMENT_REPORT)
+    assert passed.status == STATUS_PASS
+    blocked = component_from_environment_report("env", BLOCKED_ENVIRONMENT_REPORT)
+    assert blocked.status == STATUS_BLOCKED
+    not_run = component_from_environment_report("env", None)
+    assert not_run.status == STATUS_NOT_RUN
+    # An environment report with no recognizable status must never be
+    # silently trusted as ready -- degrade to blocked, not pass.
+    garbled = component_from_environment_report("env", {"status": "who-knows"})
+    assert garbled.status == STATUS_BLOCKED
+
+
+def test_missing_environment_blocks_overall_even_when_everything_else_passes():
+    # This is the core Workstream 4 requirement: Prepare is mandatory. A
+    # release run where the tablet/mobile/manual checks all passed but
+    # Prepare never reported ready must never read as an overall PASS.
+    report = build_release_report(
+        tablet=PASSING_TABLET_REPORT,
+        mobile_api=PASSING_API_REPORT,
+        manual_checks=ALL_PASSED_MANUAL_CHECKS,
+        android_mandatory=False,
+        ios_mandatory=False,
+    )
+    assert report.overall_status == STATUS_BLOCKED
+    env_component = next(c for c in report.components if c.name == "Test environment and regression fixture")
+    assert env_component.status == STATUS_NOT_RUN
+    assert env_component.mandatory is True
+
+
+def test_blocked_environment_blocks_overall_even_when_everything_else_passes():
+    report = build_release_report(
+        environment=BLOCKED_ENVIRONMENT_REPORT,
+        tablet=PASSING_TABLET_REPORT,
+        mobile_api=PASSING_API_REPORT,
+        manual_checks=ALL_PASSED_MANUAL_CHECKS,
+        android_mandatory=False,
+        ios_mandatory=False,
+    )
+    assert report.overall_status == STATUS_BLOCKED
+    env_component = next(c for c in report.components if c.name == "Test environment and regression fixture")
+    assert env_component.status == STATUS_BLOCKED
 
 
 def test_mobile_ui_platforms_default_to_mandatory_and_block_when_missing():
@@ -137,6 +194,7 @@ def test_missing_manual_checks_blocks_overall_pass():
 
 def test_optional_component_being_not_run_does_not_block_overall_pass():
     report = build_release_report(
+        environment=PASSING_ENVIRONMENT_REPORT,
         tablet=PASSING_TABLET_REPORT,
         mobile_api=PASSING_API_REPORT,
         mobile_android_ui=None,
@@ -197,6 +255,7 @@ def test_suggested_next_action_present_for_each_overall_status():
     fail_report = build_release_report(tablet=FAILING_TABLET_REPORT, mobile_api=PASSING_API_REPORT, android_mandatory=False, ios_mandatory=False)
     blocked_report = build_release_report(tablet=PASSING_TABLET_REPORT, mobile_api=None, android_mandatory=False, ios_mandatory=False)
     pass_report = build_release_report(
+        environment=PASSING_ENVIRONMENT_REPORT,
         tablet=PASSING_TABLET_REPORT, mobile_api=PASSING_API_REPORT, manual_checks=ALL_PASSED_MANUAL_CHECKS,
         android_mandatory=False, ios_mandatory=False,
     )
@@ -207,6 +266,7 @@ def test_suggested_next_action_present_for_each_overall_status():
 
 def test_write_json_html_junit_and_bundle(tmp_path):
     report = build_release_report(
+        environment=PASSING_ENVIRONMENT_REPORT,
         tablet=PASSING_TABLET_REPORT,
         mobile_api=PASSING_API_REPORT,
         manual_checks=ALL_PASSED_MANUAL_CHECKS,

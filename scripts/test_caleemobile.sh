@@ -4,8 +4,10 @@
 # the same orchestration logic. Runs CaleeMobile-Regression's backend API
 # checks (always possible, no device needed) and its per-platform UI
 # checks via run_ui_suite.py, which resolves a real device (never a
-# hardcoded "-d android"/"-d ios"), passes test credentials through
-# --dart-define, and writes a structured results.json for consolidation.
+# hardcoded "-d android"/"-d ios"), passes test credentials to the
+# CaleeMobile process securely (never as a bare CLI argument another
+# process could read off the process list), and writes a structured
+# results.json for consolidation.
 set -uo pipefail
 
 PLATFORM="${1:-}"
@@ -16,9 +18,19 @@ fi
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 cd "$SCRIPT_DIR" || exit 1
-TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-REPORT_DIR="reports/mobile-${PLATFORM}-${TIMESTAMP}"
-mkdir -p "$REPORT_DIR"
+
+# Every invocation belongs to a run workspace, whether or not it's part of
+# an orchestrated "06 Test Full Calee Solution" run -- a standalone
+# "03/04 Test CaleeMobile ..." run just gets its own run ID instead of
+# writing to shared "-latest" files (see calee_regression/run_context.py
+# and docs/RELEASE_POLICY.md).
+CALEE_RUN_ID="${CALEE_RUN_ID:-mobile-standalone-$(date +%Y%m%d-%H%M%S)}"
+export CALEE_RUN_ID
+RUN_DIR="reports/runs/$CALEE_RUN_ID"
+API_DIR="$RUN_DIR/mobile-api"
+UI_DIR="$RUN_DIR/mobile-$PLATFORM"
+mkdir -p "$API_DIR" "$UI_DIR"
+echo "Run ID: $CALEE_RUN_ID"
 
 SIBLING="../CaleeMobile-Regression"
 if [ ! -d "$SIBLING/api" ]; then
@@ -28,13 +40,13 @@ if [ ! -d "$SIBLING/api" ]; then
 fi
 echo "[OK] CaleeMobile source found"
 
-API_REPORT="reports/mobile-api-latest.json"
+API_REPORT="$API_DIR/results.json"
 echo "Running the CaleeMobile backend API checks..."
 ( cd "$SIBLING/api" && python3 run_regression.py --report "$SCRIPT_DIR/$API_REPORT" )
 API_STATUS=$?
 
 UI_STATUS=3
-UI_REPORT="$REPORT_DIR/results.json"
+UI_REPORT="$UI_DIR/results.json"
 
 # CALEE_TEST_EMAIL/CALEE_TEST_PASSWORD are read from the environment by
 # run_ui_suite.py itself (never passed as a bare CLI argument here), so
@@ -57,18 +69,23 @@ elif [ ! -d "$SIBLING/ui" ]; then
 else
     echo ""
     echo "Preparing the CaleeMobile $PLATFORM UI checks..."
-    if ! ( cd "$SIBLING/ui" && flutter pub get ) > "$SCRIPT_DIR/$REPORT_DIR/pub-get.log" 2>&1; then
+    if ! ( cd "$SIBLING/ui" && flutter pub get ) > "$SCRIPT_DIR/$UI_DIR/pub-get.log" 2>&1; then
         echo "BLOCKED: \`flutter pub get\` failed in CaleeMobile-Regression/ui — a Flutter toolchain/dependency"
-        echo "problem, not a product failure. See $REPORT_DIR/pub-get.log"
+        echo "problem, not a product failure. See $UI_DIR/pub-get.log"
         UI_STATUS=3
     else
         ( cd "$SIBLING/ui" && python3 run_ui_suite.py \
             --platform "$PLATFORM" \
             --report "$SCRIPT_DIR/$UI_REPORT" \
-            --log "$SCRIPT_DIR/$REPORT_DIR/flutter.log" )
+            --log "$SCRIPT_DIR/$UI_DIR/flutter.log" )
         UI_STATUS=$?
     fi
 fi
+
+python -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component mobile-api \
+    --report-path "$API_REPORT" --exit-code "$API_STATUS" || true
+python -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component "mobile-$PLATFORM" \
+    --report-path "$UI_REPORT" --exit-code "$UI_STATUS" || true
 
 echo ""
 if [ "$API_STATUS" -eq 1 ] || [ "$UI_STATUS" -eq 1 ]; then

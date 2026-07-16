@@ -23,13 +23,12 @@ SAMPLE_DEFINITIONS = [
 
 
 @pytest.fixture(autouse=True)
-def _isolate_manual_checks_latest_path(tmp_path, monkeypatch):
-    # record-manual-checks always writes a second copy to
-    # _manual_checks_latest_path() (the real repo's reports/ dir by
-    # default, for the full-solution launcher to auto-discover) --
-    # redirect it under tmp_path so these tests never write into this
-    # checkout's working tree.
-    monkeypatch.setattr(cli, "_manual_checks_latest_path", lambda: tmp_path / "manual-checks-latest.json")
+def _isolate_repo_root(tmp_path, monkeypatch):
+    # record-manual-checks only writes outside --out when --run-id is
+    # given (into REPO_ROOT/reports/runs/<run-id>/) -- redirect REPO_ROOT
+    # under tmp_path so a test that does pass --run-id never writes into
+    # this checkout's working tree.
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
 
 
 def _scripted_input(answers):
@@ -154,6 +153,39 @@ def test_cli_record_manual_checks_exits_regression_when_mandatory_fails(tmp_path
         main, ["record-manual-checks", "--checks", checks_path, "--out", str(tmp_path / "out.json")],
     )
     assert result.exit_code == EXIT_REGRESSION
+
+
+def test_cli_record_manual_checks_with_run_id_writes_into_workspace(tmp_path, monkeypatch):
+    checks_path = _write_definitions(tmp_path, SAMPLE_DEFINITIONS)
+    monkeypatch.setattr("builtins.input", _scripted_input(["1", "1"]))
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "record-manual-checks", "--checks", checks_path, "--out", str(tmp_path / "out.json"),
+            "--run-id", "release-test-manual-id",
+        ],
+    )
+    assert result.exit_code == EXIT_SUCCESS
+    workspace_report = tmp_path / "reports" / "runs" / "release-test-manual-id" / "manual-checks" / "results.json"
+    assert workspace_report.is_file()
+    payload = json.loads(workspace_report.read_text())
+    assert payload["runId"] == "release-test-manual-id"
+    assert payload["checks"][0]["title"] == "Kiosk escape check"
+
+    manifest_path = tmp_path / "reports" / "runs" / "release-test-manual-id" / "run-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert "manual-checks" in manifest["reportPaths"]
+
+
+def test_write_results_wraps_with_run_id_when_given(tmp_path):
+    results = manual_checks.run_recorder(
+        SAMPLE_DEFINITIONS, input_fn=_scripted_input(["1", "1"]), print_fn=lambda *_: None,
+    )
+    out_path = manual_checks.write_results(results, tmp_path / "results.json", run_id="release-abc")
+    on_disk = json.loads(out_path.read_text())
+    assert on_disk["runId"] == "release-abc"
+    assert on_disk["checks"][0]["title"] == "Kiosk escape check"
 
 
 def test_cli_record_manual_checks_rejects_missing_checks_file(tmp_path):

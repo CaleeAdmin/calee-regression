@@ -138,10 +138,19 @@ def run_recorder(definitions: list, *, input_fn=None, print_fn=None) -> list:
     return results
 
 
-def write_results(results: list, path: Path) -> Path:
+def write_results(results: list, path: Path, *, run_id: "str | None" = None) -> Path:
+    """Writes `results` as a bare JSON list (the shape `consolidate
+    --manual-checks` has always accepted) unless `run_id` is given, in
+    which case it's wrapped as `{"runId": ..., "checks": [...]}` so
+    consolidation can verify this report belongs to the current release
+    run (see run_context.py). Bare-list output stays the default for a
+    standalone "05 Record Manual Checks" run outside a shared run
+    workspace -- there's no run ID to validate against in that case.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+    payload = {"runId": run_id, "checks": results} if run_id else results
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
 
 

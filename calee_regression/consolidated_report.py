@@ -243,6 +243,30 @@ def component_from_api_report(name: str, report_dict: "dict[str, Any] | None", *
     )
 
 
+def component_from_environment_report(
+    name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = True
+) -> ComponentResult:
+    """Build a ComponentResult from `prepare`'s environment/results.json
+    (cli.py's prepare command / run_context.py). Prepare is always
+    mandatory -- an environment/fixture that was never verified ready must
+    block the release the same as any other missing mandatory component,
+    never just an informational note next to an otherwise-green result.
+
+    Prepare only ever reports "pass" or "blocked" (never "fail" -- there is
+    no product assertion here, only "was the environment/fixture ready").
+    A status this function doesn't recognize is treated as blocked rather
+    than silently trusted.
+    """
+    if report_dict is None:
+        return ComponentResult(name=name, status=STATUS_NOT_RUN, mandatory=mandatory, detail=["Not executed."])
+    status = report_dict.get("status")
+    detail = list(report_dict.get("detail", []))
+    if status not in (STATUS_PASS, STATUS_BLOCKED):
+        detail = detail + [f"Unrecognized environment status {report_dict.get('status')!r}."]
+        status = STATUS_BLOCKED
+    return ComponentResult(name=name, status=status, mandatory=mandatory, detail=detail)
+
+
 def component_from_manual_checks(checks: "list[ManualCheck]", *, name: str = "manual checks") -> ComponentResult:
     if not checks:
         return ComponentResult(name=name, status=STATUS_NOT_RUN, mandatory=True, detail=["No manual checks recorded."])
@@ -260,6 +284,7 @@ def component_from_manual_checks(checks: "list[ManualCheck]", *, name: str = "ma
 
 def build_release_report(
     *,
+    environment: "dict[str, Any] | None" = None,
     tablet: "dict[str, Any] | None" = None,
     mobile_api: "dict[str, Any] | None" = None,
     mobile_android_ui: "dict[str, Any] | None" = None,
@@ -286,8 +311,14 @@ def build_release_report(
     mismatch against the detected `calee_build_version`/
     `caleemobile_build_version` BLOCKS the release (see
     component_from_build_version_match).
+
+    `environment` (prepare's environment/results.json) is always
+    mandatory -- unlike every other component here, there is no
+    "environment is optional for this release" concept. See
+    component_from_environment_report and Workstream 4.
     """
     components = [
+        component_from_environment_report("Test environment and regression fixture", environment, mandatory=True),
         component_from_tablet_report("Calee tablet", tablet, mandatory=True),
         component_from_api_report("CaleeMobile Client API", mobile_api, mandatory=True),
         component_from_api_report("CaleeMobile Android UI", mobile_android_ui, mandatory=android_mandatory),
