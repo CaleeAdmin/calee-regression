@@ -1,0 +1,21 @@
+# Technical-owner configuration: which platforms this release includes.
+#
+# Copy this file to config/release-platforms.yaml (gitignored, like
+# tester.local.yaml) and edit it once per release-candidate build. This is
+# NOT something a non-technical tester should ever need to touch.
+#
+# `consolidate` uses this to decide whether the CaleeMobile Android UI and
+# iPhone UI results are mandatory (release-gating) or optional. If this
+# file is absent, every platform defaults to mandatory=true -- an omitted
+# platform must block the release, not silently pass by omission.
+#
+# Set a platform to `false` only when this release genuinely does not
+# include that platform (e.g. an Android-only hotfix). Do not set
+# mobile_android/mobile_ios to false just because you don't want to run
+# the mobile UI suite this time -- that is a real release-scope decision,
+# not a shortcut.
+
+release_platforms:
+  tablet: true
+  mobile_android: true
+  mobile_ios: true

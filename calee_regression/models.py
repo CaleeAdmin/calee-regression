@@ -70,6 +70,12 @@ class Scenario:
     requires_state: str
     default_timeout_seconds: int
     steps: list
+    # Release-critical by default: a scenario that ends up whole-scenario
+    # SKIPPED (e.g. a requires_state mismatch) still blocks the suite unless
+    # the scenario author explicitly opts out with `mandatory: false` in the
+    # YAML. This mirrors the step-level required/optional default below --
+    # absence of a real result must never silently read as a pass.
+    mandatory: bool = True
 
 
 @dataclass
@@ -82,6 +88,7 @@ class ScenarioResult:
     skip_reason: "str | None" = None
     blocked_reason: "str | None" = None
     tags: list = field(default_factory=list)
+    mandatory: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -92,6 +99,7 @@ class ScenarioResult:
             "skip_reason": self.skip_reason,
             "blocked_reason": self.blocked_reason,
             "tags": self.tags,
+            "mandatory": self.mandatory,
             "steps": [s.to_dict() for s in self.steps],
         }
 
@@ -119,6 +127,18 @@ class SuiteResult:
     def blocked_count(self) -> int:
         return sum(1 for s in self.scenarios if s.status == STATUS_BLOCKED)
 
+    @property
+    def mandatory_skipped_count(self) -> int:
+        """Mandatory (release-critical) scenarios that ended up SKIPPED.
+
+        These are not counted in blocked_count (their own status is
+        STATUS_SKIPPED, not STATUS_BLOCKED) but must still prevent an
+        overall PASS -- a required scenario that never ran is not evidence
+        of anything passing. Callers feed this into decide_status's
+        `blocked` bucket alongside blocked_count.
+        """
+        return sum(1 for s in self.scenarios if s.status == STATUS_SKIPPED and s.mandatory)
+
     def to_dict(self) -> dict:
         return {
             "name": self.name,
@@ -128,6 +148,7 @@ class SuiteResult:
             "failed_count": self.failed_count,
             "skipped_count": self.skipped_count,
             "blocked_count": self.blocked_count,
+            "mandatory_skipped_count": self.mandatory_skipped_count,
             "scenarios": [s.to_dict() for s in self.scenarios],
         }
 

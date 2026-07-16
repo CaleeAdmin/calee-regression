@@ -83,18 +83,63 @@ export CALEE_TEST_EMAIL="demo@example.com"
 export CALEE_TEST_PASSWORD="..."
 ```
 
-If these aren't set, Prepare still runs the local environment checks — it just skips the fixture
-reset step and says so, rather than failing.
+If these aren't set, `01 Prepare Test Environment.command` now **BLOCKS** rather than silently
+reporting READY — a release-gating run (the default) must not proceed without a real, verified
+fixture. If you're deliberately preparing for a suite that genuinely doesn't need the fixture (e.g.
+`smoke-fresh`), pass `--allow-no-fixture --suite smoke-fresh` from a terminal; the numbered
+launchers never do this automatically.
 
-## 5. Start Appium
+### Release platform profile (which platforms this release includes)
 
-In its own terminal window/tab, leave this running while you test:
+```bash
+cp config/release-platforms.example.yaml config/release-platforms.yaml
+```
+
+Edit it to say which platforms this release build actually includes (`tablet`, `mobile_android`,
+`mobile_ios`) — this decides whether the CaleeMobile Android/iOS UI results are mandatory for an
+overall PASS. If you skip this step, every platform defaults to mandatory, which is the safe
+default but may block on a platform you never intended to test this round.
+
+### Manual checks (optional but recommended)
+
+```bash
+cp config/manual-checks.example.json config/manual-checks.json
+```
+
+Edit the checklist to match your release's real manual checks. If you skip this, `05 Record Manual
+Checks.command` falls back to the example checklist and says so.
+
+## 5. Appium
+
+`01 Prepare Test Environment.command` starts Appium automatically (with the required flags) if it
+isn't already reachable at your config's `appium_url` — you do not need to open a separate terminal
+for this anymore. Logs go to `reports/appium.log`; if it fails to start you'll see a plain-language
+BLOCKED message there and in the launcher's own output. `06 Test Full Calee Solution.command` stops
+Appium again at the end of the run, but only if it was the one that started it — an Appium you
+started yourself (see below) is never touched.
+
+To start it manually anyway (e.g. for interactive debugging outside this framework):
 
 ```bash
 appium --base-path /wd/hub --allow-insecure uiautomator2:adb_shell
 ```
 
 Both flags matter — see `docs/TROUBLESHOOTING.md` if you forget one.
+
+### Optional: build/version metadata for the consolidated report
+
+`06 Test Full Calee Solution.command` picks these up automatically if set (never fabricated if
+absent):
+
+```bash
+export CALEE_BUILD_VERSION="0.3.22"              # Calee tablet app version
+export CALEEMOBILE_BUILD_VERSION="0.0.22"        # CaleeMobile app version
+export CALEE_EXPECTED_BUILD_VERSION="0.3.22"     # optional: block if the detected build differs
+export CALEEMOBILE_EXPECTED_BUILD_VERSION="0.0.22"
+export CALEESHELL_VERSION="..."                  # optional
+export CALEE_GIT_SHA="$(git -C /path/to/Calee rev-parse HEAD)"           # optional
+export CALEEMOBILE_GIT_SHA="$(git -C /path/to/CaleeMobile rev-parse HEAD)" # optional
+```
 
 ## 6. Start your emulator (or connect the tablet)
 

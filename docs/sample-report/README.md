@@ -8,9 +8,14 @@ JSON (not a real device/backend run) — see `docs/RELEASE_POLICY.md` for the ru
 - `consolidated-report.json` — machine-readable, same content.
 - `consolidated-report.junit.xml` — for CI dashboards that ingest JUnit.
 - `Calee-Regression-SAMPLE-PASS.zip` — the release bundle (same three files, zipped) that
-  `05 Test Full Calee Solution.command` produces for a real run.
+  `06 Test Full Calee Solution.command` produces for a real run.
 
 This example shows an overall **PASS**: the tablet suite and CaleeMobile API suite both passed
-(mandatory), the CaleeMobile Android UI suite is BLOCKED (no device connected — but it's optional,
-so this alone doesn't block PASS), the iPhone UI suite wasn't run at all (also optional), and both
-sample manual checks are recorded as passed (mandatory once any are defined).
+(always mandatory), and both sample manual checks are recorded as passed. The CaleeMobile Android
+and iPhone UI suites are shown as `not_run`/optional here because this sample was explicitly
+generated with `--android-optional --ios-optional` (a tablet-only release scope, for illustration).
+By default — with no `config/release-platforms.yaml` and no `--android-optional`/`--ios-optional`
+override — both platforms default to **mandatory**, and a `not_run` mobile UI result would instead
+make the overall status BLOCKED; see `docs/RELEASE_POLICY.md` for the full rule and
+`framework_tests/test_release_platforms.py` for the tablet-only / tablet+Android / tablet+Android+
+iOS scenarios exercised as automated tests.

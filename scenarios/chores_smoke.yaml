@@ -14,11 +14,18 @@ steps:
   # Chores is a conditional bottom-navigation tab, hidden entirely for
   # accounts/experience modes without a chore-capable ("portal") service.
   # See docs/TEST_DATA_RESET_CONTRACT.md for how "no chore service" is
-  # expected to be handled by this scenario: its absence is not itself a
-  # failure, but if it's present, the screen must actually render.
+  # expected to be handled by this scenario. Its absence is explicitly
+  # marked optional (so this scenario can still PASS on a no-chores
+  # account), but if llChores IS present, then_wait_for_id makes tapping
+  # it and failing to actually render the chores list (id=choresRecyclerView,
+  # confirmed against layout_chores_navigation.xml) a real, hard FAILED --
+  # a present-but-broken chores tab must not silently pass.
   - name: Open Chores if this account has a Chores tab
     action: tap_if_present
     id: llChores
+    optional: true
+    then_wait_for_id: choresRecyclerView
+    then_wait_for_id_timeout_seconds: 10
 
   - name: Let chores screen settle
     action: sleep

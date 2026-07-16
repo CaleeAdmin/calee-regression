@@ -61,6 +61,7 @@ def load_scenario(path) -> Scenario:
         requires_state=requires_state,
         default_timeout_seconds=int(raw.get("default_timeout_seconds", 20)),
         steps=steps,
+        mandatory=bool(raw.get("mandatory", True)),
     )
 
 
@@ -158,12 +159,73 @@ def _step_tap(ctx, step):
     _tap_target(ctx["driver"], step)
 
 
+def _step_is_optional(step: dict) -> bool:
+    """A step is optional if explicitly marked `optional: true` or
+    `required: false`. The default is required -- see Workstream 1's
+    "the default must be required" rule. Only the step author's explicit
+    marking may downgrade an absent element from BLOCKED to SKIPPED.
+    """
+    if "optional" in step:
+        return bool(step["optional"])
+    if "required" in step:
+        return not bool(step["required"])
+    return False
+
+
 def _step_tap_if_present(ctx, step, result: StepResult):
     try:
         _tap_target(ctx["driver"], step)
     except Exception:
+        if _step_is_optional(step):
+            result.status = STATUS_SKIPPED
+            result.message = "element not present, skipped (step marked optional)"
+        else:
+            # Absence of a required element means this scenario cannot
+            # complete reliably -- that is an environment/product-state
+            # uncertainty, not evidence the product regressed, so it must
+            # block rather than silently letting the scenario pass. Mark
+            # the step `optional: true` (or `required: false`) if its
+            # absence really is acceptable.
+            result.status = STATUS_BLOCKED
+            result.message = (
+                "element not present, and this step is required (default) -- "
+                "the scenario cannot reliably continue. Mark this step "
+                "'optional: true' if its absence is genuinely acceptable."
+            )
+        return
+
+    verify_id = step.get("then_wait_for_id")
+    if verify_id:
+        # The element existed and was tapped -- if it's a nav target whose
+        # destination screen must then render, a present-but-broken target
+        # (e.g. a nav tab that crashes/hangs when opened) must be caught as
+        # a real product failure, not silently pass just because the tap
+        # itself succeeded.
+        timeout = step.get("then_wait_for_id_timeout_seconds", 10)
+        if not ctx["driver"].wait_for_id(verify_id, timeout):
+            raise AssertionError(
+                f"Tapped {step.get('id') or step.get('text') or step.get('xpath')!r} but the "
+                f"expected content (id={verify_id!r}) never appeared within {timeout}s -- present "
+                f"but did not render."
+            )
+        result.message = f"tapped and verified id {verify_id!r} appeared"
+
+
+def _step_tap_if_absent(ctx, step, result: StepResult):
+    """Tap `id`/`text`/`xpath` only if `unless_id` is not already present.
+
+    For idempotent toggle controls (e.g. an expand/collapse rail button)
+    where blindly tapping every run would flip an already-correct,
+    persisted UI state back to the wrong one instead of reliably reaching
+    a known state.
+    """
+    unless_id = step["unless_id"]
+    if ctx["driver"].id_present(unless_id):
         result.status = STATUS_SKIPPED
-        result.message = "element not present, skipped"
+        result.message = f"{unless_id!r} already present, toggle not needed"
+        return
+    _tap_target(ctx["driver"], step)
+    result.message = f"{unless_id!r} was not present, tapped toggle"
 
 
 def _step_type_text(ctx, step):
@@ -193,12 +255,23 @@ def _step_wait_for_text(ctx, step, result: StepResult):
 
 
 def _step_optional(ctx, step, result: StepResult):
+    # _execute_step() always catches the nested step's own exceptions
+    # internally and returns a StepResult rather than raising -- so this
+    # must inspect the returned result's status, not wrap the call in a
+    # try/except (which would never trigger and would silently leave this
+    # step PASSED even when the wrapped assertion actually failed).
     nested = step["step"]
-    try:
-        _execute_step(ctx, nested)
-    except Exception as exc:
+    inner = _execute_step(ctx, nested)
+    result.screenshot_path = inner.screenshot_path
+    result.diff_path = inner.diff_path
+    if inner.status in (STATUS_FAILED, STATUS_BLOCKED):
         result.status = STATUS_WARNING
-        result.message = f"optional step {nested.get('name', nested.get('action'))!r} did not succeed: {exc}"
+        result.message = (
+            f"optional step {nested.get('name', nested.get('action'))!r} did not succeed: {inner.message}"
+        )
+    else:
+        result.status = inner.status
+        result.message = inner.message
 
 
 def _step_fail_if_text(ctx, step, result: StepResult):
@@ -230,6 +303,7 @@ ACTIONS = {
     "assert_id": _step_assert_id,
     "tap": _step_tap,
     "tap_if_present": _step_tap_if_present,
+    "tap_if_absent": _step_tap_if_absent,
     "type_text": _step_type_text,
     "hide_keyboard": _step_hide_keyboard,
     "back": _step_back,
@@ -239,6 +313,27 @@ ACTIONS = {
     "fail_if_text": _step_fail_if_text,
     "assert_current_activity": _step_assert_current_activity,
 }
+
+
+VERIFYING_ACTIONS = {
+    "assert_text", "assert_any_text", "assert_id", "wait_for_id", "wait_for_text",
+    "fail_if_text", "assert_current_activity",
+}
+
+
+def _step_is_real_verification(step: dict) -> bool:
+    """Whether a PASSED result for this step is evidence something was
+    actually checked, as opposed to a no-op (launch/sleep/a screenshot
+    taken with compare: false all trivially resolve PASSED without
+    verifying anything)."""
+    action = step.get("action")
+    if action in VERIFYING_ACTIONS:
+        return True
+    if action == "screenshot" and step.get("compare", True):
+        return True
+    if action == "tap_if_present" and step.get("then_wait_for_id"):
+        return True
+    return False
 
 
 def _execute_step(ctx, step: dict) -> StepResult:
@@ -338,6 +433,7 @@ class ScenarioRunner:
                         status=STATUS_SKIPPED,
                         skip_reason=skip_reason,
                         tags=scenario.tags,
+                        mandatory=scenario.mandatory,
                     )
                 )
             else:
@@ -396,16 +492,20 @@ class ScenarioRunner:
         }
         steps: list = []
         started = time.monotonic()
-        failed = False
+        stopped = False
+        saw_failed = False
+        saw_blocked = False
+        saw_real_verification = False
+        blocked_reason = None
 
         for raw_step in scenario.steps:
-            if failed:
+            if stopped:
                 steps.append(
                     StepResult(
                         name=raw_step.get("name", raw_step.get("action", "unnamed step")),
                         action=raw_step.get("action", ""),
                         status=STATUS_SKIPPED,
-                        message="not run: earlier step failed",
+                        message="not run: earlier step failed or blocked",
                     )
                 )
                 continue
@@ -413,9 +513,37 @@ class ScenarioRunner:
             result = _execute_step(ctx, raw_step)
             steps.append(result)
             if result.status == STATUS_FAILED:
-                failed = True
+                saw_failed = True
+                stopped = True
+            elif result.status == STATUS_BLOCKED:
+                saw_blocked = True
+                blocked_reason = result.message
+                stopped = True
+            elif result.status == STATUS_PASSED and _step_is_real_verification(raw_step):
+                saw_real_verification = True
 
-        status = STATUS_FAILED if failed else STATUS_PASSED
+        if saw_failed:
+            # A real product assertion failure always wins over a block --
+            # see docs/RELEASE_POLICY.md's FAIL-beats-BLOCKED precedence.
+            status = STATUS_FAILED
+        elif saw_blocked:
+            status = STATUS_BLOCKED
+        elif not saw_real_verification:
+            # Nothing in this scenario actually verified anything -- e.g.
+            # every tap_if_present target was absent-and-optional, or every
+            # assertion was wrapped in `optional`, leaving only no-op steps
+            # (launch/sleep/screenshot-without-compare all trivially
+            # resolve PASSED without checking anything). That must never
+            # read as a release PASS -- see Workstream 1's "all-optional
+            # scenario with no actual assertions" requirement.
+            status = STATUS_BLOCKED
+            blocked_reason = (
+                "No step in this scenario actually verified anything -- every assertion was "
+                "skipped, optional, or absent. This cannot count as a release pass."
+            )
+        else:
+            status = STATUS_PASSED
+
         return ScenarioResult(
             name=scenario.name,
             file=str(scenario.file),
@@ -423,4 +551,6 @@ class ScenarioRunner:
             steps=steps,
             duration_seconds=time.monotonic() - started,
             tags=scenario.tags,
+            mandatory=scenario.mandatory,
+            blocked_reason=blocked_reason if status == STATUS_BLOCKED else None,
         )

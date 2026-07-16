@@ -23,7 +23,7 @@ if [ $STATUS -eq 0 ]; then
     echo "PASSED: calendar"
 else
     echo ""
-    echo "FAILED/BLOCKED: calendar — open the report ('06 Open Latest Report') for details."
+    echo "FAILED/BLOCKED: calendar — open the report ('07 Open Latest Report') for details."
 fi
 
 read -p "Press Enter to close..."

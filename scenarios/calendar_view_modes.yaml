@@ -20,59 +20,85 @@ steps:
     id: btnAddEvent
     timeout_seconds: 10
 
-  # The Day/Week/Month/Agenda toggles (real labels, confirmed against
-  # layout_calendar_navigation.xml) live in the calendar's navigation rail,
-  # which can be collapsed/expanded via a separate toggle. This framework
-  # doesn't yet know the rail's default expand state on a given build, so
-  # these taps stay tap_if_present rather than a hard tap -- that is a real,
-  # documented uncertainty about tablet layout state, not a guess about
-  # label wording (the labels themselves are confirmed).
-  - name: Switch to Day view if the navigation rail is showing it
-    action: tap_if_present
+  # The Day/Week/Month/Agenda navigation rail (ids confirmed against
+  # layout_calendar_navigation.xml) is collapsed by default and its
+  # expand/collapse state is a persisted per-device preference
+  # (CalendarFragment.kt: SharedPreferences "calendar_ui_prefs" ->
+  # "sidebar_expanded", default false -- see ivExpand's click handler).
+  # A device that was previously used may already have it expanded, so
+  # this uses tap_if_absent rather than blindly tapping ivExpand: blindly
+  # tapping a toggle would collapse an already-expanded rail instead of
+  # reliably reaching a known (expanded) state.
+  - name: Expand the navigation rail if it is currently collapsed
+    action: tap_if_absent
+    unless_id: llDay
+    id: ivExpand
+
+  - name: Assert the navigation rail is now expanded
+    action: wait_for_id
+    id: llDay
+    timeout_seconds: 10
+
+  # From here the rail is guaranteed expanded, so every switch below is a
+  # hard tap (not tap_if_present) followed by a real content assertion.
+  # Selected/active state on the nav row itself (llDay/llWeek/llMonth/
+  # llSchedule) is applied as background/text-color/typeface only
+  # (CalendarFragment.select()) -- none of that is exposed as a UiAutomator
+  # attribute, so "became active" is verified the only reliable way: by
+  # waiting for the view-mode-specific content panel that HubCalendarFragment
+  # shows exclusively (panelHubDay/panelHubWeek/panelHubMonth/panelHubAgenda,
+  # confirmed against HubCalendarFragment.kt's exclusive-visibility switch)
+  # to actually appear in the hierarchy.
+  - name: Switch to Day view
+    action: tap
     id: llDay
 
-  - name: Let day view settle
-    action: sleep
-    seconds: 1.5
+  - name: Verify Day view actually became active
+    action: wait_for_id
+    id: panelHubDay
+    timeout_seconds: 10
 
   - name: Capture day view
     action: screenshot
     screenshot_name: 00_day_view
     compare: false
 
-  - name: Switch to Week view if the navigation rail is showing it
-    action: tap_if_present
+  - name: Switch to Week view
+    action: tap
     id: llWeek
 
-  - name: Let week view settle
-    action: sleep
-    seconds: 1.5
+  - name: Verify Week view actually became active
+    action: wait_for_id
+    id: panelHubWeek
+    timeout_seconds: 10
 
   - name: Capture week view
     action: screenshot
     screenshot_name: 01_week_view
     compare: false
 
-  - name: Switch to Month view if the navigation rail is showing it
-    action: tap_if_present
+  - name: Switch to Month view
+    action: tap
     id: llMonth
 
-  - name: Let month view settle
-    action: sleep
-    seconds: 1.5
+  - name: Verify Month view actually became active
+    action: wait_for_id
+    id: panelHubMonth
+    timeout_seconds: 10
 
   - name: Capture month view
     action: screenshot
     screenshot_name: 02_month_view
     compare: false
 
-  - name: Switch to Agenda view if the navigation rail is showing it
-    action: tap_if_present
+  - name: Switch to Agenda view
+    action: tap
     id: llSchedule
 
-  - name: Let agenda view settle
-    action: sleep
-    seconds: 1.5
+  - name: Verify Agenda view actually became active
+    action: wait_for_id
+    id: panelHubAgenda
+    timeout_seconds: 10
 
   - name: Capture agenda view
     action: screenshot

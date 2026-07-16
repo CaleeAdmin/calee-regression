@@ -7,6 +7,7 @@ name: calee-example-scenario
 tags: [smoke, tablet]
 requires_state: logged_in_tablet   # fresh | logged_in_tablet | physical_tablet | any
 default_timeout_seconds: 20
+mandatory: true                    # optional, defaults to true -- see below
 steps:
   - name: Human-readable step name
     action: launch
@@ -18,9 +19,18 @@ steps:
 - `requires_state` — controls where this scenario is allowed to run (see below). Defaults to `any`.
 - `default_timeout_seconds` — default timeout used by `wait_for_id`/`wait_for_text` steps that don't
   specify their own `timeout_seconds`. Defaults to `20`.
-- `steps` — required, non-empty list of step dicts, executed in order. If a step fails, later steps
-  in the same scenario are skipped (marked `skipped`, "not run: earlier step failed") — except steps
-  wrapped in `optional`, whose failures never stop the scenario.
+- `mandatory` — whether this scenario is release-critical. Defaults to `true` (the safe default,
+  same "default must be required" rule as step-level `optional`/`required` below). If this scenario
+  ends up whole-scenario `SKIPPED` (e.g. a `requires_state` mismatch) while `mandatory: true`, the
+  suite is BLOCKED, not silently passed — see `SuiteResult.mandatory_skipped_count`. Set
+  `mandatory: false` only for a genuinely optional scenario (e.g. one that only applies to some
+  account configurations).
+- `steps` — required, non-empty list of step dicts, executed in order. If a step's result is
+  `failed` **or** `blocked`, later steps in the same scenario are skipped (marked `skipped`, "not
+  run: earlier step failed or blocked") — except steps wrapped in `optional`, whose failures never
+  stop the scenario. A scenario in which no step actually verified anything (every step
+  skipped/optional/no-op) resolves `blocked`, not `passed` — see `tap_if_present` and `optional`
+  below for what counts as "actually verified".
 
 ## `requires_state` values
 
@@ -121,13 +131,42 @@ Taps an element found by exactly one of `id`, `text`, or `xpath`. Fails the scen
 ```
 
 ### `tap_if_present`
-Same params as `tap`, but if the element isn't found the step is marked `skipped` ("element not
-present, skipped") instead of failing the scenario. Use this whenever exact labels/ids aren't
-guaranteed.
+Same params as `tap`, but if the element isn't found the step doesn't fail outright. What happens
+next depends on whether the step is marked optional -- **the default is required**:
+
+- **Required (default)**: absence is treated as `blocked`, not `skipped` -- the scenario cannot
+  reliably continue, so it BLOCKS (see `docs/RELEASE_POLICY.md`'s required/optional rule). Only use
+  the bare, unmarked form when the element's presence is actually guaranteed and you just haven't
+  confirmed the exact id yet -- that uncertainty itself should surface as BLOCKED, not a silent
+  pass.
+- **Explicitly optional** (`optional: true` or `required: false`): absence is marked `skipped`
+  ("element not present, skipped (step marked optional)") and the scenario continues normally. Use
+  this only when the element's absence is genuinely, deliberately acceptable (e.g. a conditional
+  nav tab that some accounts don't have).
+
 ```yaml
-- name: Tap Calendar tab if present
+- name: Open Chores if this account has a Chores tab
   action: tap_if_present
-  text: Calendar
+  id: llChores
+  optional: true                     # absence is fine -- some accounts have no chore service
+  then_wait_for_id: choresRecyclerView   # but if present, the tab MUST actually render
+  then_wait_for_id_timeout_seconds: 10
+```
+
+`then_wait_for_id` (optional): if the tap succeeds, wait for this id to appear afterward, and
+**fail** the step (a real product failure, not BLOCKED/SKIPPED) if it doesn't -- a present-but-
+broken tab must not silently pass just because the tap itself landed.
+
+### `tap_if_absent`
+Taps `id`/`text`/`xpath` only if a *different* element (`unless_id`) is **not** currently present.
+For idempotent toggle controls (e.g. an expand/collapse rail button) where blindly tapping every
+run would flip an already-correct, persisted UI state back to the wrong one instead of reliably
+reaching a known state.
+```yaml
+- name: Expand the navigation rail if it is currently collapsed
+  action: tap_if_absent
+  unless_id: llDay        # if llDay is already visible, the rail is already expanded -- do nothing
+  id: ivExpand             # otherwise tap the expand/collapse toggle
 ```
 
 ### `type_text`
@@ -174,8 +213,11 @@ Same as `wait_for_id` but polls for `text` anywhere on screen.
 
 ### `optional`
 Wraps a nested `step` (a full step dict with its own `name`/`action`/params). If the nested step
-would have failed, this step is marked `warning` instead (carrying the failure message) and the
-scenario continues normally.
+would have failed or blocked, this step is marked `warning` instead (carrying the failure message)
+and the scenario continues normally. If the nested step passes, this step reflects that real
+outcome (not an automatic pass) -- a scenario relying solely on `optional`-wrapped assertions can
+never, by itself, prove this scenario actually verified anything (see the all-`skipped`/`warning`
+BLOCKED rule above), so don't use `optional` as the *only* assertion in a release-critical scenario.
 ```yaml
 - name: Optionally assert recurring event fields
   action: optional
