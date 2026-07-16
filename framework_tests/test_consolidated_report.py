@@ -17,6 +17,7 @@ from calee_regression.consolidated_report import (
     STATUS_PASS,
     ManualCheck,
     build_release_report,
+    component_from_api_report,
     component_from_build_version_match,
     component_from_environment_report,
     decide_status,
@@ -72,6 +73,89 @@ BLOCKED_API_REPORT = {
 ALL_PASSED_MANUAL_CHECKS = [
     ManualCheck(title="Kiosk escape check", instruction="Try swiping down", expected_result="No shade opens", status="pass"),
 ]
+
+
+def _mobile_report(steps):
+    counts = {}
+    for step in steps:
+        counts[step["status"]] = counts.get(step["status"], 0) + 1
+    return {"runId": "r1", "counts": counts, "steps": steps}
+
+
+def _passed(name):
+    return {"name": name, "status": "PASS", "mandatory": True, "skipCategory": None, "detail": ""}
+
+
+def _optional_skip(name):
+    return {"name": name, "status": "SKIP", "mandatory": False, "skipCategory": "optional_feature", "detail": "OPTIONAL: no chore service"}
+
+
+def _mandatory_skip(name):
+    return {"name": name, "status": "SKIP", "mandatory": True, "skipCategory": "unspecified", "detail": ""}
+
+
+def _fixture_missing_skip(name):
+    return {"name": name, "status": "SKIP", "mandatory": True, "skipCategory": "missing_fixture", "detail": "FIXTURE_MISSING: REG-EVENT-RECURRING-001"}
+
+
+# Workstream 5: component_from_api_report must read the mandatory/
+# skipCategory fields CaleeMobile-Regression's UI reports now carry (see
+# ui/run_ui_suite.py in that repo) and fold a mandatory skip into BLOCKED
+# -- the same "not_run == blocked for a mandatory component" rule applied
+# everywhere else in this framework.
+
+
+def test_passed_tests_plus_one_optional_skip_still_passes():
+    report = _mobile_report([_passed("a"), _passed("b"), _optional_skip("chores: complete a chore")])
+    component = component_from_api_report("CaleeMobile Android UI", report)
+    assert component.status == STATUS_PASS
+
+
+def test_passed_tests_plus_one_mandatory_skip_blocks():
+    # The core Workstream 5 requirement: a suite containing passed tests
+    # plus one mandatory skipped test must never return success.
+    report = _mobile_report([_passed("a"), _passed("b"), _mandatory_skip("tasks: reopen a task")])
+    component = component_from_api_report("CaleeMobile Android UI", report)
+    assert component.status == STATUS_BLOCKED
+    assert any("tasks: reopen a task" in d for d in component.detail)
+
+
+def test_step_with_no_mandatory_key_defaults_to_mandatory_and_blocks():
+    # Absence of "mandatory" (e.g. an older report, or the Client API
+    # report shape which has no such concept) must default to
+    # mandatory=True, never be read as an accepted optional skip.
+    report = _mobile_report([_passed("a"), {"name": "b", "status": "SKIP", "detail": "no reason given"}])
+    component = component_from_api_report("CaleeMobile Client API", report)
+    assert component.status == STATUS_BLOCKED
+
+
+def test_missing_fixture_skip_blocks_not_fails():
+    # "Do not classify 'fixture record missing' as a product FAIL."
+    report = _mobile_report([_passed("a"), _fixture_missing_skip("calendar: recurring event edit")])
+    component = component_from_api_report("CaleeMobile iPhone UI", report)
+    assert component.status == STATUS_BLOCKED
+    assert component.status != STATUS_FAIL
+
+
+def test_multiple_optional_skips_alongside_passes_still_passes():
+    report = _mobile_report([
+        _passed("a"), _passed("b"),
+        _optional_skip("chores: complete a chore"),
+        _optional_skip("meals: edit a meal"),
+    ])
+    component = component_from_api_report("CaleeMobile Android UI", report)
+    assert component.status == STATUS_PASS
+
+
+def test_real_failure_alongside_mandatory_skip_is_still_fail_not_blocked():
+    # FAIL always wins over BLOCKED, even when the block comes from a
+    # mandatory skip in the same report.
+    report = _mobile_report([
+        {"name": "bad", "status": "FAIL", "mandatory": True, "skipCategory": None, "detail": "assertion failed"},
+        _mandatory_skip("other test"),
+    ])
+    component = component_from_api_report("CaleeMobile Android UI", report)
+    assert component.status == STATUS_FAIL
 
 
 def test_decide_status_basic_cases():

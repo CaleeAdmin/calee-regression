@@ -81,6 +81,16 @@ Beyond the pass/fail/blocked roll-up above, an overall PASS additionally require
   `mandatory: false` may be skipped without blocking. The same applies at the step level: a
   `tap_if_present` step whose target is absent BLOCKS the scenario unless the step is explicitly
   marked `optional: true`/`required: false` — the default is always required.
+- The same rule applies to CaleeMobile's mobile UI reports (Android/iPhone). Each test step there
+  carries its own `mandatory` (bool) and `skipCategory` fields (see CaleeMobile-Regression's
+  `ui/run_ui_suite.py::classify_skip`, driven by the skip reason a test passes to Dart's
+  `markTestSkipped(reason)`): a step skipped with an `OPTIONAL: ...` reason (the signed-in test
+  account genuinely doesn't have that feature) stays `SKIP` and does not block; anything else —
+  including an unexplained skip — defaults to `mandatory=true` and is folded into BLOCKED by
+  `component_from_api_report`, the same way a mandatory tablet-scenario skip is. A skip reasoned
+  `FIXTURE_MISSING: ...` (the deterministic regression fixture wasn't reset/verified) is always
+  mandatory too, and is deliberately never reported as a product FAIL — see
+  `docs/TEST_DATA_RESET_CONTRACT.md`.
 - No scenario passes on the strength of skipped/optional steps alone — a scenario where nothing
   actually asserted anything (every step skipped, absent-and-optional, or wrapped in `optional`)
   cannot resolve to PASS; it BLOCKS instead, since nothing was actually verified.

@@ -46,6 +46,14 @@ STATUS_FAIL = "fail"
 STATUS_BLOCKED = "blocked"
 STATUS_NOT_RUN = "not_run"
 
+# The literal per-step status string CaleeMobile-Regression's api/ui
+# report JSON uses (uppercase, "PASS"/"FAIL"/"BLOCKED"/"SKIP") -- a
+# different namespace from this module's own lowercase ComponentResult
+# statuses above. Named separately so a step-status comparison in
+# component_from_api_report is never confused for a ComponentResult
+# status comparison.
+STATUS_SKIP_RAW = "SKIP"
+
 
 def decide_status(*, passed: int, failed: int, blocked: int, total: "int | None" = None) -> str:
     """The one place the PASS/FAIL/BLOCKED decision rule lives.
@@ -222,7 +230,21 @@ def component_from_tablet_report(name: str, suite_dict: "dict[str, Any] | None",
 
 
 def component_from_api_report(name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = True) -> ComponentResult:
-    """Build a ComponentResult from CaleeMobile-Regression's --report json shape."""
+    """Build a ComponentResult from CaleeMobile-Regression's --report json
+    shape (shared by the Client API suite and the mobile Android/iPhone UI
+    suites -- see api/caleemobile_regression/reporting.py and
+    ui/run_ui_suite.py in that repo).
+
+    Each step may carry "mandatory" (bool, default True when absent -- the
+    API report's steps don't have this concept at all yet, so absence must
+    never be read as "optional") and "skipCategory" (informational only;
+    see ui/run_ui_suite.py's classify_skip). A SKIP step is folded into
+    the blocked count exactly when it's mandatory -- mirroring
+    component_from_tablet_report's mandatory_skipped handling, so a suite
+    containing passed tests plus one mandatory skipped test can never
+    read as an overall pass, and a fixture-related skip (skipCategory
+    "missing_fixture") is BLOCKED, never a product FAIL.
+    """
     if report_dict is None:
         return ComponentResult(name=name, status=STATUS_NOT_RUN, mandatory=mandatory, detail=["Not executed."])
     counts = report_dict.get("counts", {})
@@ -230,12 +252,18 @@ def component_from_api_report(name: str, report_dict: "dict[str, Any] | None", *
     failed = counts.get("FAIL", 0)
     blocked = counts.get("BLOCKED", 0)
     skipped = counts.get("SKIP", 0)
-    total = len(report_dict.get("steps", [])) or (passed + failed + blocked + skipped)
-    status = decide_status(passed=passed, failed=failed, blocked=blocked, total=total)
+    steps = report_dict.get("steps", [])
+    total = len(steps) or (passed + failed + blocked + skipped)
+    mandatory_skipped = sum(
+        1 for s in steps
+        if s.get("status") == STATUS_SKIP_RAW and s.get("mandatory", True)
+    )
+    status = decide_status(passed=passed, failed=failed, blocked=blocked + mandatory_skipped, total=total)
     detail = [
         f"{s['name']}: {s.get('detail')}"
-        for s in report_dict.get("steps", [])
+        for s in steps
         if s.get("status") in ("FAIL", "BLOCKED")
+        or (s.get("status") == STATUS_SKIP_RAW and s.get("mandatory", True))
     ]
     return ComponentResult(
         name=name, status=status, mandatory=mandatory,
