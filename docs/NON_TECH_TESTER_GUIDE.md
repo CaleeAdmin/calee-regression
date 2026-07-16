@@ -1,55 +1,137 @@
 # Guide for testers (double-click, no terminal needed)
 
 This guide is for running regression checks by double-clicking files in the `tester/` folder — no
-command line required, once a technical owner has done the one-time setup in `docs/SETUP_MAC.md`.
+command line, no typed commands, no environment variables. All of that is handled for you. A
+technical owner must have completed the one-time setup in `docs/SETUP_MAC.md` first.
 
-## Always run this first
+## 1. What equipment you need
 
-**`tester/Check Setup.command`** — confirms Appium is running, the device is connected, and the
-config is valid. If it reports `FAILED`, stop and ask a technical owner before continuing.
+- The Mac that has already been set up by a technical owner (see `docs/SETUP_MAC.md`).
+- The Calee tablet (or emulator) you were told to test on, with its USB cable.
+- If you were also asked to test CaleeMobile: an Android phone/emulator and/or an iPhone, as
+  applicable, each with the CaleeMobile app installed and signed in.
+- Whatever device state you were told to start from (a **clean** device with no account, or a
+  **prepared** device with a demo account already signed in) — see the table below.
 
-## Which test to run depends on the device state
+## 2. Connect the devices
 
-| Device state | What to run |
+- Plug the tablet into the Mac with its USB cable. Unlock it. If a prompt appears asking to
+  **"Allow USB debugging"**, tap **Allow**.
+- Leave the tablet unlocked and awake for the duration of the test run.
+- For CaleeMobile Android/iPhone checks, make sure the phone is unlocked and connected (USB for
+  Android, or already paired for an iOS simulator/device) before you start.
+
+## 3. Which launcher to double-click
+
+Always start with **`01 Prepare Test Environment.command`**. Then pick the one launcher that
+matches what you were asked to test:
+
+| You were asked to test | Double-click |
 |---|---|
-| Clean emulator or freshly-wiped tablet, **no account signed in** | `tester/Run Smoke Fresh.command` |
-| Tablet/emulator **prepared by a technical owner with a demo account already signed in** | `tester/Run Smoke Tablet.command`, `tester/Run Calendar Regression.command`, `tester/Run Full Tester Regression.command` |
+| Everything is ready to go | `01 Prepare Test Environment.command`, then `05 Test Full Calee Solution.command` |
+| Just the Calee tablet | `01 Prepare Test Environment.command`, then `02 Test Calee Tablet.command` |
+| Just CaleeMobile on Android | `03 Test CaleeMobile Android.command` |
+| Just CaleeMobile on iPhone | `04 Test CaleeMobile iPhone.command` |
+| To see the last report again | `06 Open Latest Report.command` |
 
-**Never** run the tablet-only tests against a clean device — they will fail because the app is
-still on the sign-in screen, not because anything is actually broken. The report will say so
-clearly (see below).
+You should not normally need anything outside these six files. Files under `tester/advanced/` and
+`tester/technical/` are for a technical owner — **never** double-click anything in
+`tester/technical/` unless specifically asked to; it requires a real physical tablet and admin
+access.
 
-**Never** double-click anything inside `tester/technical/` unless a technical owner specifically
-asks you to — those tests require a real physical tablet and specific admin access.
+## 4. What PASS means
 
-## Reading the report
+**PASS** (green) means the feature was actually exercised and worked correctly. Nothing further to
+do — the report is ready to file or send on as-is.
 
-Each run opens (or you can open via `tester/Open Latest Report.command`) a `summary.html` file with:
+## 5. What FAIL means
 
-- **Green** = passed, **red** = failed, **gray** = skipped, **amber** = warning
-- A screenshot for each step that took one
-- A yellow **hint** box under anything that failed, explaining what likely went wrong and what to
-  check
+**FAIL** (red) means a feature was exercised and produced the **wrong** result — this is a real
+product problem. The report's yellow hint box explains what was expected vs. what happened. Send
+the report (see below) — don't try to diagnose it yourself.
 
-If a tablet-only scenario fails with the message *"Calee launched, but the screen is not the
-logged-in home screen. This scenario requires a prepared tablet or test account."* — that means the
-device isn't in the state the test expected (still on sign-in), not that Calee is broken. Check with
-whoever prepared the device.
+## 6. What BLOCKED means
 
-## Sending a report back to Yiwen
+**BLOCKED** (purple) means the test **could not run at all** — a disconnected device, an app that
+wasn't in the state the test expected, a network problem, or similar. This is explicitly **not** a
+claim that Calee or CaleeMobile is broken. Common reasons you'll see spelled out in the report:
 
-Each run creates a folder under `reports/`, named like `smoke-tablet-20260715-143012/`. To send it:
+- The device wasn't connected properly, or wasn't unlocked.
+- The device was in the wrong state for the test you ran (e.g. you ran a "prepared tablet" test on
+  a clean device, or vice versa — see the table above).
+- The regression fixture (the known test data the calendar checks look for) hasn't been reset —
+  `01 Prepare Test Environment.command` handles this automatically if credentials are configured;
+  if it says it skipped this step, ask your technical owner.
 
-1. In Finder, navigate to the `calee-regression/reports/` folder.
-2. Right-click the folder for the run in question → **Compress**.
-3. Attach/upload the resulting `.zip` to email, Slack, or Drive, and send it to Yiwen.
+If you see BLOCKED, the right move is almost always: check the device is connected and in the
+right state, then retry (see §12). If it's still BLOCKED after that, send the report to your
+technical owner — don't report it as a bug yourself.
 
-Include a note about what device/emulator you ran it on and what you expected to happen.
+You may also see gray **SKIP** entries — these are deliberately optional checks (e.g. a feature
+that doesn't apply to this account) and are not evidence of anything being broken.
+
+## 7. How to add a note
+
+If something looks wrong on screen but the automated check didn't catch it (e.g. a slightly odd
+color, a button that looked briefly frozen), don't just close the window. Open a text file (Notes,
+TextEdit, anything) and write down:
+
+- Which launcher you ran and roughly what time.
+- What you saw and what screen you were on.
+- What you expected instead.
+
+Include this note when you send the report — see §9.
+
+## 8. How to capture evidence
+
+The framework already takes screenshots automatically at key steps — you don't need to do this
+yourself for anything the report already covers. If you want to capture something extra (something
+that looked wrong but wasn't part of an automated screenshot moment):
+
+- On the tablet: press the physical power + volume-down buttons together (standard Android
+  screenshot), or use whatever screenshot method the device supports.
+- Save it somewhere you'll remember (e.g. your Desktop) and mention it in your note (§7) so it can
+  be attached alongside the report.
+
+## 9. Where the report is saved
+
+Each run creates a folder under `reports/`, and `05 Test Full Calee Solution.command` additionally
+produces one combined report under `reports/consolidated-<date-time>/`, including a
+`Calee-Regression-<date>-<build>-<PASS|FAIL|BLOCKED>.zip` bundle. `06 Open Latest Report.command`
+always opens the most recent one.
+
+## 10. What to send to the technical owner
+
+1. In Finder, go to the `reports/` folder.
+2. Find the run (or the `Calee-Regression-...zip` bundle, if you ran the full solution) — it's
+   already a `.zip` if it's a bundle; otherwise right-click the folder → **Compress**.
+3. Attach/upload it and send it, along with:
+   - Your note from §7, if you made one.
+   - What device/emulator you ran it on.
+   - What you expected to happen.
+
+## 11. What never to do during testing
+
+- Don't sign out, clear app data, or change any device settings yourself — ask a technical owner if
+  a device seems to be in the wrong state.
+- Don't run anything in `tester/technical/` unless specifically asked.
+- Don't approve/replace baseline screenshots in `baselines/` — that's a technical-owner-only action
+  (see §13); doing it by mistake can hide a real regression from every future run.
+- Don't edit any `config/*.yaml` file — ask a technical owner if configuration seems wrong.
+- Don't report a BLOCKED result as if it were a product bug — see §6.
+
+## 12. How to retry a blocked test safely
+
+1. Check the device is still connected, unlocked, and awake.
+2. Confirm it's in the state the test expects (clean vs. prepared — see the table in §3).
+3. Re-run `01 Prepare Test Environment.command`, then the same test again.
+4. If it's still BLOCKED after that, stop and send the report to your technical owner rather than
+   retrying repeatedly — repeated retries won't fix an environment problem, and the report already
+   captures what's needed for them to diagnose it.
 
 ## Baselines (screenshot comparison)
 
 Most scenarios take screenshots for humans to look at (`compare: false`) rather than doing strict
 pixel comparison — you do not need to do anything special with these. Strict baseline image
 comparison is opt-in and **only a technical owner should approve new baseline images** (copying a
-screenshot into `baselines/`) — testers should never do this themselves, since an approved-by-mistake
-baseline would hide real regressions from then on.
+screenshot into `baselines/`) — see §11.

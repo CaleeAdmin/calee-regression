@@ -33,7 +33,15 @@ COMPOSITE_SUITES = {
     "release-technical": ["full-tester", "kiosk_admin_physical", "system_receivers"],
 }
 
-SUITE_ALIASES = {"full": "full-tester"}
+SUITE_ALIASES = {
+    "full": "full-tester",
+    # Aliases matching the project's canonical suite-profile names (see
+    # docs/SUITE_REFERENCE.md) so `tablet-smoke`/`tablet-full`/`full-release`
+    # work here even though the underlying suites predate that naming.
+    "tablet-smoke": "smoke-tablet",
+    "tablet-full": "full-tester",
+    "full-release": "full-tester",
+}
 
 PHYSICAL_ONLY_SCENARIOS = {
     "scenarios/kiosk_admin_physical.yaml",

@@ -1,0 +1,85 @@
+{
+  "overallStatus": "pass",
+  "meta": {
+    "buildVersion": "0.3.22 / 0.0.22",
+    "testEnvironment": "https://hub-dev.calee.com.au",
+    "tester": "Sample Tester"
+  },
+  "generatedAt": "2026-07-16 02:22:48",
+  "components": [
+    {
+      "name": "Calee tablet",
+      "status": "pass",
+      "mandatory": true,
+      "passed": 11,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": []
+    },
+    {
+      "name": "CaleeMobile Client API",
+      "status": "pass",
+      "mandatory": true,
+      "passed": 92,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": []
+    },
+    {
+      "name": "CaleeMobile Android UI",
+      "status": "blocked",
+      "mandatory": false,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 1,
+      "skipped": 0,
+      "detail": [
+        "app boot: No Android device/emulator connected in this environment"
+      ]
+    },
+    {
+      "name": "CaleeMobile iPhone UI",
+      "status": "not_run",
+      "mandatory": false,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [
+        "Not executed."
+      ]
+    },
+    {
+      "name": "manual checks",
+      "status": "pass",
+      "mandatory": true,
+      "passed": 2,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": []
+    }
+  ],
+  "manualChecks": [
+    {
+      "title": "Kiosk escape check",
+      "instruction": "Swipe down from the top edge and try the recents button while Calee is foregrounded.",
+      "expectedResult": "No notification shade or recents view opens.",
+      "status": "pass",
+      "note": "",
+      "screenshotRef": null,
+      "mandatory": true
+    },
+    {
+      "title": "Calendar colour legibility",
+      "instruction": "Open Month view and check each calendar's colour dot is distinguishable.",
+      "expectedResult": "All colours are visually distinct and readable.",
+      "status": "pass",
+      "note": "",
+      "screenshotRef": null,
+      "mandatory": true
+    }
+  ]
+}

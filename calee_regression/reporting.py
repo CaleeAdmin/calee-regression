@@ -16,7 +16,7 @@ _STATUS_MARKERS = {
     "failed": "[FAIL]",
     "skipped": "[SKIP]",
     "warning": "[WARN]",
-    "error": "[ERR ]",
+    "blocked": "[BLOCKED]",
 }
 
 _STATUS_COLORS = {
@@ -24,7 +24,7 @@ _STATUS_COLORS = {
     "failed": "#cf222e",
     "skipped": "#6e7781",
     "warning": "#9a6700",
-    "error": "#cf222e",
+    "blocked": "#8250df",
 }
 
 
@@ -64,13 +64,15 @@ class ReportBuilder:
         lines.append(f"Finished: {suite_result.finished_at}")
         lines.append(
             f"Passed: {suite_result.passed_count}  Failed: {suite_result.failed_count}  "
-            f"Skipped: {suite_result.skipped_count}"
+            f"Skipped: {suite_result.skipped_count}  Blocked: {suite_result.blocked_count}"
         )
         lines.append("")
         for scenario in suite_result.scenarios:
             lines.append(f"== {scenario.name} [{scenario.status.upper()}] ({scenario.file}) ==")
             if scenario.skip_reason:
                 lines.append(f"  skip reason: {scenario.skip_reason}")
+            if scenario.blocked_reason:
+                lines.append(f"  blocked reason: {scenario.blocked_reason}")
             for step in scenario.steps:
                 marker = _STATUS_MARKERS.get(step.status, f"[{step.status.upper()}]")
                 lines.append(f"  {marker} {step.name} ({step.action}) - {step.message}")
@@ -102,7 +104,8 @@ class ReportBuilder:
             f"<div class='summary'>Started: {_escape(suite_result.started_at)}<br>"
             f"Finished: {_escape(suite_result.finished_at)}<br>"
             f"<b>Passed: {suite_result.passed_count} &nbsp; Failed: {suite_result.failed_count} "
-            f"&nbsp; Skipped: {suite_result.skipped_count}</b></div>"
+            f"&nbsp; Skipped: {suite_result.skipped_count} &nbsp; "
+            f"Blocked: {suite_result.blocked_count}</b></div>"
         )
         for scenario in suite_result.scenarios:
             color = _STATUS_COLORS.get(scenario.status, "#1f2328")
@@ -111,6 +114,8 @@ class ReportBuilder:
             parts.append(f"<div>file: {_escape(scenario.file)}</div>")
             if scenario.skip_reason:
                 parts.append(f"<div class='hint'>{_escape(scenario.skip_reason)}</div>")
+            if scenario.blocked_reason:
+                parts.append(f"<div class='hint'>{_escape(scenario.blocked_reason)}</div>")
             for step in scenario.steps:
                 step_color = _STATUS_COLORS.get(step.status, "#1f2328")
                 parts.append(
@@ -148,6 +153,11 @@ class ReportBuilder:
                 "tests": str(len(suite_result.scenarios)),
                 "failures": str(suite_result.failed_count),
                 "skipped": str(suite_result.skipped_count),
+                # JUnit's "errors" bucket is the standard place to report a test
+                # that could not be executed due to an environment/tooling
+                # problem, as distinct from "failures" (a real assertion
+                # failure) — that's exactly what BLOCKED means here.
+                "errors": str(suite_result.blocked_count),
                 "time": f"{total_time:.3f}",
             },
         )
@@ -165,6 +175,11 @@ class ReportBuilder:
                 messages = "; ".join(s.message for s in scenario.steps if s.status == "failed")
                 failure = ET.SubElement(testcase, "failure", {"message": messages or "scenario failed"})
                 failure.text = messages
+            elif scenario.status == "blocked":
+                error = ET.SubElement(
+                    testcase, "error", {"message": scenario.blocked_reason or "blocked"}
+                )
+                error.text = scenario.blocked_reason or ""
             elif scenario.status == "skipped":
                 ET.SubElement(testcase, "skipped", {"message": scenario.skip_reason or "skipped"})
         tree = ET.ElementTree(testsuite)

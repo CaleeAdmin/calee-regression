@@ -42,3 +42,32 @@ jobs:
 
           print('All scenario files parsed cleanly.')
           "
+
+      - name: Validate config templates load with placeholders filled in
+        run: |
+          python -c "
+          import tempfile, pathlib
+          from calee_regression.config import load_config
+
+          template = pathlib.Path('config/tester.local.example.yaml').read_text()
+          filled = template.replace('PUT_ACTIVITY_HERE', '.ui.HomeActivity')
+          with tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False) as f:
+              f.write(filled)
+              path = f.name
+          load_config(path)
+          print('config/tester.local.example.yaml loads cleanly once placeholders are filled in.')
+          "
+
+      - name: Shellcheck tester launchers and scripts
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y shellcheck
+          shellcheck -S warning tester/*.command tester/advanced/*.command tester/technical/*.command scripts/*.sh
+
+      - name: Dry-run the tester environment bootstrap (no real device/Appium needed)
+        run: |
+          cp config/tester.local.example.yaml config/tester.local.yaml
+          bash -c '
+            source scripts/ensure_environment.sh
+            python -c "import click, yaml, appium, selenium, PIL, numpy; print(\"all runtime dependencies import cleanly\")"
+          '

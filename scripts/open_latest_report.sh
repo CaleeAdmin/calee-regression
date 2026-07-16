@@ -9,11 +9,19 @@ if [ ! -d reports ] || [ -z "$(ls -A reports 2>/dev/null)" ]; then
     exit 1
 fi
 
-LATEST="$(ls -1dt reports/*/ | head -n1)"
-SUMMARY="${LATEST}summary.html"
+# Prefer the latest consolidated cross-repo release report, if one exists,
+# since that's the most complete picture; otherwise fall back to the latest
+# single-suite report this repo produced on its own.
+LATEST_CONSOLIDATED="$(ls -1dt reports/consolidated-*/ 2>/dev/null | head -n1 || true)"
+if [ -n "$LATEST_CONSOLIDATED" ] && [ -f "${LATEST_CONSOLIDATED}consolidated-report.html" ]; then
+    SUMMARY="${LATEST_CONSOLIDATED}consolidated-report.html"
+else
+    LATEST="$(ls -1dt reports/*/ | head -n1)"
+    SUMMARY="${LATEST}summary.html"
+fi
 
 if [ ! -f "$SUMMARY" ]; then
-    echo "Latest report directory $LATEST has no summary.html." >&2
+    echo "Latest report directory has no summary.html." >&2
     exit 1
 fi
 

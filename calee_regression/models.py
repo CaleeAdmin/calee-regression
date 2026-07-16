@@ -7,7 +7,16 @@ STATUS_PASSED = "passed"
 STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
 STATUS_WARNING = "warning"
-STATUS_ERROR = "error"
+STATUS_BLOCKED = "blocked"
+
+# Process exit codes. These are the framework's outward contract with CI and
+# the tester-facing launchers: a caller must be able to tell "the product is
+# broken" (EXIT_REGRESSION) apart from "the test environment/tooling/config
+# is broken" (EXIT_BLOCKED / EXIT_INVALID_CONFIG) without parsing output.
+EXIT_SUCCESS = 0
+EXIT_REGRESSION = 1
+EXIT_INVALID_CONFIG = 2
+EXIT_BLOCKED = 3
 
 REQUIRES_STATE_FRESH = "fresh"
 REQUIRES_STATE_LOGGED_IN_TABLET = "logged_in_tablet"
@@ -71,6 +80,7 @@ class ScenarioResult:
     steps: list = field(default_factory=list)
     duration_seconds: float = 0.0
     skip_reason: "str | None" = None
+    blocked_reason: "str | None" = None
     tags: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -80,6 +90,7 @@ class ScenarioResult:
             "status": self.status,
             "duration_seconds": self.duration_seconds,
             "skip_reason": self.skip_reason,
+            "blocked_reason": self.blocked_reason,
             "tags": self.tags,
             "steps": [s.to_dict() for s in self.steps],
         }
@@ -104,6 +115,10 @@ class SuiteResult:
     def skipped_count(self) -> int:
         return sum(1 for s in self.scenarios if s.status == STATUS_SKIPPED)
 
+    @property
+    def blocked_count(self) -> int:
+        return sum(1 for s in self.scenarios if s.status == STATUS_BLOCKED)
+
     def to_dict(self) -> dict:
         return {
             "name": self.name,
@@ -112,6 +127,7 @@ class SuiteResult:
             "passed_count": self.passed_count,
             "failed_count": self.failed_count,
             "skipped_count": self.skipped_count,
+            "blocked_count": self.blocked_count,
             "scenarios": [s.to_dict() for s in self.scenarios],
         }
 

@@ -6,24 +6,27 @@ steps:
   - name: Launch Calee
     action: launch
 
-  - name: Let home screen settle
-    action: sleep
-    seconds: 3
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llCalendar
+    timeout_seconds: 20
 
   - name: Capture home screen
     action: screenshot
     screenshot_name: 00_home
     compare: false
 
-  # Every tap below is tap_if_present: exact nav labels/ids aren't guaranteed across
-  # releases, and this scenario must not hard-fail the whole suite over label wording.
-  - name: Open Calendar if present
-    action: tap_if_present
-    text: Calendar
+  # Today/Calendar/Tasks are unconditional bottom-navigation tabs (always
+  # present, per activity_home.xml) so these are hard taps with a real
+  # per-screen assertion, not a soft "if present" probe.
+  - name: Open Calendar
+    action: tap
+    id: llCalendar
 
-  - name: Let calendar settle
-    action: sleep
-    seconds: 2
+  - name: Assert the Calendar screen actually rendered
+    action: wait_for_id
+    id: btnAddEvent
+    timeout_seconds: 10
 
   - name: Capture calendar tab
     action: screenshot
@@ -33,13 +36,14 @@ steps:
   - name: Back to home
     action: back
 
-  - name: Open Tasks if present
-    action: tap_if_present
-    text: Tasks
+  - name: Open Tasks
+    action: tap
+    id: llTask
 
-  - name: Let tasks settle
-    action: sleep
-    seconds: 2
+  - name: Assert the Tasks screen actually rendered
+    action: wait_for_id
+    id: llAll
+    timeout_seconds: 10
 
   - name: Capture tasks tab
     action: screenshot
@@ -49,9 +53,13 @@ steps:
   - name: Back to home
     action: back
 
-  - name: Open Chores if present
+  # Chores is a conditional tab (hidden entirely for accounts/experience
+  # modes without a chore-capable service), so this stays tap_if_present --
+  # see docs/TEST_DATA_RESET_CONTRACT.md for what "no chore service" means
+  # for this scenario's coverage.
+  - name: Open Chores if this account has a Chores tab
     action: tap_if_present
-    text: Chores
+    id: llChores
 
   - name: Let chores settle
     action: sleep
@@ -65,13 +73,14 @@ steps:
   - name: Back to home
     action: back
 
-  - name: Open Settings if present
-    action: tap_if_present
-    text: Settings
+  - name: Open Settings
+    action: tap
+    id: ivHomeSetting
 
-  - name: Let settings settle
-    action: sleep
-    seconds: 2
+  - name: Assert the Settings screen actually rendered
+    action: wait_for_id
+    id: tvLogout
+    timeout_seconds: 10
 
   - name: Capture settings tab
     action: screenshot
@@ -81,9 +90,9 @@ steps:
   - name: Back to home
     action: back
 
-  - name: Assert still on a Calee screen (not crashed)
-    action: assert_any_text
-    texts: [Calee, Calendar, Tasks, Chores, Home, Today, Weather, Settings]
+  - name: Assert home screen is showing again
+    action: assert_id
+    id: llCalendar
 
   - name: Assert no crash/error dialog is showing
     action: fail_if_text

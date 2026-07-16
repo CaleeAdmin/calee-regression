@@ -6,26 +6,24 @@ steps:
   - name: Launch Calee
     action: launch
 
-  - name: Let home screen settle
-    action: sleep
-    seconds: 3
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llTask
+    timeout_seconds: 20
 
-  - name: Open Tasks if present
-    action: tap_if_present
-    text: Tasks
+  - name: Open Tasks
+    action: tap
+    id: llTask
 
-  - name: Let tasks screen settle
-    action: sleep
-    seconds: 2
+  - name: Wait for the Tasks screen to render
+    action: wait_for_id
+    id: llAll
+    timeout_seconds: 10
 
   - name: Capture tasks screen
     action: screenshot
     screenshot_name: 00_tasks_screen
     compare: false
-
-  - name: Assert tasks screen content
-    action: assert_any_text
-    texts: [Tasks, To-Do, "Add Task"]
 
   - name: Assert no crash/error dialog is showing
     action: fail_if_text

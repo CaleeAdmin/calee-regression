@@ -6,26 +6,24 @@ steps:
   - name: Launch Calee
     action: launch
 
-  - name: Let home screen settle
-    action: sleep
-    seconds: 3
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llCalendar
+    timeout_seconds: 20
 
-  - name: Open Calendar if present
-    action: tap_if_present
-    text: Calendar
+  - name: Open Calendar
+    action: tap
+    id: llCalendar
 
-  - name: Let calendar settle
-    action: sleep
-    seconds: 2
+  - name: Wait for the calendar toolbar to render
+    action: wait_for_id
+    id: btnAddEvent
+    timeout_seconds: 10
 
   - name: Capture calendar home
     action: screenshot
     screenshot_name: 00_calendar_home
     compare: false
-
-  - name: Assert calendar screen content
-    action: assert_any_text
-    texts: [Calendar, Today, Month, Week, Day]
 
   - name: Assert no crash/error dialog is showing
     action: fail_if_text

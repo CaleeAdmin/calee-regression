@@ -9,6 +9,7 @@ import yaml
 from .appium_driver import CaleeDriver
 from .models import (
     STATE_MISMATCH_HINT,
+    STATUS_BLOCKED,
     STATUS_FAILED,
     STATUS_PASSED,
     STATUS_SKIPPED,
@@ -302,12 +303,27 @@ class ScenarioRunner:
             try:
                 loaded.append(load_scenario(path))
             except ScenarioError as exc:
+                # A scenario file that fails to parse is a framework/authoring
+                # problem, not evidence the product regressed — it must never
+                # count as a FAIL, or a broken scenario file could silently
+                # masquerade as a genuine product bug in the report.
+                blocked_reason = (
+                    f"Scenario definition at {path} is invalid and could not be loaded — "
+                    f"this is a framework/configuration problem, not a product failure. "
+                    f"Contact the technical owner. Details: {exc}"
+                )
                 suite_result.scenarios.append(
                     ScenarioResult(
                         name=str(path),
                         file=str(path),
-                        status=STATUS_FAILED,
-                        steps=[StepResult(name="load_scenario", action="load", status=STATUS_FAILED, message=str(exc))],
+                        status=STATUS_BLOCKED,
+                        blocked_reason=blocked_reason,
+                        steps=[
+                            StepResult(
+                                name="load_scenario", action="load", status=STATUS_BLOCKED,
+                                message=str(exc),
+                            )
+                        ],
                     )
                 )
 
@@ -332,17 +348,27 @@ class ScenarioRunner:
             try:
                 driver.start_session()
             except Exception as exc:
+                # Appium unreachable, device disconnected, wrong appium_url, etc.
+                # are test-environment problems, never a product regression —
+                # see docs/TEST_DATA_RESET_CONTRACT.md and the core design
+                # requirement that a disconnected device or unavailable Appium
+                # server must never be reported as a product failure.
                 hint = explain_exception(exc)
+                blocked_reason = (
+                    f"Could not start an Appium session: {exc}. This blocks every scenario "
+                    f"in this run — it is an environment/tooling problem, not a product failure."
+                )
                 for scenario in runnable:
                     suite_result.scenarios.append(
                         ScenarioResult(
                             name=scenario.name,
                             file=str(scenario.file),
-                            status=STATUS_FAILED,
+                            status=STATUS_BLOCKED,
+                            blocked_reason=blocked_reason,
                             tags=scenario.tags,
                             steps=[
                                 StepResult(
-                                    name="start_session", action="launch", status=STATUS_FAILED,
+                                    name="start_session", action="launch", status=STATUS_BLOCKED,
                                     message=str(exc), hint=hint,
                                 )
                             ],
