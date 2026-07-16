@@ -49,6 +49,19 @@ def test_script_delegates_ui_run_to_the_structured_report_wrapper():
     assert "--log" in text
 
 
+def test_script_wires_fixture_and_backend_status_into_the_ui_run():
+    # Workstream 7: before any UI assertion runs, run_ui_suite.py must be
+    # able to see this run's own fixture-verification status and target
+    # backend (from prepare's environment/results.json) so it can BLOCK
+    # instead of asserting against unverified/misdirected data -- see
+    # run_ui_suite.py::check_fixture_and_backend_alignment.
+    text = _read_script()
+    assert "CALEE_FIXTURE_STATUS" in text
+    assert "CALEE_EXPECTED_BACKEND" in text
+    assert "fixtureVerificationStatus" in text
+    assert "environment/results.json" in text or "environment', 'results.json'" in text
+
+
 def _copy_calee_regression(workspace):
     """The script locates its sibling as `../CaleeMobile-Regression`
     relative to its OWN directory (via BASH_SOURCE), not relative to the

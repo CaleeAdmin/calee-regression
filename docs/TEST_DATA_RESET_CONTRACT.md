@@ -44,6 +44,31 @@ they tap the fixture's exact titles and assert real Calee resource ids (`tvEvent
 `tvEventDetailRecurring`, ...), so they can no longer pass without the fixture actually being in
 place and the tablet actually rendering it correctly.
 
+## Fixture/backend alignment before mobile UI checks
+
+The fixture above is reset against a specific backend (`--base-url <env>`). Before running any
+CaleeMobile UI assertion, `run_ui_suite.py` (in `CaleeMobile-Regression/ui/`) verifies:
+
+- **This run's fixture is actually ready** — `prepare`'s `fixtureVerificationStatus` (from this
+  run's `reports/runs/<run-id>/environment/results.json`) must be exactly `"ok"`. Anything else
+  (absent, `blocked`, `blocked_missing_credentials`, `not_run`, ...) BLOCKS before a single UI
+  assertion runs — never assert against fixture data that was never confirmed present.
+- **The fixture's backend matches what CaleeMobile's build actually talks to.** This currently
+  has a hard limitation worth being explicit about: CaleeMobile's `CaleeHubClient()` has **no
+  build-time backend override** today (no dart-define/flavor mechanism) — every build always
+  talks to `https://hub.calee.com.au` (see `run_ui_suite.py::KNOWN_CALEE_MOBILE_BACKEND`, sourced
+  directly from CaleeMobile's `lib/app/calee_app.dart` and `lib/data/api/calee_hub_client.dart`).
+  If the fixture was reset against a different backend (e.g. `hub-dev.calee.com.au`), that
+  mismatch is detected and BLOCKS before any UI assertion — but the fixture must actually be
+  reset against **production** for CaleeMobile's mobile UI checks to run meaningfully at all,
+  until CaleeMobile gains real backend configurability. Treat that as a standing constraint on
+  what a mobile UI PASS can mean today, not a bug in this check.
+
+Both checks are wired through `scripts/test_caleemobile.sh`, which reads this run's own
+`environment/results.json` and exports `CALEE_FIXTURE_STATUS`/`CALEE_EXPECTED_BACKEND` before
+invoking `run_ui_suite.py` — see `check_fixture_and_backend_alignment` there and
+`docs/RELEASE_POLICY.md`.
+
 ## "fresh" state
 
 - No Hub session on the device (no stored access/refresh tokens).

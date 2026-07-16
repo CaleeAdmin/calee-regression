@@ -48,6 +48,27 @@ API_STATUS=$?
 UI_STATUS=3
 UI_REPORT="$UI_DIR/results.json"
 
+# Before running any UI assertion, check this run's own Prepare outcome
+# (fixture readiness) and target backend, if this run has an environment
+# report yet -- see run_ui_suite.py::check_fixture_and_backend_alignment
+# and docs/RELEASE_POLICY.md. A standalone invocation with no Prepare step
+# yet (no environment/results.json) leaves these unset, which
+# run_ui_suite.py treats as "not checked", never as "verified ready".
+ENV_REPORT="$RUN_DIR/environment/results.json"
+if [ -f "$ENV_REPORT" ]; then
+    eval "$(python3 -c "
+import json
+import shlex
+with open('$ENV_REPORT', encoding='utf-8') as f:
+    data = json.load(f)
+status = data.get('fixtureVerificationStatus', '') or ''
+backend = data.get('targetEnvironment', '') or ''
+print(f'CALEE_FIXTURE_STATUS={shlex.quote(status)}')
+print(f'CALEE_EXPECTED_BACKEND={shlex.quote(backend)}')
+")"
+    export CALEE_FIXTURE_STATUS CALEE_EXPECTED_BACKEND
+fi
+
 # CALEE_TEST_EMAIL/CALEE_TEST_PASSWORD are read from the environment by
 # run_ui_suite.py itself (never passed as a bare CLI argument here), so
 # they never appear in a process listing (ps) or in any echoed command.
