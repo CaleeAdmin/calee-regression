@@ -18,6 +18,16 @@ meaningful; use the duration *category* instead.
 | `full-release` (alias of `full-tester`) / full solution | Both (orchestrated) | `06 Test Full Calee Solution.command` (prepare incl. Appium auto-start, tablet, CaleeMobile API+UI per `config/release-platforms.yaml`, guided manual checks, consolidate) | Extended | Prepared tablet; CaleeMobile if attached | Yes | Tablet+API always mandatory; mobile UI mandatory-ness follows `config/release-platforms.yaml` (default Yes per platform, not hard-coded optional) | Yes — see `docs/RELEASE_POLICY.md` |
 | `release-technical` | `calee-regression` | `tester/technical/Run Release Technical.command` | Extended | Real physical tablet, admin/kiosk access | No | Yes — refuses to run on an emulator | Yes, for kiosk/admin/system-receiver coverage specifically |
 
+## Draft, non-canonical suites: `calendar_event_mutation` / `tasks_mutation` / `chores_mutation`
+
+Three additional suites exist (`python -m calee_regression list-suites` shows them) that are **not**
+among the ten canonical profiles above and are **not** release-gating — they are unfinished drafts for
+functional mutation coverage (create/edit/delete a calendar event; complete/reopen a task; skip a
+chore), blocked on tablet UI resource ids that have never been confirmed against the real Calee app.
+Each is `mandatory: false` in its own scenario file and deliberately absent from every
+`COMPOSITE_SUITES` entry, so no existing launcher or CI job ever runs them. See
+`docs/TABLET_MUTATION_COVERAGE_GAPS.md` for the exact gap and confirmation checklist.
+
 ## Known gap: `sync-smoke`
 
 There is no automated cross-device synchronization suite yet. Section 10 of the project brief

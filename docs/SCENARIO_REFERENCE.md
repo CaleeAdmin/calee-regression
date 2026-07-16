@@ -178,6 +178,16 @@ Types `text` into the element with resource id `id`.
   text: "Family dinner"
 ```
 
+### `clear_text`
+Clears the existing value of the element with resource id `id` (calls the standard Appium/UiAutomator
+`clear()` on it). `type_text`/`send_keys` alone only appends — use this first when a field may already
+contain a value you need to replace, not just add to.
+```yaml
+- name: Clear the existing title before typing a new one
+  action: clear_text
+  id: event_title_input
+```
+
 ### `hide_keyboard`
 No params. Hides the on-screen keyboard if present; never fails if there isn't one.
 ```yaml
@@ -235,6 +245,16 @@ Fails if any of `text` (single) or `texts` (list) IS present — used to catch c
   texts: ["Unfortunately", "has stopped", "Force Close"]
 ```
 
+### `fail_if_id`
+Fails if an element with resource id `id` IS present — the id-based counterpart to `fail_if_text`, and
+the negation of `assert_id`. Used to confirm something was actually removed/reverted (e.g. a
+"completed" indicator disappearing after reopening a task), not just that some unrelated text is gone.
+```yaml
+- name: Assert the completed indicator is gone after reopening
+  action: fail_if_id
+  id: cbTaskCompleted
+```
+
 ### `assert_current_activity`
 Fails unless the current foreground activity contains `activity` (leading-dot-insensitive substring
 match in both directions).
@@ -262,3 +282,18 @@ match in both directions).
 | `weather_system_messages.yaml` | `logged_in_tablet` | `weather_system_messages`, `full-tester`, `release-technical` |
 | `kiosk_admin_physical.yaml` | `physical_tablet` | `kiosk_admin_physical`, `release-technical` |
 | `system_receivers.yaml` | `physical_tablet` | `system_receivers`, `release-technical` |
+
+## Draft scenario files (not suite-integrated)
+
+Three more scenario files exist for functional mutation coverage (create/edit/delete/complete/
+reopen/skip, not just screen-render checks) but are **not** part of the table above on purpose: each
+is `mandatory: false` and its suite is deliberately excluded from every composite suite. They depend
+on tablet UI resource ids that have never been confirmed against the real Calee app — see
+`docs/TABLET_MUTATION_COVERAGE_GAPS.md` for the full explanation and exact confirmation checklist
+before ever promoting one of these to the table above.
+
+| File | requires_state | Draft suite (not in `full-tester`/`release-technical`) |
+|---|---|---|
+| `calendar_event_mutation.yaml` | `logged_in_tablet` | `calendar_event_mutation` |
+| `tasks_mutation.yaml` | `logged_in_tablet` | `tasks_mutation` |
+| `chores_mutation.yaml` | `logged_in_tablet` | `chores_mutation` |

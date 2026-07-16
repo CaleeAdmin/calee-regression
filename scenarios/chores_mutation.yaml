@@ -1,0 +1,81 @@
+name: calee-chores-mutation
+tags: [chores, mutation, tablet, draft-unverified]
+requires_state: logged_in_tablet
+default_timeout_seconds: 20
+mandatory: false
+# DRAFT -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md. As with
+# tasks_mutation.yaml, the actual on-screen skip/complete control for a
+# chore row is not confirmed anywhere in this framework's existing
+# scenarios/docs. Every UNCONFIRMED_* token is a placeholder -- see the
+# doc for the confirmation checklist. Do not set mandatory: true or add
+# this to a real suite until every placeholder is replaced with a real,
+# confirmed value AND the scenario has passed at least once against a
+# real, prepared tablet.
+#
+# Simplification vs. chores_smoke.yaml: this scenario taps llChores
+# directly rather than using chores_smoke.yaml's tap_if_present/optional
+# handling for accounts with no chores service. That conditional-tab
+# pattern is already solved there and can be copied in once the more
+# fundamental unconfirmed-id gap below is closed -- not duplicated here
+# to keep this draft focused on its actual open problem.
+#
+# Skips (rather than completes) today's occurrence of the fixture's
+# REG-CHORE-REPEATING-001, matching the state REG-CHORE-SKIPPED-001
+# already models as an accepted, expected chore state (see
+# docs/TEST_DATA_RESET_CONTRACT.md). Deliberately one-directional: unlike
+# tasks_mutation.yaml's complete-then-reopen, there is no confirmed (or
+# assumed) "un-skip" UI action, so this scenario does NOT attempt to
+# restore REG-CHORE-REPEATING-001 to its pre-skip state itself. Running
+# this scenario mutates shared fixture state -- the fixture's own reset
+# mechanism (01 Prepare Test Environment / manage_fixture.py reset, see
+# docs/TEST_DATA_RESET_CONTRACT.md) is what restores it, not this
+# scenario. Do not run this back-to-back expecting a clean slate without
+# an intervening fixture reset.
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llCalendar
+    timeout_seconds: 20
+
+  - name: Open Chores
+    action: tap
+    id: llChores
+
+  - name: Wait for the chores list to render
+    action: wait_for_id
+    id: choresRecyclerView
+    timeout_seconds: 10
+
+  - name: Wait for the deterministic repeating fixture chore to appear
+    action: wait_for_text
+    text: REG-CHORE-REPEATING-001
+    timeout_seconds: 20
+
+  - name: Capture the chores screen before any change
+    action: screenshot
+    screenshot_name: 00_before_skip
+    compare: false
+
+  - name: Skip today's occurrence of the fixture chore
+    action: tap
+    id: UNCONFIRMED_chore_skip_button_for_REG_CHORE_REPEATING_001
+
+  - name: Wait a moment for the skip to take effect
+    action: sleep
+    seconds: 2
+
+  - name: Assert the chore now shows as skipped
+    action: assert_id
+    id: UNCONFIRMED_chore_skipped_indicator_for_REG_CHORE_REPEATING_001
+
+  - name: Capture the chores screen after skipping
+    action: screenshot
+    screenshot_name: 01_after_skip
+    compare: false
+
+  - name: Assert no crash/error dialog is showing
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]

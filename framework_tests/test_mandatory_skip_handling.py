@@ -68,6 +68,10 @@ class _StubDriver:
         if raw_id not in self.present_ids:
             raise RuntimeError(f"element not found: {raw_id}")
 
+    def clear_text(self, raw_id):
+        if raw_id not in self.present_ids:
+            raise RuntimeError(f"element not found: {raw_id}")
+
     def tap_by_text(self, text):
         raise RuntimeError(f"element not found: {text}")
 
@@ -290,6 +294,68 @@ def test_product_assertion_failure_still_produces_fail():
         [
             {"name": "wait home", "action": "wait_for_id", "id": "llHome", "timeout_seconds": 1},
             {"name": "hard assert", "action": "assert_id", "id": "llMissing"},
+        ]
+    )
+
+    result = runner.ScenarioRunner(_make_config()).run_scenario(driver, scenario)
+
+    assert result.status == STATUS_FAILED
+
+
+def test_clear_text_action_on_present_element_passes():
+    """Added for Workstream 10 (tablet mutation scenarios): an edit flow
+    needs to replace a field's existing value, and `type_text` alone only
+    appends (send_keys does not clear first) -- see
+    docs/TABLET_MUTATION_COVERAGE_GAPS.md."""
+    driver = _StubDriver(present_ids={"llHome", "etEventTitle"})
+    scenario = _make_scenario(
+        [
+            {"name": "wait home", "action": "wait_for_id", "id": "llHome", "timeout_seconds": 1},
+            {"name": "clear title", "action": "clear_text", "id": "etEventTitle"},
+        ]
+    )
+
+    result = runner.ScenarioRunner(_make_config()).run_scenario(driver, scenario)
+
+    assert result.status == STATUS_PASSED
+
+
+def test_clear_text_action_on_missing_element_fails():
+    driver = _StubDriver(present_ids={"llHome"})
+    scenario = _make_scenario(
+        [
+            {"name": "wait home", "action": "wait_for_id", "id": "llHome", "timeout_seconds": 1},
+            {"name": "clear title", "action": "clear_text", "id": "etMissing"},
+        ]
+    )
+
+    result = runner.ScenarioRunner(_make_config()).run_scenario(driver, scenario)
+
+    assert result.status == STATUS_FAILED
+
+
+def test_fail_if_id_action_passes_when_element_absent():
+    """Added for Workstream 10: verifying a delete/reopen actually took
+    effect needs the negation of assert_id, which did not exist before."""
+    driver = _StubDriver(present_ids={"llHome"})
+    scenario = _make_scenario(
+        [
+            {"name": "wait home", "action": "wait_for_id", "id": "llHome", "timeout_seconds": 1},
+            {"name": "assert gone", "action": "fail_if_id", "id": "cbTaskComplete"},
+        ]
+    )
+
+    result = runner.ScenarioRunner(_make_config()).run_scenario(driver, scenario)
+
+    assert result.status == STATUS_PASSED
+
+
+def test_fail_if_id_action_fails_when_element_present():
+    driver = _StubDriver(present_ids={"llHome", "cbTaskComplete"})
+    scenario = _make_scenario(
+        [
+            {"name": "wait home", "action": "wait_for_id", "id": "llHome", "timeout_seconds": 1},
+            {"name": "assert gone", "action": "fail_if_id", "id": "cbTaskComplete"},
         ]
     )
 
