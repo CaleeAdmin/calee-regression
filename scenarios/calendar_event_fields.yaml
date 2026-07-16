@@ -2,46 +2,90 @@ name: calee-calendar-event-fields
 tags: [calendar, event-detail, tablet]
 requires_state: logged_in_tablet
 default_timeout_seconds: 20
+# Requires the deterministic regression fixture to have been reset first
+# (see docs/TEST_DATA_RESET_CONTRACT.md and CaleeMobile-Regression's
+# caleemobile_regression/fixture.py) so REG-EVENT-TIMED-001 and
+# REG-EVENT-ALLDAY-001 exist with known titles/fields. This scenario cannot
+# pass without actually opening both and checking their distinguishing
+# fields — there is no optional-wrapped assertion left here.
 steps:
   - name: Launch Calee
     action: launch
 
-  - name: Let home screen settle
-    action: sleep
-    seconds: 3
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llCalendar
+    timeout_seconds: 20
 
-  - name: Open Calendar if present
-    action: tap_if_present
-    text: Calendar
+  - name: Open Calendar
+    action: tap
+    id: llCalendar
 
-  - name: Let calendar settle
-    action: sleep
-    seconds: 2
+  - name: Switch to Agenda view
+    action: tap
+    id: llSchedule
 
-  # NOTE for technical owner: the exact tap target for "an existing event" is not
-  # knowable without real fixture data (see docs/TEST_DATA_RESET_CONTRACT.md). Tune
-  # this tap once known event fixtures exist on the prepared demo account.
-  - name: Open an event if one is visible
-    action: tap_if_present
-    text: Event
+  - name: Wait for the timed fixture event to appear
+    action: wait_for_text
+    text: REG-EVENT-TIMED-001
+    timeout_seconds: 20
 
-  - name: Let event detail settle
-    action: sleep
-    seconds: 1.5
+  - name: Open the timed fixture event
+    action: tap
+    text: REG-EVENT-TIMED-001
 
-  - name: Capture event detail screen
+  - name: Wait for event detail dialog to render
+    action: wait_for_id
+    id: tvEventDetailTitle
+    timeout_seconds: 10
+
+  - name: Assert the timed event's title is shown
+    action: assert_text
+    text: REG-EVENT-TIMED-001
+
+  - name: Assert a specific time (not "All day") is shown for a timed event
+    action: fail_if_text
+    text: All day
+
+  - name: Capture timed event detail
     action: screenshot
-    screenshot_name: 00_event_detail
+    screenshot_name: 00_timed_event_detail
     compare: false
 
-  # Wrapped in "optional": a fresh/empty calendar may legitimately have no events,
-  # which is a reason to skip this assertion, not fail the scenario.
-  - name: Assert event detail fields are present
-    action: optional
-    step:
-      name: Assert event field labels
-      action: assert_any_text
-      texts: [Title, Time, Location, Notes, Start, End]
+  - name: Close event detail
+    action: tap
+    id: btnEventDetailClose
+
+  - name: Wait for the all-day fixture event to appear
+    action: wait_for_text
+    text: REG-EVENT-ALLDAY-001
+    timeout_seconds: 20
+
+  - name: Open the all-day fixture event
+    action: tap
+    text: REG-EVENT-ALLDAY-001
+
+  - name: Wait for event detail dialog to render again
+    action: wait_for_id
+    id: tvEventDetailTitle
+    timeout_seconds: 10
+
+  - name: Assert the all-day event's title is shown
+    action: assert_text
+    text: REG-EVENT-ALLDAY-001
+
+  - name: Assert the event is shown as "All day"
+    action: assert_text
+    text: All day
+
+  - name: Capture all-day event detail
+    action: screenshot
+    screenshot_name: 01_allday_event_detail
+    compare: false
+
+  - name: Close event detail
+    action: tap
+    id: btnEventDetailClose
 
   - name: Assert no crash/error dialog is showing
     action: fail_if_text

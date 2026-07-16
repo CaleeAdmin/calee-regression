@@ -6,23 +6,30 @@ steps:
   - name: Launch Calee
     action: launch
 
-  - name: Let home screen settle
-    action: sleep
-    seconds: 3
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llCalendar
+    timeout_seconds: 20
 
-  - name: Open Calendar if present
+  - name: Open Calendar
+    action: tap
+    id: llCalendar
+
+  - name: Wait for the calendar toolbar to render
+    action: wait_for_id
+    id: btnAddEvent
+    timeout_seconds: 10
+
+  # The Day/Week/Month/Agenda toggles (real labels, confirmed against
+  # layout_calendar_navigation.xml) live in the calendar's navigation rail,
+  # which can be collapsed/expanded via a separate toggle. This framework
+  # doesn't yet know the rail's default expand state on a given build, so
+  # these taps stay tap_if_present rather than a hard tap -- that is a real,
+  # documented uncertainty about tablet layout state, not a guess about
+  # label wording (the labels themselves are confirmed).
+  - name: Switch to Day view if the navigation rail is showing it
     action: tap_if_present
-    text: Calendar
-
-  - name: Let calendar settle
-    action: sleep
-    seconds: 2
-
-  # Every view-mode tap is tap_if_present: exact label wording for Day/Week/Month
-  # toggles is not guaranteed and must not hard-fail this scenario.
-  - name: Switch to Day view if present
-    action: tap_if_present
-    text: Day
+    id: llDay
 
   - name: Let day view settle
     action: sleep
@@ -33,9 +40,9 @@ steps:
     screenshot_name: 00_day_view
     compare: false
 
-  - name: Switch to Week view if present
+  - name: Switch to Week view if the navigation rail is showing it
     action: tap_if_present
-    text: Week
+    id: llWeek
 
   - name: Let week view settle
     action: sleep
@@ -46,9 +53,9 @@ steps:
     screenshot_name: 01_week_view
     compare: false
 
-  - name: Switch to Month view if present
+  - name: Switch to Month view if the navigation rail is showing it
     action: tap_if_present
-    text: Month
+    id: llMonth
 
   - name: Let month view settle
     action: sleep
@@ -59,9 +66,22 @@ steps:
     screenshot_name: 02_month_view
     compare: false
 
-  - name: Assert still within a calendar-ish screen
-    action: assert_any_text
-    texts: [Calendar, Today, Month, Week, Day]
+  - name: Switch to Agenda view if the navigation rail is showing it
+    action: tap_if_present
+    id: llSchedule
+
+  - name: Let agenda view settle
+    action: sleep
+    seconds: 1.5
+
+  - name: Capture agenda view
+    action: screenshot
+    screenshot_name: 03_agenda_view
+    compare: false
+
+  - name: Assert still on the Calendar screen
+    action: assert_id
+    id: btnAddEvent
 
   - name: Assert no crash/error dialog is showing
     action: fail_if_text

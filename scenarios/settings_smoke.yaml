@@ -6,26 +6,29 @@ steps:
   - name: Launch Calee
     action: launch
 
-  - name: Let home screen settle
-    action: sleep
-    seconds: 3
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llCalendar
+    timeout_seconds: 20
 
-  - name: Open Settings if present
-    action: tap_if_present
-    text: Settings
+  # Settings is not a bottom-navigation tab and has no on-screen "Settings"
+  # text at the home level -- it's an icon-only gear button. A previous
+  # version of this scenario searched for text: Settings here, which never
+  # matched anything and silently no-opped every run (tap_if_present on a
+  # target that could never be found).
+  - name: Open Settings
+    action: tap
+    id: ivHomeSetting
 
-  - name: Let settings screen settle
-    action: sleep
-    seconds: 2
+  - name: Wait for the Settings screen to render
+    action: wait_for_id
+    id: tvLogout
+    timeout_seconds: 10
 
   - name: Capture settings screen
     action: screenshot
     screenshot_name: 00_settings_screen
     compare: false
-
-  - name: Assert settings screen content
-    action: assert_any_text
-    texts: [Settings, About, Version, "Wi-Fi", Display]
 
   - name: Assert no crash/error dialog is showing
     action: fail_if_text

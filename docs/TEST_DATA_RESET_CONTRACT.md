@@ -4,6 +4,46 @@ This framework does not itself wipe, reset, or provision any device or account �
 issues a destructive shell command. Preparing and resetting test devices is a manual, out-of-band
 responsibility of a **technical owner**, following the contract below.
 
+## Deterministic regression fixture (REG-* records)
+
+The `logged_in_tablet` demo account must contain a set of deterministic, predictably-named records
+so scenarios can target an exact known title instead of guessing at whatever data happens to
+already exist. These are created and verified through the Calee Client API — calee-hub-core has no
+seed/test-data endpoint, so fixture records go through the same ordinary CRUD endpoints CaleeMobile
+itself uses — by `caleemobile_regression.fixture` in the sibling `CaleeMobile-Regression` repo:
+
+```
+REG-EVENT-TIMED-001       a timed (non-all-day) event
+REG-EVENT-ALLDAY-001      an all-day event
+REG-EVENT-RECURRING-001   a recurring event (FREQ=WEEKLY)
+REG-EVENT-EXCEPTION-001   a detached occurrence of REG-EVENT-RECURRING-001 with an overridden title
+REG-TASK-OPEN-001         an incomplete task
+REG-TASK-COMPLETE-001     a completed task
+REG-CHORE-REPEATING-001   a repeating chore
+REG-CHORE-SKIPPED-001     a chore that has been skipped past today
+```
+
+Before running `calendar` or `full-tester`/`release-technical` against a real environment, a
+technical owner (or the `01 Prepare Test Environment` launcher) runs, from a checkout with
+`CaleeMobile-Regression` cloned as a sibling of this repo:
+
+```bash
+cd ../CaleeMobile-Regression/api
+python3 manage_fixture.py reset --base-url <env> --email <test-account> --password <...>
+```
+
+This is idempotent — re-running it deletes only the fixture's own `REG-FIXTURE-*` collections
+(never unrelated user data) and recreates them, so a stale run never accumulates. It exits `0` on
+success and a non-zero **blocked** exit code if it can't prepare the fixture (bad credentials,
+unreachable environment, an unexpected API response) — never a false product-failure signal. See
+`CaleeMobile-Regression/api/caleemobile_regression/fixture.py` for the exact fields/assertions and
+`api/tests/test_fixture.py` for its own self-tests against a fake server.
+
+`calendar_event_fields.yaml` and `calendar_recurring_events.yaml` now hard-require these records —
+they tap the fixture's exact titles and assert real Calee resource ids (`tvEventDetailTitle`,
+`tvEventDetailRecurring`, ...), so they can no longer pass without the fixture actually being in
+place and the tablet actually rendering it correctly.
+
 ## "fresh" state
 
 - No Hub session on the device (no stored access/refresh tokens).

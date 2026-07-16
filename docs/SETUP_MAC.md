@@ -1,6 +1,7 @@
 # Mac setup
 
-One-time setup for running the Calee regression framework on a Mac.
+One-time setup for running the Calee regression framework on a Mac. Once this is done, the tester
+never touches Terminal again — see `docs/NON_TECH_TESTER_GUIDE.md`.
 
 ## 1. Install prerequisites
 
@@ -19,15 +20,35 @@ One-time setup for running the Calee regression framework on a Mac.
   appium driver install uiautomator2
   ```
 - **Python 3.11**: `brew install python@3.11`
+- **Flutter** (only needed for `03/04 Test CaleeMobile Android/iPhone`'s UI checks — the API checks
+  work without it): https://docs.flutter.dev/get-started/install/macos, then `flutter doctor` to
+  confirm it's healthy for the platform(s) you'll test (Xcode for iOS, Android SDK for Android —
+  already covered above).
 
-## 2. Get the repo
+## 2. Get the repos
 
-If you were sent a zip or a link, unzip/clone it to a convenient location, e.g. `~/calee-regression`.
+This framework works alongside its sibling, `CaleeMobile-Regression` — both `01 Prepare Test
+Environment` (fixture reset) and `03`/`04` (CaleeMobile checks) expect it to be checked out right
+next to this repo:
+
+```
+some-parent-dir/
+  calee-regression/
+  CaleeMobile-Regression/
+    ui/            (also needs CaleeMobile checked out as ITS sibling, for the UI suite)
+```
+
+If you were sent a zip or a link for each, unzip/clone them so they sit side by side, e.g. under
+`~/calee/`.
 
 ## 3. Create the virtualenv and install
 
+You normally don't need to do this by hand — `01 Prepare Test Environment.command` (and every other
+launcher) creates the virtualenv and installs dependencies automatically on first run. Only do this
+manually if you're working from a terminal for development:
+
 ```bash
-cd ~/calee-regression
+cd ~/calee/calee-regression
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
@@ -48,6 +69,22 @@ Edit `config/tester.local.yaml`:
 
 `config/tester.local.yaml` is your personal, per-machine config — it is gitignored and never
 committed. `config/tester.local.example.yaml` is the template everyone starts from.
+
+### Fixture credentials (for automatic REG-* fixture reset)
+
+`01 Prepare Test Environment.command` resets the deterministic regression fixture (see
+`docs/TEST_DATA_RESET_CONTRACT.md`) automatically if it can find a target environment and test
+account. Store these as environment variables in your shell profile (`~/.zshrc` or similar) — never
+commit them:
+
+```bash
+export CALEE_API_BASE="https://hub-dev.calee.com.au"
+export CALEE_TEST_EMAIL="demo@example.com"
+export CALEE_TEST_PASSWORD="..."
+```
+
+If these aren't set, Prepare still runs the local environment checks — it just skips the fixture
+reset step and says so, rather than failing.
 
 ## 5. Start Appium
 
@@ -70,10 +107,10 @@ adb devices
 
 ## 7. Check your setup
 
-Double-click `tester/Check Setup.command`, or from a terminal:
+Double-click `tester/01 Prepare Test Environment.command`, or from a terminal:
 
 ```bash
-bash scripts/doctor.sh
+python -m calee_regression prepare --config config/tester.local.yaml
 ```
 
 Fix anything reported as `[ERROR]` before running any suite.

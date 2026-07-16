@@ -13,6 +13,12 @@ def test_full_alias_equals_full_tester():
     assert suites.resolve_suite("full") == suites.resolve_suite("full-tester")
 
 
+def test_canonical_profile_name_aliases_resolve_correctly():
+    assert suites.resolve_suite("tablet-smoke") == suites.resolve_suite("smoke-tablet")
+    assert suites.resolve_suite("tablet-full") == suites.resolve_suite("full-tester")
+    assert suites.resolve_suite("full-release") == suites.resolve_suite("full-tester")
+
+
 def test_release_technical_includes_physical_scenarios():
     assert suites.suite_includes_physical("release-technical") is True
     resolved = [str(p) for p in suites.resolve_suite("release-technical")]

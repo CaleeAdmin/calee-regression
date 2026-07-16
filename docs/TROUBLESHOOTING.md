@@ -1,10 +1,34 @@
 # Troubleshooting
 
-Start with `python -m calee_regression doctor --config <your config>` for any of the below — it
-checks most of these automatically and prints a hint.
+Start with `python -m calee_regression prepare --config <your config>` for any of the below (or
+double-click `01 Prepare Test Environment.command`) — it checks most of these automatically and
+prints a plain-language hint. `prepare` also resets the regression fixture; use
+`python -m calee_regression doctor --config <your config>` if you only want the local-environment
+checks without touching the fixture.
+
+## Exit codes
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Success — everything that ran passed. |
+| `1` | Product regression — a real assertion failed. |
+| `2` | Invalid usage/configuration — bad `--config`, unknown suite name, missing `--confirm-technical`, missing credentials. |
+| `3` | Blocked — the test environment (device, Appium, fixture, credentials, tooling) wasn't ready. Not a product failure. |
+
+## BLOCKED scenarios specifically
+
+A scenario reporting `blocked` (not `failed`) means the framework couldn't determine PASS or FAIL
+at all — e.g. Appium was unreachable, or the scenario file itself was invalid. Check the scenario's
+`blocked_reason` in the report; it's written in plain language and points at what to fix. Never
+treat a BLOCKED result as evidence of a product bug.
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| A scenario reports `blocked` with "Could not start an Appium session" | Appium is down, or the device disconnected between `prepare` and running the suite | Re-run `01 Prepare Test Environment`, confirm the device is still connected, then retry |
+| `calendar_event_fields`/`calendar_recurring_events` are `blocked` or fail to find a fixture event by title | The REG-* regression fixture hasn't been reset (or reset failed) | Run `01 Prepare Test Environment` with fixture credentials configured (see `docs/SETUP_MAC.md`) — check `docs/TEST_DATA_RESET_CONTRACT.md` for what should exist afterward |
+| `01 Prepare Test Environment` says "Fixture reset skipped: no target environment/test-account configured" | `CALEE_API_BASE`/`CALEE_TEST_EMAIL`/`CALEE_TEST_PASSWORD` aren't set | Set them in your shell profile — see `docs/SETUP_MAC.md` |
+| `03`/`04 Test CaleeMobile ...` reports BLOCKED for the UI portion specifically | Flutter isn't installed, or no device/emulator/simulator is connected | Install Flutter (`docs/SETUP_MAC.md`) and connect a device — the backend API checks in the same run are unaffected and still count |
+| `03`/`04 Test CaleeMobile ...` reports BLOCKED immediately | `CaleeMobile-Regression` isn't checked out as a sibling of `calee-regression` | Check it out next to this repo — see `docs/SETUP_MAC.md` §2 |
 | `doctor` reports `appium_reachable: error`, or every command fails with a connection error | Appium isn't running | Start it: `appium --base-path /wd/hub --allow-insecure uiautomator2:adb_shell` |
 | Errors mentioning `/session` or `//session`, or 404s from Appium | The Appium server's `--base-path` doesn't match your config's `appium_url` | Make sure `appium_url` ends in `/wd/hub` if the server was started with `--base-path /wd/hub` (the default this framework expects) — or change one to match the other |
 | `doctor` reports `android_sdk_env: error` | Neither `ANDROID_HOME` nor `ANDROID_SDK_ROOT` is set | `export ANDROID_HOME=/path/to/Android/sdk` (e.g. `~/Library/Android/sdk` on Mac) |

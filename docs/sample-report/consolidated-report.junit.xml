@@ -1,0 +1,12 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="calee-consolidated-release" tests="5" failures="0" errors="2">
+  <testcase classname="release" name="Calee tablet" />
+  <testcase classname="release" name="CaleeMobile Client API" />
+  <testcase classname="release" name="CaleeMobile Android UI">
+    <error message="app boot: No Android device/emulator connected in this environment">app boot: No Android device/emulator connected in this environment</error>
+  </testcase>
+  <testcase classname="release" name="CaleeMobile iPhone UI">
+    <error message="Not executed.">Not executed.</error>
+  </testcase>
+  <testcase classname="release" name="manual checks" />
+</testsuite>

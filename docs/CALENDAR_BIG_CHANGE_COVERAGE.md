@@ -6,31 +6,34 @@ regressions when Calee's calendar code changes significantly.
 
 ## What each scenario checks
 
-- **`calendar_smoke.yaml`** — Calendar tab opens and shows recognizably calendar-ish content
-  (`Calendar`/`Today`/`Month`/`Week`/`Day`). Cheapest, run this first.
-- **`calendar_view_modes.yaml`** — Day, Week, and Month view toggles (if present) each render without
-  crashing, with a screenshot captured per view. This is the scenario most likely to catch a broken
-  view mode after a calendar refactor.
-- **`calendar_event_fields.yaml`** — Opens an existing event (if one is visible) and checks for
-  expected field labels (Title/Time/Location/Notes/Start/End). Best-effort: wrapped in `optional`
-  since a calendar with no fixture events has nothing to open.
-- **`calendar_recurring_events.yaml`** — Same idea, specifically for recurrence indicators
-  (Repeat/Recurring/Weekly/etc.). Also `optional`-wrapped for the same fixture-data reason.
+- **`calendar_smoke.yaml`** — Calendar tab opens and its toolbar (`btnAddEvent`) actually renders.
+  Cheapest, run this first.
+- **`calendar_view_modes.yaml`** — Day, Week, Month, and Agenda toggles (if the navigation rail is
+  showing them — see the scenario's own comment on why that tap stays conditional) each render
+  without crashing, with a screenshot captured per view, then asserts the Calendar screen is still
+  showing. This is the scenario most likely to catch a broken view mode after a calendar refactor.
+- **`calendar_event_fields.yaml`** — Requires the deterministic regression fixture (see
+  `docs/TEST_DATA_RESET_CONTRACT.md`). Opens `REG-EVENT-TIMED-001` and `REG-EVENT-ALLDAY-001` by
+  their exact, guaranteed-to-exist titles, and hard-asserts each event's detail dialog shows the
+  right title and time/all-day rendering (`tvEventDetailTitle`, and "All day" text presence/absence).
+- **`calendar_recurring_events.yaml`** — Also requires the fixture. Opens `REG-EVENT-RECURRING-001`
+  and hard-asserts its recurring indicator (`tvEventDetailRecurring`) is present, then opens
+  `REG-EVENT-EXCEPTION-001` (a detached occurrence of the same series with an overridden title) and
+  hard-asserts it shows its own overridden title, not the series' original one. Neither assertion is
+  wrapped in `optional` — both scenarios fail (or block, if the fixture isn't there) rather than
+  silently pass if the fixture is missing or the tablet renders it wrong.
 
-## Current limitations
+## Prerequisites
 
-- Every navigation tap uses `tap_if_present`, and both event-detail assertions use `optional` — this
-  makes the suite resilient to missing fixture data or label drift, but it also means a passing run
-  doesn't prove event/recurrence UI is fully correct if no fixture events exist yet. See
-  `docs/TEST_DATA_RESET_CONTRACT.md` for the recommended fixture setup (at least one recurring
-  event).
-- The exact text used in `assert_any_text` calls is a best guess based on typical calendar UI
-  copy, not confirmed against the actual Calee UI strings. A technical owner should tune these once
-  real screens are inspected, especially after a big visual change.
+Both event/recurrence scenarios require `01 Prepare Test Environment` (or
+`python3 manage_fixture.py reset` in the sibling `CaleeMobile-Regression/api`) to have reset the
+regression fixture first. If the fixture isn't there, expect these scenarios to fail their
+`wait_for_text`/`tap` steps (a real, diagnosable failure) rather than silently pass — see
+`docs/TEST_DATA_RESET_CONTRACT.md`.
 
 ## Recommended workflow for a big calendar change
 
-1. On a prepared `logged_in_tablet` device with known fixture events, run
+1. On a prepared `logged_in_tablet` device with the regression fixture reset, run
    `python -m calee_regression suite --config config/tester.local.yaml --suite calendar` **before**
    making the change. Keep the report folder.
 2. Make the calendar change.

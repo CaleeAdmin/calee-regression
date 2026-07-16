@@ -1,16 +1,14 @@
 #!/bin/bash
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$DIR/../.."
+cd "$DIR/../.." || exit 1
 
-if [ ! -f .venv/bin/activate ]; then
-    echo "No .venv found. Run this first in Terminal:"
-    echo "  python3.11 -m venv .venv && source .venv/bin/activate && pip install -e '.[dev]'"
+# shellcheck source=../../scripts/ensure_environment.sh
+source scripts/ensure_environment.sh
+BOOTSTRAP_STATUS=$?
+if [ $BOOTSTRAP_STATUS -ne 0 ]; then
     read -p "Press Enter to close..."
-    exit 1
+    exit $BOOTSTRAP_STATUS
 fi
-
-source .venv/bin/activate
-export CALEE_TEST_CONFIG=config/tester.local.yaml
 
 echo "============================================================"
 echo " release-technical requires a REAL PHYSICAL TABLET."
@@ -28,7 +26,7 @@ if [ $STATUS -eq 0 ]; then
     echo "PASSED: release-technical"
 else
     echo ""
-    echo "FAILED: release-technical — open the report (Open Latest Report.command) for details."
+    echo "FAILED/BLOCKED: release-technical — open the report ('06 Open Latest Report') for details."
 fi
 
 read -p "Press Enter to close..."

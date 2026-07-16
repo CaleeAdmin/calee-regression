@@ -1,0 +1,47 @@
+[
+  {
+    "title": "Kiosk escape check",
+    "instruction": "While Calee is in the foreground, swipe down from the top edge of the screen, then press the recents/home hardware button if the device has one.",
+    "expectedResult": "No notification shade, quick-settings panel, or recents view opens. The screen stays on Calee.",
+    "status": null,
+    "note": "",
+    "screenshotRef": null,
+    "mandatory": true
+  },
+  {
+    "title": "Calendar colour legibility",
+    "instruction": "Open the Calendar tab in Month view and look at each calendar's colour dot/highlight.",
+    "expectedResult": "Every calendar's colour is visually distinct from the others and readable against the background.",
+    "status": null,
+    "note": "",
+    "screenshotRef": null,
+    "mandatory": true
+  },
+  {
+    "title": "Long event title layout",
+    "instruction": "Open or create an event with a very long title and view it in Day, Week, and Month views.",
+    "expectedResult": "The long title truncates or wraps cleanly -- it does not overflow, overlap other text, or break the layout.",
+    "status": null,
+    "note": "",
+    "screenshotRef": null,
+    "mandatory": true
+  },
+  {
+    "title": "Touch responsiveness",
+    "instruction": "Tap through Today, Calendar, Tasks, Chores, and Settings tabs at a normal pace.",
+    "expectedResult": "Every tap registers promptly with no noticeable lag, double-tap requirement, or missed taps.",
+    "status": null,
+    "note": "",
+    "screenshotRef": null,
+    "mandatory": true
+  },
+  {
+    "title": "Weather rendering (if configured)",
+    "instruction": "Check the top-bar weather widget.",
+    "expectedResult": "Either real weather data renders correctly, or (if weather isn't configured for this account) no broken/placeholder/error state is shown instead.",
+    "status": null,
+    "note": "",
+    "screenshotRef": null,
+    "mandatory": false
+  }
+]
