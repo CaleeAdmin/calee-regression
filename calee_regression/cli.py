@@ -14,6 +14,8 @@ from . import config as config_mod
 from . import manual_checks as manual_checks_mod
 from . import preflight, release_platforms, reporting, suites
 from . import run_context
+from . import sync_smoke
+from .appium_driver import CaleeDriver
 from .consolidated_report import (
     STATUS_BLOCKED,
     STATUS_PASS,
@@ -611,6 +613,101 @@ def suite(config_path, suite_name, confirm_technical, run_id_opt):
     )
     click.echo(f"Report: {report_dir}")
     raise SystemExit(_exit_code_for(result))
+
+
+@main.command("sync-smoke")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
+@click.option(
+    "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True,
+    help="Shared release run ID (see run_context.py). Every sync-smoke run belongs to a workspace.",
+)
+@click.option("--base-url", envvar="CALEE_EXPECTED_BACKEND", default=None, help="Calee Client API base URL.")
+@click.option("--email", envvar="CALEE_TEST_EMAIL", default=None)
+@click.option("--password", envvar="CALEE_TEST_PASSWORD", default=None)
+@click.option(
+    "--platform", type=click.Choice(["android", "ios"]), default="android",
+    help="Which CaleeMobile platform runs the mobile legs (sync_task_complete_test.dart / sync_chore_complete_test.dart).",
+)
+@click.option(
+    "--task-id", default=None,
+    help="REG-TASK-OPEN-001's server-assigned id, for the task flow's API-based cleanup fallback. "
+         "Optional -- without it, that fallback is recorded BLOCKED instead of guessing an id.",
+)
+def sync_smoke_cmd(config_path, run_id_opt, base_url, email, password, platform, task_id):
+    """Cross-device sync-smoke: event/task/chore flows across the API, CaleeMobile, and the tablet.
+
+    NOT release-gating today -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md.
+    The event and task flows always include one genuinely BLOCKED step
+    because tablet-side mutation isn't possible yet (unconfirmed resource
+    ids); every other leg runs for real. Writes reports/runs/<run-id>/sync/
+    results.json but is not yet auto-discovered by `consolidate` -- this is
+    deliberate, matching how the Workstream 10 draft scenarios are kept out
+    of a real release's mandatory components until that gap closes.
+    """
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r} (expected letters/digits/._- only).", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    run_id = run_id_opt
+
+    if not base_url or not email or not password:
+        click.echo(
+            "BLOCKED: sync-smoke needs --base-url/--email/--password (or CALEE_EXPECTED_BACKEND/"
+            "CALEE_TEST_EMAIL/CALEE_TEST_PASSWORD) to reach the Calee Client API and CaleeMobile.",
+            err=True,
+        )
+        raise SystemExit(EXIT_BLOCKED)
+
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    workspace.ensure_created()
+    report_dir = workspace.component_dir("sync")
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = config_mod.load_config(config_path) if config_path else None
+    tablet_driver = None
+    if cfg is not None:
+        driver = CaleeDriver(cfg)
+        try:
+            driver.start_session()
+            tablet_driver = driver
+        except Exception as exc:
+            click.echo(
+                f"[WARN] Could not start a tablet Appium session ({exc}) -- tablet-leg checks in this "
+                f"run will all be recorded as real failed polls, not skipped or faked.",
+                err=True,
+            )
+
+    try:
+        env = sync_smoke.build_real_environment(
+            repo_root=REPO_ROOT, base_url=base_url, email=email, password=password, platform=platform,
+            report_dir=report_dir, tablet_driver=tablet_driver,
+            device_id=cfg.udid if cfg is not None else None,
+        )
+        results = sync_smoke.run_all_sync_flows(env, run_id=run_id, task_id=task_id)
+    finally:
+        if tablet_driver is not None:
+            tablet_driver.quit()
+
+    report_path = report_dir / "results.json"
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump({"runId": run_id, "flows": [r.to_dict() for r in results]}, f, indent=2)
+        f.write("\n")
+
+    for result in results:
+        click.echo(f"{result.flow}: {result.status.upper()}")
+    click.echo(f"Report: {report_path}")
+
+    if any(r.status == "failed" for r in results):
+        overall_exit = EXIT_REGRESSION
+    elif any(r.status == "blocked" for r in results):
+        overall_exit = EXIT_BLOCKED
+    else:
+        overall_exit = EXIT_SUCCESS
+
+    manifest = _load_or_init_manifest(workspace)
+    manifest.record_component("sync", report_path=str(report_path), exit_code=overall_exit)
+    manifest.write(workspace.manifest_path)
+
+    raise SystemExit(overall_exit)
 
 
 def _load_json_report(path: "str | None") -> "dict | None":

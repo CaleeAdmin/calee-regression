@@ -14,7 +14,7 @@ meaningful; use the duration *category* instead.
 | `mobile-api` | `CaleeMobile-Regression` | `python3 run_regression.py` in `api/` | Standard | None — hits the backend directly | Auto-managed per run (run-tagged `RT ...` records + best-effort cleanup); can also target the shared REG-* fixture | No | Yes |
 | `mobile-android` | `CaleeMobile-Regression` | `ui/run_ui_suite.py --platform android` (auto-resolves the device, passes credentials via `--dart-define`), or `03 Test CaleeMobile Android.command` | Standard | Signed-in CaleeMobile session on an Android device/emulator; `CALEE_TEST_EMAIL`/`CALEE_TEST_PASSWORD` configured | Recommended (REG-* fixture) — the calendar/tasks flow tests assert against it | Yes (or an Android emulator) | Driven by `config/release-platforms.yaml`'s `mobile_android` — defaults to Yes. Format/analyze/unit-tests pass; device execution depends on an Android emulator/device being available where this runs — see the session's final report for what was and wasn't actually executed |
 | `mobile-ios` | `CaleeMobile-Regression` | `ui/run_ui_suite.py --platform ios`, or `04 Test CaleeMobile iPhone.command` | Standard | Signed-in CaleeMobile session on an iPhone/simulator; same credentials as above | Same as `mobile-android` | Yes (a Mac with Xcode; simulator counts) | Driven by `config/release-platforms.yaml`'s `mobile_ios` — defaults to Yes. iOS device/simulator execution requires a real Mac; never executable on Linux |
-| `sync-smoke` | Both (orchestrated) | Not yet automated — see "Known gap" below | Standard | Prepared tablet + a CaleeMobile session, both on the same household | Yes — REG-* fixture | Yes | Yes, once implemented |
+| `sync-smoke` | Both (orchestrated) | `python -m calee_regression sync-smoke --run-id <id> --base-url ... --email ... --password ...` | Standard | Prepared tablet + a CaleeMobile session, both on the same household | Yes — REG-* fixture | Yes | Not yet — see "Partially implemented" below |
 | `full-release` (alias of `full-tester`) / full solution | Both (orchestrated) | `06 Test Full Calee Solution.command` (prepare incl. Appium auto-start, tablet, CaleeMobile API+UI per `config/release-platforms.yaml`, guided manual checks, consolidate) | Extended | Prepared tablet; CaleeMobile if attached | Yes | Tablet+API always mandatory; mobile UI mandatory-ness follows `config/release-platforms.yaml` (default Yes per platform, not hard-coded optional) | Yes — see `docs/RELEASE_POLICY.md` |
 | `release-technical` | `calee-regression` | `tester/technical/Run Release Technical.command` | Extended | Real physical tablet, admin/kiosk access | No | Yes — refuses to run on an emulator | Yes, for kiosk/admin/system-receiver coverage specifically |
 
@@ -28,15 +28,40 @@ Each is `mandatory: false` in its own scenario file and deliberately absent from
 `COMPOSITE_SUITES` entry, so no existing launcher or CI job ever runs them. See
 `docs/TABLET_MUTATION_COVERAGE_GAPS.md` for the exact gap and confirmation checklist.
 
-## Known gap: `sync-smoke`
+## Partially implemented: `sync-smoke`
 
-There is no automated cross-device synchronization suite yet. Section 10 of the project brief
-("Cross-device synchronization suite") describes the intended shape: prepare the fixture, change an
-event/task/chore through the API or CaleeMobile, poll (bounded, not `sleep`-based) until it appears
-on the tablet, modify it from the tablet, poll until it's visible back through the API/CaleeMobile,
-then delete and verify propagation. This requires a real tablet and a real CaleeMobile
-session simultaneously and wasn't executable in the environment this round of work was done in (no
-physical devices available) — see the deliverables summary for what's still needed to build it.
+`calee_regression/sync_smoke.py` orchestrates three flows across the API, CaleeMobile, and the
+tablet, each with bounded polling (never `sleep`-and-hope) and structured evidence per step (source
+operation, expected/observed state, timeout, polling attempts, device/build info, screenshots, API
+response excerpts) — see `SyncStepEvidence`/`SyncFlowResult` there and
+`framework_tests/test_sync_smoke.py` for the fully-tested orchestration logic:
+
+- **Event flow**: create via the Calee Client API → poll the tablet (bounded) → *modify on the
+  tablet* → delete via the API → poll both for deletion.
+- **Task flow**: poll the tablet baseline → complete `REG-TASK-OPEN-001` via CaleeMobile
+  (`sync_task_complete_test.dart`) → poll the tablet → *reopen on the tablet*, falling back to an
+  API-based reopen purely as cleanup → verify final state.
+- **Chore flow**: poll the tablet baseline → complete then un-complete `REG-CHORE-REPEATING-001` via
+  CaleeMobile's row toggle (`sync_chore_complete_test.dart`, fully self-contained and self-cleaning)
+  → poll the tablet again. No tablet-side mutation needed at all for this one.
+
+The *italicized* steps above are always recorded `BLOCKED`, never attempted and never faked as
+passing — they need tablet-side mutation resource ids that have never been confirmed against the
+real Calee app, the same gap `calendar_event_mutation`/`tasks_mutation` (above) are blocked on. See
+`docs/TABLET_MUTATION_COVERAGE_GAPS.md`. Because of this, **`sync-smoke` is not yet release-gating**:
+the event and task flows can never reach a clean `ok` status until that gap closes, so making it
+mandatory today would mean no release could ever pass. Its report
+(`reports/runs/<run-id>/sync/results.json`) is written for every run but is not yet auto-discovered
+by `consolidate` — informational only until the tablet-mutation gap closes, at which point it should
+be wired in as a mandatory component the same way `environment`/`tablet`/`mobile-*` already are (see
+`docs/RELEASE_POLICY.md`).
+
+Every *other* step in all three flows is exercised for real against whatever backend/device the
+caller points it at — `sync_smoke_bridge.py` shells out to CaleeMobile-Regression's
+`api/sync_smoke_actions.py` (API leg, `framework_tests/test_sync_smoke_bridge.py`) and `ui/run_ui_suite.py`
+(CaleeMobile leg), and a live `CaleeDriver`/Appium session drives the tablet-read legs. Section 10 of
+the project brief ("Cross-device synchronization suite") is the origin of this suite's intended
+shape; this closes it as far as the current tablet-mutation gap allows.
 
 ## Notes
 

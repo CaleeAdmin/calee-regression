@@ -15,6 +15,12 @@ Three draft scenarios now exist that exercise exactly that:
 | `scenarios/tasks_mutation.yaml` | `tasks_mutation` | locate `REG-TASK-OPEN-001` → complete → verify → reopen → verify (self-cleaning) |
 | `scenarios/chores_mutation.yaml` | `chores_mutation` | locate `REG-CHORE-REPEATING-001` → skip → verify (relies on fixture reset to restore) |
 
+This is the same gap `calee_regression/sync_smoke.py`'s cross-device flows (Workstream 11 — see
+`docs/SUITE_REFERENCE.md`'s "Partially implemented: sync-smoke" section) hit for their "modify on
+tablet" (event flow) and "reopen on tablet" (task flow) steps: both are recorded `BLOCKED` for
+exactly this reason, cross-referencing this same checklist rather than a separate one. Closing the
+gap below unblocks both the draft scenarios above *and* those two sync-smoke steps.
+
 **None of these are runnable yet.** They are structurally complete — correct flow, correct use of
 the deterministic REG-* fixture, self-cleaning where a UI-level undo is plausible, framework actions
 that already exist and are unit-tested — but every interactive element beyond simple navigation uses
