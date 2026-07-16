@@ -19,10 +19,11 @@ side-by-side checkout layout.
 
 If you're running checks by double-clicking files, start with
 [docs/NON_TECH_TESTER_GUIDE.md](docs/NON_TECH_TESTER_GUIDE.md) — you shouldn't need anything below
-this point. The six launchers you need are in `tester/`:
+this point. The seven launchers you need are in `tester/`:
 
-`01 Prepare Test Environment` → `02 Test Calee Tablet` / `03 Test CaleeMobile Android` /
-`04 Test CaleeMobile iPhone` / `05 Test Full Calee Solution` → `06 Open Latest Report`.
+`01 Prepare Test Environment` (also starts Appium automatically) → `02 Test Calee Tablet` /
+`03 Test CaleeMobile Android` / `04 Test CaleeMobile iPhone` / `05 Record Manual Checks` /
+`06 Test Full Calee Solution` (runs everything, incl. manual checks) → `07 Open Latest Report`.
 
 ## Technical quickstart
 
@@ -33,7 +34,10 @@ pip install -e '.[dev]'
 python -m pytest
 ```
 
-Start Appium 3 (required flags — see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)):
+`prepare` starts Appium 3 automatically (with the required flags — see
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)) if it isn't already reachable at the configured
+`appium_url`, so you normally don't need to start it yourself. To start it manually anyway (e.g.
+for interactive debugging outside this framework):
 
 ```bash
 appium --base-path /wd/hub --allow-insecure uiautomator2:adb_shell
@@ -46,9 +50,12 @@ cp config/tester.local.example.yaml config/tester.local.yaml
 # edit config/tester.local.yaml: apk_path, udid, etc.
 ```
 
-**Run this first, always** — checks the local environment *and* resets the deterministic
-regression fixture (see [docs/TEST_DATA_RESET_CONTRACT.md](docs/TEST_DATA_RESET_CONTRACT.md)) if
-`CALEE_API_BASE`/`CALEE_TEST_EMAIL`/`CALEE_TEST_PASSWORD` are set:
+**Run this first, always** — checks the local environment (incl. starting Appium if needed) *and*
+resets+verifies the deterministic regression fixture (see
+[docs/TEST_DATA_RESET_CONTRACT.md](docs/TEST_DATA_RESET_CONTRACT.md)). For a release-gating suite
+(the default), missing fixture credentials or a failed reset/verify now correctly **BLOCKS** —
+it never silently reports READY without a real fixture. Pass `--allow-no-fixture` only for a suite
+that genuinely doesn't need the fixture (e.g. `smoke-fresh`):
 
 ```bash
 python -m calee_regression prepare --config config/tester.local.yaml
@@ -80,7 +87,10 @@ command: `0` success, `1` product regression, `2` invalid usage/configuration, `
 | `python -m calee_regression list-suites` | List all suites and the scenario files each resolves to |
 | `python -m calee_regression run --config <config> --scenario <path>` | Run a single scenario file |
 | `python -m calee_regression suite --config <config> --suite <name>` | Run a named suite |
-| `python -m calee_regression consolidate --tablet-report <json> --mobile-api-report <json> ...` | Combine per-framework JSON reports into one release report (HTML/JSON/JUnit + zip bundle) |
+| `python -m calee_regression record-manual-checks` | Guided terminal menu for recording manual checks — no JSON editing |
+| `python -m calee_regression release-platforms` | Print the resolved release-platform profile (`config/release-platforms.yaml`) |
+| `python -m calee_regression stop-appium` | Stop Appium, but only if this framework auto-started it |
+| `python -m calee_regression consolidate --tablet-report <json> --mobile-api-report <json> ...` | Combine per-framework JSON reports into one release report (HTML/JSON/JUnit + zip bundle); Android/iOS UI mandatory-ness comes from `config/release-platforms.yaml` |
 
 ## Suites
 

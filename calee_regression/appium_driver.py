@@ -195,6 +195,16 @@ class CaleeDriver:
     def back(self) -> None:
         self.driver.back()
 
+    def id_present(self, raw_id: str) -> bool:
+        """Single-shot presence check (no wait loop, no tap) -- used to
+        decide whether a toggle control needs pressing without flipping it
+        blindly (see runner.py's tap_if_absent action)."""
+        try:
+            self.find_by_id(raw_id)
+            return True
+        except Exception:
+            return False
+
     def wait_for_id(self, raw_id: str, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:

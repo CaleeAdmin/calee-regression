@@ -54,12 +54,16 @@ steps:
     action: back
 
   # Chores is a conditional tab (hidden entirely for accounts/experience
-  # modes without a chore-capable service), so this stays tap_if_present --
-  # see docs/TEST_DATA_RESET_CONTRACT.md for what "no chore service" means
-  # for this scenario's coverage.
+  # modes without a chore-capable service), so this stays optional -- see
+  # docs/TEST_DATA_RESET_CONTRACT.md for what "no chore service" means for
+  # this scenario's coverage. then_wait_for_id makes a present-but-broken
+  # chores tab a real FAILED instead of silently passing on a bare tap.
   - name: Open Chores if this account has a Chores tab
     action: tap_if_present
     id: llChores
+    optional: true
+    then_wait_for_id: choresRecyclerView
+    then_wait_for_id_timeout_seconds: 10
 
   - name: Let chores settle
     action: sleep

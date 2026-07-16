@@ -10,7 +10,7 @@ STATUS=$?
 
 if [ $STATUS -ne 0 ]; then
     echo ""
-    echo "No report could be opened. Run '02 Test Calee Tablet' or '05 Test Full Calee Solution' first."
+    echo "No report could be opened. Run '02 Test Calee Tablet' or '06 Test Full Calee Solution' first."
 fi
 
 read -p "Press Enter to close..."

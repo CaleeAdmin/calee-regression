@@ -48,6 +48,17 @@ PHYSICAL_ONLY_SCENARIOS = {
     "scenarios/system_receivers.yaml",
 }
 
+# Scenarios that assert against the deterministic REG-* fixture (see
+# docs/TEST_DATA_RESET_CONTRACT.md) -- kept in sync with
+# framework_tests/test_scenario_release_critical.py's
+# RELEASE_CRITICAL_CALENDAR_SCENARIOS list. Any suite resolving to one of
+# these requires a real fixture reset+verify in `prepare`; it must never be
+# silently bypassed with --skip-fixture/--allow-no-fixture (see cli.py).
+FIXTURE_DEPENDENT_SCENARIOS = {
+    "scenarios/calendar_event_fields.yaml",
+    "scenarios/calendar_recurring_events.yaml",
+}
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -84,6 +95,19 @@ def suite_includes_physical(name: str, repo_root=None) -> bool:
     paths = resolve_suite(name, repo_root)
     return any(
         str(p.relative_to(repo_root)).replace(os.sep, "/") in PHYSICAL_ONLY_SCENARIOS
+        for p in paths
+    )
+
+
+def suite_requires_fixture(name: str, repo_root=None) -> bool:
+    """Whether resolving this suite includes a scenario that asserts
+    against the deterministic REG-* fixture -- used by `prepare` to refuse
+    --skip-fixture/--allow-no-fixture for a release-gating profile like
+    tablet-full/full-release (see docs/TEST_DATA_RESET_CONTRACT.md)."""
+    repo_root = repo_root or REPO_ROOT
+    paths = resolve_suite(name, repo_root)
+    return any(
+        str(p.relative_to(repo_root)).replace(os.sep, "/") in FIXTURE_DEPENDENT_SCENARIOS
         for p in paths
     )
 

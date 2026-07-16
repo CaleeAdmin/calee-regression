@@ -52,6 +52,12 @@ def test_consolidate_passes_when_everything_is_provided_and_clean(tmp_path):
             "--mobile-api-report", api,
             "--manual-checks", manual,
             "--build-version", "9.9.9",
+            # This release doesn't include mobile UI results at all (a
+            # tablet-only scope for this test) -- without an explicit
+            # opt-out, Android/iOS UI default to mandatory=True and a
+            # missing report would correctly BLOCK. See
+            # test_release_platforms.py for the platform-driven cases.
+            "--android-optional", "--ios-optional",
             "--out-dir", str(tmp_path / "out"),
         ],
     )

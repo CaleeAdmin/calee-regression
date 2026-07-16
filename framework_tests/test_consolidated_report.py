@@ -17,6 +17,7 @@ from calee_regression.consolidated_report import (
     STATUS_PASS,
     ManualCheck,
     build_release_report,
+    component_from_build_version_match,
     decide_status,
     write_html,
     write_json,
@@ -75,8 +76,25 @@ def test_all_components_pass_and_manual_checks_pass_yields_overall_pass():
         mobile_api=PASSING_API_REPORT,
         manual_checks=ALL_PASSED_MANUAL_CHECKS,
         meta={"buildVersion": "1.2.3"},
+        android_mandatory=False,
+        ios_mandatory=False,
     )
     assert report.overall_status == STATUS_PASS
+
+
+def test_mobile_ui_platforms_default_to_mandatory_and_block_when_missing():
+    # An omitted required platform must block the release -- the default
+    # (no explicit android_mandatory/ios_mandatory override) is mandatory,
+    # not the old hard-coded mandatory=False.
+    report = build_release_report(
+        tablet=PASSING_TABLET_REPORT,
+        mobile_api=PASSING_API_REPORT,
+        manual_checks=ALL_PASSED_MANUAL_CHECKS,
+    )
+    assert report.overall_status == STATUS_BLOCKED
+    android_component = next(c for c in report.components if c.name == "CaleeMobile Android UI")
+    assert android_component.mandatory is True
+    assert android_component.status == STATUS_NOT_RUN
 
 
 def test_a_single_tablet_failure_makes_overall_fail_even_if_everything_else_passes():
@@ -124,6 +142,8 @@ def test_optional_component_being_not_run_does_not_block_overall_pass():
         mobile_android_ui=None,
         mobile_ios_ui=None,
         manual_checks=ALL_PASSED_MANUAL_CHECKS,
+        android_mandatory=False,
+        ios_mandatory=False,
     )
     assert report.overall_status == STATUS_PASS
     android_component = next(c for c in report.components if c.name == "CaleeMobile Android UI")
@@ -139,12 +159,60 @@ def test_a_failed_mandatory_manual_check_makes_overall_fail():
     assert report.overall_status == STATUS_FAIL
 
 
+def test_no_expected_build_version_configured_means_no_check_performed():
+    assert component_from_build_version_match(name="x", expected=None, detected="1.2.3") is None
+
+
+def test_matching_build_version_passes():
+    component = component_from_build_version_match(name="Calee build version", expected="1.2.3", detected="1.2.3")
+    assert component.status == STATUS_PASS
+
+
+def test_mismatched_build_version_blocks():
+    component = component_from_build_version_match(name="Calee build version", expected="1.2.3", detected="1.2.4")
+    assert component.status == STATUS_BLOCKED
+
+
+def test_missing_detected_build_version_blocks_when_one_was_expected():
+    component = component_from_build_version_match(name="Calee build version", expected="1.2.3", detected=None)
+    assert component.status == STATUS_BLOCKED
+
+
+def test_build_version_mismatch_blocks_the_whole_release():
+    report = build_release_report(
+        tablet=PASSING_TABLET_REPORT,
+        mobile_api=PASSING_API_REPORT,
+        manual_checks=ALL_PASSED_MANUAL_CHECKS,
+        android_mandatory=False,
+        ios_mandatory=False,
+        calee_build_version="0.3.21",
+        expected_calee_build_version="0.3.22",
+    )
+    assert report.overall_status == STATUS_BLOCKED
+    version_component = next(c for c in report.components if c.name == "Calee build version")
+    assert version_component.status == STATUS_BLOCKED
+
+
+def test_suggested_next_action_present_for_each_overall_status():
+    fail_report = build_release_report(tablet=FAILING_TABLET_REPORT, mobile_api=PASSING_API_REPORT, android_mandatory=False, ios_mandatory=False)
+    blocked_report = build_release_report(tablet=PASSING_TABLET_REPORT, mobile_api=None, android_mandatory=False, ios_mandatory=False)
+    pass_report = build_release_report(
+        tablet=PASSING_TABLET_REPORT, mobile_api=PASSING_API_REPORT, manual_checks=ALL_PASSED_MANUAL_CHECKS,
+        android_mandatory=False, ios_mandatory=False,
+    )
+    assert "do not release" in fail_report.summary["suggestedNextAction"].lower()
+    assert "not yet releasable" in blocked_report.summary["suggestedNextAction"].lower()
+    assert "approved to release" in pass_report.summary["suggestedNextAction"].lower()
+
+
 def test_write_json_html_junit_and_bundle(tmp_path):
     report = build_release_report(
         tablet=PASSING_TABLET_REPORT,
         mobile_api=PASSING_API_REPORT,
         manual_checks=ALL_PASSED_MANUAL_CHECKS,
         meta={"buildVersion": "1.2.3", "testEnvironment": "https://hub-dev.calee.com.au"},
+        android_mandatory=False,
+        ios_mandatory=False,
     )
 
     json_path = tmp_path / "report.json"
@@ -163,6 +231,28 @@ def test_write_json_html_junit_and_bundle(tmp_path):
     assert bundle_path.exists()
     assert bundle_path.name.startswith("Calee-Regression-")
     assert bundle_path.name.endswith("-PASS.zip")
+
+
+def test_synthetic_fail_bundle_can_be_generated_and_inspected(tmp_path):
+    report = build_release_report(
+        tablet=FAILING_TABLET_REPORT, mobile_api=PASSING_API_REPORT, manual_checks=ALL_PASSED_MANUAL_CHECKS,
+        android_mandatory=False, ios_mandatory=False,
+    )
+    assert report.overall_status == STATUS_FAIL
+    bundle_path = write_release_bundle(report, tmp_path / "bundle", build_label="1.2.3")
+    assert bundle_path.exists()
+    assert bundle_path.name.endswith("-FAIL.zip")
+
+
+def test_synthetic_blocked_bundle_can_be_generated_and_inspected(tmp_path):
+    report = build_release_report(
+        tablet=PASSING_TABLET_REPORT, mobile_api=None, manual_checks=ALL_PASSED_MANUAL_CHECKS,
+        android_mandatory=False, ios_mandatory=False,
+    )
+    assert report.overall_status == STATUS_BLOCKED
+    bundle_path = write_release_bundle(report, tmp_path / "bundle", build_label="1.2.3")
+    assert bundle_path.exists()
+    assert bundle_path.name.endswith("-BLOCKED.zip")
 
 
 def test_write_release_bundle_sanitizes_unsafe_build_labels(tmp_path):

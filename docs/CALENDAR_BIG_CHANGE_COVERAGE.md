@@ -8,10 +8,15 @@ regressions when Calee's calendar code changes significantly.
 
 - **`calendar_smoke.yaml`** — Calendar tab opens and its toolbar (`btnAddEvent`) actually renders.
   Cheapest, run this first.
-- **`calendar_view_modes.yaml`** — Day, Week, Month, and Agenda toggles (if the navigation rail is
-  showing them — see the scenario's own comment on why that tap stays conditional) each render
-  without crashing, with a screenshot captured per view, then asserts the Calendar screen is still
-  showing. This is the scenario most likely to catch a broken view mode after a calendar refactor.
+- **`calendar_view_modes.yaml`** — deterministically expands the navigation rail if it's collapsed
+  (`tap_if_absent`, keyed off whether `llDay` is already visible — never blindly toggles an
+  already-expanded rail), then hard-taps Day, Week, Month, and Agenda in turn. Each switch is
+  verified by waiting for that view mode's own content panel to actually appear
+  (`panelHubDay`/`panelHubWeek`/`panelHubMonth`/`panelHubAgenda` — confirmed against
+  `HubCalendarFragment.kt`'s exclusive-visibility switch, since the nav row's own "selected" look is
+  pure background/text-color styling with no UiAutomator-visible state), not just a tap-and-
+  screenshot. This is the scenario most likely to catch a broken view mode after a calendar
+  refactor.
 - **`calendar_event_fields.yaml`** — Requires the deterministic regression fixture (see
   `docs/TEST_DATA_RESET_CONTRACT.md`). Opens `REG-EVENT-TIMED-001` and `REG-EVENT-ALLDAY-001` by
   their exact, guaranteed-to-exist titles, and hard-asserts each event's detail dialog shows the

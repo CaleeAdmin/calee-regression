@@ -1,17 +1,37 @@
 """Tests for the `prepare` CLI command ("01 Prepare Test Environment").
 
 Mocks preflight.run_doctor and fixture_bridge.run_fixture_action so this
-covers the command's own decision logic (never claim success it can't back
-up) without needing a real device, Appium server, or backend.
+covers the command's own decision logic (never claim success/READY it
+can't back up) without needing a real device, Appium server, or backend.
 """
 
 from __future__ import annotations
 
+import json
+
+import pytest
 from click.testing import CliRunner
 
-from calee_regression import cli, preflight
+from calee_regression import appium_lifecycle, cli, preflight
 from calee_regression.fixture_bridge import FixtureBridgeError
-from calee_regression.models import DoctorCheck, EXIT_BLOCKED, EXIT_SUCCESS
+from calee_regression.models import DoctorCheck, EXIT_BLOCKED, EXIT_INVALID_CONFIG, EXIT_SUCCESS
+
+
+@pytest.fixture(autouse=True)
+def _appium_already_healthy(monkeypatch):
+    # These tests cover `prepare`'s own fixture-preparation decision logic
+    # (see test_appium_lifecycle.py for Appium lifecycle coverage itself)
+    # -- assume Appium is already up so a real network call is never made.
+    monkeypatch.setattr(appium_lifecycle, "is_appium_healthy", lambda base_url, timeout_seconds=5: True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_environment_status_path(tmp_path, monkeypatch):
+    # _environment_status_path() defaults to the real repo's reports/ dir
+    # (correct for an actual tester run) -- redirect it under tmp_path so
+    # these tests never write into this checkout's working tree.
+    monkeypatch.setattr(cli, "_environment_status_path", lambda: tmp_path / "environment-status-latest.json")
+
 
 _CONFIG_YAML = """
 appium_url: "http://127.0.0.1:4723/wd/hub"
@@ -53,20 +73,33 @@ def test_prepare_succeeds_with_skip_fixture(tmp_path, monkeypatch):
     assert "skipped" in result.output.lower()
 
 
-def test_prepare_succeeds_without_fixture_credentials_configured(tmp_path, monkeypatch):
+def test_prepare_blocks_without_fixture_credentials_configured(tmp_path, monkeypatch):
+    # This is the core fix for the "prepare can return success/READY when
+    # fixture credentials were absent" defect: for a release-gating run
+    # (no explicit bypass), missing credentials must BLOCK, never silently
+    # claim READY.
     monkeypatch.setattr(preflight, "run_doctor", lambda cfg: [DoctorCheck("adb_available", "ok", "found")])
     monkeypatch.delenv("CALEE_API_BASE", raising=False)
     monkeypatch.delenv("CALEE_TEST_EMAIL", raising=False)
     monkeypatch.delenv("CALEE_TEST_PASSWORD", raising=False)
     runner = CliRunner()
     result = runner.invoke(cli.main, ["prepare", "--config", _config_path(tmp_path)])
-    assert result.exit_code == EXIT_SUCCESS
-    assert "fixture reset skipped" in result.output.lower()
+    assert result.exit_code == EXIT_BLOCKED
+    assert "blocked" in result.output.lower()
+    assert "fixture credentials are not configured" in result.output.lower()
 
 
-def test_prepare_resets_fixture_when_credentials_given(tmp_path, monkeypatch):
+def test_prepare_resets_and_verifies_fixture_when_credentials_given(tmp_path, monkeypatch):
     monkeypatch.setattr(preflight, "run_doctor", lambda cfg: [DoctorCheck("adb_available", "ok", "found")])
-    monkeypatch.setattr(cli, "run_fixture_action", lambda action, **kwargs: "Fixture reset OK (version=v1)")
+    calls = []
+
+    def _fake_action(action, **kwargs):
+        calls.append(action)
+        if action == "reset":
+            return "Fixture reset OK (version=regression-fixture-v1, prepared_at=2024-01-01)"
+        return "Fixture verify OK (version=regression-fixture-v1)"
+
+    monkeypatch.setattr(cli, "run_fixture_action", _fake_action)
     runner = CliRunner()
     result = runner.invoke(
         cli.main,
@@ -79,6 +112,17 @@ def test_prepare_resets_fixture_when_credentials_given(tmp_path, monkeypatch):
     )
     assert result.exit_code == EXIT_SUCCESS
     assert "environment ready" in result.output.lower()
+    assert calls == ["reset", "verify"]  # verify must run after a successful reset
+    assert "secret" not in result.output  # never expose the password
+
+    status_path = cli._environment_status_path()
+    status = json.loads(status_path.read_text())
+    assert status["fixtureVersion"] == "regression-fixture-v1"
+    assert status["fixtureResetStatus"] == "ok"
+    assert status["fixtureVerificationStatus"] == "ok"
+    assert status["targetEnvironment"] == "https://hub-dev.calee.com.au"
+    assert "secret" not in json.dumps(status)
+    assert "demo@example.com" not in json.dumps(status)
 
 
 def test_prepare_blocks_when_fixture_reset_fails(tmp_path, monkeypatch):
@@ -100,3 +144,69 @@ def test_prepare_blocks_when_fixture_reset_fails(tmp_path, monkeypatch):
     )
     assert result.exit_code == EXIT_BLOCKED
     assert "blocked" in result.output.lower()
+
+
+def test_prepare_blocks_when_fixture_verification_fails_after_successful_reset(tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight, "run_doctor", lambda cfg: [DoctorCheck("adb_available", "ok", "found")])
+
+    def _fake_action(action, **kwargs):
+        if action == "reset":
+            return "Fixture reset OK (version=regression-fixture-v1, prepared_at=2024-01-01)"
+        raise FixtureBridgeError("REG-EVENT-RECURRING-001 missing")
+
+    monkeypatch.setattr(cli, "run_fixture_action", _fake_action)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        [
+            "prepare", "--config", _config_path(tmp_path),
+            "--fixture-base-url", "https://hub-dev.calee.com.au",
+            "--fixture-email", "demo@example.com",
+            "--fixture-password", "secret",
+        ],
+    )
+    assert result.exit_code == EXIT_BLOCKED
+    assert "verification failed" in result.output.lower()
+
+    status = json.loads(cli._environment_status_path().read_text())
+    assert status["fixtureResetStatus"] == "ok"
+    assert status["fixtureVerificationStatus"] == "blocked"
+
+
+def test_prepare_allow_no_fixture_alias_works_like_skip_fixture(tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight, "run_doctor", lambda cfg: [DoctorCheck("adb_available", "ok", "found")])
+    runner = CliRunner()
+    result = runner.invoke(cli.main, ["prepare", "--config", _config_path(tmp_path), "--allow-no-fixture"])
+    assert result.exit_code == EXIT_SUCCESS
+    assert "skipped" in result.output.lower()
+
+
+def test_prepare_rejects_skip_fixture_for_a_suite_that_requires_the_fixture(tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight, "run_doctor", lambda cfg: [DoctorCheck("adb_available", "ok", "found")])
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["prepare", "--config", _config_path(tmp_path), "--allow-no-fixture", "--suite", "tablet-full"],
+    )
+    assert result.exit_code == EXIT_BLOCKED
+    assert "cannot be silently skipped" in result.output.lower()
+
+
+def test_prepare_allows_skip_fixture_for_a_suite_that_does_not_require_the_fixture(tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight, "run_doctor", lambda cfg: [DoctorCheck("adb_available", "ok", "found")])
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["prepare", "--config", _config_path(tmp_path), "--allow-no-fixture", "--suite", "smoke-fresh"],
+    )
+    assert result.exit_code == EXIT_SUCCESS
+
+
+def test_prepare_rejects_unknown_suite_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight, "run_doctor", lambda cfg: [DoctorCheck("adb_available", "ok", "found")])
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["prepare", "--config", _config_path(tmp_path), "--allow-no-fixture", "--suite", "not-a-real-suite"],
+    )
+    assert result.exit_code == EXIT_INVALID_CONFIG

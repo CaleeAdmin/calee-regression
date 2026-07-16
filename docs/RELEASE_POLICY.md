@@ -1,7 +1,7 @@
 # Release approval policy
 
 This is the decision rule the consolidated report (`python -m calee_regression consolidate`,
-run by `05 Test Full Calee Solution.command`) applies. It is implemented in
+run by `06 Test Full Calee Solution.command`) applies. It is implemented in
 `calee_regression/consolidated_report.py::decide_status`/`build_release_report` — this document
 describes the rule; the code is the source of truth if they ever disagree.
 
@@ -21,30 +21,41 @@ describes the rule; the code is the source of truth if they ever disagree.
 
 | Component | Mandatory for overall PASS? |
 |---|---|
-| Calee tablet suite (`full-tester`/`release-technical`) | Yes |
-| CaleeMobile Client API suite | Yes |
-| CaleeMobile Android UI suite | No — flags BLOCKED if run and blocked, but its absence alone doesn't block overall PASS (Flutter/device availability varies by machine) |
-| CaleeMobile iPhone UI suite | No — same as Android; requires a Mac with Xcode |
+| Calee tablet suite (`full-tester`/`release-technical`) | Yes, always |
+| CaleeMobile Client API suite | Yes, always |
+| CaleeMobile Android UI suite | Driven by `config/release-platforms.yaml`'s `mobile_android` — **defaults to Yes** if that file is absent |
+| CaleeMobile iPhone UI suite | Driven by `config/release-platforms.yaml`'s `mobile_ios` — **defaults to Yes** if that file is absent |
 | Manual guided checks | Yes, whenever any are defined for the release profile in question — see `docs/NON_TECH_TESTER_GUIDE.md` and `config/manual-checks.example.json` |
 
-Only the tablet suite and the API suite are unconditionally mandatory, because they're the only two
-components guaranteed to run in every environment without extra device/toolchain requirements.
-Whoever runs `05 Test Full Calee Solution.command` for an actual release decision should also
-attach the mobile UI suites and manual checks so the release report reflects real coverage — the
-policy doesn't silently let their absence become an easy PASS: any component simply omitted from
-`consolidate`'s inputs recorded as `not_run`, which is treated the same as BLOCKED.
+Android/iOS UI mandatory-ness is **not** hard-coded — it comes from the technical owner's
+`config/release-platforms.yaml` (copy `config/release-platforms.example.yaml`), or `--android-
+mandatory`/`--android-optional`/`--ios-mandatory`/`--ios-optional` on `consolidate` directly. An
+**omitted** or absent config file means every platform defaults to mandatory: a platform must be
+explicitly opted out (e.g. `mobile_ios: false` for an Android-only hotfix), never silently narrowed
+by convenience. `06 Test Full Calee Solution.command` reads this same profile to decide which
+platforms to even attempt running (see `release-platforms` CLI output).
+
+Any component simply omitted from `consolidate`'s inputs is recorded as `not_run`, which is treated
+exactly like BLOCKED for a mandatory component — its absence can never become an easy PASS.
 
 ## Additional PASS preconditions
 
 Beyond the pass/fail/blocked roll-up above, an overall PASS additionally requires:
 
-- No mandatory test was skipped for a non-optional reason (a `SKIPPED` scenario/step that isn't
-  explicitly, deliberately optional for this test configuration still shows up as a mandatory
-  component not fully passing — see the scenario's own `skip_reason`).
-- The tested application version(s) — Calee build, CaleeMobile build — match the intended release
-  candidate. This isn't automatically checked by `consolidate` today; record it in the report's
-  `meta` (`--build-version`) and confirm manually before treating a report as authoritative for a
-  specific release.
+- No mandatory scenario/step was skipped. A mandatory (release-critical) scenario that ends up
+  `SKIPPED` — e.g. a `requires_state` mismatch — is folded into the same blocking bucket as an
+  outright-blocked one (`SuiteResult.mandatory_skipped_count`); only a scenario explicitly marked
+  `mandatory: false` may be skipped without blocking. The same applies at the step level: a
+  `tap_if_present` step whose target is absent BLOCKS the scenario unless the step is explicitly
+  marked `optional: true`/`required: false` — the default is always required.
+- No scenario passes on the strength of skipped/optional steps alone — a scenario where nothing
+  actually asserted anything (every step skipped, absent-and-optional, or wrapped in `optional`)
+  cannot resolve to PASS; it BLOCKS instead, since nothing was actually verified.
+- The tested application version(s) match the intended release candidate. Pass `--calee-build-
+  version`/`--caleemobile-build-version` (detected) alongside `--expected-calee-build-version`/
+  `--expected-caleemobile-build-version` (technical-owner-configured) to `consolidate` for an
+  automated block-on-mismatch check; if no expected version is configured, this isn't checked and
+  falls back to manual confirmation, same as before.
 
 ## Where this is enforced in code
 
@@ -53,6 +64,16 @@ Beyond the pass/fail/blocked roll-up above, an overall PASS additionally require
   and the consolidated report, so they can never disagree.
 - `calee_regression/consolidated_report.py::build_release_report` — combines the tablet suite, the
   CaleeMobile API/UI reports, and manual checks into one `ReleaseReport`, applying the
-  mandatory/optional distinction above.
-- `framework_tests/test_consolidated_report.py` — self-tests this policy against synthetic
+  mandatory/optional distinction above and `component_from_build_version_match`.
+- `calee_regression/release_platforms.py` — loads `config/release-platforms.yaml` and resolves the
+  Android/iOS mandatory flags passed into `build_release_report`.
+- `calee_regression/runner.py::run_scenario`/`_step_tap_if_present` — the required/optional step
+  default and the "no real verification occurred" BLOCKED rule.
+- `calee_regression/models.py::SuiteResult.mandatory_skipped_count` — a mandatory scenario ending up
+  `SKIPPED` feeds into the same blocked bucket as `blocked_count`.
+- `calee_regression/cli.py::prepare` — BLOCKS on missing fixture credentials/reset/verify failure
+  for a release-gating profile; records fixture version/status to
+  `reports/environment-status-latest.json`, which `consolidate` folds into the report's `meta`.
+- `framework_tests/test_consolidated_report.py`, `test_release_platforms.py`,
+  `test_mandatory_skip_handling.py`, `test_cli_prepare.py` — self-test this policy against synthetic
   pass/fail/blocked/missing inputs (no real device or backend needed).

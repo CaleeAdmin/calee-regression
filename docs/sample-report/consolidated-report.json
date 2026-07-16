@@ -1,17 +1,17 @@
 {
   "overallStatus": "pass",
   "meta": {
-    "buildVersion": "0.3.22 / 0.0.22",
-    "testEnvironment": "https://hub-dev.calee.com.au",
-    "tester": "Sample Tester"
+    "buildVersion": "SAMPLE",
+    "fixtureResetStatus": "skipped",
+    "fixtureVerificationStatus": "skipped"
   },
-  "generatedAt": "2026-07-16 02:22:48",
+  "generatedAt": "2026-07-16 08:12:00",
   "components": [
     {
       "name": "Calee tablet",
       "status": "pass",
       "mandatory": true,
-      "passed": 11,
+      "passed": 12,
       "failed": 0,
       "blocked": 0,
       "skipped": 0,
@@ -21,7 +21,7 @@
       "name": "CaleeMobile Client API",
       "status": "pass",
       "mandatory": true,
-      "passed": 92,
+      "passed": 40,
       "failed": 0,
       "blocked": 0,
       "skipped": 0,
@@ -29,14 +29,14 @@
     },
     {
       "name": "CaleeMobile Android UI",
-      "status": "blocked",
+      "status": "not_run",
       "mandatory": false,
       "passed": 0,
       "failed": 0,
-      "blocked": 1,
+      "blocked": 0,
       "skipped": 0,
       "detail": [
-        "app boot: No Android device/emulator connected in this environment"
+        "Not executed."
       ]
     },
     {
@@ -65,8 +65,8 @@
   "manualChecks": [
     {
       "title": "Kiosk escape check",
-      "instruction": "Swipe down from the top edge and try the recents button while Calee is foregrounded.",
-      "expectedResult": "No notification shade or recents view opens.",
+      "instruction": "Swipe down from the top and press Home/Recents.",
+      "expectedResult": "The notification shade, quick settings and recents must not open.",
       "status": "pass",
       "note": "",
       "screenshotRef": null,
@@ -74,12 +74,22 @@
     },
     {
       "title": "Calendar colour legibility",
-      "instruction": "Open Month view and check each calendar's colour dot is distinguishable.",
-      "expectedResult": "All colours are visually distinct and readable.",
+      "instruction": "Look at the calendar and confirm each person's colour is easy to tell apart.",
+      "expectedResult": "All calendar colours are visually distinct.",
       "status": "pass",
       "note": "",
       "screenshotRef": null,
       "mandatory": true
     }
-  ]
+  ],
+  "summary": {
+    "blockedComponents": [
+      "CaleeMobile Android UI",
+      "CaleeMobile iPhone UI"
+    ],
+    "failedComponents": [],
+    "skippedMandatoryManualChecks": [],
+    "skippedOptionalManualChecks": [],
+    "suggestedNextAction": "All mandatory components passed. Review any optional/skipped items below, then this build is approved to release."
+  }
 }

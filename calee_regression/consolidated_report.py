@@ -121,6 +121,7 @@ class ReleaseReport:
     manual_checks: "list[ManualCheck]"
     meta: dict
     generated_at: str
+    summary: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -129,7 +130,65 @@ class ReleaseReport:
             "generatedAt": self.generated_at,
             "components": [c.to_dict() for c in self.components],
             "manualChecks": [m.to_dict() for m in self.manual_checks],
+            "summary": self.summary,
         }
+
+
+def _build_summary(components: "list[ComponentResult]", manual_checks: "list[ManualCheck]", overall: str) -> dict:
+    """A human-scannable roll-up for the tester/technical owner: which
+    components are blocked/failed, which mandatory/optional tests were
+    skipped, and a one-line suggested next action. See Workstream 9."""
+    blocked_components = [c.name for c in components if c.status in (STATUS_BLOCKED, STATUS_NOT_RUN)]
+    failed_components = [c.name for c in components if c.status == STATUS_FAIL]
+    skipped_mandatory_checks = [c.title for c in manual_checks if c.mandatory and c.status not in (STATUS_PASS,)]
+    skipped_optional_checks = [
+        c.title for c in manual_checks if not c.mandatory and c.status not in (STATUS_PASS, STATUS_FAIL)
+    ]
+
+    if overall == STATUS_FAIL:
+        next_action = (
+            f"Do not release. A real product problem was found in: {', '.join(failed_components) or 'see components below'}."
+        )
+    elif overall == STATUS_BLOCKED:
+        mandatory_blocked = [c.name for c in components if c.mandatory and c.status in (STATUS_BLOCKED, STATUS_NOT_RUN)]
+        next_action = (
+            f"Not yet releasable. Resolve and re-run the blocked/not-executed mandatory component(s): "
+            f"{', '.join(mandatory_blocked) or ', '.join(blocked_components) or 'see components below'}."
+        )
+    else:
+        next_action = "All mandatory components passed. Review any optional/skipped items below, then this build is approved to release."
+
+    return {
+        "blockedComponents": blocked_components,
+        "failedComponents": failed_components,
+        "skippedMandatoryManualChecks": skipped_mandatory_checks,
+        "skippedOptionalManualChecks": skipped_optional_checks,
+        "suggestedNextAction": next_action,
+    }
+
+
+def component_from_build_version_match(
+    *, name: str, expected: "str | None", detected: "str | None"
+) -> "ComponentResult | None":
+    """Compares a technical-owner-configured expected build/version
+    against the detected one for a single app (Calee or CaleeMobile).
+    Returns None when no expectation was configured -- there is nothing to
+    check, so this must not manufacture a component out of nothing. A
+    version mismatch BLOCKS (it means the wrong build was tested, which is
+    a process problem, not evidence the tested build itself regressed)."""
+    if not expected:
+        return None
+    if not detected or detected == "unknown":
+        return ComponentResult(
+            name=name, status=STATUS_BLOCKED, mandatory=True,
+            detail=[f"Expected build {expected!r} but no build version was detected/provided."],
+        )
+    if str(detected) != str(expected):
+        return ComponentResult(
+            name=name, status=STATUS_BLOCKED, mandatory=True,
+            detail=[f"Expected build {expected!r} but detected {detected!r} -- the wrong build may have been tested."],
+        )
+    return ComponentResult(name=name, status=STATUS_PASS, mandatory=True, detail=[f"Build matches expected {expected!r}."])
 
 
 def component_from_tablet_report(name: str, suite_dict: "dict[str, Any] | None", *, mandatory: bool = True) -> ComponentResult:
@@ -141,7 +200,16 @@ def component_from_tablet_report(name: str, suite_dict: "dict[str, Any] | None",
     blocked = suite_dict.get("blocked_count", 0)
     skipped = suite_dict.get("skipped_count", 0)
     total = len(suite_dict.get("scenarios", [])) or (passed + failed + blocked + skipped)
-    status = decide_status(passed=passed, failed=failed, blocked=blocked, total=total)
+    # A mandatory (release-critical) scenario that ended up SKIPPED must
+    # block the same as an outright-blocked one -- see
+    # SuiteResult.mandatory_skipped_count and cli.py::_exit_code_for, which
+    # this mirrors so the tablet CLI's own exit code and this consolidated
+    # component can never disagree about the same run.
+    mandatory_skipped = sum(
+        1 for s in suite_dict.get("scenarios", [])
+        if s.get("status") == "skipped" and s.get("mandatory", True)
+    )
+    status = decide_status(passed=passed, failed=failed, blocked=blocked + mandatory_skipped, total=total)
     detail = [
         f"{s['name']}: {s.get('blocked_reason') or s.get('skip_reason')}"
         for s in suite_dict.get("scenarios", [])
@@ -199,14 +267,44 @@ def build_release_report(
     manual_checks: "list[ManualCheck] | None" = None,
     meta: "dict[str, Any] | None" = None,
     generated_at: "str | None" = None,
+    android_mandatory: bool = True,
+    ios_mandatory: bool = True,
+    calee_build_version: "str | None" = None,
+    expected_calee_build_version: "str | None" = None,
+    caleemobile_build_version: "str | None" = None,
+    expected_caleemobile_build_version: "str | None" = None,
 ) -> ReleaseReport:
+    """`android_mandatory`/`ios_mandatory` come from the technical owner's
+    release-platform profile (calee_regression/release_platforms.py),
+    never a hard-coded default here -- an omitted platform selection must
+    default to mandatory=True (the release-gating, safe default), the same
+    "default must be required" rule applied everywhere else in this
+    framework. See docs/RELEASE_POLICY.md and Workstream 9.
+
+    `expected_calee_build_version`/`expected_caleemobile_build_version` are
+    optional technical-owner-configured expectations; when given, a
+    mismatch against the detected `calee_build_version`/
+    `caleemobile_build_version` BLOCKS the release (see
+    component_from_build_version_match).
+    """
     components = [
         component_from_tablet_report("Calee tablet", tablet, mandatory=True),
         component_from_api_report("CaleeMobile Client API", mobile_api, mandatory=True),
-        component_from_api_report("CaleeMobile Android UI", mobile_android_ui, mandatory=False),
-        component_from_api_report("CaleeMobile iPhone UI", mobile_ios_ui, mandatory=False),
+        component_from_api_report("CaleeMobile Android UI", mobile_android_ui, mandatory=android_mandatory),
+        component_from_api_report("CaleeMobile iPhone UI", mobile_ios_ui, mandatory=ios_mandatory),
         component_from_manual_checks(manual_checks or []),
     ]
+
+    for build_component in (
+        component_from_build_version_match(
+            name="Calee build version", expected=expected_calee_build_version, detected=calee_build_version,
+        ),
+        component_from_build_version_match(
+            name="CaleeMobile build version", expected=expected_caleemobile_build_version, detected=caleemobile_build_version,
+        ),
+    ):
+        if build_component is not None:
+            components.append(build_component)
 
     mandatory_statuses = [c.status for c in components if c.mandatory]
     if any(s == STATUS_FAIL for s in mandatory_statuses):
@@ -216,12 +314,14 @@ def build_release_report(
     else:
         overall = STATUS_PASS
 
+    manual_checks = list(manual_checks or [])
     return ReleaseReport(
         overall_status=overall,
         components=components,
-        manual_checks=list(manual_checks or []),
+        manual_checks=manual_checks,
         meta=dict(meta or {}),
         generated_at=generated_at or (time.strftime("%Y-%m-%d %H:%M:%S")),
+        summary=_build_summary(components, manual_checks, overall),
     )
 
 
@@ -260,6 +360,10 @@ def write_html(report: ReleaseReport, path: Path) -> None:
     for key, value in report.meta.items():
         parts.append(f"{_escape(key)}: {_escape(value)}<br>")
     parts.append("</div>")
+    if report.summary.get("suggestedNextAction"):
+        parts.append(
+            f"<div class='summary'><b>Suggested next action:</b> {_escape(report.summary['suggestedNextAction'])}</div>"
+        )
     for component in report.components:
         color = _STATUS_COLORS.get(component.status, "#1f2328")
         mandatory_label = "mandatory" if component.mandatory else "optional"

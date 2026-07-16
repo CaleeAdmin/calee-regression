@@ -28,6 +28,7 @@ steps:
       name: Tap admin/kiosk entry point
       action: tap_if_present
       text: Admin
+      optional: true
 
   - name: Let admin screen settle if it opened
     action: sleep

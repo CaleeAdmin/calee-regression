@@ -21,7 +21,7 @@ STATUS=$?
 echo ""
 case $STATUS in
     0) echo "PASS: Calee tablet" ;;
-    1) echo "FAIL: Calee tablet — a real problem was found. Open the report ('06 Open Latest Report') for details." ;;
+    1) echo "FAIL: Calee tablet — a real problem was found. Open the report ('07 Open Latest Report') for details." ;;
     3) echo "BLOCKED: Calee tablet — the test could not run (see messages above). This is NOT a product failure — check the device/tablet state and try again." ;;
     *) echo "BLOCKED: Calee tablet — could not finish (see messages above)." ;;
 esac
