@@ -1,0 +1,34 @@
+# Copy this file to config/tester.local.yaml and fill in real values for your machine.
+# config/tester.local.yaml is gitignored on purpose — it is per-tester/per-machine, never committed.
+
+appium_url: "http://127.0.0.1:4723/wd/hub"
+
+device_name: "Calee Test Tablet"
+udid: "emulator-5554"
+
+apk_path: "/Users/yiwen/Downloads/calee.apk"
+
+app_package: "com.viso.calee"
+app_activity: ".ui.HomeActivity"
+
+shell_package: "com.viso.caleeshell"
+shell_activity: ".ui.LauncherActivity"
+
+# launch_strategy: how the framework starts Calee. Calee has no normal MAIN/LAUNCHER
+# activity, so "driver.activate_app()" does not work for it — see docs/CALEE_LAUNCH_MODEL.md.
+# One of: direct_activity | start_action | calee_shell | normal_launcher
+launch_strategy: "direct_activity"
+start_action: "com.viso.calee.action.START"
+
+default_timeout_seconds: 20
+report_dir: "reports"
+baseline_dir: "baselines"
+
+screenshot_stabilize_seconds: 0.5
+max_diff_ratio: 0.01
+pixel_threshold: 12
+
+# expected_state: what state you believe this device/emulator is in right now.
+# One of: fresh (no account/session — use for smoke-fresh) | logged_in_tablet (prepared demo
+# account — required for smoke-tablet, calendar, tasks, chores, settings, weather suites).
+expected_state: "fresh"

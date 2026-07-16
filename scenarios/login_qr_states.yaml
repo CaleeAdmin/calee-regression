@@ -1,0 +1,34 @@
+name: calee-login-qr-states
+tags: [login, qr, fresh]
+requires_state: fresh
+default_timeout_seconds: 20
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Let onboarding screen settle
+    action: sleep
+    seconds: 2
+
+  - name: Capture onboarding/QR screen
+    action: screenshot
+    screenshot_name: 00_onboarding_qr
+    compare: false
+
+  # Real copy seen in the tablet QR login flow: "Connect your Calee tablet" /
+  # "Scan the QR code with your phone to connect this tablet to your Calee account."
+  # Generic fallbacks are included so this tolerates minor copy changes release to release.
+  - name: Assert QR/login screen content
+    action: assert_any_text
+    texts:
+      - "Connect your Calee tablet"
+      - "Scan the QR code"
+      - "Grant access"
+      - Sign
+      - Login
+      - QR
+      - Scan
+
+  - name: Assert no crash/error dialog is showing
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]

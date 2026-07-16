@@ -1,0 +1,55 @@
+name: calee-system-receivers
+tags: [physical, system, receivers]
+requires_state: physical_tablet
+default_timeout_seconds: 20
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Let home screen settle
+    action: sleep
+    seconds: 3
+
+  - name: Capture home screen
+    action: screenshot
+    screenshot_name: 00_home_screen
+    compare: false
+
+  # Real-hardware-only: several Calee/CaleeShell receivers (OvernightRefreshBootReceiver,
+  # UpdateStatusReceiver, CaleeShell's BootReceiver/UpdateCommandReceiver) are only
+  # reliably triggerable via adb broadcast on a debuggable physical unit. Only SAFE,
+  # idempotent broadcasts are sent below — no BOOT_COMPLETED (not safely triggerable
+  # without root and risks side effects) and no destructive/uninstall/wipe command.
+  - name: Broadcast TIME_SET (harmless, triggers OvernightRefreshBootReceiver)
+    action: shell
+    command: "am broadcast -a android.intent.action.TIME_SET"
+
+  - name: Let receiver process the broadcast
+    action: sleep
+    seconds: 1.5
+
+  - name: Capture screen after TIME_SET broadcast
+    action: screenshot
+    screenshot_name: 01_after_time_set
+    compare: false
+
+  - name: Assert no crash/error dialog after TIME_SET
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]
+
+  - name: Broadcast Calee UPDATE_STATUS action
+    action: shell
+    command: "am broadcast -a com.viso.calee.action.UPDATE_STATUS -p com.viso.calee"
+
+  - name: Let receiver process the broadcast
+    action: sleep
+    seconds: 1.5
+
+  - name: Capture screen after UPDATE_STATUS broadcast
+    action: screenshot
+    screenshot_name: 02_after_update_status
+    compare: false
+
+  - name: Assert no crash/error dialog after UPDATE_STATUS
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]

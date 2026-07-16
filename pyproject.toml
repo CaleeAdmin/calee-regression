@@ -1,0 +1,29 @@
+[project]
+name = "calee-regression"
+version = "0.1.0"
+description = "Regression testing framework for the Calee Android app"
+requires-python = ">=3.11"
+dependencies = [
+    "Appium-Python-Client>=3.1.0",
+    "selenium>=4.15",
+    "PyYAML>=6.0",
+    "Pillow>=10.0",
+    "numpy>=1.26",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+calee-regression = "calee_regression.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["calee_regression*"]
+
+[tool.pytest.ini_options]
+testpaths = ["framework_tests"]

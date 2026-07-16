@@ -1,0 +1,28 @@
+name: calee-smoke-tablet
+tags: [smoke, tablet, logged_in]
+requires_state: logged_in_tablet
+default_timeout_seconds: 20
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Let home screen settle
+    action: sleep
+    seconds: 3
+
+  - name: Capture home screen
+    action: screenshot
+    screenshot_name: 00_home_screen
+    compare: false
+
+  - name: Assert HomeActivity is showing (not SignUpActivity)
+    action: assert_current_activity
+    activity: HomeActivity
+
+  - name: Assert logged-in home screen content
+    action: assert_any_text
+    texts: [Calendar, Tasks, Chores, Home, Today, Weather, Settings]
+
+  - name: Assert no crash/error dialog is showing
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]

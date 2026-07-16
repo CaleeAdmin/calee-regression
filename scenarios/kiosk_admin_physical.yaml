@@ -1,0 +1,49 @@
+name: calee-kiosk-admin-physical
+tags: [physical, kiosk, admin]
+requires_state: physical_tablet
+default_timeout_seconds: 20
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Let home screen settle
+    action: sleep
+    seconds: 3
+
+  - name: Capture home screen
+    action: screenshot
+    screenshot_name: 00_home_screen
+    compare: false
+
+  # Calee's CaleeDeviceAdminReceiver requires BIND_DEVICE_ADMIN and backs kiosk/admin
+  # device-owner-style control. Real-hardware-only: not safely testable on a throwaway
+  # emulator, since device-admin state persists and can affect the device.
+  #
+  # NOTE for technical owner: the exact admin-entry gesture (long-press, hidden gear
+  # icon, PIN entry, etc.) is app-specific and not yet finalized. This scenario is a
+  # scaffold — fill in the real tap target(s) once the kiosk admin UI is finalized.
+  - name: Probe for an admin-entry affordance if present
+    action: optional
+    step:
+      name: Tap admin/kiosk entry point
+      action: tap_if_present
+      text: Admin
+
+  - name: Let admin screen settle if it opened
+    action: sleep
+    seconds: 1.5
+
+  - name: Capture screen after admin-entry probe
+    action: screenshot
+    screenshot_name: 01_after_admin_probe
+    compare: false
+
+  # Non-destructive status check only — never issue a factory-reset/wipe/uninstall
+  # style shell command from this scenario.
+  - name: Log device admin status (non-destructive)
+    action: shell
+    command: "dumpsys device_policy"
+
+  - name: Assert no crash/error dialog is showing
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]
