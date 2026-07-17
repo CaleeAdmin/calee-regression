@@ -10,6 +10,7 @@ from typing import NamedTuple
 import click
 
 from . import appium_lifecycle
+from . import build_identity as build_identity_mod
 from . import config as config_mod
 from . import manual_checks as manual_checks_mod
 from . import preflight, release_platforms, reporting, suites
@@ -737,6 +738,43 @@ def release_platforms_cmd():
     raise SystemExit(EXIT_SUCCESS)
 
 
+@main.command("build-identity")
+@click.option(
+    "--caleemobile-source", default=None,
+    help="Path to the CaleeMobile checkout. Defaults to ../CaleeMobile next to this repo.",
+)
+@click.option(
+    "--calee-source", default=None,
+    help="Path to the Calee tablet source checkout, where available (for its Git SHA).",
+)
+@click.option(
+    "--android-package", default=None, envvar="CALEE_TABLET_PACKAGE",
+    help="Calee tablet Android application id to query via `adb dumpsys package` for the installed version.",
+)
+@click.option("--caleeshell-version", default=None, envvar="CALEESHELL_VERSION")
+def build_identity_cmd(caleemobile_source, calee_source, android_package, caleeshell_version):
+    """Automatically collect build identity and print it as shell assignments.
+
+    A launcher can `eval "$(python -m calee_regression build-identity)"` and
+    then prefer any value a technical owner set manually
+    (`${CALEEMOBILE_BUILD_VERSION:-$AUTO_CALEEMOBILE_BUILD_VERSION}`), falling
+    back to the auto-detected one. This replaces the old "only when an env var
+    was manually provided" behaviour -- see Phase 3 and docs/RELEASE_POLICY.md.
+
+    Never fails the run: an unreachable device/adb or a missing checkout just
+    yields AUTO_*_IDENTITY_AVAILABLE=false, which the consolidator turns into
+    BLOCKED when that app is in scope (never a fabricated pass).
+    """
+    cm_source = Path(caleemobile_source) if caleemobile_source else (REPO_ROOT.parent / "CaleeMobile")
+    caleemobile = build_identity_mod.collect_caleemobile_identity(cm_source)
+    tablet = build_identity_mod.collect_calee_tablet_identity(
+        source_dir=calee_source, android_package=android_package, caleeshell_version=caleeshell_version,
+    )
+    click.echo(caleemobile.to_shell("CALEEMOBILE"))
+    click.echo(tablet.to_shell("CALEE"))
+    raise SystemExit(EXIT_SUCCESS)
+
+
 def _manual_checks_from_list(raw: list) -> "list[ManualCheck]":
     return [
         ManualCheck(
@@ -840,8 +878,18 @@ def _resolve_component(
 @click.option("--caleemobile-build-version", default=None, help="CaleeMobile app version/build under test")
 @click.option("--expected-caleemobile-build-version", default=None, help="Technical-owner-configured expected CaleeMobile build; mismatch BLOCKS")
 @click.option("--caleeshell-version", default=None, help="CaleeShell version, where available")
-@click.option("--calee-git-sha", default=None, help="Calee repo commit SHA under test")
-@click.option("--caleemobile-git-sha", default=None, help="CaleeMobile repo commit SHA under test")
+@click.option("--calee-git-sha", default=None, help="Calee tablet commit SHA under test")
+@click.option("--expected-calee-git-sha", default=None, help="Technical-owner-configured expected Calee tablet commit; mismatch BLOCKS")
+@click.option("--caleemobile-git-sha", default=None, help="CaleeMobile commit SHA under test")
+@click.option("--expected-caleemobile-git-sha", default=None, help="Technical-owner-configured expected CaleeMobile commit; mismatch BLOCKS")
+@click.option("--calee-version-code", default=None, help="Calee tablet installed versionCode (from adb), where available")
+@click.option("--calee-application-id", default=None, help="Calee tablet Android application id, where available")
+@click.option("--caleemobile-dirty/--caleemobile-clean", "caleemobile_dirty", default=False, help="CaleeMobile build has uncommitted changes (BLOCKS unless --allow-dirty)")
+@click.option("--calee-dirty/--calee-clean", "calee_dirty", default=False, help="Calee tablet build has uncommitted changes (BLOCKS unless --allow-dirty)")
+@click.option("--caleemobile-identity-available/--caleemobile-identity-unavailable", "caleemobile_identity_available", default=True, help="Whether CaleeMobile build identity could be determined")
+@click.option("--calee-identity-available/--calee-identity-unavailable", "calee_identity_available", default=True, help="Whether Calee tablet build identity could be determined")
+@click.option("--require-build-identity/--allow-unknown-build-identity", "require_build_identity", default=True, help="Whether an in-scope app's build identity must be known (default: required -- a PASS must prove which build was tested)")
+@click.option("--allow-dirty/--no-allow-dirty", "allow_dirty_opt", default=None, help="Explicitly approve testing an uncommitted build. Defaults to config/release-platforms.yaml (expected_build_identity.allow_dirty).")
 @click.option("--android-device-id", default=None, help="Android device/emulator identifier used for the Android UI run")
 @click.option("--ios-device-id", default=None, help="iOS device/simulator identifier used for the iOS UI run")
 @click.option("--test-environment", default="", help="Target environment URL")
@@ -852,7 +900,10 @@ def consolidate(
     manual_checks_path, environment_report, android_mandatory, ios_mandatory,
     build_version, calee_build_version, expected_calee_build_version,
     caleemobile_build_version, expected_caleemobile_build_version, caleeshell_version,
-    calee_git_sha, caleemobile_git_sha, android_device_id, ios_device_id,
+    calee_git_sha, expected_calee_git_sha, caleemobile_git_sha, expected_caleemobile_git_sha,
+    calee_version_code, calee_application_id, caleemobile_dirty, calee_dirty,
+    caleemobile_identity_available, calee_identity_available, require_build_identity, allow_dirty_opt,
+    android_device_id, ios_device_id,
     test_environment, tester, out_dir,
 ):
     """Combine this run's per-component JSON reports into one consolidated
@@ -922,6 +973,8 @@ def consolidate(
         "caleeShellVersion": caleeshell_version,
         "caleeGitSha": calee_git_sha,
         "caleeMobileGitSha": caleemobile_git_sha,
+        "caleeVersionCode": calee_version_code,
+        "caleeApplicationId": calee_application_id,
         "androidDeviceId": android_device_id,
         "iosDeviceId": ios_device_id,
         "testEnvironment": test_environment,
@@ -936,11 +989,27 @@ def consolidate(
 
     try:
         platforms = release_platforms.load_release_platforms()
+        expected_identity = release_platforms.load_expected_build_identity()
     except release_platforms.ReleasePlatformsError as exc:
         click.echo(str(exc), err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
     android_gating = android_mandatory if android_mandatory is not None else platforms.mobile_android
     ios_gating = ios_mandatory if ios_mandatory is not None else platforms.mobile_ios
+
+    # Expected build identity: an explicit CLI flag wins over the release
+    # profile (config/release-platforms.yaml's expected_build_identity).
+    eff_expected_calee_build = expected_calee_build_version or expected_identity.calee_build_version
+    eff_expected_calee_sha = expected_calee_git_sha or expected_identity.calee_git_sha
+    eff_expected_caleemobile_build = expected_caleemobile_build_version or expected_identity.caleemobile_build_version
+    eff_expected_caleemobile_sha = expected_caleemobile_git_sha or expected_identity.caleemobile_git_sha
+    allow_dirty = allow_dirty_opt if allow_dirty_opt is not None else expected_identity.allow_dirty
+
+    # An app's identity is required (mandatory-to-know) only when that app is
+    # in this release's scope: the tablet when the tablet is gating, CaleeMobile
+    # when at least one mobile platform is gating. A PASS then may never leave
+    # an in-scope build's identity unknown (Phase 3).
+    require_calee_identity = require_build_identity and platforms.tablet
+    require_caleemobile_identity = require_build_identity and (android_gating or ios_gating)
 
     report = build_release_report(
         environment=env_report,
@@ -953,9 +1022,23 @@ def consolidate(
         android_mandatory=android_gating,
         ios_mandatory=ios_gating,
         calee_build_version=calee_build_version,
-        expected_calee_build_version=expected_calee_build_version,
+        expected_calee_build_version=eff_expected_calee_build,
         caleemobile_build_version=caleemobile_build_version,
-        expected_caleemobile_build_version=expected_caleemobile_build_version,
+        expected_caleemobile_build_version=eff_expected_caleemobile_build,
+        calee_git_sha=calee_git_sha,
+        expected_calee_git_sha=eff_expected_calee_sha,
+        caleemobile_git_sha=caleemobile_git_sha,
+        expected_caleemobile_git_sha=eff_expected_caleemobile_sha,
+        calee_dirty=calee_dirty,
+        caleemobile_dirty=caleemobile_dirty,
+        calee_identity_available=calee_identity_available,
+        caleemobile_identity_available=caleemobile_identity_available,
+        calee_version_code=calee_version_code,
+        calee_application_id=calee_application_id,
+        caleeshell_version=caleeshell_version,
+        require_calee_identity=require_calee_identity,
+        require_caleemobile_identity=require_caleemobile_identity,
+        allow_dirty=allow_dirty,
     )
 
     out = Path(out_dir) if out_dir else workspace.consolidated_dir

@@ -93,6 +93,11 @@ def test_consolidate_passes_when_everything_is_provided_and_clean(tmp_path):
             # missing report would correctly BLOCK. See
             # test_release_platforms.py for the platform-driven cases.
             "--android-optional", "--ios-optional",
+            # The tablet IS in scope, so its build identity is mandatory to
+            # know (Phase 3): provide the detected version so identity is
+            # available and clean. CaleeMobile identity is not required here
+            # (no mobile platform in scope).
+            "--calee-build-version", "0.3.22",
             "--out-dir", str(tmp_path / "out"),
         ],
     )
@@ -111,6 +116,89 @@ def test_consolidate_passes_when_everything_is_provided_and_clean(tmp_path):
     latest_link = tmp_path / "reports" / "latest-run"
     assert latest_link.is_symlink()
     assert latest_link.resolve() == workspace.root.resolve()
+
+
+def _write_full_tablet_only_components(workspace, run_id=RUN_ID):
+    _write_component(workspace, "environment", {"runId": run_id, "status": "pass", "detail": []})
+    _write_component(workspace, "tablet", {
+        "runId": run_id,
+        "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
+        "scenarios": [{"name": "a", "status": "passed"}],
+    })
+    _write_component(workspace, "mobile-api", {
+        "runId": run_id, "counts": {"PASS": 1}, "steps": [{"name": "x", "status": "PASS"}],
+    })
+    _write_component(workspace, "manual-checks", {
+        "runId": run_id,
+        "checks": [{"title": "Kiosk escape check", "instruction": "swipe down", "expectedResult": "no shade", "status": "pass"}],
+    })
+
+
+def test_consolidate_blocks_when_required_tablet_identity_is_unknown(tmp_path):
+    # Tablet is in scope (default mandatory) but no --calee-build-version is
+    # given and identity is required -> BLOCKED (never certify an unknown build).
+    workspace = _make_workspace(tmp_path)
+    _write_full_tablet_only_components(workspace)
+    result = CliRunner().invoke(
+        main,
+        ["consolidate", "--run-id", RUN_ID, "--android-optional", "--ios-optional",
+         "--out-dir", str(tmp_path / "out")],
+    )
+    assert result.exit_code == EXIT_BLOCKED
+    assert "Calee tablet build identity: BLOCKED" in result.output
+
+
+def test_consolidate_blocks_on_dirty_build_without_approval(tmp_path):
+    workspace = _make_workspace(tmp_path)
+    _write_full_tablet_only_components(workspace)
+    result = CliRunner().invoke(
+        main,
+        ["consolidate", "--run-id", RUN_ID, "--android-optional", "--ios-optional",
+         "--calee-build-version", "0.3.22", "--calee-dirty",
+         "--out-dir", str(tmp_path / "out")],
+    )
+    assert result.exit_code == EXIT_BLOCKED
+    assert "Calee tablet build identity: BLOCKED" in result.output
+
+
+def test_consolidate_passes_on_dirty_build_when_explicitly_approved(tmp_path):
+    workspace = _make_workspace(tmp_path)
+    _write_full_tablet_only_components(workspace)
+    result = CliRunner().invoke(
+        main,
+        ["consolidate", "--run-id", RUN_ID, "--android-optional", "--ios-optional",
+         "--calee-build-version", "0.3.22", "--calee-dirty", "--allow-dirty",
+         "--out-dir", str(tmp_path / "out")],
+    )
+    assert result.exit_code == EXIT_SUCCESS
+    assert "PASS" in result.output
+
+
+def test_consolidate_blocks_on_expected_build_mismatch(tmp_path):
+    workspace = _make_workspace(tmp_path)
+    _write_full_tablet_only_components(workspace)
+    result = CliRunner().invoke(
+        main,
+        ["consolidate", "--run-id", RUN_ID, "--android-optional", "--ios-optional",
+         "--calee-build-version", "0.3.21", "--expected-calee-build-version", "0.3.22",
+         "--out-dir", str(tmp_path / "out")],
+    )
+    assert result.exit_code == EXIT_BLOCKED
+    assert "Calee tablet build identity: BLOCKED" in result.output
+
+
+def test_consolidate_allow_unknown_build_identity_opts_out(tmp_path):
+    # The escape hatch: explicitly allow an unknown identity (e.g. a
+    # diagnostic run) -> the identity no longer gates.
+    workspace = _make_workspace(tmp_path)
+    _write_full_tablet_only_components(workspace)
+    result = CliRunner().invoke(
+        main,
+        ["consolidate", "--run-id", RUN_ID, "--android-optional", "--ios-optional",
+         "--allow-unknown-build-identity", "--out-dir", str(tmp_path / "out")],
+    )
+    assert result.exit_code == EXIT_SUCCESS
+    assert "PASS" in result.output
 
 
 def test_consolidate_rejects_report_with_wrong_run_id(tmp_path):

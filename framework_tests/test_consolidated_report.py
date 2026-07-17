@@ -16,8 +16,11 @@ from calee_regression.consolidated_report import (
     STATUS_NOT_RUN,
     STATUS_PASS,
     ManualCheck,
+    backend_evidence_component,
+    backend_match_status,
     build_release_report,
     component_from_api_report,
+    component_from_build_identity,
     component_from_build_version_match,
     component_from_environment_report,
     decide_status,
@@ -331,7 +334,7 @@ def test_build_version_mismatch_blocks_the_whole_release():
         expected_calee_build_version="0.3.22",
     )
     assert report.overall_status == STATUS_BLOCKED
-    version_component = next(c for c in report.components if c.name == "Calee build version")
+    version_component = next(c for c in report.components if c.name == "Calee tablet build identity")
     assert version_component.status == STATUS_BLOCKED
 
 
@@ -408,3 +411,324 @@ def test_write_release_bundle_sanitizes_unsafe_build_labels(tmp_path):
     assert bundle_path.exists()
     assert bundle_path.parent == tmp_path / "bundle"
     assert "/" not in bundle_path.name
+
+
+# --- Phase 4: per-platform backend evidence ------------------------------
+
+DEV_BACKEND = "https://hub-dev.calee.com.au"
+PROD_BACKEND = "https://hub.calee.com.au"
+
+
+def _mobile_ui_report_with_backend(
+    steps, *, requested, resolved, fixture, device_id="emulator-5554", platform="android"
+):
+    """A CaleeMobile-Regression run_ui_suite.py-shaped report that carries the
+    per-platform backend triple this run recorded (requested/resolved/fixture)
+    plus a device id -- exactly what the consolidator independently verifies."""
+    counts = {}
+    for step in steps:
+        counts[step["status"]] = counts.get(step["status"], 0) + 1
+    return {
+        "runId": "ui-local",
+        "releaseRunId": "r1",
+        "platform": platform,
+        "deviceId": device_id,
+        "backend": {"requested": requested, "resolved": resolved, "fixture": fixture},
+        "counts": counts,
+        "steps": steps,
+    }
+
+
+def test_backend_match_status_classifies_the_triple():
+    assert backend_match_status(DEV_BACKEND, DEV_BACKEND, DEV_BACKEND) == "match"
+    # Only the non-empty values need to agree; a resolved backend must exist.
+    assert backend_match_status(None, DEV_BACKEND, None) == "match"
+    # Trailing slash / case are normalized before comparison.
+    assert backend_match_status(DEV_BACKEND, DEV_BACKEND + "/", DEV_BACKEND.upper()) == "match"
+    # A resolved backend that disagrees with what was requested/fixtured.
+    assert backend_match_status(DEV_BACKEND, PROD_BACKEND, DEV_BACKEND) == "mismatch"
+    # Something was requested but the app never reported a resolved backend.
+    assert backend_match_status(DEV_BACKEND, None, DEV_BACKEND) == "missing_resolved"
+    # Nothing recorded at all.
+    assert backend_match_status(None, None, None) == "no_evidence"
+
+
+def _passing_release_kwargs():
+    return dict(
+        environment=PASSING_ENVIRONMENT_REPORT,
+        tablet=PASSING_TABLET_REPORT,
+        mobile_api=PASSING_API_REPORT,
+        manual_checks=ALL_PASSED_MANUAL_CHECKS,
+    )
+
+
+def test_matching_backend_triple_passes_and_surfaces_evidence():
+    android = _mobile_ui_report_with_backend(
+        [_passed("boot"), _passed("login")],
+        requested=DEV_BACKEND, resolved=DEV_BACKEND, fixture=DEV_BACKEND,
+        device_id="emulator-5554",
+    )
+    report = build_release_report(
+        **_passing_release_kwargs(),
+        mobile_android_ui=android,
+        android_mandatory=True, ios_mandatory=False,
+        caleemobile_build_version="0.0.22+22",
+        caleemobile_git_sha="abc1234",
+    )
+    assert report.overall_status == STATUS_PASS
+    backend = next(c for c in report.components if c.name == "CaleeMobile Android UI backend")
+    assert backend.status == STATUS_PASS
+    assert backend.mandatory is True
+    assert backend.evidence["matchStatus"] == "match"
+    assert backend.evidence["resolved"] == DEV_BACKEND
+    assert backend.evidence["deviceId"] == "emulator-5554"
+    assert backend.evidence["buildVersion"] == "0.0.22+22"
+    assert backend.evidence["gitSha"] == "abc1234"
+    # No iOS platform this release -> no iOS backend component.
+    assert not any(c.name == "CaleeMobile iPhone UI backend" for c in report.components)
+
+
+def test_backend_mismatch_blocks_even_when_the_ui_suite_itself_passed():
+    # The mobile UI counts are all PASS (the runner would exit 0), but the app
+    # resolved a DIFFERENT backend than the prepared fixture. The consolidator
+    # must catch this independently of the exit code and BLOCK.
+    android = _mobile_ui_report_with_backend(
+        [_passed("boot"), _passed("login")],
+        requested=DEV_BACKEND, resolved=PROD_BACKEND, fixture=DEV_BACKEND,
+    )
+    report = build_release_report(
+        **_passing_release_kwargs(),
+        mobile_android_ui=android,
+        android_mandatory=True, ios_mandatory=False,
+    )
+    assert report.overall_status == STATUS_BLOCKED
+    ui = next(c for c in report.components if c.name == "CaleeMobile Android UI")
+    assert ui.status == STATUS_PASS  # the UI suite itself passed...
+    backend = next(c for c in report.components if c.name == "CaleeMobile Android UI backend")
+    assert backend.status == STATUS_BLOCKED  # ...but the backend evidence blocks
+    assert backend.evidence["matchStatus"] == "mismatch"
+
+
+def test_missing_resolved_backend_blocks_a_mandatory_platform():
+    android = _mobile_ui_report_with_backend(
+        [_passed("boot")],
+        requested=DEV_BACKEND, resolved=None, fixture=DEV_BACKEND,
+    )
+    report = build_release_report(
+        **_passing_release_kwargs(),
+        mobile_android_ui=android,
+        android_mandatory=True, ios_mandatory=False,
+    )
+    assert report.overall_status == STATUS_BLOCKED
+    backend = next(c for c in report.components if c.name == "CaleeMobile Android UI backend")
+    assert backend.status == STATUS_BLOCKED
+    assert backend.evidence["matchStatus"] == "missing_resolved"
+
+
+def test_backend_mismatch_on_an_optional_platform_does_not_block():
+    android = _mobile_ui_report_with_backend(
+        [_passed("boot")], requested=DEV_BACKEND, resolved=DEV_BACKEND, fixture=DEV_BACKEND,
+    )
+    ios = _mobile_ui_report_with_backend(
+        [_passed("boot")], requested=DEV_BACKEND, resolved="https://somewhere-else.example.com",
+        fixture=DEV_BACKEND, platform="ios", device_id="ABCD-SIM",
+    )
+    report = build_release_report(
+        **_passing_release_kwargs(),
+        mobile_android_ui=android, mobile_ios_ui=ios,
+        android_mandatory=True, ios_mandatory=False,
+    )
+    ios_backend = next(c for c in report.components if c.name == "CaleeMobile iPhone UI backend")
+    assert ios_backend.status == STATUS_BLOCKED
+    assert ios_backend.mandatory is False
+    # An optional platform's backend problem is recorded but does not gate.
+    assert report.overall_status == STATUS_PASS
+
+
+def test_report_without_a_backend_block_gets_no_backend_component():
+    # A legacy/synthetic mobile report with no "backend" key is not gated --
+    # only a real run (which always records the backend triple) is verified.
+    android = _mobile_report([_passed("boot")])
+    assert "backend" not in android
+    report = build_release_report(
+        **_passing_release_kwargs(),
+        mobile_android_ui=android,
+        android_mandatory=True, ios_mandatory=False,
+    )
+    assert not any("backend" in c.name for c in report.components)
+    assert report.overall_status == STATUS_PASS
+
+
+def test_backend_evidence_component_returns_none_when_not_run():
+    assert backend_evidence_component("x", None, mandatory=True) is None
+
+
+def test_backend_evidence_surfaced_in_json_and_html(tmp_path):
+    android = _mobile_ui_report_with_backend(
+        [_passed("boot")], requested=DEV_BACKEND, resolved=DEV_BACKEND, fixture=DEV_BACKEND,
+        device_id="emulator-5554",
+    )
+    report = build_release_report(
+        **_passing_release_kwargs(),
+        mobile_android_ui=android,
+        android_mandatory=True, ios_mandatory=False,
+        caleemobile_build_version="0.0.22+22", caleemobile_git_sha="abc1234",
+    )
+    json_path = tmp_path / "r.json"
+    write_json(report, json_path)
+    data = json.loads(json_path.read_text())
+    backend = next(c for c in data["components"] if c["name"] == "CaleeMobile Android UI backend")
+    ev = backend["evidence"]
+    assert ev["requested"] == DEV_BACKEND
+    assert ev["resolved"] == DEV_BACKEND
+    assert ev["fixture"] == DEV_BACKEND
+    assert ev["matchStatus"] == "match"
+    assert ev["deviceId"] == "emulator-5554"
+    assert ev["buildVersion"] == "0.0.22+22"
+    assert ev["gitSha"] == "abc1234"
+
+    html_path = tmp_path / "r.html"
+    write_html(report, html_path)
+    html = html_path.read_text()
+    for expected in ("Requested backend", "Resolved backend", "Fixture backend", "Match status",
+                     "Device ID", "Build version", "Git SHA", DEV_BACKEND, "emulator-5554", "abc1234"):
+        assert expected in html, f"{expected!r} missing from consolidated HTML"
+
+
+# --- Phase 3: mandatory automatic build identity -------------------------
+
+
+def test_build_identity_not_required_and_unconfigured_is_no_component():
+    assert component_from_build_identity(
+        "CaleeMobile build identity", detected_version=None, required=False,
+    ) is None
+
+
+def test_build_identity_required_but_unknown_blocks():
+    component = component_from_build_identity(
+        "CaleeMobile build identity", detected_version=None, required=True,
+    )
+    assert component.status == STATUS_BLOCKED
+    assert component.mandatory is True
+    assert "unknown build" in " ".join(component.detail).lower()
+
+
+def test_build_identity_unavailable_blocks_even_with_a_version_string():
+    # available=False means "we could not determine this" -- never trust a
+    # stale/echoed version string in that case.
+    component = component_from_build_identity(
+        "Calee tablet build identity", detected_version="0.3.22", available=False, required=True,
+    )
+    assert component.status == STATUS_BLOCKED
+
+
+def test_build_identity_dirty_blocks_unless_approved():
+    dirty = component_from_build_identity(
+        "CaleeMobile build identity", detected_version="0.0.22+22", dirty=True, required=True,
+    )
+    assert dirty.status == STATUS_BLOCKED
+    assert "uncommitted" in " ".join(dirty.detail).lower()
+    approved = component_from_build_identity(
+        "CaleeMobile build identity", detected_version="0.0.22+22", dirty=True,
+        required=True, allow_dirty=True,
+    )
+    assert approved.status == STATUS_PASS
+    assert approved.evidence["dirty"] is True
+
+
+def test_build_identity_version_mismatch_blocks():
+    component = component_from_build_identity(
+        "Calee tablet build identity", detected_version="0.3.21", expected_version="0.3.22",
+    )
+    assert component.status == STATUS_BLOCKED
+    assert "0.3.22" in " ".join(component.detail)
+
+
+def test_build_identity_git_sha_mismatch_blocks():
+    component = component_from_build_identity(
+        "CaleeMobile build identity", detected_version="0.0.22+22",
+        detected_git_sha="aaaaaaa", expected_git_sha="bbbbbbb",
+    )
+    assert component.status == STATUS_BLOCKED
+    assert "commit" in " ".join(component.detail).lower()
+
+
+def test_build_identity_expected_git_sha_but_none_detected_blocks():
+    component = component_from_build_identity(
+        "CaleeMobile build identity", detected_version="0.0.22+22",
+        detected_git_sha=None, expected_git_sha="bbbbbbb",
+    )
+    assert component.status == STATUS_BLOCKED
+
+
+def test_build_identity_match_passes_and_records_evidence():
+    component = component_from_build_identity(
+        "CaleeMobile build identity", detected_version="0.0.22+22", expected_version="0.0.22+22",
+        detected_git_sha="abc1234", expected_git_sha="abc1234", version_code="22",
+        application_id="com.calee.mobile",
+    )
+    assert component.status == STATUS_PASS
+    assert component.evidence["buildVersion"] == "0.0.22+22"
+    assert component.evidence["gitSha"] == "abc1234"
+    assert component.evidence["versionCode"] == "22"
+    assert component.evidence["applicationId"] == "com.calee.mobile"
+
+
+def test_release_blocks_when_required_caleemobile_identity_is_unknown():
+    report = build_release_report(
+        **_passing_release_kwargs(),
+        mobile_android_ui=_mobile_ui_report_with_backend(
+            [_passed("boot")], requested=DEV_BACKEND, resolved=DEV_BACKEND, fixture=DEV_BACKEND),
+        android_mandatory=True, ios_mandatory=False,
+        require_caleemobile_identity=True,  # in scope, but no caleemobile_build_version provided
+    )
+    assert report.overall_status == STATUS_BLOCKED
+    identity = next(c for c in report.components if c.name == "CaleeMobile build identity")
+    assert identity.status == STATUS_BLOCKED
+
+
+def test_release_passes_with_known_clean_matching_identity():
+    report = build_release_report(
+        **_passing_release_kwargs(),
+        mobile_android_ui=_mobile_ui_report_with_backend(
+            [_passed("boot")], requested=DEV_BACKEND, resolved=DEV_BACKEND, fixture=DEV_BACKEND),
+        android_mandatory=True, ios_mandatory=False,
+        require_calee_identity=True, require_caleemobile_identity=True,
+        calee_build_version="0.3.22", caleemobile_build_version="0.0.22+22",
+        caleemobile_git_sha="abc1234", expected_caleemobile_git_sha="abc1234",
+    )
+    assert report.overall_status == STATUS_PASS
+    identity = next(c for c in report.components if c.name == "CaleeMobile build identity")
+    assert identity.status == STATUS_PASS
+
+
+def test_release_blocks_on_dirty_caleemobile_build_without_approval():
+    report = build_release_report(
+        **_passing_release_kwargs(),
+        mobile_android_ui=_mobile_ui_report_with_backend(
+            [_passed("boot")], requested=DEV_BACKEND, resolved=DEV_BACKEND, fixture=DEV_BACKEND),
+        android_mandatory=True, ios_mandatory=False,
+        require_calee_identity=True, require_caleemobile_identity=True,
+        calee_build_version="0.3.22", caleemobile_build_version="0.0.22+22",
+        caleemobile_dirty=True,
+    )
+    assert report.overall_status == STATUS_BLOCKED
+    identity = next(c for c in report.components if c.name == "CaleeMobile build identity")
+    assert identity.status == STATUS_BLOCKED
+
+
+def test_build_identity_evidence_surfaced_in_html(tmp_path):
+    report = build_release_report(
+        **_passing_release_kwargs(),
+        android_mandatory=False, ios_mandatory=False,
+        require_calee_identity=True,
+        calee_build_version="0.3.22", calee_git_sha="tab123",
+        calee_version_code="322", calee_application_id="com.calee.app",
+        caleeshell_version="1.4.0",
+    )
+    html_path = tmp_path / "r.html"
+    write_html(report, html_path)
+    html = html_path.read_text()
+    for expected in ("Calee tablet build identity", "0.3.22", "tab123", "322",
+                     "com.calee.app", "CaleeShell version", "1.4.0"):
+        assert expected in html, f"{expected!r} missing from build-identity HTML"
