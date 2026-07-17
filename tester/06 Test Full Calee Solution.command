@@ -48,43 +48,77 @@ echo "--- Collecting pre-run build identity ---"
 # is captured after testing (below); consolidate BLOCKS when an in-scope app's
 # identity changed during the run (e.g. the CaleeMobile SHA or the installed
 # tablet package changed mid-run). Never collected only at consolidation time.
+#
+# This step reads local git/adb state only -- it runs no product test -- so it
+# is safe to collect even on a fail-fast BLOCKED run, and the consolidated
+# bundle needs BOTH the pre and post snapshot (exactly one is "incomplete
+# capture", which BLOCKS); see consolidated_report.component_from_identity_stability.
 python -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase pre >/dev/null
 
-echo ""
-echo "--- Step 2: Calee Tablet ---"
-python -m calee_regression suite --config "$CALEE_TEST_CONFIG" --suite full-tester --run-id "$CALEE_RUN_ID"
-
-echo ""
-echo "--- Step 3: CaleeMobile Client API (device-independent — run once) ---"
-# The Client API suite is device-independent, so it runs EXACTLY ONCE for the
-# whole release, never once per platform. The Android and iOS steps below run
-# the UI ONLY (--ui-only), so neither can re-run or overwrite this run's one
-# reports/runs/$CALEE_RUN_ID/mobile-api/results.json. An initial API result
-# therefore stands for the whole release; see scripts/test_caleemobile.sh and
-# Phase 3.
-bash scripts/test_caleemobile.sh api-only
-
-if [ "$RELEASE_PLATFORM_ANDROID" = "true" ]; then
+# Phase 1: fail fast when Prepare did not succeed.
+#
+# Prepare has no concept of a product FAIL -- it exits 0 (READY) or non-zero
+# (BLOCKED: Appium unavailable, preflight error, missing fixture credentials,
+# fixture reset/verify failure, ...). When it is NOT ready, the environment is
+# not in a known-good state, so running the tablet, Client API, Android UI,
+# iOS UI, synchronization or manual functional checks now would either fail for
+# environmental reasons (pure noise) or -- worse -- assert against an
+# unprepared/unverified fixture and be mistaken for a product result. We
+# therefore skip EVERY downstream functional test command, preserve the
+# environment report Prepare already wrote (reports/runs/$CALEE_RUN_ID/
+# environment/results.json -- nothing below overwrites it), collect only the
+# safe build identity above/below, and still produce ONE consolidated BLOCKED
+# bundle so the release has an auditable record of exactly why it stopped.
+if [ "$PREPARE_STATUS" -eq 0 ]; then
     echo ""
-    echo "--- Step 4: CaleeMobile Android UI ---"
-    bash scripts/test_caleemobile.sh android --ui-only
+    echo "--- Step 2: Calee Tablet ---"
+    python -m calee_regression suite --config "$CALEE_TEST_CONFIG" --suite full-tester --run-id "$CALEE_RUN_ID"
+
+    echo ""
+    echo "--- Step 3: CaleeMobile Client API (device-independent — run once) ---"
+    # The Client API suite is device-independent, so it runs EXACTLY ONCE for the
+    # whole release, never once per platform. The Android and iOS steps below run
+    # the UI ONLY (--ui-only), so neither can re-run or overwrite this run's one
+    # reports/runs/$CALEE_RUN_ID/mobile-api/results.json. An initial API result
+    # therefore stands for the whole release; see scripts/test_caleemobile.sh and
+    # Phase 3.
+    bash scripts/test_caleemobile.sh api-only
+
+    if [ "$RELEASE_PLATFORM_ANDROID" = "true" ]; then
+        echo ""
+        echo "--- Step 4: CaleeMobile Android UI ---"
+        bash scripts/test_caleemobile.sh android --ui-only
+    else
+        echo ""
+        echo "--- Step 4: CaleeMobile Android UI — SKIPPED (not part of this release; see config/release-platforms.yaml) ---"
+    fi
+
+    if [ "$RELEASE_PLATFORM_IOS" = "true" ]; then
+        echo ""
+        echo "--- Step 5: CaleeMobile iPhone UI ---"
+        bash scripts/test_caleemobile.sh ios --ui-only
+    else
+        echo ""
+        echo "--- Step 5: CaleeMobile iPhone UI — SKIPPED (not part of this release; see config/release-platforms.yaml) ---"
+    fi
+
+    echo ""
+    echo "--- Step 6: Manual Checks ---"
+    python -m calee_regression record-manual-checks --run-id "$CALEE_RUN_ID"
 else
     echo ""
-    echo "--- Step 4: CaleeMobile Android UI — SKIPPED (not part of this release; see config/release-platforms.yaml) ---"
+    echo "=== Prepare did not succeed (status $PREPARE_STATUS) — FAIL FAST ==="
+    echo "The test environment is not in a known-good state, so NONE of the"
+    echo "downstream functional tests will run for this release:"
+    echo "  - Calee Tablet suite:          SKIPPED (Prepare not ready)"
+    echo "  - CaleeMobile Client API:      SKIPPED (Prepare not ready)"
+    echo "  - CaleeMobile Android UI:      SKIPPED (Prepare not ready)"
+    echo "  - CaleeMobile iPhone UI:       SKIPPED (Prepare not ready)"
+    echo "  - Cross-device synchronization: SKIPPED (Prepare not ready)"
+    echo "  - Manual functional checks:    SKIPPED (Prepare not ready)"
+    echo "The environment report Prepare wrote is preserved and consolidated"
+    echo "below into one BLOCKED bundle."
 fi
-
-if [ "$RELEASE_PLATFORM_IOS" = "true" ]; then
-    echo ""
-    echo "--- Step 5: CaleeMobile iPhone UI ---"
-    bash scripts/test_caleemobile.sh ios --ui-only
-else
-    echo ""
-    echo "--- Step 5: CaleeMobile iPhone UI — SKIPPED (not part of this release; see config/release-platforms.yaml) ---"
-fi
-
-echo ""
-echo "--- Step 6: Manual Checks ---"
-python -m calee_regression record-manual-checks --run-id "$CALEE_RUN_ID"
 
 echo ""
 echo "--- Collecting post-run build identity ---"
@@ -99,6 +133,8 @@ echo "--- Collecting post-run build identity ---"
 # --phase post also writes reports/runs/$CALEE_RUN_ID/identity/post.json; the
 # consolidator compares it against pre.json (captured before testing) and
 # BLOCKS when an in-scope app's identity changed during the run (Phase 4).
+# Like the pre snapshot, this reads local git/adb only and runs no product
+# test, so it is collected on the fail-fast BLOCKED path too.
 eval "$(python -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase post)"
 CALEEMOBILE_BUILD_VERSION="${CALEEMOBILE_BUILD_VERSION:-${AUTO_CALEEMOBILE_BUILD_VERSION:-}}"
 CALEEMOBILE_GIT_SHA="${CALEEMOBILE_GIT_SHA:-${AUTO_CALEEMOBILE_GIT_SHA:-}}"
@@ -167,14 +203,43 @@ case $STATUS in
     1) echo "FAIL: Full Calee Solution (run $CALEE_RUN_ID) — a real problem was found. Open the report ('07 Open Latest Report') for details." ;;
     *) echo "BLOCKED: Full Calee Solution (run $CALEE_RUN_ID) — see the messages above and in the report. This is NOT necessarily a product failure." ;;
 esac
-if [ "$PREPARE_STATUS" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
-    # Not reachable in practice any more: Prepare is now a mandatory
-    # consolidated component (see consolidated_report.py), so a failed
-    # Prepare always makes $STATUS non-zero too. Kept as a hard backstop —
-    # a passing consolidate must never mask a failed Prepare step.
-    echo "NOTE: Prepare Test Environment reported a problem earlier in this run — see Step 1 above."
-    STATUS=3
+if [ "$PREPARE_STATUS" -ne 0 ]; then
+    # Fail-fast run: surface the EXACT Prepare problem from the environment
+    # report (Prepare's own words) so the tester sees why the whole release
+    # stopped without opening the bundle. Read-only, best-effort.
+    echo ""
+    echo "Prepare did not succeed (status $PREPARE_STATUS). Exact problem(s) from the environment report:"
+    python - "$CALEE_RUN_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+run_id = sys.argv[1]
+report = pathlib.Path("reports") / "runs" / run_id / "environment" / "results.json"
+try:
+    data = json.loads(report.read_text(encoding="utf-8"))
+except Exception as exc:  # noqa: BLE001 - best-effort, never crash the launcher
+    print(f"  (environment report could not be read: {exc})")
+    sys.exit(0)
+detail = data.get("detail") or []
+if isinstance(detail, str):
+    detail = [detail]
+print(f"  Prepare status: {data.get('status', 'unknown')}")
+for line in detail:
+    print(f"  - {line}")
+if not detail:
+    print("  - (no further detail recorded)")
+PY
+    if [ "$STATUS" -eq 0 ]; then
+        # Not reachable in practice any more: Prepare is now a mandatory
+        # consolidated component (see consolidated_report.py), so a failed
+        # Prepare always makes $STATUS non-zero too. Kept as a hard backstop --
+        # a passing consolidate must never mask a failed Prepare step.
+        echo "NOTE: Prepare Test Environment reported a problem earlier in this run — see Step 1 above."
+        STATUS=3
+    fi
 fi
+echo "Run ID: $CALEE_RUN_ID"
 echo "Report workspace: reports/runs/$CALEE_RUN_ID/"
 
 read -p "Press Enter to close..."
