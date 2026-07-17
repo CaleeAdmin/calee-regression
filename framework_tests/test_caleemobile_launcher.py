@@ -78,9 +78,23 @@ def _make_fake_sibling(workspace, ui_recorder=False):
     sibling = workspace / "CaleeMobile-Regression"
     api_dir = sibling / "api"
     api_dir.mkdir(parents=True)
+    # The stand-in run_regression.py appends "API" to FAKE_ORDER_LOG (when
+    # set) and records the backend env var it saw into FAKE_API_RECORD (when
+    # set) before writing a PASS report -- so a test can confirm BOTH that
+    # the Client API suite never ran ahead of the Prepare gate, and that the
+    # one verified backend reached it. When neither env var is set it behaves
+    # exactly as before (write report, exit 0).
     (api_dir / "run_regression.py").write_text(
-        "import sys, json\n"
+        "import sys, os, json\n"
         "idx = sys.argv.index('--report')\n"
+        "order_log = os.environ.get('FAKE_ORDER_LOG')\n"
+        "if order_log:\n"
+        "    with open(order_log, 'a') as f:\n"
+        "        f.write('API\\n')\n"
+        "api_record = os.environ.get('FAKE_API_RECORD')\n"
+        "if api_record:\n"
+        "    with open(api_record, 'w') as f:\n"
+        "        json.dump({'CALEE_API_BASE': os.environ.get('CALEE_API_BASE')}, f)\n"
         "with open(sys.argv[idx + 1], 'w') as f:\n"
         "    json.dump({'runId': 'r', 'counts': {'PASS': 1}, 'steps': [{'name': 'x', 'status': 'PASS'}]}, f)\n"
         "sys.exit(0)\n"
@@ -90,13 +104,19 @@ def _make_fake_sibling(workspace, ui_recorder=False):
     if ui_recorder:
         # A stand-in run_ui_suite.py that records the backend/fixture env vars
         # the launcher exported for it, and writes a PASS report -- so a test
-        # can confirm the verified backend actually reached the UI step.
+        # can confirm the verified backend actually reached the UI step. It
+        # also appends "UI" to FAKE_ORDER_LOG (when set) so a test can assert
+        # the API suite ran strictly before it.
         (ui_dir / "run_ui_suite.py").write_text(
             "import sys, os, json\n"
             "report = ''\n"
             "for i, a in enumerate(sys.argv):\n"
             "    if a == '--report':\n"
             "        report = sys.argv[i + 1]\n"
+            "order_log = os.environ.get('FAKE_ORDER_LOG')\n"
+            "if order_log:\n"
+            "    with open(order_log, 'a') as f:\n"
+            "        f.write('UI\\n')\n"
             "rec = {\n"
             "    'CALEE_MOBILE_BACKEND': os.environ.get('CALEE_MOBILE_BACKEND'),\n"
             "    'CALEE_EXPECTED_BACKEND': os.environ.get('CALEE_EXPECTED_BACKEND'),\n"
@@ -287,6 +307,20 @@ def test_full_solution_launcher_runs_manual_checks_and_stops_appium():
     assert "release-platforms" in text
 
 
+def test_full_solution_launcher_auto_collects_build_identity():
+    # Phase 3: build identity must be collected automatically (not only when a
+    # technical owner manually set env vars) and passed to consolidate, with
+    # the dirty/availability flags wired through.
+    text = FULL_SOLUTION_SCRIPT.read_text(encoding="utf-8")
+    assert "build-identity" in text
+    assert "AUTO_CALEEMOBILE_BUILD_VERSION" in text
+    assert "AUTO_CALEE_BUILD_VERSION" in text
+    assert "--caleemobile-dirty" in text
+    assert "--calee-identity-unavailable" in text
+    # The auto value only fills a gap -- a manually-set env var still wins.
+    assert '${CALEEMOBILE_BUILD_VERSION:-${AUTO_CALEEMOBILE_BUILD_VERSION' in text
+
+
 def test_full_solution_launcher_respects_release_platform_profile_for_mandatory_flags():
     text = FULL_SOLUTION_SCRIPT.read_text(encoding="utf-8")
     assert "--android-mandatory" in text
@@ -470,3 +504,116 @@ def test_env_report_fixture_not_ok_blocks(tmp_path):
 
     assert result.returncode == 3
     assert "fixture was not verified" in result.stdout
+
+
+# --- Phase 1: Prepare-before-API execution ordering ----------------------
+# NEITHER the Client API regression NOR the mobile UI regression may run
+# before Prepare has passed and this run's environment/fixture/backend have
+# been verified. The old ordering ran the Client API suite first, against a
+# not-yet-prepared environment.
+
+
+def test_script_runs_client_api_after_the_prepare_gate_not_before():
+    # Structural guard: the run_regression.py invocation must appear AFTER
+    # the environment-verification gate (the "[OK] Environment verified"
+    # line the gate emits), never before it, so a future edit can't quietly
+    # move the API suite back ahead of Prepare.
+    text = _read_script()
+    gate_marker = "Environment verified for run"
+    api_marker = "python3 run_regression.py"
+    assert gate_marker in text
+    assert api_marker in text
+    assert text.index(api_marker) > text.index(gate_marker), (
+        "the Client API regression must be invoked after the environment "
+        "verification gate, not before it"
+    )
+    # And it must live inside the "gate passed" branch, alongside the guard
+    # comment that documents the ordering contract.
+    assert "only once the gate has passed" in text
+
+
+def test_verified_report_runs_client_api_then_ui_with_the_verified_backend(tmp_path):
+    # A verified same-run environment report already exists (the "06 Test
+    # Full Calee Solution" case). Both suites must run, the API strictly
+    # before the UI, and each must see the one verified backend.
+    calee_regression_copy = _copy_calee_regression(tmp_path)
+    _make_fake_sibling(tmp_path, ui_recorder=True)
+    fakebin = _make_fakebin(tmp_path, with_flutter=True)
+    run_id = "release-20260101-000000-order1"
+    _write_env_report(calee_regression_copy, run_id, fixture_status="ok", backend=DEV_BACKEND)
+
+    order_log = tmp_path / "order.log"
+    api_record = tmp_path / "api_record.json"
+    ui_record = tmp_path / "ui_record.json"
+    result = _run_script_fakebin(
+        calee_regression_copy, tmp_path, "android", fakebin=fakebin,
+        extra_env={
+            "CALEE_RUN_ID": run_id,
+            "CALEE_TEST_EMAIL": "demo@example.com",
+            "CALEE_TEST_PASSWORD": "hunter2",
+            "FAKE_ORDER_LOG": str(order_log),
+            "FAKE_API_RECORD": str(api_record),
+            "FAKE_UI_RECORD": str(ui_record),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    # API ran strictly before UI.
+    assert order_log.read_text() == "API\nUI\n"
+    # The one verified backend reached the Client API suite as CALEE_API_BASE...
+    assert json.loads(api_record.read_text())["CALEE_API_BASE"] == DEV_BACKEND
+    # ...and reached the UI suite as CALEE_MOBILE_BACKEND / CALEE_EXPECTED_BACKEND.
+    ui_rec = json.loads(ui_record.read_text())
+    assert ui_rec["CALEE_MOBILE_BACKEND"] == DEV_BACKEND
+    assert ui_rec["CALEE_EXPECTED_BACKEND"] == DEV_BACKEND
+    assert ui_rec["CALEE_FIXTURE_STATUS"] == "ok"
+
+
+def test_prepare_failure_prevents_client_api_from_running(tmp_path):
+    # Prepare exits non-zero -> the whole mobile run is BLOCKED and the
+    # Client API suite must NOT have executed (the old bug ran it first).
+    calee_regression_copy = _copy_calee_regression(tmp_path)
+    _make_fake_sibling(tmp_path, ui_recorder=True)
+    fakebin = _make_fakebin(tmp_path, with_flutter=True)
+    call_log = tmp_path / "prepare_calls.log"
+    order_log = tmp_path / "order.log"
+
+    extra_env = _prepare_env(
+        calee_regression_copy, call_log, exit_code=3, writes_report=False, report={},
+    )
+    extra_env["CALEE_RUN_ID"] = "release-20260101-000000-block1"
+    extra_env["FAKE_ORDER_LOG"] = str(order_log)
+
+    result = _run_script_fakebin(
+        calee_regression_copy, tmp_path, "android", fakebin=fakebin, extra_env=extra_env
+    )
+
+    assert result.returncode == 3
+    assert "Prepare did not pass" in result.stdout
+    assert "Neither the Client API checks nor the android UI checks ran" in result.stdout
+    # The Client API suite never ran -- the order log was never written.
+    assert not order_log.exists()
+
+
+def test_fixture_not_ok_prevents_client_api_from_running(tmp_path):
+    # A same-run report exists but the fixture wasn't verified -> both
+    # suites are gated out, including the Client API suite.
+    calee_regression_copy = _copy_calee_regression(tmp_path)
+    _make_fake_sibling(tmp_path)
+    run_id = "release-20260101-000000-block2"
+    _write_env_report(calee_regression_copy, run_id, fixture_status="blocked")
+    order_log = tmp_path / "order.log"
+
+    result = _run_script(
+        calee_regression_copy, tmp_path, "android",
+        env_overrides={
+            "CALEE_RUN_ID": run_id,
+            "CALEE_TEST_EMAIL": "demo@example.com",
+            "CALEE_TEST_PASSWORD": "hunter2",
+            "FAKE_ORDER_LOG": str(order_log),
+        },
+    )
+
+    assert result.returncode == 3
+    assert "fixture was not verified" in result.stdout
+    assert not order_log.exists()

@@ -2,12 +2,31 @@
 # Shared by "03 Test CaleeMobile Android.command" and
 # "04 Test CaleeMobile iPhone.command" so the two launchers don't duplicate
 # the same orchestration logic. Runs CaleeMobile-Regression's backend API
-# checks (always possible, no device needed) and its per-platform UI
-# checks via run_ui_suite.py, which resolves a real device (never a
-# hardcoded "-d android"/"-d ios"), passes test credentials to the
-# CaleeMobile process securely (never as a bare CLI argument another
-# process could read off the process list), and writes a structured
-# results.json for consolidation.
+# checks and its per-platform UI checks via run_ui_suite.py, which resolves
+# a real device (never a hardcoded "-d android"/"-d ios"), passes test
+# credentials to the CaleeMobile process securely (never as a bare CLI
+# argument another process could read off the process list), and writes a
+# structured results.json for consolidation.
+#
+# Execution order (see docs/RELEASE_POLICY.md and Phase 1 of the release
+# plan). NEITHER the Client API regression NOR the mobile UI regression may
+# run before Prepare has passed and this run's environment/fixture/backend
+# have been verified:
+#
+#   1. validate local setup (platform arg, CaleeMobile-Regression sibling)
+#   2. create or reuse the run ID and its workspace
+#   3. run Prepare when this run has no environment report yet
+#   4. validate the same-run environment report (belongs to THIS run)
+#   5. validate the fixture status ("ok") and resolve the verified backend
+#   6. run the Client API regression (against the verified backend)
+#   7. run the mobile UI regression (against the same verified backend)
+#   8. record both components into the run manifest
+#
+# The old ordering ran the Client API regression FIRST -- before Prepare had
+# even reset/verified the fixture -- so the API suite could exercise an
+# unprepared or misdirected backend and still be consolidated. That is the
+# defect this ordering closes: a verified, same-run environment now gates
+# BOTH suites, and the one verified backend is passed consistently to each.
 set -uo pipefail
 
 PLATFORM="${1:-}"
@@ -19,6 +38,7 @@ fi
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 cd "$SCRIPT_DIR" || exit 1
 
+# --- Step 1/2: validate local setup, create/reuse the run ID -------------
 # Every invocation belongs to a run workspace, whether or not it's part of
 # an orchestrated "06 Test Full Calee Solution" run -- a standalone
 # "03/04 Test CaleeMobile ..." run just gets its own run ID instead of
@@ -41,14 +61,14 @@ fi
 echo "[OK] CaleeMobile source found"
 
 API_REPORT="$API_DIR/results.json"
-echo "Running the CaleeMobile backend API checks..."
-( cd "$SIBLING/api" && python3 run_regression.py --report "$SCRIPT_DIR/$API_REPORT" )
-API_STATUS=$?
-
-UI_STATUS=3
 UI_REPORT="$UI_DIR/results.json"
+# Default both suites to BLOCKED (exit 3): if the Prepare gate below refuses
+# to let them run, that is exactly the state they must be recorded in --
+# never a silent pass by never having executed.
+API_STATUS=3
+UI_STATUS=3
 
-# --- Phase 2: same-run Prepare enforcement -------------------------------
+# --- Step 3/4/5: same-run Prepare + environment/fixture/backend gate ------
 # A standalone "03/04 Test CaleeMobile ..." run must exercise the app
 # against a VERIFIED, same-run environment -- never the old "not checked"
 # behaviour. If this run has no environment report yet (i.e. it is not a
@@ -56,10 +76,11 @@ UI_REPORT="$UI_DIR/results.json"
 # same run ID), run Prepare now with THIS run ID, then require: Prepare
 # passed, it wrote an environment report, that report belongs to THIS run,
 # and the regression fixture verified "ok". Any of those failing BLOCKS the
-# mobile UI checks -- see docs/RELEASE_POLICY.md and
-# docs/TEST_DATA_RESET_CONTRACT.md.
+# whole mobile run -- both the API and the UI checks -- see
+# docs/RELEASE_POLICY.md and docs/TEST_DATA_RESET_CONTRACT.md.
 ENV_REPORT="$RUN_DIR/environment/results.json"
 PREPARE_BLOCK=""
+ENV_BACKEND=""
 
 if [ ! -f "$ENV_REPORT" ]; then
     echo ""
@@ -72,7 +93,7 @@ if [ ! -f "$ENV_REPORT" ]; then
         python -m calee_regression prepare --config "$CALEE_TEST_CONFIG" --run-id "$CALEE_RUN_ID"
         PREPARE_STATUS=$?
         if [ "$PREPARE_STATUS" -ne 0 ]; then
-            PREPARE_BLOCK="Prepare did not pass (exit $PREPARE_STATUS) — refusing to run the mobile UI checks against an unprepared environment."
+            PREPARE_BLOCK="Prepare did not pass (exit $PREPARE_STATUS) — refusing to run the mobile checks against an unprepared environment."
         elif [ ! -f "$ENV_REPORT" ]; then
             PREPARE_BLOCK="Prepare reported success but wrote no environment report at $ENV_REPORT — refusing to proceed."
         fi
@@ -97,13 +118,15 @@ print(f'ENV_BACKEND={shlex.quote(backend)}')
     if [ "$ENV_RUN_ID" != "$CALEE_RUN_ID" ]; then
         PREPARE_BLOCK="the environment report's run ID ('${ENV_RUN_ID:-missing}') does not match this run ('$CALEE_RUN_ID') — refusing to trust a report from another run."
     elif [ "$ENV_FIXTURE_STATUS" != "ok" ]; then
-        PREPARE_BLOCK="the regression fixture was not verified (status: '${ENV_FIXTURE_STATUS:-missing}') — refusing to run the mobile UI checks against unverified data."
+        PREPARE_BLOCK="the regression fixture was not verified (status: '${ENV_FIXTURE_STATUS:-missing}') — refusing to run the mobile checks against unverified data."
     else
-        # The verified backend flows to run_ui_suite.py both as the backend to
-        # build CaleeMobile against (CALEE_MOBILE_BACKEND -> --dart-define=
-        # CALEE_API_BASE) and as the fixture backend to confirm against
-        # (CALEE_EXPECTED_BACKEND); run_ui_suite then verifies the app
-        # actually resolved it. See run_ui_suite.py.
+        # The one verified backend flows to BOTH suites. To the API suite as
+        # CALEE_API_BASE (the fixture backend run_regression.py talks to), and
+        # to run_ui_suite.py both as the backend to build CaleeMobile against
+        # (CALEE_MOBILE_BACKEND -> --dart-define=CALEE_API_BASE) and as the
+        # fixture backend to confirm against (CALEE_EXPECTED_BACKEND);
+        # run_ui_suite then verifies the app actually resolved it. See
+        # run_ui_suite.py.
         CALEE_FIXTURE_STATUS="$ENV_FIXTURE_STATUS"
         CALEE_EXPECTED_BACKEND="$ENV_BACKEND"
         CALEE_MOBILE_BACKEND="$ENV_BACKEND"
@@ -112,47 +135,66 @@ print(f'ENV_BACKEND={shlex.quote(backend)}')
     fi
 fi
 
+# --- Step 6/7: run the two suites, but only once the gate has passed ------
 # CALEE_TEST_EMAIL/CALEE_TEST_PASSWORD are read from the environment by
-# run_ui_suite.py itself (never passed as a bare CLI argument here), so
-# they never appear in a process listing (ps) or in any echoed command.
+# run_regression.py / run_ui_suite.py themselves (never passed as a bare CLI
+# argument here), so they never appear in a process listing (ps) or in any
+# echoed command.
 if [ -n "$PREPARE_BLOCK" ]; then
     echo ""
-    echo "BLOCKED: the CaleeMobile $PLATFORM UI checks — $PREPARE_BLOCK"
-    echo "The backend API checks above still ran."
+    echo "BLOCKED: the CaleeMobile $PLATFORM checks — $PREPARE_BLOCK"
+    echo "Neither the Client API checks nor the $PLATFORM UI checks ran (Prepare must pass first)."
+    API_STATUS=3
     UI_STATUS=3
-elif [ -z "${CALEE_TEST_EMAIL:-}" ] || [ -z "${CALEE_TEST_PASSWORD:-}" ]; then
-    echo ""
-    echo "BLOCKED: the CaleeMobile $PLATFORM UI checks need CALEE_TEST_EMAIL and CALEE_TEST_PASSWORD to be"
-    echo "configured. Ask your technical owner to set these (see docs/SETUP_MAC.md). Skipping — the backend"
-    echo "API checks above still ran."
-elif ! command -v flutter >/dev/null 2>&1; then
-    echo ""
-    if [ "$PLATFORM" = "ios" ]; then
-        echo "BLOCKED: the CaleeMobile iPhone UI checks need a Mac with Flutter and Xcode installed. Skipping — the backend API checks above still ran."
-    else
-        echo "BLOCKED: the CaleeMobile Android UI checks need Flutter installed. Skipping — the backend API checks above still ran."
-    fi
-elif [ ! -d "$SIBLING/ui" ]; then
-    echo ""
-    echo "BLOCKED: CaleeMobile-Regression/ui was not found next to this folder. Skipping — the backend API checks above still ran."
 else
+    # Pass the one verified backend to the Client API suite too, so both
+    # suites certify the same backend the fixture was prepared against.
+    if [ -n "$ENV_BACKEND" ]; then
+        export CALEE_API_BASE="$ENV_BACKEND"
+    fi
+
+    # --- Step 6: Client API regression (device-independent) ---
     echo ""
-    echo "Preparing the CaleeMobile $PLATFORM UI checks..."
-    if ! ( cd "$SIBLING/ui" && flutter pub get ) > "$SCRIPT_DIR/$UI_DIR/pub-get.log" 2>&1; then
-        echo "BLOCKED: \`flutter pub get\` failed in CaleeMobile-Regression/ui — a Flutter toolchain/dependency"
-        echo "problem, not a product failure. See $UI_DIR/pub-get.log"
-        UI_STATUS=3
+    echo "Running the CaleeMobile backend API checks..."
+    ( cd "$SIBLING/api" && python3 run_regression.py --report "$SCRIPT_DIR/$API_REPORT" )
+    API_STATUS=$?
+
+    # --- Step 7: mobile UI regression ---
+    if [ -z "${CALEE_TEST_EMAIL:-}" ] || [ -z "${CALEE_TEST_PASSWORD:-}" ]; then
+        echo ""
+        echo "BLOCKED: the CaleeMobile $PLATFORM UI checks need CALEE_TEST_EMAIL and CALEE_TEST_PASSWORD to be"
+        echo "configured. Ask your technical owner to set these (see docs/SETUP_MAC.md). Skipping — the backend"
+        echo "API checks above still ran."
+    elif ! command -v flutter >/dev/null 2>&1; then
+        echo ""
+        if [ "$PLATFORM" = "ios" ]; then
+            echo "BLOCKED: the CaleeMobile iPhone UI checks need a Mac with Flutter and Xcode installed. Skipping — the backend API checks above still ran."
+        else
+            echo "BLOCKED: the CaleeMobile Android UI checks need Flutter installed. Skipping — the backend API checks above still ran."
+        fi
+    elif [ ! -d "$SIBLING/ui" ]; then
+        echo ""
+        echo "BLOCKED: CaleeMobile-Regression/ui was not found next to this folder. Skipping — the backend API checks above still ran."
     else
-        # CALEE_MOBILE_BACKEND / CALEE_EXPECTED_BACKEND / CALEE_FIXTURE_STATUS
-        # are exported above and read by run_ui_suite.py from the environment.
-        ( cd "$SIBLING/ui" && python3 run_ui_suite.py \
-            --platform "$PLATFORM" \
-            --report "$SCRIPT_DIR/$UI_REPORT" \
-            --log "$SCRIPT_DIR/$UI_DIR/flutter.log" )
-        UI_STATUS=$?
+        echo ""
+        echo "Preparing the CaleeMobile $PLATFORM UI checks..."
+        if ! ( cd "$SIBLING/ui" && flutter pub get ) > "$SCRIPT_DIR/$UI_DIR/pub-get.log" 2>&1; then
+            echo "BLOCKED: \`flutter pub get\` failed in CaleeMobile-Regression/ui — a Flutter toolchain/dependency"
+            echo "problem, not a product failure. See $UI_DIR/pub-get.log"
+            UI_STATUS=3
+        else
+            # CALEE_MOBILE_BACKEND / CALEE_EXPECTED_BACKEND / CALEE_FIXTURE_STATUS
+            # are exported above and read by run_ui_suite.py from the environment.
+            ( cd "$SIBLING/ui" && python3 run_ui_suite.py \
+                --platform "$PLATFORM" \
+                --report "$SCRIPT_DIR/$UI_REPORT" \
+                --log "$SCRIPT_DIR/$UI_DIR/flutter.log" )
+            UI_STATUS=$?
+        fi
     fi
 fi
 
+# --- Step 8: record both components into the run manifest ----------------
 python -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component mobile-api \
     --report-path "$API_REPORT" --exit-code "$API_STATUS" || true
 python -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component "mobile-$PLATFORM" \

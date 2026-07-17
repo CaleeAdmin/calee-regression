@@ -86,9 +86,15 @@ class ComponentResult:
     blocked: int = 0
     skipped: int = 0
     detail: "list[str]" = field(default_factory=list)
+    # Optional structured evidence for this component (e.g. per-platform
+    # backend triple + device/build identity; see backend_evidence_component).
+    # Rendered as a labelled table in the HTML report and surfaced verbatim in
+    # the JSON report. None (the default) means "no structured evidence", and
+    # is omitted from to_dict so existing components are unchanged.
+    evidence: "dict | None" = None
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "name": self.name,
             "status": self.status,
             "mandatory": self.mandatory,
@@ -98,6 +104,9 @@ class ComponentResult:
             "skipped": self.skipped,
             "detail": list(self.detail),
         }
+        if self.evidence is not None:
+            data["evidence"] = dict(self.evidence)
+        return data
 
 
 @dataclass
@@ -199,6 +208,106 @@ def component_from_build_version_match(
     return ComponentResult(name=name, status=STATUS_PASS, mandatory=True, detail=[f"Build matches expected {expected!r}."])
 
 
+def _versions_match(a: "Any | None", b: "Any | None") -> bool:
+    return str(a).strip() == str(b).strip()
+
+
+def component_from_build_identity(
+    name: str,
+    *,
+    detected_version: "str | None" = None,
+    expected_version: "str | None" = None,
+    detected_git_sha: "str | None" = None,
+    expected_git_sha: "str | None" = None,
+    dirty: bool = False,
+    available: bool = True,
+    required: bool = False,
+    allow_dirty: bool = False,
+    version_code: "str | None" = None,
+    application_id: "str | None" = None,
+    caleeshell_version: "str | None" = None,
+    source: "str | None" = None,
+) -> "ComponentResult | None":
+    """Gate one app's build identity for the release (Phase 3).
+
+    ``required`` means this app's identity is in scope for this release and
+    must be known -- an unknown/undetected identity then BLOCKS, because a
+    release PASS must prove *which* build was tested. Returns None only when
+    the identity is neither required nor has any expectation to check
+    (nothing to say).
+
+    Result rules (see docs/RELEASE_POLICY.md and the Phase 3 spec):
+      * identity unavailable/unknown while required (or expected) -> BLOCKED
+        ("do not allow a release PASS with unknown build identity");
+      * dirty/uncommitted build without ``allow_dirty`` -> BLOCKED;
+      * expected version or Git SHA configured but the detected one differs
+        -> BLOCKED ("the wrong build may have been tested");
+      * otherwise -> PASS.
+
+    The full detected identity (version, Git SHA, dirty flag, versionCode,
+    application id, CaleeShell version) is attached as structured evidence so
+    the consolidated report can show exactly what was tested.
+    """
+    if not required and expected_version is None and expected_git_sha is None:
+        return None
+
+    known_version = available and bool(detected_version) and str(detected_version) != "unknown"
+    evidence = {
+        "buildVersion": detected_version,
+        "gitSha": detected_git_sha,
+        "dirty": dirty,
+        "versionCode": version_code,
+        "applicationId": application_id,
+        "caleeShellVersion": caleeshell_version,
+        "expectedBuildVersion": expected_version,
+        "expectedGitSha": expected_git_sha,
+        "available": available,
+        "source": source,
+    }
+    evidence = {k: v for k, v in evidence.items() if v is not None}
+
+    def blocked(detail: str) -> ComponentResult:
+        return ComponentResult(name=name, status=STATUS_BLOCKED, mandatory=True, detail=[detail], evidence=evidence)
+
+    if not known_version:
+        return blocked(
+            "Build identity could not be determined -- refusing to certify a release "
+            "against an unknown build (which build was actually tested?)."
+        )
+    if dirty and not allow_dirty:
+        return blocked(
+            f"The build under test ({detected_version}) has uncommitted local changes; a "
+            f"dirty/uncommitted build is not approved for release (set allow_dirty to override)."
+        )
+    if expected_version is not None and not _versions_match(detected_version, expected_version):
+        return blocked(
+            f"Expected build {expected_version!r} but detected {detected_version!r} -- the wrong build may have been tested."
+        )
+    if expected_git_sha is not None:
+        if not detected_git_sha or str(detected_git_sha) == "unknown":
+            return blocked(
+                f"Expected commit {expected_git_sha!r} but no Git SHA was detected -- cannot confirm the intended commit was tested."
+            )
+        if not _versions_match(detected_git_sha, expected_git_sha):
+            return blocked(
+                f"Expected commit {expected_git_sha!r} but detected {detected_git_sha!r} -- the wrong commit may have been tested."
+            )
+
+    note = f"Build {detected_version}"
+    if detected_git_sha:
+        note += f" @ {detected_git_sha}"
+    matched = []
+    if expected_version is not None:
+        matched.append("version")
+    if expected_git_sha is not None:
+        matched.append("commit")
+    if matched:
+        note += f" matches expected {' and '.join(matched)}"
+    if dirty and allow_dirty:
+        note += " (dirty working tree, explicitly approved)"
+    return ComponentResult(name=name, status=STATUS_PASS, mandatory=True, detail=[note + "."], evidence=evidence)
+
+
 def component_from_tablet_report(name: str, suite_dict: "dict[str, Any] | None", *, mandatory: bool = True) -> ComponentResult:
     """Build a ComponentResult from calee-regression's SuiteResult.to_dict() shape."""
     if suite_dict is None:
@@ -295,6 +404,115 @@ def component_from_environment_report(
     return ComponentResult(name=name, status=status, mandatory=mandatory, detail=detail)
 
 
+def _normalize_backend(value: "Any | None") -> "str | None":
+    """Normalize a backend URL for equality: trimmed, lower-cased, and with a
+    single trailing slash removed, so `https://Hub.calee.com.au/` and
+    `https://hub.calee.com.au` compare equal. Empty/whitespace -> None."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("/"):
+        text = text[:-1]
+    return text.lower()
+
+
+# Backend-evidence match verdicts (see backend_match_status). Distinct from
+# the ComponentResult STATUS_* namespace above.
+BACKEND_MATCH = "match"
+BACKEND_MISMATCH = "mismatch"
+BACKEND_MISSING_RESOLVED = "missing_resolved"
+BACKEND_NO_EVIDENCE = "no_evidence"
+
+
+def backend_match_status(
+    requested: "Any | None", resolved: "Any | None", fixture: "Any | None"
+) -> str:
+    """Independently classify a mobile per-platform backend triple, WITHOUT
+    trusting the mobile runner's exit code:
+
+      * ``match``            -- every non-empty value agrees (and a resolved
+                                backend is present -- the ground truth of what
+                                the app actually talked to).
+      * ``mismatch``         -- a resolved backend is present but at least one
+                                other non-empty value disagrees with it.
+      * ``missing_resolved`` -- something was requested/fixtured but the app
+                                never reported a resolved backend, so we can't
+                                certify which backend was actually tested.
+      * ``no_evidence``      -- no backend value at all.
+
+    Only ``match`` is safe for a release; the rest BLOCK for a mandatory
+    platform (see backend_evidence_component)."""
+    norm_resolved = _normalize_backend(resolved)
+    non_empty = [
+        v for v in (_normalize_backend(requested), norm_resolved, _normalize_backend(fixture))
+        if v is not None
+    ]
+    if norm_resolved is None:
+        return BACKEND_MISSING_RESOLVED if non_empty else BACKEND_NO_EVIDENCE
+    return BACKEND_MATCH if len(set(non_empty)) == 1 else BACKEND_MISMATCH
+
+
+def backend_evidence_component(
+    name: str,
+    report_dict: "dict[str, Any] | None",
+    *,
+    mandatory: bool,
+    build_version: "str | None" = None,
+    git_sha: "str | None" = None,
+) -> "ComponentResult | None":
+    """Build a release-gating backend-evidence component from a mobile
+    per-platform UI report (CaleeMobile-Regression's run_ui_suite.py, which
+    always records a ``backend`` block: requested/resolved/fixture -- see that
+    repo's _write_report).
+
+    Returns None when there is nothing to verify: the platform wasn't run
+    (report_dict is None -- the platform's own component already renders that
+    as NOT_RUN/blocked), or the report predates the backend-evidence contract
+    (no ``backend`` key at all). A real release report always carries the
+    ``backend`` block, so a real run is always verified here.
+
+    This is the independent check Phase 4 requires: even if the mobile UI
+    suite itself exited 0, a backend mismatch or a missing resolved backend
+    for a mandatory platform BLOCKS the release. ``build_version``/``git_sha``
+    are the consolidate-level CaleeMobile identity, used when the report
+    doesn't embed its own -- they are surfaced in the evidence for audit, not
+    used in the match decision."""
+    if report_dict is None or "backend" not in report_dict:
+        return None
+    backend = report_dict.get("backend") or {}
+    requested = backend.get("requested")
+    resolved = backend.get("resolved")
+    fixture = backend.get("fixture")
+    match_status = backend_match_status(requested, resolved, fixture)
+    status = STATUS_PASS if match_status == BACKEND_MATCH else STATUS_BLOCKED
+    evidence = {
+        "requested": requested,
+        "resolved": resolved,
+        "fixture": fixture,
+        "matchStatus": match_status,
+        "deviceId": report_dict.get("deviceId"),
+        "buildVersion": report_dict.get("buildVersion") or build_version,
+        "gitSha": report_dict.get("gitSha") or git_sha,
+    }
+    if match_status == BACKEND_MISMATCH:
+        detail = [
+            f"Backend mismatch: requested={requested!r}, resolved={resolved!r}, "
+            f"fixture={fixture!r} -- the app did not talk to the prepared fixture backend."
+        ]
+    elif match_status in (BACKEND_MISSING_RESOLVED, BACKEND_NO_EVIDENCE):
+        detail = [
+            f"No resolved backend recorded (requested={requested!r}, fixture={fixture!r}) "
+            f"-- cannot certify which backend was actually tested."
+        ]
+    else:
+        detail = [f"Backend verified: {resolved} (requested/resolved/fixture agree)."]
+    return ComponentResult(
+        name=name, status=status, mandatory=mandatory, detail=detail, evidence=evidence,
+    )
+
+
 def component_from_manual_checks(checks: "list[ManualCheck]", *, name: str = "manual checks") -> ComponentResult:
     if not checks:
         return ComponentResult(name=name, status=STATUS_NOT_RUN, mandatory=True, detail=["No manual checks recorded."])
@@ -326,6 +544,20 @@ def build_release_report(
     expected_calee_build_version: "str | None" = None,
     caleemobile_build_version: "str | None" = None,
     expected_caleemobile_build_version: "str | None" = None,
+    calee_git_sha: "str | None" = None,
+    expected_calee_git_sha: "str | None" = None,
+    caleemobile_git_sha: "str | None" = None,
+    expected_caleemobile_git_sha: "str | None" = None,
+    calee_dirty: bool = False,
+    caleemobile_dirty: bool = False,
+    calee_identity_available: bool = True,
+    caleemobile_identity_available: bool = True,
+    calee_version_code: "str | None" = None,
+    calee_application_id: "str | None" = None,
+    caleeshell_version: "str | None" = None,
+    require_calee_identity: bool = False,
+    require_caleemobile_identity: bool = False,
+    allow_dirty: bool = False,
 ) -> ReleaseReport:
     """`android_mandatory`/`ios_mandatory` come from the technical owner's
     release-platform profile (calee_regression/release_platforms.py),
@@ -354,16 +586,47 @@ def build_release_report(
         component_from_manual_checks(manual_checks or []),
     ]
 
-    for build_component in (
-        component_from_build_version_match(
-            name="Calee build version", expected=expected_calee_build_version, detected=calee_build_version,
+    # Independent per-platform backend verification (Phase 4). Inserted right
+    # after the platform UI components so the report reads platform -> its
+    # backend evidence. This does NOT rely on the mobile runner's exit code:
+    # a backend mismatch or a missing resolved backend for a mandatory
+    # platform BLOCKS the release even if that platform's UI checks "passed".
+    insert_at = 5  # after the iPhone UI component, before manual checks
+    for evidence_name, evidence_report, evidence_mandatory in (
+        ("CaleeMobile Android UI backend", mobile_android_ui, android_mandatory),
+        ("CaleeMobile iPhone UI backend", mobile_ios_ui, ios_mandatory),
+    ):
+        evidence_component = backend_evidence_component(
+            evidence_name, evidence_report, mandatory=evidence_mandatory,
+            build_version=caleemobile_build_version, git_sha=caleemobile_git_sha,
+        )
+        if evidence_component is not None:
+            components.insert(insert_at, evidence_component)
+            insert_at += 1
+
+    # Build identity (Phase 3). When an app's identity is required (in scope
+    # for this release) it must be known, or the release BLOCKS -- a PASS must
+    # prove which build/commit was actually tested. A configured expectation
+    # that doesn't match, or an unapproved dirty build, also BLOCKS.
+    for identity_component in (
+        component_from_build_identity(
+            "Calee tablet build identity",
+            detected_version=calee_build_version, expected_version=expected_calee_build_version,
+            detected_git_sha=calee_git_sha, expected_git_sha=expected_calee_git_sha,
+            dirty=calee_dirty, available=calee_identity_available, required=require_calee_identity,
+            allow_dirty=allow_dirty, version_code=calee_version_code,
+            application_id=calee_application_id, caleeshell_version=caleeshell_version,
         ),
-        component_from_build_version_match(
-            name="CaleeMobile build version", expected=expected_caleemobile_build_version, detected=caleemobile_build_version,
+        component_from_build_identity(
+            "CaleeMobile build identity",
+            detected_version=caleemobile_build_version, expected_version=expected_caleemobile_build_version,
+            detected_git_sha=caleemobile_git_sha, expected_git_sha=expected_caleemobile_git_sha,
+            dirty=caleemobile_dirty, available=caleemobile_identity_available,
+            required=require_caleemobile_identity, allow_dirty=allow_dirty,
         ),
     ):
-        if build_component is not None:
-            components.append(build_component)
+        if identity_component is not None:
+            components.append(identity_component)
 
     mandatory_statuses = [c.status for c in components if c.mandatory]
     if any(s == STATUS_FAIL for s in mandatory_statuses):
@@ -396,6 +659,38 @@ def _escape(value: Any) -> str:
     if value is None:
         return ""
     return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+_EVIDENCE_LABELS = {
+    "requested": "Requested backend",
+    "resolved": "Resolved backend",
+    "fixture": "Fixture backend",
+    "matchStatus": "Match status",
+    "deviceId": "Device ID",
+    "buildVersion": "Build version",
+    "expectedBuildVersion": "Expected build version",
+    "gitSha": "Git SHA",
+    "expectedGitSha": "Expected Git SHA",
+    "dirty": "Uncommitted changes",
+    "versionCode": "Version code",
+    "applicationId": "Application ID",
+    "caleeShellVersion": "CaleeShell version",
+    "available": "Identity available",
+    "source": "Detected from",
+}
+
+
+def _evidence_html(evidence: dict) -> str:
+    """Render a component's structured evidence (backend triple, or build
+    identity) as a labelled table. Keys are shown in insertion order with a
+    friendly label where known, falling back to the raw key. Used for both the
+    Phase 4 per-platform backend evidence and the Phase 3 build identity."""
+    cells = "".join(
+        f"<tr><td style='padding:2px 12px 2px 0;color:#57606a'>{_escape(_EVIDENCE_LABELS.get(key, key))}</td>"
+        f"<td style='padding:2px 0'>{_escape('—' if value in (None, '') else value)}</td></tr>"
+        for key, value in evidence.items()
+    )
+    return f"<table style='margin:6px 0;border-collapse:collapse'>{cells}</table>"
 
 
 def write_json(report: ReleaseReport, path: Path) -> None:
@@ -432,6 +727,8 @@ def write_html(report: ReleaseReport, path: Path) -> None:
             f"<div>passed={component.passed} failed={component.failed} "
             f"blocked={component.blocked} skipped={component.skipped}</div>"
         )
+        if component.evidence is not None:
+            parts.append(_evidence_html(component.evidence))
         for line in component.detail:
             parts.append(f"<div class='detail'>{_escape(line)}</div>")
         parts.append("</div>")

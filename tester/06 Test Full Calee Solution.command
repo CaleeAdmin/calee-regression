@@ -68,6 +68,30 @@ echo "--- Step 5: Manual Checks ---"
 python -m calee_regression record-manual-checks --run-id "$CALEE_RUN_ID"
 
 echo ""
+echo "--- Recording build identity ---"
+# Automatic build-identity collection (Phase 3). Detect the CaleeMobile
+# version/commit/dirty state from its checkout, and the Calee tablet
+# identity from adb/source where available, so a release PASS can prove
+# exactly which builds were tested. A technical owner can still override any
+# value by exporting the matching env var; the AUTO_* values only fill the
+# gaps. Never fabricated: an undetectable identity stays unavailable, which
+# the consolidator turns into BLOCKED for an in-scope app.
+eval "$(python -m calee_regression build-identity)"
+CALEEMOBILE_BUILD_VERSION="${CALEEMOBILE_BUILD_VERSION:-${AUTO_CALEEMOBILE_BUILD_VERSION:-}}"
+CALEEMOBILE_GIT_SHA="${CALEEMOBILE_GIT_SHA:-${AUTO_CALEEMOBILE_GIT_SHA:-}}"
+CALEEMOBILE_DIRTY="${CALEEMOBILE_DIRTY:-${AUTO_CALEEMOBILE_DIRTY:-false}}"
+CALEEMOBILE_IDENTITY_AVAILABLE="${CALEEMOBILE_IDENTITY_AVAILABLE:-${AUTO_CALEEMOBILE_IDENTITY_AVAILABLE:-false}}"
+CALEE_BUILD_VERSION="${CALEE_BUILD_VERSION:-${AUTO_CALEE_BUILD_VERSION:-}}"
+CALEE_GIT_SHA="${CALEE_GIT_SHA:-${AUTO_CALEE_GIT_SHA:-}}"
+CALEE_DIRTY="${CALEE_DIRTY:-${AUTO_CALEE_DIRTY:-false}}"
+CALEE_IDENTITY_AVAILABLE="${CALEE_IDENTITY_AVAILABLE:-${AUTO_CALEE_IDENTITY_AVAILABLE:-false}}"
+CALEE_VERSION_CODE="${CALEE_VERSION_CODE:-${AUTO_CALEE_VERSION_CODE:-}}"
+CALEE_APPLICATION_ID="${CALEE_APPLICATION_ID:-${AUTO_CALEE_APPLICATION_ID:-}}"
+CALEESHELL_VERSION="${CALEESHELL_VERSION:-${AUTO_CALEE_CALEESHELL_VERSION:-}}"
+echo "CaleeMobile: ${CALEEMOBILE_BUILD_VERSION:-unknown} @ ${CALEEMOBILE_GIT_SHA:-unknown} (dirty=$CALEEMOBILE_DIRTY, available=$CALEEMOBILE_IDENTITY_AVAILABLE)"
+echo "Calee tablet: ${CALEE_BUILD_VERSION:-unknown} @ ${CALEE_GIT_SHA:-unknown} (dirty=$CALEE_DIRTY, available=$CALEE_IDENTITY_AVAILABLE)"
+
+echo ""
 echo "--- Combining into one report ---"
 # No per-component report path flags here: consolidate auto-discovers
 # each one from this run's fixed workspace paths
@@ -85,8 +109,9 @@ if [ "$RELEASE_PLATFORM_IOS" = "true" ]; then
 else
     CONSOLIDATE_ARGS+=(--ios-optional)
 fi
-# Optional build/commit metadata -- only included when a technical owner has
-# set these (never fabricated); see docs/SETUP_MAC.md.
+# Build/commit identity -- auto-collected above (a technical owner can still
+# override any value via the matching env var). The detected identity is
+# always passed so the consolidator can gate on it; see Phase 3.
 [ -n "${CALEE_BUILD_VERSION:-}" ] && CONSOLIDATE_ARGS+=(--calee-build-version "$CALEE_BUILD_VERSION")
 [ -n "${CALEEMOBILE_BUILD_VERSION:-}" ] && CONSOLIDATE_ARGS+=(--caleemobile-build-version "$CALEEMOBILE_BUILD_VERSION")
 [ -n "${CALEE_EXPECTED_BUILD_VERSION:-}" ] && CONSOLIDATE_ARGS+=(--expected-calee-build-version "$CALEE_EXPECTED_BUILD_VERSION")
@@ -94,6 +119,16 @@ fi
 [ -n "${CALEESHELL_VERSION:-}" ] && CONSOLIDATE_ARGS+=(--caleeshell-version "$CALEESHELL_VERSION")
 [ -n "${CALEE_GIT_SHA:-}" ] && CONSOLIDATE_ARGS+=(--calee-git-sha "$CALEE_GIT_SHA")
 [ -n "${CALEEMOBILE_GIT_SHA:-}" ] && CONSOLIDATE_ARGS+=(--caleemobile-git-sha "$CALEEMOBILE_GIT_SHA")
+[ -n "${CALEE_EXPECTED_GIT_SHA:-}" ] && CONSOLIDATE_ARGS+=(--expected-calee-git-sha "$CALEE_EXPECTED_GIT_SHA")
+[ -n "${CALEEMOBILE_EXPECTED_GIT_SHA:-}" ] && CONSOLIDATE_ARGS+=(--expected-caleemobile-git-sha "$CALEEMOBILE_EXPECTED_GIT_SHA")
+[ -n "${CALEE_VERSION_CODE:-}" ] && CONSOLIDATE_ARGS+=(--calee-version-code "$CALEE_VERSION_CODE")
+[ -n "${CALEE_APPLICATION_ID:-}" ] && CONSOLIDATE_ARGS+=(--calee-application-id "$CALEE_APPLICATION_ID")
+[ "${CALEEMOBILE_DIRTY:-false}" = "true" ] && CONSOLIDATE_ARGS+=(--caleemobile-dirty)
+[ "${CALEE_DIRTY:-false}" = "true" ] && CONSOLIDATE_ARGS+=(--calee-dirty)
+[ "${CALEEMOBILE_IDENTITY_AVAILABLE:-false}" = "true" ] || CONSOLIDATE_ARGS+=(--caleemobile-identity-unavailable)
+[ "${CALEE_IDENTITY_AVAILABLE:-false}" = "true" ] || CONSOLIDATE_ARGS+=(--calee-identity-unavailable)
+[ "${CALEE_ALLOW_DIRTY:-false}" = "true" ] && CONSOLIDATE_ARGS+=(--allow-dirty)
+[ "${CALEE_ALLOW_UNKNOWN_BUILD_IDENTITY:-false}" = "true" ] && CONSOLIDATE_ARGS+=(--allow-unknown-build-identity)
 [ -n "${CALEE_TESTER_ID:-}" ] && CONSOLIDATE_ARGS+=(--tester "$CALEE_TESTER_ID")
 
 python -m calee_regression consolidate "${CONSOLIDATE_ARGS[@]}"

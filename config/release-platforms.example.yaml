@@ -19,3 +19,19 @@ release_platforms:
   tablet: true
   mobile_android: true
   mobile_ios: true
+
+# Expected build identity for this release (Phase 3). The launcher
+# auto-detects the CaleeMobile version/commit (and the Calee tablet identity
+# from adb/source, where available); the values below are the *expected* ones
+# to check the detected build against. A mismatch BLOCKS the release ("the
+# wrong build may have been tested"). Leave a value blank/removed to record
+# the detected identity without a match check -- but note that an in-scope
+# app whose identity can't be determined at all still BLOCKS (a PASS must
+# prove which build was tested). Uncomment and set these per release-candidate.
+#
+# expected_build_identity:
+#   calee_build_version: "0.3.22"        # Calee tablet installed versionName
+#   calee_git_sha: "<full tablet commit sha>"
+#   caleemobile_build_version: "0.0.22+22"  # CaleeMobile pubspec version+build
+#   caleemobile_git_sha: "<full CaleeMobile commit sha>"
+#   allow_dirty: false                   # set true ONLY to approve an uncommitted build

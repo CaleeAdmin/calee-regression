@@ -55,6 +55,54 @@ def test_invalid_yaml_raises_a_clear_error(tmp_path):
         release_platforms.load_release_platforms(config)
 
 
+# --- Phase 3: expected build identity in the release profile -------------
+
+
+def test_absent_config_has_no_expected_identity(tmp_path):
+    identity = release_platforms.load_expected_build_identity(tmp_path / "nope.yaml")
+    assert identity.calee_build_version is None
+    assert identity.caleemobile_build_version is None
+    assert identity.allow_dirty is False
+
+
+def test_expected_build_identity_is_loaded_from_the_profile(tmp_path):
+    config = tmp_path / "release-platforms.yaml"
+    config.write_text(
+        "release_platforms:\n  tablet: true\n"
+        "expected_build_identity:\n"
+        "  calee_build_version: '0.3.22'\n"
+        "  calee_git_sha: 'tab123'\n"
+        "  caleemobile_build_version: '0.0.22+22'\n"
+        "  caleemobile_git_sha: 'mob456'\n"
+        "  allow_dirty: true\n"
+    )
+    identity = release_platforms.load_expected_build_identity(config)
+    assert identity.calee_build_version == "0.3.22"
+    assert identity.calee_git_sha == "tab123"
+    assert identity.caleemobile_build_version == "0.0.22+22"
+    assert identity.caleemobile_git_sha == "mob456"
+    assert identity.allow_dirty is True
+
+
+def test_expected_build_identity_blank_values_are_none(tmp_path):
+    config = tmp_path / "release-platforms.yaml"
+    config.write_text(
+        "expected_build_identity:\n"
+        "  calee_build_version: ''\n"
+        "  caleemobile_build_version: '   '\n"
+    )
+    identity = release_platforms.load_expected_build_identity(config)
+    assert identity.calee_build_version is None
+    assert identity.caleemobile_build_version is None
+
+
+def test_expected_build_identity_non_mapping_raises(tmp_path):
+    config = tmp_path / "release-platforms.yaml"
+    config.write_text("expected_build_identity: [nope]\n")
+    with pytest.raises(release_platforms.ReleasePlatformsError):
+        release_platforms.load_expected_build_identity(config)
+
+
 PASSING_ENVIRONMENT = {"runId": RUN_ID, "status": "pass", "detail": ["Environment and fixture ready."]}
 PASSING_TABLET = {
     "runId": RUN_ID,
@@ -100,6 +148,11 @@ def _consolidate(tmp_path, *extra_args, run_id=RUN_ID):
         [
             "consolidate", "--run-id", run_id,
             "--out-dir", str(tmp_path / "out"),
+            # These tests exercise platform (Android/iOS/tablet) mandatoriness,
+            # not build identity -- opt out of the Phase 3 identity requirement
+            # so a missing --*-build-version doesn't confound the platform
+            # assertions. Build-identity gating has its own tests.
+            "--allow-unknown-build-identity",
             *extra_args,
         ],
     )
