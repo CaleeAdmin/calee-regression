@@ -46,6 +46,14 @@ STATUS_FAIL = "fail"
 STATUS_BLOCKED = "blocked"
 STATUS_NOT_RUN = "not_run"
 
+# The literal per-step status string CaleeMobile-Regression's api/ui
+# report JSON uses (uppercase, "PASS"/"FAIL"/"BLOCKED"/"SKIP") -- a
+# different namespace from this module's own lowercase ComponentResult
+# statuses above. Named separately so a step-status comparison in
+# component_from_api_report is never confused for a ComponentResult
+# status comparison.
+STATUS_SKIP_RAW = "SKIP"
+
 
 def decide_status(*, passed: int, failed: int, blocked: int, total: "int | None" = None) -> str:
     """The one place the PASS/FAIL/BLOCKED decision rule lives.
@@ -222,7 +230,21 @@ def component_from_tablet_report(name: str, suite_dict: "dict[str, Any] | None",
 
 
 def component_from_api_report(name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = True) -> ComponentResult:
-    """Build a ComponentResult from CaleeMobile-Regression's --report json shape."""
+    """Build a ComponentResult from CaleeMobile-Regression's --report json
+    shape (shared by the Client API suite and the mobile Android/iPhone UI
+    suites -- see api/caleemobile_regression/reporting.py and
+    ui/run_ui_suite.py in that repo).
+
+    Each step may carry "mandatory" (bool, default True when absent -- the
+    API report's steps don't have this concept at all yet, so absence must
+    never be read as "optional") and "skipCategory" (informational only;
+    see ui/run_ui_suite.py's classify_skip). A SKIP step is folded into
+    the blocked count exactly when it's mandatory -- mirroring
+    component_from_tablet_report's mandatory_skipped handling, so a suite
+    containing passed tests plus one mandatory skipped test can never
+    read as an overall pass, and a fixture-related skip (skipCategory
+    "missing_fixture") is BLOCKED, never a product FAIL.
+    """
     if report_dict is None:
         return ComponentResult(name=name, status=STATUS_NOT_RUN, mandatory=mandatory, detail=["Not executed."])
     counts = report_dict.get("counts", {})
@@ -230,17 +252,47 @@ def component_from_api_report(name: str, report_dict: "dict[str, Any] | None", *
     failed = counts.get("FAIL", 0)
     blocked = counts.get("BLOCKED", 0)
     skipped = counts.get("SKIP", 0)
-    total = len(report_dict.get("steps", [])) or (passed + failed + blocked + skipped)
-    status = decide_status(passed=passed, failed=failed, blocked=blocked, total=total)
+    steps = report_dict.get("steps", [])
+    total = len(steps) or (passed + failed + blocked + skipped)
+    mandatory_skipped = sum(
+        1 for s in steps
+        if s.get("status") == STATUS_SKIP_RAW and s.get("mandatory", True)
+    )
+    status = decide_status(passed=passed, failed=failed, blocked=blocked + mandatory_skipped, total=total)
     detail = [
         f"{s['name']}: {s.get('detail')}"
-        for s in report_dict.get("steps", [])
+        for s in steps
         if s.get("status") in ("FAIL", "BLOCKED")
+        or (s.get("status") == STATUS_SKIP_RAW and s.get("mandatory", True))
     ]
     return ComponentResult(
         name=name, status=status, mandatory=mandatory,
         passed=passed, failed=failed, blocked=blocked, skipped=skipped, detail=detail,
     )
+
+
+def component_from_environment_report(
+    name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = True
+) -> ComponentResult:
+    """Build a ComponentResult from `prepare`'s environment/results.json
+    (cli.py's prepare command / run_context.py). Prepare is always
+    mandatory -- an environment/fixture that was never verified ready must
+    block the release the same as any other missing mandatory component,
+    never just an informational note next to an otherwise-green result.
+
+    Prepare only ever reports "pass" or "blocked" (never "fail" -- there is
+    no product assertion here, only "was the environment/fixture ready").
+    A status this function doesn't recognize is treated as blocked rather
+    than silently trusted.
+    """
+    if report_dict is None:
+        return ComponentResult(name=name, status=STATUS_NOT_RUN, mandatory=mandatory, detail=["Not executed."])
+    status = report_dict.get("status")
+    detail = list(report_dict.get("detail", []))
+    if status not in (STATUS_PASS, STATUS_BLOCKED):
+        detail = detail + [f"Unrecognized environment status {report_dict.get('status')!r}."]
+        status = STATUS_BLOCKED
+    return ComponentResult(name=name, status=status, mandatory=mandatory, detail=detail)
 
 
 def component_from_manual_checks(checks: "list[ManualCheck]", *, name: str = "manual checks") -> ComponentResult:
@@ -260,6 +312,7 @@ def component_from_manual_checks(checks: "list[ManualCheck]", *, name: str = "ma
 
 def build_release_report(
     *,
+    environment: "dict[str, Any] | None" = None,
     tablet: "dict[str, Any] | None" = None,
     mobile_api: "dict[str, Any] | None" = None,
     mobile_android_ui: "dict[str, Any] | None" = None,
@@ -286,8 +339,14 @@ def build_release_report(
     mismatch against the detected `calee_build_version`/
     `caleemobile_build_version` BLOCKS the release (see
     component_from_build_version_match).
+
+    `environment` (prepare's environment/results.json) is always
+    mandatory -- unlike every other component here, there is no
+    "environment is optional for this release" concept. See
+    component_from_environment_report and Workstream 4.
     """
     components = [
+        component_from_environment_report("Test environment and regression fixture", environment, mandatory=True),
         component_from_tablet_report("Calee tablet", tablet, mandatory=True),
         component_from_api_report("CaleeMobile Client API", mobile_api, mandatory=True),
         component_from_api_report("CaleeMobile Android UI", mobile_android_ui, mandatory=android_mandatory),

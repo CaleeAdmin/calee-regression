@@ -186,6 +186,9 @@ class CaleeDriver:
     def type_text(self, raw_id: str, text: str) -> None:
         self.find_by_id(raw_id).send_keys(text)
 
+    def clear_text(self, raw_id: str) -> None:
+        self.find_by_id(raw_id).clear()
+
     def hide_keyboard(self) -> None:
         try:
             self.driver.hide_keyboard()

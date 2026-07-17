@@ -1,0 +1,88 @@
+name: calee-tasks-mutation
+tags: [tasks, mutation, tablet, draft-unverified]
+requires_state: logged_in_tablet
+default_timeout_seconds: 20
+mandatory: false
+# DRAFT -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md. Even more of this
+# scenario is unconfirmed than calendar_event_mutation.yaml: there is no
+# grounded information anywhere in this framework's existing
+# scenarios/docs about how task completion is actually represented in the
+# UI -- an inline checkbox, a swipe gesture, a detail-screen button, and/or
+# a distinct completed-state indicator (text change, strikethrough,
+# filter/tab change) are all plausible and none is confirmed. Every
+# UNCONFIRMED_* token below is a placeholder -- see the doc for the
+# confirmation checklist. Do not set mandatory: true or add this to a real
+# suite until every placeholder is replaced with a real, confirmed value
+# AND the scenario has passed at least once against a real, prepared
+# tablet.
+#
+# Uses the fixture's own REG-TASK-OPEN-001 (see
+# docs/TEST_DATA_RESET_CONTRACT.md) rather than creating a scratch task --
+# completes it, verifies, then reopens it so the fixture is left exactly
+# as it was found. Self-cleaning by design: never leaves the shared
+# fixture mutated for the next run or tester.
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llTask
+    timeout_seconds: 20
+
+  - name: Open Tasks
+    action: tap
+    id: llTask
+
+  - name: Wait for the Tasks screen to render
+    action: wait_for_id
+    id: llAll
+    timeout_seconds: 10
+
+  - name: Wait for the deterministic open fixture task to appear
+    action: wait_for_text
+    text: REG-TASK-OPEN-001
+    timeout_seconds: 20
+
+  - name: Capture the tasks screen before any change
+    action: screenshot
+    screenshot_name: 00_before_complete
+    compare: false
+
+  - name: Mark the fixture task complete
+    action: tap
+    id: UNCONFIRMED_task_complete_toggle_for_REG_TASK_OPEN_001
+
+  - name: Wait a moment for the completion state to take effect
+    action: sleep
+    seconds: 2
+
+  - name: Assert the task now shows as complete
+    action: assert_id
+    id: UNCONFIRMED_task_completed_indicator_for_REG_TASK_OPEN_001
+
+  - name: Capture the tasks screen after completing
+    action: screenshot
+    screenshot_name: 01_after_complete
+    compare: false
+
+  - name: Reopen the fixture task, restoring its original state
+    action: tap
+    id: UNCONFIRMED_task_reopen_toggle_for_REG_TASK_OPEN_001
+
+  - name: Wait a moment for the reopened state to take effect
+    action: sleep
+    seconds: 2
+
+  - name: Assert the task is open again, matching its original fixture state
+    action: fail_if_id
+    id: UNCONFIRMED_task_completed_indicator_for_REG_TASK_OPEN_001
+
+  - name: Capture the tasks screen after reopening
+    action: screenshot
+    screenshot_name: 02_after_reopen
+    compare: false
+
+  - name: Assert no crash/error dialog is showing
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]

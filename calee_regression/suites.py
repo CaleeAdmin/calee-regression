@@ -19,6 +19,18 @@ SCENARIO_GROUPS = {
     "login_qr_states": ["scenarios/login_qr_states.yaml"],
     "kiosk_admin_physical": ["scenarios/kiosk_admin_physical.yaml"],
     "system_receivers": ["scenarios/system_receivers.yaml"],
+    # Workstream 10 drafts -- deliberately NOT part of any COMPOSITE_SUITES
+    # entry (full-tester/release-technical/etc.) and each scenario is
+    # mandatory: false in its own YAML as a second, independent safety
+    # layer. These depend on tablet UI resource ids that have never been
+    # confirmed against the real Calee app -- see
+    # docs/TABLET_MUTATION_COVERAGE_GAPS.md. Only reachable by an explicit
+    # `--suite calendar_event_mutation` (etc.); never picked up by a normal
+    # release run. See test_tablet_mutation_drafts.py for the tests that
+    # enforce this stays true.
+    "calendar_event_mutation": ["scenarios/calendar_event_mutation.yaml"],
+    "tasks_mutation": ["scenarios/tasks_mutation.yaml"],
+    "chores_mutation": ["scenarios/chores_mutation.yaml"],
 }
 
 COMPOSITE_SUITES = {

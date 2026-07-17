@@ -49,6 +49,19 @@ def test_script_delegates_ui_run_to_the_structured_report_wrapper():
     assert "--log" in text
 
 
+def test_script_wires_fixture_and_backend_status_into_the_ui_run():
+    # Workstream 7: before any UI assertion runs, run_ui_suite.py must be
+    # able to see this run's own fixture-verification status and target
+    # backend (from prepare's environment/results.json) so it can BLOCK
+    # instead of asserting against unverified/misdirected data -- see
+    # run_ui_suite.py::check_fixture_and_backend_alignment.
+    text = _read_script()
+    assert "CALEE_FIXTURE_STATUS" in text
+    assert "CALEE_EXPECTED_BACKEND" in text
+    assert "fixtureVerificationStatus" in text
+    assert "environment/results.json" in text or "environment', 'results.json'" in text
+
+
 def _copy_calee_regression(workspace):
     """The script locates its sibling as `../CaleeMobile-Regression`
     relative to its OWN directory (via BASH_SOURCE), not relative to the
@@ -119,17 +132,34 @@ def test_dry_run_blocks_with_clear_message_when_credentials_are_missing(tmp_path
 FULL_SOLUTION_SCRIPT = REPO_ROOT / "tester" / "06 Test Full Calee Solution.command"
 
 
-def test_full_solution_launcher_wires_in_every_component_to_consolidate():
+def test_full_solution_launcher_generates_and_shares_one_run_id():
     text = FULL_SOLUTION_SCRIPT.read_text(encoding="utf-8")
+    assert "CALEE_RUN_ID=" in text
+    assert "export CALEE_RUN_ID" in text
+    # Every component-producing step must be handed the same run ID --
+    # see calee_regression/run_context.py and Workstream 3.
     for required in (
-        "--tablet-report",
-        "--mobile-api-report",
-        "--mobile-android-report",
-        "--mobile-ios-report",
-        "--manual-checks",
-        "--environment-report",
+        'prepare --config "$CALEE_TEST_CONFIG" --suite tablet-full --run-id "$CALEE_RUN_ID"',
+        'suite --config "$CALEE_TEST_CONFIG" --suite full-tester --run-id "$CALEE_RUN_ID"',
+        'record-manual-checks --run-id "$CALEE_RUN_ID"',
+        '--run-id "$CALEE_RUN_ID"',  # consolidate
     ):
-        assert required in text, f"{FULL_SOLUTION_SCRIPT.name} no longer wires in {required}"
+        assert required in text, f"{FULL_SOLUTION_SCRIPT.name} does not wire the shared run ID into: {required}"
+
+
+def test_full_solution_launcher_does_not_use_forbidden_discovery_patterns():
+    # These are exactly the patterns that let a stale/foreign report slip
+    # into consolidation undetected -- see Workstream 3 and
+    # docs/RELEASE_POLICY.md. consolidate now auto-discovers every
+    # component from this run's fixed workspace paths instead.
+    text = FULL_SOLUTION_SCRIPT.read_text(encoding="utf-8")
+    assert "ls -1dt" not in text
+    assert "head -n1" not in text
+    assert "mobile-api-latest.json" not in text
+    assert "manual-checks-latest.json" not in text
+    assert "environment-status-latest.json" not in text
+    for forbidden in ("--tablet-report", "--mobile-api-report", "--mobile-android-report", "--mobile-ios-report"):
+        assert forbidden not in text, f"{FULL_SOLUTION_SCRIPT.name} should let consolidate auto-discover {forbidden}"
 
 
 def test_full_solution_launcher_runs_manual_checks_and_stops_appium():

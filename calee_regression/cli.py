@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import click
 
@@ -11,7 +13,17 @@ from . import appium_lifecycle
 from . import config as config_mod
 from . import manual_checks as manual_checks_mod
 from . import preflight, release_platforms, reporting, suites
-from .consolidated_report import ManualCheck, build_release_report, decide_status, write_release_bundle
+from . import run_context
+from . import sync_smoke
+from .appium_driver import CaleeDriver
+from .consolidated_report import (
+    STATUS_BLOCKED,
+    STATUS_PASS,
+    ManualCheck,
+    build_release_report,
+    decide_status,
+    write_release_bundle,
+)
 from .fixture_bridge import FixtureBridgeError, run_fixture_action
 from .models import EXIT_BLOCKED, EXIT_INVALID_CONFIG, EXIT_REGRESSION, EXIT_SUCCESS
 from .runner import ScenarioRunner
@@ -103,8 +115,45 @@ def _extract_fixture_version(output: "str | None") -> "str | None":
     return match.group(1) if match else None
 
 
-def _environment_status_path() -> Path:
-    return REPO_ROOT / "reports" / "environment-status-latest.json"
+def _resolve_run_id(run_id: "str | None") -> str:
+    """Every `prepare` invocation operates inside a run workspace, whether
+    or not it's part of an orchestrated "06 Test Full Calee Solution" run
+    -- a standalone "01 Prepare Test Environment" run just gets a fresh
+    run ID of its own instead of overwriting a shared "-latest" file (see
+    run_context.py's module docstring for why that pattern was the bug).
+    """
+    if run_id:
+        if not run_context.is_valid_run_id(run_id):
+            click.echo(f"Invalid --run-id {run_id!r} (expected letters/digits/._- only).", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        return run_id
+    env_run_id = os.environ.get("CALEE_RUN_ID")
+    if env_run_id:
+        return _resolve_run_id(env_run_id)
+    return run_context.generate_run_id()
+
+
+def _load_or_init_manifest(
+    workspace: run_context.RunWorkspace, *, suite_name: "str | None" = None, tester: "str | None" = None
+) -> run_context.RunManifest:
+    if workspace.manifest_path.is_file():
+        return run_context.RunManifest.load(workspace.manifest_path)
+    try:
+        platforms = release_platforms.load_release_platforms()
+        profile = {
+            "tablet": platforms.tablet,
+            "mobile_android": platforms.mobile_android,
+            "mobile_ios": platforms.mobile_ios,
+        }
+    except release_platforms.ReleasePlatformsError:
+        profile = {}
+    return run_context.RunManifest(
+        run_id=workspace.run_id,
+        started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+        expected_components=list(run_context.COMPONENT_NAMES),
+        release_platform_profile=profile,
+        tester=tester or os.environ.get("CALEE_TESTER_ID") or None,
+    )
 
 
 def _appium_log_path() -> Path:
@@ -113,10 +162,6 @@ def _appium_log_path() -> Path:
 
 def _appium_pid_path() -> Path:
     return REPO_ROOT / "reports" / "appium.pid"
-
-
-def _manual_checks_latest_path() -> Path:
-    return REPO_ROOT / "reports" / "manual-checks-latest.json"
 
 
 def _ensure_appium_or_echo_blocked(cfg, *, ready_timeout_seconds: float = 60) -> bool:
@@ -139,23 +184,32 @@ def _ensure_appium_or_echo_blocked(cfg, *, ready_timeout_seconds: float = 60) ->
     return True
 
 
-def _write_environment_status(
+def _write_environment_report(
+    workspace: run_context.RunWorkspace,
     *,
+    status: str,
+    detail: "list[str]",
     target_environment: "str | None",
     fixture_version: "str | None",
     fixture_reset_status: str,
     fixture_verification_status: str,
     suite_name: "str | None",
 ) -> Path:
-    """Records fixture/environment status for the consolidated report.
+    """Records fixture/environment status as this run's mandatory "Test
+    environment and regression fixture" component (see
+    consolidated_report.component_from_environment_report). `status` is
+    "pass" or "blocked" -- Prepare has no concept of a product FAIL, only
+    "ready" or "not ready" -- see docs/RELEASE_POLICY.md.
 
     Never includes the email/password/access token -- only the target base
-    URL (not a secret) and status labels. See docs/RELEASE_POLICY.md and
-    Workstream 2's "the report must record" requirement.
+    URL (not a secret) and status labels.
     """
-    path = _environment_status_path()
+    path = workspace.component_report_path("environment")
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "runId": workspace.run_id,
+        "status": status,
+        "detail": detail,
         "targetEnvironment": target_environment,
         "fixtureVersion": fixture_version,
         "fixtureResetStatus": fixture_reset_status,
@@ -183,22 +237,55 @@ def _write_environment_status(
          "fixture. Refused (BLOCKED) for a --suite that depends on the fixture (e.g. tablet-full, "
          "full-release, calendar) -- see docs/TEST_DATA_RESET_CONTRACT.md.",
 )
-def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suite_name, skip_fixture):
+@click.option(
+    "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None,
+    help="Shared release run ID (see run_context.py). Auto-generated when omitted, so a "
+         "standalone 'Prepare Test Environment' run still gets its own workspace instead of "
+         "overwriting a shared '-latest' file.",
+)
+@click.option("--tester", "tester_opt", envvar="CALEE_TESTER_ID", default=None)
+def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suite_name, skip_fixture, run_id_opt, tester_opt):
     """Check the local environment and reset+verify the deterministic REG-* fixture.
 
-    This is what "01 Prepare Test Environment" runs. It never claims READY
-    it can't back up: any preflight error, any fixture-reset/verify failure,
-    or (for a release-gating profile) missing fixture credentials all exit
-    BLOCKED -- see Workstream 2's fixture-preparation-integrity requirement.
+    This is what "01 Prepare Test Environment" runs, and step 1 of "06 Test
+    Full Calee Solution". It never claims READY it can't back up: any
+    preflight error, any fixture-reset/verify failure, or (for a
+    release-gating profile) missing fixture credentials all exit BLOCKED.
     Only a real preflight pass plus (fixture credentials given and both
     reset and verify succeeding, or an explicit --skip-fixture/
     --allow-no-fixture for a suite that doesn't need the fixture) exits
     READY.
+
+    Every outcome -- including the earliest failures (Appium won't start,
+    preflight errors) -- is recorded as this run's mandatory "Test
+    environment and regression fixture" component at
+    reports/runs/<run-id>/environment/results.json, so a release run's
+    Prepare step is always traceable even when it fails before reaching
+    the fixture-reset stage.
     """
     cfg = _load_config_or_exit(config_path)
+    run_id = _resolve_run_id(run_id_opt)
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    workspace.ensure_created()
+    manifest = _load_or_init_manifest(workspace, suite_name=suite_name, tester=tester_opt)
+    if fixture_base_url:
+        manifest.target_backend = fixture_base_url
+    manifest.write(workspace.manifest_path)
+    click.echo(f"Run ID: {run_id}")
+
+    def _finish(*, status: str, detail: "list[str]", exit_code: int, **status_kwargs) -> "None":
+        _write_environment_report(workspace, status=status, detail=detail, **status_kwargs)
+        manifest.record_component("environment", report_path=str(workspace.component_report_path("environment")), exit_code=exit_code)
+        manifest.fixture_version = status_kwargs.get("fixture_version") or manifest.fixture_version
+        manifest.write(workspace.manifest_path)
+        raise SystemExit(exit_code)
 
     if not _ensure_appium_or_echo_blocked(cfg):
-        raise SystemExit(EXIT_BLOCKED)
+        _finish(
+            status=STATUS_BLOCKED, detail=["Appium could not be started or reached."], exit_code=EXIT_BLOCKED,
+            target_environment=fixture_base_url, fixture_version=None,
+            fixture_reset_status="not_run", fixture_verification_status="not_run", suite_name=suite_name,
+        )
 
     checks = preflight.run_doctor(cfg)
     for check in checks:
@@ -211,7 +298,13 @@ def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suit
 
     if preflight.has_errors(checks):
         click.echo("\nEnvironment is not ready — fix the [ERROR] items above and run this again.", err=True)
-        raise SystemExit(EXIT_BLOCKED)
+        _finish(
+            status=STATUS_BLOCKED,
+            detail=[f"{c.name}: {c.message}" for c in checks if c.status == "error"],
+            exit_code=EXIT_BLOCKED,
+            target_environment=fixture_base_url, fixture_version=None,
+            fixture_reset_status="not_run", fixture_verification_status="not_run", suite_name=suite_name,
+        )
 
     suite_requires_fixture = False
     if suite_name:
@@ -223,38 +316,43 @@ def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suit
 
     if skip_fixture:
         if suite_requires_fixture:
-            click.echo(
-                f"\nBLOCKED: --skip-fixture/--allow-no-fixture was used with --suite {suite_name!r}, "
-                f"which depends on the deterministic REG-* fixture (see "
-                f"docs/TEST_DATA_RESET_CONTRACT.md). Fixture preparation cannot be silently skipped "
-                f"for this suite — configure fixture credentials, or choose a suite that doesn't "
-                f"need the fixture.",
-                err=True,
+            detail = [
+                f"--skip-fixture/--allow-no-fixture was used with --suite {suite_name!r}, which depends "
+                f"on the deterministic REG-* fixture (see docs/TEST_DATA_RESET_CONTRACT.md). Fixture "
+                f"preparation cannot be silently skipped for this suite."
+            ]
+            click.echo(f"\nBLOCKED: {detail[0]}", err=True)
+            _finish(
+                status=STATUS_BLOCKED, detail=detail, exit_code=EXIT_BLOCKED,
+                target_environment=fixture_base_url, fixture_version=None,
+                fixture_reset_status="not_run", fixture_verification_status="not_run", suite_name=suite_name,
             )
-            raise SystemExit(EXIT_BLOCKED)
         click.echo("\nFixture reset skipped (--skip-fixture/--allow-no-fixture).")
-        _write_environment_status(
+        _finish(
+            status=STATUS_PASS, detail=["Fixture reset explicitly skipped for a suite that doesn't need it."],
+            exit_code=EXIT_SUCCESS,
             target_environment=fixture_base_url, fixture_version=None,
             fixture_reset_status="skipped", fixture_verification_status="skipped", suite_name=suite_name,
         )
-        raise SystemExit(EXIT_SUCCESS)
 
     if not (fixture_base_url and fixture_email and fixture_password):
+        detail = [
+            "Fixture credentials are not configured (set CALEE_API_BASE, CALEE_TEST_EMAIL, "
+            "CALEE_TEST_PASSWORD, or pass --fixture-base-url/--fixture-email/--fixture-password)."
+        ]
         click.echo(
-            "\nBLOCKED: fixture credentials are not configured (set CALEE_API_BASE, "
-            "CALEE_TEST_EMAIL, CALEE_TEST_PASSWORD, or pass --fixture-base-url/--fixture-email/"
-            "--fixture-password). Release-gating scenarios that require the deterministic fixture "
-            "(e.g. the calendar suite) cannot be trusted without it. If you are deliberately "
-            "running a suite that doesn't need the fixture, pass --allow-no-fixture "
+            f"\nBLOCKED: {detail[0]} Release-gating scenarios that require the deterministic "
+            "fixture (e.g. the calendar suite) cannot be trusted without it. If you are "
+            "deliberately running a suite that doesn't need the fixture, pass --allow-no-fixture "
             "--suite <suite-name>.",
             err=True,
         )
-        _write_environment_status(
+        _finish(
+            status=STATUS_BLOCKED, detail=detail, exit_code=EXIT_BLOCKED,
             target_environment=fixture_base_url, fixture_version=None,
             fixture_reset_status="blocked_missing_credentials", fixture_verification_status="blocked_missing_credentials",
             suite_name=suite_name,
         )
-        raise SystemExit(EXIT_BLOCKED)
 
     click.echo(f"\nResetting the regression fixture at {fixture_base_url} ...")
     try:
@@ -263,11 +361,11 @@ def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suit
         )
     except FixtureBridgeError as exc:
         click.echo(f"\n=== Blocked: fixture reset failed: {exc} ===", err=True)
-        _write_environment_status(
+        _finish(
+            status=STATUS_BLOCKED, detail=[f"Fixture reset failed: {exc}"], exit_code=EXIT_BLOCKED,
             target_environment=fixture_base_url, fixture_version=None,
             fixture_reset_status="blocked", fixture_verification_status="not_run", suite_name=suite_name,
         )
-        raise SystemExit(EXIT_BLOCKED)
     click.echo(reset_output)
 
     click.echo(f"\nVerifying the regression fixture at {fixture_base_url} ...")
@@ -277,21 +375,53 @@ def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suit
         )
     except FixtureBridgeError as exc:
         click.echo(f"\n=== Blocked: fixture verification failed: {exc} ===", err=True)
-        _write_environment_status(
+        _finish(
+            status=STATUS_BLOCKED, detail=[f"Fixture verification failed: {exc}"], exit_code=EXIT_BLOCKED,
             target_environment=fixture_base_url,
             fixture_version=_extract_fixture_version(reset_output),
             fixture_reset_status="ok", fixture_verification_status="blocked", suite_name=suite_name,
         )
-        raise SystemExit(EXIT_BLOCKED)
     click.echo(verify_output)
 
     fixture_version = _extract_fixture_version(verify_output) or _extract_fixture_version(reset_output)
-    status_path = _write_environment_status(
+    click.echo(f"\nEnvironment ready. Fixture version: {fixture_version or 'unknown'}.")
+    click.echo(f"Environment report: {workspace.component_report_path('environment')}")
+    _finish(
+        status=STATUS_PASS, detail=["Environment and fixture ready."], exit_code=EXIT_SUCCESS,
         target_environment=fixture_base_url, fixture_version=fixture_version,
         fixture_reset_status="ok", fixture_verification_status="ok", suite_name=suite_name,
     )
-    click.echo(f"\nEnvironment ready. Fixture version: {fixture_version or 'unknown'}.")
-    click.echo(f"Environment status: {status_path}")
+
+
+@main.command("record-component")
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True)
+@click.option("--component", "component", required=True, type=click.Choice(run_context.COMPONENT_NAMES))
+@click.option("--report-path", default=None, help="Path to this component's results.json, if produced")
+@click.option("--exit-code", type=int, default=None, help="This component's own process exit code")
+@click.option("--device-id", default=None)
+@click.option("--build-version", default=None)
+@click.option("--git-sha", default=None)
+def record_component_cmd(run_id_opt, component, report_path, exit_code, device_id, build_version, git_sha):
+    """Records one component's outcome into an existing run's manifest.
+
+    For components not driven directly through this CLI (e.g. CaleeMobile's
+    mobile-api/mobile-android/mobile-ios checks, run from
+    CaleeMobile-Regression's own scripts) -- see scripts/test_caleemobile.sh.
+    Requires the run workspace to already exist (created by `prepare`).
+    """
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+    if not workspace.root.is_dir():
+        click.echo(f"No run workspace found for run ID {run_id_opt!r} at {workspace.root}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    manifest = _load_or_init_manifest(workspace)
+    manifest.record_component(
+        component, report_path=report_path, exit_code=exit_code,
+        device_id=device_id, build_version=build_version, git_sha=git_sha,
+    )
+    manifest.write(workspace.manifest_path)
     raise SystemExit(EXIT_SUCCESS)
 
 
@@ -319,7 +449,12 @@ def stop_appium_cmd():
          "config/manual-checks.example.json if the real one hasn't been set up yet.",
 )
 @click.option("--out", "out_path", type=click.Path(), default=None, help="Where to write the recorded results")
-def record_manual_checks(checks_path, out_path):
+@click.option(
+    "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None,
+    help="Shared release run ID (see run_context.py). When given, results are also written to "
+         "this run's workspace (reports/runs/<run-id>/manual-checks/results.json) for consolidation.",
+)
+def record_manual_checks(checks_path, out_path, run_id_opt):
     """Guided terminal menu for recording manual checks -- "05 Record Manual Checks".
 
     The tester only ever types a single digit (1-6); nothing here requires
@@ -351,7 +486,15 @@ def record_manual_checks(checks_path, out_path):
 
     out = Path(out_path) if out_path else manual_checks_mod.default_output_path(REPO_ROOT / "reports")
     manual_checks_mod.write_results(results, out)
-    manual_checks_mod.write_results(results, _manual_checks_latest_path())
+
+    if run_id_opt:
+        run_id = _resolve_run_id(run_id_opt)
+        workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+        workspace.ensure_created()
+        manual_checks_mod.write_results(results, workspace.component_report_path("manual-checks"), run_id=run_id)
+        manifest = _load_or_init_manifest(workspace)
+        manifest.record_component("manual-checks", report_path=str(workspace.component_report_path("manual-checks")))
+        manifest.write(workspace.manifest_path)
 
     click.echo(manual_checks_mod.summarize(results))
     click.echo(f"\nSaved: {out}")
@@ -382,19 +525,47 @@ def list_suites_cmd():
 @main.command()
 @click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
 @click.option("--scenario", "scenario_arg", required=True)
-def run(config_path, scenario_arg):
+@click.option(
+    "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None,
+    help="Shared release run ID (see run_context.py). When given, writes into this run's "
+         "workspace (reports/runs/<run-id>/tablet/results.json) instead of a standalone "
+         "timestamped report directory.",
+)
+def run(config_path, scenario_arg, run_id_opt):
     """Run a single scenario YAML file."""
     cfg = _load_config_or_exit(config_path)
     scenario_path = _resolve_scenario_path(scenario_arg)
-    rb = reporting.ReportBuilder(cfg, run_name=scenario_path.stem)
+    out_dir, run_id = _tablet_out_dir(run_id_opt)
+    rb = reporting.ReportBuilder(cfg, run_name=scenario_path.stem, out_dir=out_dir)
     result = ScenarioRunner(cfg, report_builder=rb).run_scenarios([scenario_path], suite_name=scenario_path.stem)
+    if run_id:
+        result.run_id = run_id
     report_dir = rb.write(result)
+    _record_tablet_component(run_id, report_dir, result)
     click.echo(
         f"Passed: {result.passed_count}  Failed: {result.failed_count}  "
         f"Skipped: {result.skipped_count}  Blocked: {result.blocked_count}"
     )
     click.echo(f"Report: {report_dir}")
     raise SystemExit(_exit_code_for(result))
+
+
+def _tablet_out_dir(run_id_opt: "str | None") -> "tuple[Path | None, str | None]":
+    if not run_id_opt:
+        return None, None
+    run_id = _resolve_run_id(run_id_opt)
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    workspace.ensure_created()
+    return workspace.component_dir("tablet"), run_id
+
+
+def _record_tablet_component(run_id: "str | None", report_dir: Path, result) -> None:
+    if not run_id:
+        return
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    manifest = _load_or_init_manifest(workspace)
+    manifest.record_component("tablet", report_path=str(report_dir / "results.json"), exit_code=_exit_code_for(result))
+    manifest.write(workspace.manifest_path)
 
 
 @main.command()
@@ -405,7 +576,13 @@ def run(config_path, scenario_arg):
     help="Required (or set allow_release_technical: true in your config) to run a suite containing "
          "physical-tablet-only scenarios.",
 )
-def suite(config_path, suite_name, confirm_technical):
+@click.option(
+    "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None,
+    help="Shared release run ID (see run_context.py). When given, writes into this run's "
+         "workspace (reports/runs/<run-id>/tablet/results.json) instead of a standalone "
+         "timestamped report directory.",
+)
+def suite(config_path, suite_name, confirm_technical, run_id_opt):
     """Run a named suite of scenarios."""
     cfg = _load_config_or_exit(config_path)
     try:
@@ -423,15 +600,114 @@ def suite(config_path, suite_name, confirm_technical):
         )
         raise SystemExit(EXIT_INVALID_CONFIG)
 
-    rb = reporting.ReportBuilder(cfg, run_name=suite_name)
+    out_dir, run_id = _tablet_out_dir(run_id_opt)
+    rb = reporting.ReportBuilder(cfg, run_name=suite_name, out_dir=out_dir)
     result = ScenarioRunner(cfg, report_builder=rb).run_scenarios(scenario_paths, suite_name=suite_name)
+    if run_id:
+        result.run_id = run_id
     report_dir = rb.write(result)
+    _record_tablet_component(run_id, report_dir, result)
     click.echo(
         f"Passed: {result.passed_count}  Failed: {result.failed_count}  "
         f"Skipped: {result.skipped_count}  Blocked: {result.blocked_count}"
     )
     click.echo(f"Report: {report_dir}")
     raise SystemExit(_exit_code_for(result))
+
+
+@main.command("sync-smoke")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
+@click.option(
+    "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True,
+    help="Shared release run ID (see run_context.py). Every sync-smoke run belongs to a workspace.",
+)
+@click.option("--base-url", envvar="CALEE_EXPECTED_BACKEND", default=None, help="Calee Client API base URL.")
+@click.option("--email", envvar="CALEE_TEST_EMAIL", default=None)
+@click.option("--password", envvar="CALEE_TEST_PASSWORD", default=None)
+@click.option(
+    "--platform", type=click.Choice(["android", "ios"]), default="android",
+    help="Which CaleeMobile platform runs the mobile legs (sync_task_complete_test.dart / sync_chore_complete_test.dart).",
+)
+@click.option(
+    "--task-id", default=None,
+    help="REG-TASK-OPEN-001's server-assigned id, for the task flow's API-based cleanup fallback. "
+         "Optional -- without it, that fallback is recorded BLOCKED instead of guessing an id.",
+)
+def sync_smoke_cmd(config_path, run_id_opt, base_url, email, password, platform, task_id):
+    """Cross-device sync-smoke: event/task/chore flows across the API, CaleeMobile, and the tablet.
+
+    NOT release-gating today -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md.
+    The event and task flows always include one genuinely BLOCKED step
+    because tablet-side mutation isn't possible yet (unconfirmed resource
+    ids); every other leg runs for real. Writes reports/runs/<run-id>/sync/
+    results.json but is not yet auto-discovered by `consolidate` -- this is
+    deliberate, matching how the Workstream 10 draft scenarios are kept out
+    of a real release's mandatory components until that gap closes.
+    """
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r} (expected letters/digits/._- only).", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    run_id = run_id_opt
+
+    if not base_url or not email or not password:
+        click.echo(
+            "BLOCKED: sync-smoke needs --base-url/--email/--password (or CALEE_EXPECTED_BACKEND/"
+            "CALEE_TEST_EMAIL/CALEE_TEST_PASSWORD) to reach the Calee Client API and CaleeMobile.",
+            err=True,
+        )
+        raise SystemExit(EXIT_BLOCKED)
+
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    workspace.ensure_created()
+    report_dir = workspace.component_dir("sync")
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = config_mod.load_config(config_path) if config_path else None
+    tablet_driver = None
+    if cfg is not None:
+        driver = CaleeDriver(cfg)
+        try:
+            driver.start_session()
+            tablet_driver = driver
+        except Exception as exc:
+            click.echo(
+                f"[WARN] Could not start a tablet Appium session ({exc}) -- tablet-leg checks in this "
+                f"run will all be recorded as real failed polls, not skipped or faked.",
+                err=True,
+            )
+
+    try:
+        env = sync_smoke.build_real_environment(
+            repo_root=REPO_ROOT, base_url=base_url, email=email, password=password, platform=platform,
+            report_dir=report_dir, tablet_driver=tablet_driver,
+            device_id=cfg.udid if cfg is not None else None,
+        )
+        results = sync_smoke.run_all_sync_flows(env, run_id=run_id, task_id=task_id)
+    finally:
+        if tablet_driver is not None:
+            tablet_driver.quit()
+
+    report_path = report_dir / "results.json"
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump({"runId": run_id, "flows": [r.to_dict() for r in results]}, f, indent=2)
+        f.write("\n")
+
+    for result in results:
+        click.echo(f"{result.flow}: {result.status.upper()}")
+    click.echo(f"Report: {report_path}")
+
+    if any(r.status == "failed" for r in results):
+        overall_exit = EXIT_REGRESSION
+    elif any(r.status == "blocked" for r in results):
+        overall_exit = EXIT_BLOCKED
+    else:
+        overall_exit = EXIT_SUCCESS
+
+    manifest = _load_or_init_manifest(workspace)
+    manifest.record_component("sync", report_path=str(report_path), exit_code=overall_exit)
+    manifest.write(workspace.manifest_path)
+
+    raise SystemExit(overall_exit)
 
 
 def _load_json_report(path: "str | None") -> "dict | None":
@@ -461,11 +737,7 @@ def release_platforms_cmd():
     raise SystemExit(EXIT_SUCCESS)
 
 
-def _load_manual_checks(path: "str | None") -> "list[ManualCheck] | None":
-    if not path:
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
+def _manual_checks_from_list(raw: list) -> "list[ManualCheck]":
     return [
         ManualCheck(
             title=item["title"],
@@ -480,16 +752,77 @@ def _load_manual_checks(path: "str | None") -> "list[ManualCheck] | None":
     ]
 
 
+def _load_manual_checks(path: "str | None") -> "list[ManualCheck] | None":
+    """Legacy/ad-hoc entry point: loads a bare JSON list with no run-ID
+    validation. Run-scoped consolidation uses _resolve_component instead
+    (see consolidate below), which also accepts the {"runId":...,
+    "checks":[...]} shape manual_checks.write_results produces when given
+    a run_id."""
+    if not path:
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if isinstance(raw, dict):
+        raw = raw.get("checks", [])
+    return _manual_checks_from_list(raw)
+
+
+class _ConsolidationProblem(NamedTuple):
+    component: str
+    message: str
+
+
+def _resolve_component(
+    component: str,
+    explicit_path: "str | None",
+    *,
+    workspace: run_context.RunWorkspace,
+    run_id: str,
+    run_started_at_epoch: "float | None",
+    problems: "list[_ConsolidationProblem]",
+) -> "dict | None":
+    """Resolves one component's report: an explicit --foo-report path if
+    given, else the fixed workspace location. Missing is "not executed"
+    (not a problem -- component_from_* already renders that as blocked for
+    a mandatory component). A file that exists but fails run-ID/workspace/
+    freshness validation is recorded in `problems` and treated as if it
+    were never produced -- a report that can't be trusted must never be
+    silently used, but the CLI still finishes and reports every problem it
+    found rather than crashing on the first one.
+    """
+    path = Path(explicit_path) if explicit_path else workspace.component_report_path(component)
+    if not path.is_file():
+        return None
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        problems.append(_ConsolidationProblem(component, f"could not read {path}: {exc}"))
+        return None
+    try:
+        run_context.validate_component_report(
+            report, report_path=path, run_id=run_id, workspace=workspace,
+            component=component, run_started_at_epoch=run_started_at_epoch,
+        )
+    except run_context.RunIdError as exc:
+        problems.append(_ConsolidationProblem(component, str(exc)))
+        return None
+    return report
+
+
 @main.command()
-@click.option("--tablet-report", type=click.Path(exists=True), default=None, help="calee-regression results.json")
-@click.option("--mobile-api-report", type=click.Path(exists=True), default=None, help="CaleeMobile-Regression api --report json")
-@click.option("--mobile-android-report", type=click.Path(exists=True), default=None, help="CaleeMobile-Regression ui Android --report json")
-@click.option("--mobile-ios-report", type=click.Path(exists=True), default=None, help="CaleeMobile-Regression ui iOS --report json")
-@click.option("--manual-checks", "manual_checks_path", type=click.Path(exists=True), default=None, help="JSON list of manual guided check results")
+@click.option(
+    "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True,
+    help="Shared release run ID for this consolidation (see run_context.py). Every component "
+         "report must carry this same run ID -- consolidation refuses to guess.",
+)
+@click.option("--tablet-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's tablet/results.json")
+@click.option("--mobile-api-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's mobile-api/results.json")
+@click.option("--mobile-android-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's mobile-android/results.json")
+@click.option("--mobile-ios-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's mobile-ios/results.json")
+@click.option("--manual-checks", "manual_checks_path", type=click.Path(exists=True), default=None, help="Override: defaults to this run's manual-checks/results.json")
 @click.option(
     "--environment-report", type=click.Path(exists=True), default=None,
-    help="prepare's reports/environment-status-latest.json (fixture version/reset/verify status). "
-         "Auto-discovered from reports/ if not given and present.",
+    help="Override: defaults to this run's environment/results.json (prepare's output).",
 )
 @click.option(
     "--android-mandatory/--android-optional", "android_mandatory", default=None,
@@ -513,27 +846,76 @@ def _load_manual_checks(path: "str | None") -> "list[ManualCheck] | None":
 @click.option("--ios-device-id", default=None, help="iOS device/simulator identifier used for the iOS UI run")
 @click.option("--test-environment", default="", help="Target environment URL")
 @click.option("--tester", default="", help="Tester name/identifier")
-@click.option("--out-dir", type=click.Path(), default=None, help="Where to write the consolidated bundle (default: reports/)")
+@click.option("--out-dir", type=click.Path(), default=None, help="Where to write the consolidated bundle (default: this run's workspace)")
 def consolidate(
-    tablet_report, mobile_api_report, mobile_android_report, mobile_ios_report,
+    run_id_opt, tablet_report, mobile_api_report, mobile_android_report, mobile_ios_report,
     manual_checks_path, environment_report, android_mandatory, ios_mandatory,
     build_version, calee_build_version, expected_calee_build_version,
     caleemobile_build_version, expected_caleemobile_build_version, caleeshell_version,
     calee_git_sha, caleemobile_git_sha, android_device_id, ios_device_id,
     test_environment, tester, out_dir,
 ):
-    """Combine per-framework JSON reports into one consolidated release report.
+    """Combine this run's per-component JSON reports into one consolidated
+    release report.
 
-    Reads already-produced report files -- it does not run anything itself.
-    Any report not given is treated as "not executed", which blocks an
-    overall PASS for any component that is mandatory for this release (see
+    Reads already-produced report files -- it does not run anything
+    itself. Every report (explicit --foo-report or auto-discovered from
+    the run workspace) is validated against --run-id before it's trusted:
+    a missing run ID, a mismatched run ID, a path outside this run's
+    workspace, or a report that predates this run's start are all treated
+    as if that component was never executed (and reported as a specific
+    problem), never silently accepted. Any component with no valid report
+    at all is "not executed", which blocks an overall PASS for any
+    component that is mandatory for this release (see
     docs/RELEASE_POLICY.md and config/release-platforms.example.yaml).
     """
-    env_report_path = environment_report or (
-        str(_environment_status_path()) if _environment_status_path().is_file() else None
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r} (expected letters/digits/._- only).", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    run_id = run_id_opt
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    if not workspace.root.is_dir():
+        click.echo(
+            f"No run workspace found for run ID {run_id!r} at {workspace.root}. "
+            f"Run 'prepare --run-id {run_id}' first to create it.",
+            err=True,
+        )
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    manifest = _load_or_init_manifest(workspace)
+    run_started_at_epoch = None
+    if manifest.started_at:
+        try:
+            run_started_at_epoch = time.mktime(time.strptime(manifest.started_at, "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            run_started_at_epoch = None
+
+    problems: "list[_ConsolidationProblem]" = []
+    resolve = lambda component, explicit: _resolve_component(  # noqa: E731
+        component, explicit, workspace=workspace, run_id=run_id,
+        run_started_at_epoch=run_started_at_epoch, problems=problems,
     )
-    env_status = _load_json_report(env_report_path) or {}
+    env_report = resolve("environment", environment_report)
+    tablet = resolve("tablet", tablet_report)
+    mobile_api = resolve("mobile-api", mobile_api_report)
+    mobile_android = resolve("mobile-android", mobile_android_report)
+    mobile_ios = resolve("mobile-ios", mobile_ios_report)
+
+    manual_checks_raw = resolve("manual-checks", manual_checks_path)
+    manual_checks_list = None
+    if manual_checks_raw is not None:
+        manual_checks_list = _manual_checks_from_list(manual_checks_raw.get("checks", []))
+    elif manual_checks_path:
+        # An explicit --manual-checks path outside a run workspace (legacy/
+        # ad-hoc use, e.g. from existing tests) has no run ID to validate --
+        # still usable, just not run-scoped.
+        manual_checks_list = _load_manual_checks(manual_checks_path)
+
+    for problem in problems:
+        click.echo(f"BLOCKED: {problem.component} report rejected: {problem.message}", err=True)
+
     meta = {
+        "runId": run_id,
         "buildVersion": build_version,
         "caleeBuildVersion": calee_build_version,
         "caleeMobileBuildVersion": caleemobile_build_version,
@@ -543,13 +925,13 @@ def consolidate(
         "androidDeviceId": android_device_id,
         "iosDeviceId": ios_device_id,
         "testEnvironment": test_environment,
-        "tester": tester,
+        "tester": tester or manifest.tester,
     }
-    if env_status:
-        meta["fixtureVersion"] = env_status.get("fixtureVersion")
-        meta["fixtureTargetEnvironment"] = env_status.get("targetEnvironment")
-        meta["fixtureResetStatus"] = env_status.get("fixtureResetStatus")
-        meta["fixtureVerificationStatus"] = env_status.get("fixtureVerificationStatus")
+    if env_report:
+        meta["fixtureVersion"] = env_report.get("fixtureVersion")
+        meta["fixtureTargetEnvironment"] = env_report.get("targetEnvironment")
+        meta["fixtureResetStatus"] = env_report.get("fixtureResetStatus")
+        meta["fixtureVerificationStatus"] = env_report.get("fixtureVerificationStatus")
     meta = {k: v for k, v in meta.items() if v not in (None, "")}
 
     try:
@@ -561,11 +943,12 @@ def consolidate(
     ios_gating = ios_mandatory if ios_mandatory is not None else platforms.mobile_ios
 
     report = build_release_report(
-        tablet=_load_json_report(tablet_report),
-        mobile_api=_load_json_report(mobile_api_report),
-        mobile_android_ui=_load_json_report(mobile_android_report),
-        mobile_ios_ui=_load_json_report(mobile_ios_report),
-        manual_checks=_load_manual_checks(manual_checks_path),
+        environment=env_report,
+        tablet=tablet,
+        mobile_api=mobile_api,
+        mobile_android_ui=mobile_android,
+        mobile_ios_ui=mobile_ios,
+        manual_checks=manual_checks_list,
         meta=meta,
         android_mandatory=android_gating,
         ios_mandatory=ios_gating,
@@ -575,10 +958,10 @@ def consolidate(
         expected_caleemobile_build_version=expected_caleemobile_build_version,
     )
 
-    out = Path(out_dir) if out_dir else REPO_ROOT / "reports"
-    bundle_dir = out / f"consolidated-{time.strftime('%Y%m%d-%H%M%S')}"
-    bundle_path = write_release_bundle(report, bundle_dir, build_label=build_version)
+    out = Path(out_dir) if out_dir else workspace.consolidated_dir
+    bundle_path = write_release_bundle(report, out, build_label=build_version)
 
+    click.echo(f"Run ID: {run_id}")
     click.echo(f"Overall: {report.overall_status.upper()}")
     for component in report.components:
         marker = "" if component.mandatory else " (optional)"
@@ -586,7 +969,42 @@ def consolidate(
     click.echo(f"Suggested next action: {report.summary.get('suggestedNextAction', '')}")
     click.echo(f"Bundle: {bundle_path}")
 
-    raise SystemExit(_STATUS_TO_EXIT_CODE[report.overall_status])
+    exit_code = _STATUS_TO_EXIT_CODE[report.overall_status]
+    manifest.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    manifest.record_component("consolidated", report_path=str(bundle_path), exit_code=exit_code)
+    if calee_build_version:
+        manifest.build_versions["calee"] = calee_build_version
+    if caleemobile_build_version:
+        manifest.build_versions["caleemobile"] = caleemobile_build_version
+    if calee_git_sha:
+        manifest.git_shas["calee"] = calee_git_sha
+    if caleemobile_git_sha:
+        manifest.git_shas["caleemobile"] = caleemobile_git_sha
+    if android_device_id:
+        manifest.device_ids["android"] = android_device_id
+    if ios_device_id:
+        manifest.device_ids["ios"] = ios_device_id
+    if test_environment:
+        manifest.target_backend = test_environment
+    if meta.get("fixtureVersion"):
+        manifest.fixture_version = meta["fixtureVersion"]
+    manifest.write(workspace.manifest_path)
+
+    if exit_code == EXIT_SUCCESS or out_dir is None:
+        # A convenience pointer to the most recent run, created only now
+        # that the run has actually finished -- never a consolidation
+        # input (see run_context.py). Refreshed on every consolidate call
+        # (not just PASS) so "open latest report" also works for a
+        # FAIL/BLOCKED run the tester needs to inspect.
+        latest_link = REPO_ROOT / "reports" / "latest-run"
+        try:
+            if latest_link.is_symlink() or latest_link.exists():
+                latest_link.unlink()
+            latest_link.symlink_to(Path("runs") / run_id, target_is_directory=True)
+        except OSError:
+            pass  # Best-effort convenience link; never fail the run over it.
+
+    raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

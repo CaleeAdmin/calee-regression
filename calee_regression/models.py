@@ -110,6 +110,10 @@ class SuiteResult:
     scenarios: list = field(default_factory=list)
     started_at: str = ""
     finished_at: str = ""
+    # Set by the CLI when this suite is run as part of a shared release run
+    # ("06 Test Full Calee Solution") -- see run_context.py. Empty for a
+    # standalone suite/scenario run outside that context.
+    run_id: str = ""
 
     @property
     def passed_count(self) -> int:
@@ -142,6 +146,7 @@ class SuiteResult:
     def to_dict(self) -> dict:
         return {
             "name": self.name,
+            "runId": self.run_id,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "passed_count": self.passed_count,

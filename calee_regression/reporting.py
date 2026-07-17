@@ -29,12 +29,21 @@ _STATUS_COLORS = {
 
 
 class ReportBuilder:
-    def __init__(self, config, run_name: str, repo_root=None):
-        sanitized = re.sub(r"[^A-Za-z0-9_-]", "-", run_name)
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
+    def __init__(self, config, run_name: str, repo_root=None, out_dir=None):
+        """`out_dir`, when given, is used verbatim instead of the default
+        auto-timestamped `<report_dir>/<run_name>-<timestamp>/` directory --
+        used by the CLI to write directly into a shared release run's fixed
+        workspace path (reports/runs/<run_id>/tablet/) instead of a
+        directory whose name a caller would otherwise have to rediscover
+        with something like `ls -1dt` (see run_context.py)."""
         self.config = config
         self.run_name = run_name
-        self.dir = Path(config.report_dir) / f"{sanitized}-{timestamp}"
+        if out_dir is not None:
+            self.dir = Path(out_dir)
+        else:
+            sanitized = re.sub(r"[^A-Za-z0-9_-]", "-", run_name)
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            self.dir = Path(config.report_dir) / f"{sanitized}-{timestamp}"
         self.screenshots_dir = self.dir / "screenshots"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,185 @@
+name: calee-calendar-event-mutation
+tags: [calendar, mutation, tablet, draft-unverified]
+requires_state: logged_in_tablet
+default_timeout_seconds: 20
+mandatory: false
+# DRAFT -- NOT release-gating and NOT included in any suite a real release
+# run uses (full-tester/release-technical/calendar). See
+# docs/TABLET_MUTATION_COVERAGE_GAPS.md before running this for the first
+# time, and do not set mandatory: true or add this to a real suite until
+# every UNCONFIRMED_* id below has been replaced with a real, confirmed
+# value and the scenario has passed at least once against a real, prepared
+# tablet.
+#
+# Exercises create -> verify -> edit -> verify -> delete -> verify
+# disappearance for a single scratch calendar event. Every step marked
+# UNCONFIRMED_* uses a resource id that has never been confirmed against
+# the real Calee tablet app: this framework's accessible source does not
+# include the Calee Android app repository, and no device/emulator/Appium
+# Inspector session was available to discover these live. Every
+# UNCONFIRMED_* token is deliberately not a plausible-looking guess -- it
+# will fail loudly and immediately ("element not found") if run as-is, so
+# it can never be mistaken for verified coverage.
+#
+# The two scratch titles below (ALPHA/BRAVO) are deliberately chosen so
+# neither is a substring of the other -- fail_if_text/text_present do a
+# raw substring check against the page source, so e.g. "...-001" vs
+# "...-001-EDITED" would make the "old title is gone" assertion fail even
+# after a correct edit, since the old string is still literally contained
+# in the new one.
+#
+# Self-cleaning by design: this scenario creates its own scratch event and
+# deletes it again by the end, and never touches the shared REG-* fixture.
+# If a previous run crashed before reaching the delete step, a leftover
+# "REG-SCRATCH-EVENT-MUTATION-ALPHA" or "-BRAVO" event may need to be
+# removed by hand before re-running.
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llCalendar
+    timeout_seconds: 20
+
+  - name: Open Calendar
+    action: tap
+    id: llCalendar
+
+  - name: Wait for the calendar toolbar to render
+    action: wait_for_id
+    id: btnAddEvent
+    timeout_seconds: 10
+
+  - name: Tap Add Event
+    action: tap
+    id: btnAddEvent
+
+  - name: Wait for the add-event form to render
+    action: wait_for_id
+    id: UNCONFIRMED_event_title_input
+    timeout_seconds: 10
+
+  - name: Type the scratch event's title
+    action: type_text
+    id: UNCONFIRMED_event_title_input
+    text: REG-SCRATCH-EVENT-MUTATION-ALPHA
+
+  - name: Hide the keyboard so the save control isn't covered
+    action: hide_keyboard
+
+  - name: Save the new event
+    action: tap
+    id: UNCONFIRMED_event_save_button
+
+  - name: Switch to Agenda view to reliably locate the new event
+    action: tap
+    id: llSchedule
+
+  - name: Wait for the newly created event to appear
+    action: wait_for_text
+    text: REG-SCRATCH-EVENT-MUTATION-ALPHA
+    timeout_seconds: 20
+
+  - name: Capture the event list after creation
+    action: screenshot
+    screenshot_name: 00_after_create
+    compare: false
+
+  - name: Open the newly created event
+    action: tap
+    text: REG-SCRATCH-EVENT-MUTATION-ALPHA
+
+  - name: Wait for event detail dialog to render
+    action: wait_for_id
+    id: tvEventDetailTitle
+    timeout_seconds: 10
+
+  - name: Assert the created event's title is shown
+    action: assert_text
+    text: REG-SCRATCH-EVENT-MUTATION-ALPHA
+
+  - name: Open the edit form for this event
+    action: tap
+    id: UNCONFIRMED_event_edit_button
+
+  - name: Wait for the edit form to render
+    action: wait_for_id
+    id: UNCONFIRMED_event_edit_title_input
+    timeout_seconds: 10
+
+  - name: Clear the existing title
+    action: clear_text
+    id: UNCONFIRMED_event_edit_title_input
+
+  - name: Type the edited title
+    action: type_text
+    id: UNCONFIRMED_event_edit_title_input
+    text: REG-SCRATCH-EVENT-MUTATION-BRAVO
+
+  - name: Hide the keyboard so the save control isn't covered
+    action: hide_keyboard
+
+  - name: Save the edit
+    action: tap
+    id: UNCONFIRMED_event_edit_save_button
+
+  - name: Switch to Agenda view to confirm the edit stuck
+    action: tap
+    id: llSchedule
+
+  - name: Wait for the edited title to appear
+    action: wait_for_text
+    text: REG-SCRATCH-EVENT-MUTATION-BRAVO
+    timeout_seconds: 20
+
+  - name: Assert the pre-edit title is gone from the list
+    action: fail_if_text
+    text: REG-SCRATCH-EVENT-MUTATION-ALPHA
+
+  - name: Capture the event list after edit
+    action: screenshot
+    screenshot_name: 01_after_edit
+    compare: false
+
+  - name: Open the edited event
+    action: tap
+    text: REG-SCRATCH-EVENT-MUTATION-BRAVO
+
+  - name: Wait for event detail dialog to render again
+    action: wait_for_id
+    id: tvEventDetailTitle
+    timeout_seconds: 10
+
+  - name: Delete this event
+    action: tap
+    id: UNCONFIRMED_event_delete_button
+
+  - name: Confirm deletion
+    # ASSUMPTION TO VERIFY: assumes a confirmation dialog appears and this
+    # id is its confirm button. Also unconfirmed: whether confirming closes
+    # straight back to the Agenda list, or leaves the (now-empty) detail
+    # dialog open needing an explicit close/back step first.
+    action: tap
+    id: UNCONFIRMED_event_delete_confirm_button
+
+  - name: Switch to Agenda view to confirm deletion
+    action: tap
+    id: llSchedule
+
+  - name: Wait a moment for the deletion to take effect
+    action: sleep
+    seconds: 2
+
+  - name: Assert the deleted event no longer appears
+    action: fail_if_text
+    text: REG-SCRATCH-EVENT-MUTATION-BRAVO
+
+  - name: Capture the event list after deletion
+    action: screenshot
+    screenshot_name: 02_after_delete
+    compare: false
+
+  - name: Assert no crash/error dialog is showing
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]

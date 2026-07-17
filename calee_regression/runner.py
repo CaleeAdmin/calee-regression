@@ -232,6 +232,10 @@ def _step_type_text(ctx, step):
     ctx["driver"].type_text(step["id"], step["text"])
 
 
+def _step_clear_text(ctx, step):
+    ctx["driver"].clear_text(step["id"])
+
+
 def _step_hide_keyboard(ctx, step):
     ctx["driver"].hide_keyboard()
 
@@ -282,6 +286,13 @@ def _step_fail_if_text(ctx, step, result: StepResult):
     result.message = f"none of {texts!r} present, as expected"
 
 
+def _step_fail_if_id(ctx, step, result: StepResult):
+    raw_id = step["id"]
+    if ctx["driver"].id_present(raw_id):
+        raise AssertionError(f"Unexpected element present: id={raw_id!r}")
+    result.message = f"id {raw_id!r} not present, as expected"
+
+
 def _step_assert_current_activity(ctx, step):
     expected = step["activity"]
     actual = ctx["driver"].current_activity()
@@ -305,19 +316,21 @@ ACTIONS = {
     "tap_if_present": _step_tap_if_present,
     "tap_if_absent": _step_tap_if_absent,
     "type_text": _step_type_text,
+    "clear_text": _step_clear_text,
     "hide_keyboard": _step_hide_keyboard,
     "back": _step_back,
     "wait_for_id": _step_wait_for_id,
     "wait_for_text": _step_wait_for_text,
     "optional": _step_optional,
     "fail_if_text": _step_fail_if_text,
+    "fail_if_id": _step_fail_if_id,
     "assert_current_activity": _step_assert_current_activity,
 }
 
 
 VERIFYING_ACTIONS = {
     "assert_text", "assert_any_text", "assert_id", "wait_for_id", "wait_for_text",
-    "fail_if_text", "assert_current_activity",
+    "fail_if_text", "fail_if_id", "assert_current_activity",
 }
 
 

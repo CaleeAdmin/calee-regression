@@ -5,6 +5,12 @@ config/release-platforms.yaml (or its safe True-by-default absence), never
 a hard-coded mandatory=False, and exercises the tablet-only /
 tablet+android / tablet+android+ios / selected-platform-missing /
 optional-platform-omitted combinations end to end through `consolidate`.
+
+Every consolidate call here is run-scoped (see run_context.py): each test
+writes its synthetic component reports straight into a run workspace under
+tmp_path (with REPO_ROOT monkeypatched there) rather than arbitrary paths,
+so the same run-ID/workspace validation a real release run goes through is
+exercised here too.
 """
 
 from __future__ import annotations
@@ -14,9 +20,17 @@ import json
 import pytest
 from click.testing import CliRunner
 
-from calee_regression import release_platforms
+from calee_regression import release_platforms, run_context
 from calee_regression.cli import main
 from calee_regression.models import EXIT_BLOCKED, EXIT_SUCCESS
+
+RUN_ID = "release-test-run-001"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_repo_root(tmp_path, monkeypatch):
+    import calee_regression.cli as cli_mod
+    monkeypatch.setattr(cli_mod, "REPO_ROOT", tmp_path)
 
 
 def test_absent_config_defaults_every_platform_to_mandatory(tmp_path):
@@ -41,33 +55,50 @@ def test_invalid_yaml_raises_a_clear_error(tmp_path):
         release_platforms.load_release_platforms(config)
 
 
-def _write(tmp_path, name, data):
-    path = tmp_path / name
+PASSING_ENVIRONMENT = {"runId": RUN_ID, "status": "pass", "detail": ["Environment and fixture ready."]}
+PASSING_TABLET = {
+    "runId": RUN_ID,
+    "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
+    "scenarios": [{"name": "a", "status": "passed"}],
+}
+PASSING_API = {"runId": RUN_ID, "counts": {"PASS": 1}, "steps": [{"name": "x", "status": "PASS"}]}
+PASSING_MOBILE_UI = {"runId": RUN_ID, "counts": {"PASS": 3}, "steps": [{"name": "y", "status": "PASS"}] * 3}
+PASSING_MANUAL = {
+    "runId": RUN_ID,
+    "checks": [{"title": "Kiosk escape check", "instruction": "swipe down", "expectedResult": "no shade", "status": "pass"}],
+}
+
+
+def _make_workspace(tmp_path, run_id=RUN_ID):
+    workspace = run_context.RunWorkspace(tmp_path, run_id)
+    workspace.ensure_created()
+    # started_at deliberately in the past -- these synthetic reports are
+    # written to disk (today's mtime) *before* the manifest exists, and a
+    # manifest self-initialized with started_at=now would make every one
+    # of them look like it predates the run.
+    manifest = run_context.RunManifest(run_id=run_id, started_at="2020-01-01 00:00:00")
+    manifest.write(workspace.manifest_path)
+    return workspace
+
+
+def _write_component(workspace, component, data):
+    path = workspace.component_report_path(component)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data))
     return str(path)
 
 
-PASSING_TABLET = {
-    "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
-    "scenarios": [{"name": "a", "status": "passed"}],
-}
-PASSING_API = {"counts": {"PASS": 1}, "steps": [{"name": "x", "status": "PASS"}]}
-PASSING_MOBILE_UI = {"counts": {"PASS": 3}, "steps": [{"name": "y", "status": "PASS"}] * 3}
-PASSING_MANUAL = [{"title": "Kiosk escape check", "instruction": "swipe down", "expectedResult": "no shade", "status": "pass"}]
-
-
-def _consolidate(tmp_path, *extra_args):
-    tablet = _write(tmp_path, "tablet.json", PASSING_TABLET)
-    api = _write(tmp_path, "api.json", PASSING_API)
-    manual = _write(tmp_path, "manual.json", PASSING_MANUAL)
+def _consolidate(tmp_path, *extra_args, run_id=RUN_ID):
+    workspace = _make_workspace(tmp_path, run_id)
+    _write_component(workspace, "environment", PASSING_ENVIRONMENT)
+    _write_component(workspace, "tablet", PASSING_TABLET)
+    _write_component(workspace, "mobile-api", PASSING_API)
+    _write_component(workspace, "manual-checks", PASSING_MANUAL)
     runner = CliRunner()
     return runner.invoke(
         main,
         [
-            "consolidate",
-            "--tablet-report", tablet,
-            "--mobile-api-report", api,
-            "--manual-checks", manual,
+            "consolidate", "--run-id", run_id,
             "--out-dir", str(tmp_path / "out"),
             *extra_args,
         ],
@@ -85,31 +116,32 @@ def test_tablet_plus_android_release_blocks_when_android_ui_report_missing(tmp_p
 
 
 def test_tablet_plus_android_release_passes_when_android_ui_report_given(tmp_path):
-    android = _write(tmp_path, "android.json", PASSING_MOBILE_UI)
-    result = _consolidate(tmp_path, "--android-mandatory", "--ios-optional", "--mobile-android-report", android)
+    workspace = _make_workspace(tmp_path)
+    _write_component(workspace, "mobile-android", PASSING_MOBILE_UI)
+    result = _consolidate(tmp_path, "--android-mandatory", "--ios-optional")
     assert result.exit_code == EXIT_SUCCESS
 
 
 def test_tablet_plus_android_plus_ios_release_blocks_when_ios_ui_report_missing(tmp_path):
-    android = _write(tmp_path, "android.json", PASSING_MOBILE_UI)
-    result = _consolidate(tmp_path, "--android-mandatory", "--ios-mandatory", "--mobile-android-report", android)
+    workspace = _make_workspace(tmp_path)
+    _write_component(workspace, "mobile-android", PASSING_MOBILE_UI)
+    result = _consolidate(tmp_path, "--android-mandatory", "--ios-mandatory")
     assert result.exit_code == EXIT_BLOCKED
 
 
 def test_tablet_plus_android_plus_ios_release_passes_when_both_ui_reports_given(tmp_path):
-    android = _write(tmp_path, "android.json", PASSING_MOBILE_UI)
-    ios = _write(tmp_path, "ios.json", PASSING_MOBILE_UI)
-    result = _consolidate(
-        tmp_path, "--android-mandatory", "--ios-mandatory",
-        "--mobile-android-report", android, "--mobile-ios-report", ios,
-    )
+    workspace = _make_workspace(tmp_path)
+    _write_component(workspace, "mobile-android", PASSING_MOBILE_UI)
+    _write_component(workspace, "mobile-ios", PASSING_MOBILE_UI)
+    result = _consolidate(tmp_path, "--android-mandatory", "--ios-mandatory")
     assert result.exit_code == EXIT_SUCCESS
 
 
 def test_selected_platform_missing_report_blocks(tmp_path):
-    # iOS selected as mandatory but no --mobile-ios-report given.
-    android = _write(tmp_path, "android.json", PASSING_MOBILE_UI)
-    result = _consolidate(tmp_path, "--android-mandatory", "--ios-mandatory", "--mobile-android-report", android)
+    # iOS selected as mandatory but no mobile-ios report given.
+    workspace = _make_workspace(tmp_path)
+    _write_component(workspace, "mobile-android", PASSING_MOBILE_UI)
+    result = _consolidate(tmp_path, "--android-mandatory", "--ios-mandatory")
     assert result.exit_code == EXIT_BLOCKED
     assert "CaleeMobile iPhone UI" in result.output
 
@@ -132,6 +164,7 @@ def test_release_platforms_config_file_drives_mandatory_when_no_cli_override(tmp
 
     # Now give the (config-mandatory) android report; ios is config-optional
     # and omitted, so this should pass.
-    android = _write(tmp_path, "android.json", PASSING_MOBILE_UI)
-    result = _consolidate(tmp_path, "--mobile-android-report", android)
+    workspace = run_context.RunWorkspace(tmp_path, RUN_ID)
+    _write_component(workspace, "mobile-android", PASSING_MOBILE_UI)
+    result = _consolidate(tmp_path)
     assert result.exit_code == EXIT_SUCCESS

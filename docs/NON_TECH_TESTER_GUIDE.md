@@ -137,10 +137,13 @@ that looked wrong but wasn't part of an automated screenshot moment):
 
 ## 9. Where the report is saved
 
-Each run creates a folder under `reports/`, and `06 Test Full Calee Solution.command` additionally
-produces one combined report under `reports/consolidated-<date-time>/`, including a
+`06 Test Full Calee Solution.command` creates one run folder under `reports/runs/<run-id>/` at the
+start and every part of that run (Prepare, tablet, CaleeMobile, manual checks) saves into it, so
+everything from one run always lives together. The combined report is under
+`reports/runs/<run-id>/consolidated/`, including a
 `Calee-Regression-<date>-<build>-<PASS|FAIL|BLOCKED>.zip` bundle. `07 Open Latest Report.command`
-always opens the most recent one.
+always opens the most recently *finished* run — you never need to hunt for the right folder
+yourself.
 
 ## 10. What to send to the technical owner
 
