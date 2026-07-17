@@ -4,6 +4,8 @@ cd "$DIR/.." || exit 1
 
 echo "=== Calee Regression — Test CaleeMobile (iPhone) ==="
 echo "Note: the iPhone UI checks only run on a Mac with Xcode installed."
+echo "If you haven't run '01 Prepare Test Environment' for this run yet, this"
+echo "will prepare and verify the regression fixture automatically first."
 echo ""
 
 # shellcheck source=../scripts/ensure_environment.sh
