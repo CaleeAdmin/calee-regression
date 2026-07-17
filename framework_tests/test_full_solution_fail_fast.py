@@ -34,8 +34,10 @@ FULL_SOLUTION_REL = "tester/06 Test Full Calee Solution.command"
 
 # The calee_regression subcommands / launcher steps that only ever run when the
 # environment is actually prepared. If any of these appear in the order log
-# after a failed Prepare, the fail-fast gate has regressed.
-DOWNSTREAM_TEST_STEPS = ("suite", "record-manual-checks", "sync")
+# after a failed Prepare, the fail-fast gate has regressed. ("sync-smoke" is the
+# cross-device synchronization step, Workstream 1 -- it must be gated behind
+# Prepare exactly like the tablet suite and manual checks.)
+DOWNSTREAM_TEST_STEPS = ("suite", "record-manual-checks", "sync-smoke")
 
 
 def _copy_repo(tmp_path: Path) -> Path:
@@ -72,8 +74,10 @@ def _install_fakes(repo: Path, tmp_path: Path) -> Path:
         '    printf "%s\\n" "$cmd" >> "$FAKE_ORDER_LOG"\n'
         '    case "$cmd" in\n'
         "        release-platforms)\n"
+        '            printf "export RELEASE_PLATFORM_TABLET=%s\\n" "${FAKE_TABLET:-true}"\n'
         '            printf "export RELEASE_PLATFORM_ANDROID=%s\\n" "${FAKE_ANDROID:-true}"\n'
         '            printf "export RELEASE_PLATFORM_IOS=%s\\n" "${FAKE_IOS:-true}"\n'
+        '            printf "export RELEASE_FEATURE_SYNCHRONIZATION=%s\\n" "${FAKE_SYNC:-true}"\n'
         "            exit 0 ;;\n"
         "        prepare)\n"
         '            run_id=""\n'
@@ -88,6 +92,17 @@ def _install_fakes(repo: Path, tmp_path: Path) -> Path:
         '            exit "${FAKE_PREPARE_EXIT:-0}" ;;\n'
         "        consolidate)\n"
         '            exit "${FAKE_CONSOLIDATE_EXIT:-3}" ;;\n'
+        "        sync-smoke)\n"
+        # Record the platform sync was asked to drive so a test can prove the
+        # launcher selected the correct in-scope mobile platform (Workstream 1).
+        '            plat=""\n'
+        "            shift 3\n"
+        '            while [ "$#" -gt 0 ]; do\n'
+        '                if [ "$1" = "--platform" ]; then plat="$2"; fi\n'
+        "                shift\n"
+        "            done\n"
+        '            printf "sync-smoke:%s\\n" "$plat" >> "$FAKE_ORDER_LOG"\n'
+        "            exit 0 ;;\n"
         "        *)\n"
         "            exit 0 ;;\n"
         "    esac\n"
@@ -110,7 +125,7 @@ def _install_fakes(repo: Path, tmp_path: Path) -> Path:
 
 
 def _run(repo: Path, fakebin: Path, order_log: Path, prepare_report: dict, *, prepare_exit: int,
-         android: str = "true", ios: str = "true") -> subprocess.CompletedProcess:
+         android: str = "true", ios: str = "true", sync: str = "true") -> subprocess.CompletedProcess:
     env = {
         "PATH": f"{fakebin}:/usr/bin:/bin",
         "HOME": str(repo),
@@ -121,6 +136,7 @@ def _run(repo: Path, fakebin: Path, order_log: Path, prepare_report: dict, *, pr
         "FAKE_PREPARE_EXIT": str(prepare_exit),
         "FAKE_ANDROID": android,
         "FAKE_IOS": ios,
+        "FAKE_SYNC": sync,
     }
     return subprocess.run(
         ["bash", str(repo / FULL_SOLUTION_REL)],
@@ -258,12 +274,30 @@ def test_ready_prepare_runs_every_downstream_step(tmp_path):
     assert "caleemobile:api-only" in steps  # Client API, once
     assert "caleemobile:android --ui-only" in steps
     assert "caleemobile:ios --ui-only" in steps
+    # Cross-device synchronization ran (Workstream 1) -- the positive path must
+    # prove sync is actually invoked, not just gated behind Prepare.
+    assert "sync-smoke" in steps
     assert "record-manual-checks" in steps
     assert "consolidate" in steps
     assert "stop-appium" in steps
     # Client API runs exactly once, and strictly before the platform UI runs.
     assert steps.count("caleemobile:api-only") == 1
     assert steps.index("caleemobile:api-only") < steps.index("caleemobile:android --ui-only")
+    # Full ordering: Prepare -> tablet -> API -> Android/iOS UI -> sync ->
+    # manual checks -> consolidate. Sync runs AFTER both mobile UI legs and
+    # BEFORE manual checks and consolidation.
+    assert (
+        steps.index("prepare")
+        < steps.index("suite")
+        < steps.index("caleemobile:api-only")
+        < steps.index("caleemobile:android --ui-only")
+        < steps.index("caleemobile:ios --ui-only")
+        < steps.index("sync-smoke")
+        < steps.index("record-manual-checks")
+        < steps.index("consolidate")
+    )
+    # Sync drove the preferred in-scope mobile platform (Android).
+    assert "sync-smoke:android" in steps
     # No fail-fast messaging on the happy path.
     assert "FAIL FAST" not in result.stdout
 
@@ -282,6 +316,41 @@ def test_ready_prepare_honors_release_platform_scope(tmp_path):
     assert "caleemobile:ios --ui-only" not in steps
 
 
+def test_ready_prepare_sync_uses_remaining_platform_when_android_excluded(tmp_path):
+    # A platform-excluded release must still run sync on the correct REMAINING
+    # mobile platform: with Android out of scope, sync drives iOS (Workstream 1).
+    repo = _copy_repo(tmp_path)
+    fakebin = _install_fakes(repo, tmp_path)
+    order_log = tmp_path / "order.log"
+    report = {"status": "pass", "detail": ["ready"]}
+    _run(repo, fakebin, order_log, report, prepare_exit=0, android="false", ios="true")
+    steps = _order(order_log)
+
+    assert "sync-smoke" in steps
+    assert "sync-smoke:ios" in steps
+    assert "sync-smoke:android" not in steps
+    # The excluded Android UI leg still didn't run.
+    assert "caleemobile:android --ui-only" not in steps
+
+
+def test_ready_prepare_sync_has_no_platform_when_no_mobile_in_scope(tmp_path):
+    # No in-scope CaleeMobile platform (tablet-only mobile scope): a mandatory
+    # sync has no mobile surface to verify against. The launcher must invoke
+    # sync with --platform none (the sync-smoke command then records BLOCKED --
+    # verified in the sync consolidation tests), never silently skip it.
+    repo = _copy_repo(tmp_path)
+    fakebin = _install_fakes(repo, tmp_path)
+    order_log = tmp_path / "order.log"
+    report = {"status": "pass", "detail": ["ready"]}
+    _run(repo, fakebin, order_log, report, prepare_exit=0, android="false", ios="false")
+    steps = _order(order_log)
+
+    assert "sync-smoke" in steps  # not silently skipped
+    assert "sync-smoke:none" in steps
+    assert "sync-smoke:android" not in steps
+    assert "sync-smoke:ios" not in steps
+
+
 # --- Structural guard (protects the gate against a future refactor) ------
 
 
@@ -296,6 +365,7 @@ def test_script_gates_downstream_steps_behind_prepare_status(tmp_path):
         "bash scripts/test_caleemobile.sh api-only",
         "bash scripts/test_caleemobile.sh android --ui-only",
         "bash scripts/test_caleemobile.sh ios --ui-only",
+        "sync-smoke",
         "record-manual-checks --run-id",
     ):
         assert needle in text

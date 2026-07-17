@@ -98,6 +98,10 @@ def test_consolidate_passes_when_everything_is_provided_and_clean(tmp_path):
             # missing report would correctly BLOCK. See
             # test_release_platforms.py for the platform-driven cases.
             "--android-optional", "--ios-optional",
+            # Cross-device sync isn't exercised by this test's tablet-only
+            # scope -- opt out of the Workstream 1 sync gating (see
+            # test_sync_consolidation.py for that).
+            "--sync-optional",
             # The tablet IS in scope, so its build identity is mandatory to
             # know (Phase 3): provide the detected version so identity is
             # available and clean. A release-gating tablet run must also record
@@ -175,6 +179,7 @@ def test_consolidate_passes_on_dirty_build_when_explicitly_approved(tmp_path):
     result = CliRunner().invoke(
         main,
         ["consolidate", "--run-id", RUN_ID, "--android-optional", "--ios-optional",
+         "--sync-optional",
          "--calee-build-version", "0.3.22", "--calee-dirty", "--allow-dirty",
          "--calee-application-id", "com.viso.calee", "--calee-version-code", "322",
          "--out-dir", str(tmp_path / "out")],
@@ -204,7 +209,7 @@ def test_consolidate_allow_unknown_build_identity_opts_out(tmp_path):
     result = CliRunner().invoke(
         main,
         ["consolidate", "--run-id", RUN_ID, "--android-optional", "--ios-optional",
-         "--allow-unknown-build-identity", "--out-dir", str(tmp_path / "out")],
+         "--allow-unknown-build-identity", "--sync-optional", "--out-dir", str(tmp_path / "out")],
     )
     assert result.exit_code == EXIT_SUCCESS
     assert "PASS" in result.output
