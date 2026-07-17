@@ -53,21 +53,27 @@ CaleeMobile UI assertion, `run_ui_suite.py` (in `CaleeMobile-Regression/ui/`) ve
   run's `reports/runs/<run-id>/environment/results.json`) must be exactly `"ok"`. Anything else
   (absent, `blocked`, `blocked_missing_credentials`, `not_run`, ...) BLOCKS before a single UI
   assertion runs — never assert against fixture data that was never confirmed present.
-- **The fixture's backend matches what CaleeMobile's build actually talks to.** This currently
-  has a hard limitation worth being explicit about: CaleeMobile's `CaleeHubClient()` has **no
-  build-time backend override** today (no dart-define/flavor mechanism) — every build always
-  talks to `https://hub.calee.com.au` (see `run_ui_suite.py::KNOWN_CALEE_MOBILE_BACKEND`, sourced
-  directly from CaleeMobile's `lib/app/calee_app.dart` and `lib/data/api/calee_hub_client.dart`).
-  If the fixture was reset against a different backend (e.g. `hub-dev.calee.com.au`), that
-  mismatch is detected and BLOCKS before any UI assertion — but the fixture must actually be
-  reset against **production** for CaleeMobile's mobile UI checks to run meaningfully at all,
-  until CaleeMobile gains real backend configurability. Treat that as a standing constraint on
-  what a mobile UI PASS can mean today, not a bug in this check.
+- **The fixture's backend matches the backend CaleeMobile was actually built against, and the
+  backend the app actually resolved.** CaleeMobile now supports a real build-time backend
+  override — `--dart-define=CALEE_API_BASE=…`, defaulting safely to `https://hub.calee.com.au`
+  (see CaleeMobile's `lib/config/calee_environment.dart`). The launcher passes this run's
+  verified backend to `run_ui_suite.py` as `--mobile-backend` (built into the app securely via
+  `--dart-define=CALEE_API_BASE`) and as `--expected-backend` (the fixture backend). Before the
+  run, `check_fixture_and_backend_alignment` BLOCKS if the mobile backend is unspecified or
+  differs from the fixture backend — it never infers that an unspecified backend was verified.
+  After the run, `verify_resolved_backend` reads the backend the app *reported actually resolving*
+  (the `CALEE_ENV backend=…` diagnostic line CaleeMobile prints in a debug/regression build) and
+  BLOCKS if it doesn't match — catching, for example, a malformed override that silently fell
+  back to the production default. A mobile UI PASS therefore now certifies the app ran against the
+  same backend the fixture was reset on, whichever backend that is.
 
 Both checks are wired through `scripts/test_caleemobile.sh`, which reads this run's own
-`environment/results.json` and exports `CALEE_FIXTURE_STATUS`/`CALEE_EXPECTED_BACKEND` before
-invoking `run_ui_suite.py` — see `check_fixture_and_backend_alignment` there and
-`docs/RELEASE_POLICY.md`.
+`environment/results.json` and exports `CALEE_FIXTURE_STATUS`/`CALEE_EXPECTED_BACKEND`/
+`CALEE_MOBILE_BACKEND` before invoking `run_ui_suite.py` — see
+`check_fixture_and_backend_alignment` and `verify_resolved_backend` there and
+`docs/RELEASE_POLICY.md`. The same script now also runs `prepare` automatically (with this run's
+ID) when a standalone `03/04 Test CaleeMobile …` launch has no same-run environment report yet,
+and BLOCKS the mobile UI checks unless Prepare passes and the fixture verifies `ok`.
 
 ## "fresh" state
 
