@@ -69,6 +69,45 @@ def is_valid_run_id(run_id: "str | None") -> bool:
     return bool(run_id) and bool(RUN_ID_RE.match(run_id))
 
 
+def _exit_severity(code: "int | None") -> int:
+    """Severity of a process exit code for "worst-wins" recording:
+    FAIL (1) is the most severe, then BLOCKED / any other non-zero, then a
+    clean PASS (0). A PASS is the least severe, so it can never overwrite an
+    earlier non-PASS result.
+    """
+    if code is None:
+        return -1
+    if code == 0:
+        return 0  # pass -- least severe
+    if code == 1:
+        return 2  # fail (a real product regression) -- most severe
+    return 1  # blocked / any other non-zero
+
+
+def worst_exit_code(codes: "list[int | None]") -> "int | None":
+    """The most severe of a sequence of exit codes, so a component's recorded
+    result can never *improve* across repeated recordings within one run:
+
+      * a later PASS (0) never overwrites an earlier FAIL (1) or BLOCKED;
+      * a later FAIL escalates an earlier BLOCKED to FAIL;
+      * an earlier FAIL is preserved against a later BLOCKED or PASS.
+
+    This is what makes "an initial API FAIL cannot be replaced by a later
+    PASS" hold even if some path records the same component twice -- the
+    single-execution launcher change (Phase 3) prevents the duplicate in the
+    first place; this is the defence-in-depth backstop. Returns None only when
+    every code is None.
+    """
+    worst = None
+    worst_sev = -1
+    for code in codes:
+        sev = _exit_severity(code)
+        if code is not None and sev > worst_sev:
+            worst_sev = sev
+            worst = code
+    return worst
+
+
 @dataclass(frozen=True)
 class RunWorkspace:
     repo_root: Path
@@ -123,6 +162,13 @@ class RunManifest:
     release_platform_profile: dict = field(default_factory=dict)
     report_paths: dict = field(default_factory=dict)
     exit_codes: dict = field(default_factory=dict)
+    # Full, auditable per-component recording history: component -> list of
+    # {"exitCode": int, "reportPath": str|None} in the order they were
+    # recorded. exit_codes[component] is always the worst-wins summary of
+    # these (see record_component), so a duplicate recording is never
+    # silently dropped -- it is retained here AND can never improve the
+    # effective result.
+    component_attempts: dict = field(default_factory=dict)
     device_ids: dict = field(default_factory=dict)
     build_versions: dict = field(default_factory=dict)
     git_shas: dict = field(default_factory=dict)
@@ -139,6 +185,7 @@ class RunManifest:
             "releasePlatformProfile": dict(self.release_platform_profile),
             "reportPaths": dict(self.report_paths),
             "exitCodes": dict(self.exit_codes),
+            "componentAttempts": {k: list(v) for k, v in self.component_attempts.items()},
             "deviceIds": dict(self.device_ids),
             "buildVersions": dict(self.build_versions),
             "gitShas": dict(self.git_shas),
@@ -157,6 +204,7 @@ class RunManifest:
             release_platform_profile=dict(data.get("releasePlatformProfile", {})),
             report_paths=dict(data.get("reportPaths", {})),
             exit_codes=dict(data.get("exitCodes", {})),
+            component_attempts={k: list(v) for k, v in data.get("componentAttempts", {}).items()},
             device_ids=dict(data.get("deviceIds", {})),
             build_versions=dict(data.get("buildVersions", {})),
             git_shas=dict(data.get("gitShas", {})),
@@ -186,13 +234,29 @@ class RunManifest:
         if report_path is not None:
             self.report_paths[component] = report_path
         if exit_code is not None:
-            self.exit_codes[component] = exit_code
+            # Append to the auditable attempt history and recompute the
+            # worst-wins effective exit code, so recording the same component
+            # twice can never *improve* its result (an initial FAIL survives a
+            # later PASS). Duplicate recordings are retained, never silently
+            # overwritten. See worst_exit_code and Phase 3.
+            attempts = self.component_attempts.setdefault(component, [])
+            attempts.append({"exitCode": exit_code, "reportPath": report_path})
+            self.exit_codes[component] = worst_exit_code(
+                [a["exitCode"] for a in attempts]
+            )
         if device_id is not None:
             self.device_ids[component] = device_id
         if build_version is not None:
             self.build_versions[component] = build_version
         if git_sha is not None:
             self.git_shas[component] = git_sha
+
+    def effective_exit_code(self, component: str) -> "int | None":
+        """The worst-wins effective exit code recorded for a component, or
+        None if it was never recorded. Equivalent to exit_codes[component]
+        (kept in sync by record_component); exposed as a method so
+        consolidation can read it without assuming the dict is populated."""
+        return self.exit_codes.get(component)
 
 
 def extract_report_run_id(report: dict) -> "str | None":

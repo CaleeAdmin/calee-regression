@@ -1,26 +1,41 @@
 #!/usr/bin/env bash
-# Shared by "03 Test CaleeMobile Android.command" and
-# "04 Test CaleeMobile iPhone.command" so the two launchers don't duplicate
-# the same orchestration logic. Runs CaleeMobile-Regression's backend API
-# checks and its per-platform UI checks via run_ui_suite.py, which resolves
-# a real device (never a hardcoded "-d android"/"-d ios"), passes test
-# credentials to the CaleeMobile process securely (never as a bare CLI
-# argument another process could read off the process list), and writes a
-# structured results.json for consolidation.
+# Shared by "03 Test CaleeMobile Android.command",
+# "04 Test CaleeMobile iPhone.command" and "06 Test Full Calee Solution"
+# so the launchers don't duplicate the same orchestration logic. Runs
+# CaleeMobile-Regression's backend Client API checks and its per-platform UI
+# checks via run_ui_suite.py, which resolves a real device (never a hardcoded
+# "-d android"/"-d ios"), passes test credentials to the CaleeMobile process
+# securely (never as a bare CLI argument another process could read off the
+# process list), and writes a structured results.json for consolidation.
+#
+# Modes (Phase 3 -- run the Client API regression EXACTLY ONCE per release):
+#   test_caleemobile.sh <android|ios>              full: Prepare + API + UI
+#   test_caleemobile.sh api-only                   Prepare + Client API only
+#   test_caleemobile.sh <android|ios> --ui-only    Prepare + UI only (no API)
+#
+# The standalone "03/04 Test CaleeMobile ..." launchers still use the full
+# mode (Prepare + API + selected UI). The full-solution launcher ("06 Test
+# Full Calee Solution") instead runs `api-only` ONCE and then `--ui-only`
+# per selected platform, so the device-independent Client API suite is never
+# re-run once per platform and an Android or iOS run can never overwrite the
+# one reports/runs/<run-id>/mobile-api/results.json. `--skip-api` is an alias
+# for `--ui-only`.
 #
 # Execution order (see docs/RELEASE_POLICY.md and Phase 1 of the release
 # plan). NEITHER the Client API regression NOR the mobile UI regression may
 # run before Prepare has passed and this run's environment/fixture/backend
 # have been verified:
 #
-#   1. validate local setup (platform arg, CaleeMobile-Regression sibling)
+#   1. validate local setup (platform/mode arg, CaleeMobile-Regression sibling)
 #   2. create or reuse the run ID and its workspace
 #   3. run Prepare when this run has no environment report yet
 #   4. validate the same-run environment report (belongs to THIS run)
 #   5. validate the fixture status ("ok") and resolve the verified backend
-#   6. run the Client API regression (against the verified backend)
-#   7. run the mobile UI regression (against the same verified backend)
-#   8. record both components into the run manifest
+#   6. run the Client API regression (against the verified backend) -- when
+#      this mode runs the API
+#   7. run the mobile UI regression (against the same verified backend) --
+#      when this mode runs the UI
+#   8. record the component(s) this mode produced into the run manifest
 #
 # The old ordering ran the Client API regression FIRST -- before Prepare had
 # even reset/verified the fixture -- so the API suite could exercise an
@@ -29,13 +44,42 @@
 # BOTH suites, and the one verified backend is passed consistently to each.
 set -uo pipefail
 
-PLATFORM="${1:-}"
-if [ "$PLATFORM" != "android" ] && [ "$PLATFORM" != "ios" ]; then
-    echo "Usage: test_caleemobile.sh <android|ios>" >&2
+# --- Argument parsing: a platform and/or an explicit mode ----------------
+# Backward compatible: a bare "android"/"ios" is the full mode. "api-only"
+# needs no platform (the Client API suite is device-independent). "--ui-only"
+# (alias "--skip-api") runs only the per-platform UI checks.
+MODE="full"
+PLATFORM=""
+for arg in "$@"; do
+    case "$arg" in
+        android | ios) PLATFORM="$arg" ;;
+        api-only | --api-only) MODE="api-only" ;;
+        ui-only | --ui-only | --skip-api) MODE="ui-only" ;;
+        *)
+            echo "Usage: test_caleemobile.sh <android|ios> [--ui-only] | api-only" >&2
+            exit 2
+            ;;
+    esac
+done
+
+RUN_API=false
+RUN_UI=false
+case "$MODE" in
+    full)
+        RUN_API=true
+        RUN_UI=true
+        ;;
+    api-only) RUN_API=true ;;
+    ui-only) RUN_UI=true ;;
+esac
+
+# Any mode that runs the UI needs to know which platform; api-only does not.
+if [ "$RUN_UI" = true ] && [ "$PLATFORM" != "android" ] && [ "$PLATFORM" != "ios" ]; then
+    echo "Usage: test_caleemobile.sh <android|ios> [--ui-only] | api-only" >&2
     exit 2
 fi
 
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
 # --- Step 1/2: validate local setup, create/reuse the run ID -------------
@@ -47,10 +91,21 @@ cd "$SCRIPT_DIR" || exit 1
 CALEE_RUN_ID="${CALEE_RUN_ID:-mobile-standalone-$(date +%Y%m%d-%H%M%S)}"
 export CALEE_RUN_ID
 RUN_DIR="reports/runs/$CALEE_RUN_ID"
+mkdir -p "$RUN_DIR"
 API_DIR="$RUN_DIR/mobile-api"
-UI_DIR="$RUN_DIR/mobile-$PLATFORM"
-mkdir -p "$API_DIR" "$UI_DIR"
+API_REPORT="$API_DIR/results.json"
+UI_DIR=""
+UI_REPORT=""
+if [ "$RUN_API" = true ]; then
+    mkdir -p "$API_DIR"
+fi
+if [ "$RUN_UI" = true ]; then
+    UI_DIR="$RUN_DIR/mobile-$PLATFORM"
+    UI_REPORT="$UI_DIR/results.json"
+    mkdir -p "$UI_DIR"
+fi
 echo "Run ID: $CALEE_RUN_ID"
+echo "Mode: $MODE${PLATFORM:+ ($PLATFORM)}"
 
 SIBLING="../CaleeMobile-Regression"
 if [ ! -d "$SIBLING/api" ]; then
@@ -60,8 +115,6 @@ if [ ! -d "$SIBLING/api" ]; then
 fi
 echo "[OK] CaleeMobile source found"
 
-API_REPORT="$API_DIR/results.json"
-UI_REPORT="$UI_DIR/results.json"
 # Default both suites to BLOCKED (exit 3): if the Prepare gate below refuses
 # to let them run, that is exactly the state they must be recorded in --
 # never a silent pass by never having executed.
@@ -135,15 +188,17 @@ print(f'ENV_BACKEND={shlex.quote(backend)}')
     fi
 fi
 
-# --- Step 6/7: run the two suites, but only once the gate has passed ------
+# --- Step 6/7: run the suites this mode selects, but only once the gate has passed.
 # CALEE_TEST_EMAIL/CALEE_TEST_PASSWORD are read from the environment by
 # run_regression.py / run_ui_suite.py themselves (never passed as a bare CLI
 # argument here), so they never appear in a process listing (ps) or in any
 # echoed command.
 if [ -n "$PREPARE_BLOCK" ]; then
     echo ""
-    echo "BLOCKED: the CaleeMobile $PLATFORM checks — $PREPARE_BLOCK"
-    echo "Neither the Client API checks nor the $PLATFORM UI checks ran (Prepare must pass first)."
+    echo "BLOCKED: the CaleeMobile ${PLATFORM:-Client API} checks — $PREPARE_BLOCK"
+    if [ "$MODE" = "full" ]; then
+        echo "Neither the Client API checks nor the $PLATFORM UI checks ran (Prepare must pass first)."
+    fi
     API_STATUS=3
     UI_STATUS=3
 else
@@ -154,60 +209,101 @@ else
     fi
 
     # --- Step 6: Client API regression (device-independent) ---
-    echo ""
-    echo "Running the CaleeMobile backend API checks..."
-    ( cd "$SIBLING/api" && python3 run_regression.py --report "$SCRIPT_DIR/$API_REPORT" )
-    API_STATUS=$?
+    if [ "$RUN_API" = true ]; then
+        echo ""
+        echo "Running the CaleeMobile backend API checks..."
+        (cd "$SIBLING/api" && python3 run_regression.py --report "$SCRIPT_DIR/$API_REPORT")
+        API_STATUS=$?
+    fi
 
     # --- Step 7: mobile UI regression ---
-    if [ -z "${CALEE_TEST_EMAIL:-}" ] || [ -z "${CALEE_TEST_PASSWORD:-}" ]; then
-        echo ""
-        echo "BLOCKED: the CaleeMobile $PLATFORM UI checks need CALEE_TEST_EMAIL and CALEE_TEST_PASSWORD to be"
-        echo "configured. Ask your technical owner to set these (see docs/SETUP_MAC.md). Skipping — the backend"
-        echo "API checks above still ran."
-    elif ! command -v flutter >/dev/null 2>&1; then
-        echo ""
-        if [ "$PLATFORM" = "ios" ]; then
-            echo "BLOCKED: the CaleeMobile iPhone UI checks need a Mac with Flutter and Xcode installed. Skipping — the backend API checks above still ran."
+    if [ "$RUN_UI" = true ]; then
+        if [ -z "${CALEE_TEST_EMAIL:-}" ] || [ -z "${CALEE_TEST_PASSWORD:-}" ]; then
+            echo ""
+            echo "BLOCKED: the CaleeMobile $PLATFORM UI checks need CALEE_TEST_EMAIL and CALEE_TEST_PASSWORD to be"
+            echo "configured. Ask your technical owner to set these (see docs/SETUP_MAC.md)."
+        elif ! command -v flutter >/dev/null 2>&1; then
+            echo ""
+            if [ "$PLATFORM" = "ios" ]; then
+                echo "BLOCKED: the CaleeMobile iPhone UI checks need a Mac with Flutter and Xcode installed."
+            else
+                echo "BLOCKED: the CaleeMobile Android UI checks need Flutter installed."
+            fi
+        elif [ ! -d "$SIBLING/ui" ]; then
+            echo ""
+            echo "BLOCKED: CaleeMobile-Regression/ui was not found next to this folder."
         else
-            echo "BLOCKED: the CaleeMobile Android UI checks need Flutter installed. Skipping — the backend API checks above still ran."
-        fi
-    elif [ ! -d "$SIBLING/ui" ]; then
-        echo ""
-        echo "BLOCKED: CaleeMobile-Regression/ui was not found next to this folder. Skipping — the backend API checks above still ran."
-    else
-        echo ""
-        echo "Preparing the CaleeMobile $PLATFORM UI checks..."
-        if ! ( cd "$SIBLING/ui" && flutter pub get ) > "$SCRIPT_DIR/$UI_DIR/pub-get.log" 2>&1; then
-            echo "BLOCKED: \`flutter pub get\` failed in CaleeMobile-Regression/ui — a Flutter toolchain/dependency"
-            echo "problem, not a product failure. See $UI_DIR/pub-get.log"
-            UI_STATUS=3
-        else
-            # CALEE_MOBILE_BACKEND / CALEE_EXPECTED_BACKEND / CALEE_FIXTURE_STATUS
-            # are exported above and read by run_ui_suite.py from the environment.
-            ( cd "$SIBLING/ui" && python3 run_ui_suite.py \
-                --platform "$PLATFORM" \
-                --report "$SCRIPT_DIR/$UI_REPORT" \
-                --log "$SCRIPT_DIR/$UI_DIR/flutter.log" )
-            UI_STATUS=$?
+            echo ""
+            echo "Preparing the CaleeMobile $PLATFORM UI checks..."
+            if ! (cd "$SIBLING/ui" && flutter pub get) >"$SCRIPT_DIR/$UI_DIR/pub-get.log" 2>&1; then
+                echo "BLOCKED: \`flutter pub get\` failed in CaleeMobile-Regression/ui — a Flutter toolchain/dependency"
+                echo "problem, not a product failure. See $UI_DIR/pub-get.log"
+                UI_STATUS=3
+            else
+                # CALEE_MOBILE_BACKEND / CALEE_EXPECTED_BACKEND / CALEE_FIXTURE_STATUS
+                # are exported above and read by run_ui_suite.py from the environment.
+                (cd "$SIBLING/ui" && python3 run_ui_suite.py \
+                    --platform "$PLATFORM" \
+                    --report "$SCRIPT_DIR/$UI_REPORT" \
+                    --log "$SCRIPT_DIR/$UI_DIR/flutter.log")
+                UI_STATUS=$?
+            fi
         fi
     fi
 fi
 
-# --- Step 8: record both components into the run manifest ----------------
-python -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component mobile-api \
-    --report-path "$API_REPORT" --exit-code "$API_STATUS" || true
-python -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component "mobile-$PLATFORM" \
-    --report-path "$UI_REPORT" --exit-code "$UI_STATUS" || true
+# --- Step 8: record the component(s) this mode produced ------------------
+# api-only records ONLY mobile-api; --ui-only records ONLY mobile-<platform>.
+# This is what guarantees an Android or iOS UI run can never touch (let alone
+# overwrite) the one mobile-api report. record-component itself additionally
+# keeps an auditable attempt history and never lets a recorded result improve
+# across recordings (see calee_regression/run_context.py), so even a stray
+# second recording can't launder an earlier FAIL into a PASS.
+if [ "$RUN_API" = true ]; then
+    python -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component mobile-api \
+        --report-path "$API_REPORT" --exit-code "$API_STATUS" || true
+fi
+if [ "$RUN_UI" = true ]; then
+    python -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component "mobile-$PLATFORM" \
+        --report-path "$UI_REPORT" --exit-code "$UI_STATUS" || true
+fi
 
 echo ""
-if [ "$API_STATUS" -eq 1 ] || [ "$UI_STATUS" -eq 1 ]; then
-    echo "FAIL: CaleeMobile $PLATFORM — a real problem was found (see messages above)."
-    exit 1
-elif [ "$API_STATUS" -ne 0 ] || [ "$UI_STATUS" -ne 0 ]; then
-    echo "BLOCKED: CaleeMobile $PLATFORM — see messages above. This is NOT necessarily a product failure."
-    exit 3
-else
-    echo "PASS: CaleeMobile $PLATFORM"
-    exit 0
-fi
+case "$MODE" in
+    api-only)
+        if [ "$API_STATUS" -eq 1 ]; then
+            echo "FAIL: CaleeMobile Client API — a real problem was found (see messages above)."
+            exit 1
+        elif [ "$API_STATUS" -ne 0 ]; then
+            echo "BLOCKED: CaleeMobile Client API — see messages above. This is NOT necessarily a product failure."
+            exit 3
+        else
+            echo "PASS: CaleeMobile Client API"
+            exit 0
+        fi
+        ;;
+    ui-only)
+        if [ "$UI_STATUS" -eq 1 ]; then
+            echo "FAIL: CaleeMobile $PLATFORM UI — a real problem was found (see messages above)."
+            exit 1
+        elif [ "$UI_STATUS" -ne 0 ]; then
+            echo "BLOCKED: CaleeMobile $PLATFORM UI — see messages above. This is NOT necessarily a product failure."
+            exit 3
+        else
+            echo "PASS: CaleeMobile $PLATFORM UI"
+            exit 0
+        fi
+        ;;
+    *)
+        if [ "$API_STATUS" -eq 1 ] || [ "$UI_STATUS" -eq 1 ]; then
+            echo "FAIL: CaleeMobile $PLATFORM — a real problem was found (see messages above)."
+            exit 1
+        elif [ "$API_STATUS" -ne 0 ] || [ "$UI_STATUS" -ne 0 ]; then
+            echo "BLOCKED: CaleeMobile $PLATFORM — see messages above. This is NOT necessarily a product failure."
+            exit 3
+        else
+            echo "PASS: CaleeMobile $PLATFORM"
+            exit 0
+        fi
+        ;;
+esac

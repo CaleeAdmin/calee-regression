@@ -175,3 +175,66 @@ def test_validate_component_report_allows_small_clock_skew(tmp_path):
         {"runId": "release-test-010"}, report_path=report_path, run_id="release-test-010",
         workspace=workspace, component="tablet", run_started_at_epoch=time.time() + 5,
     )
+
+
+# --- Phase 3: worst-wins recording (a result can never improve) ----------
+
+
+def test_worst_exit_code_prefers_fail_then_blocked_then_pass():
+    # FAIL (1) is the most severe, then BLOCKED / other non-zero, then PASS (0).
+    assert run_context.worst_exit_code([0, 1]) == 1  # a later PASS can't clear a FAIL
+    assert run_context.worst_exit_code([1, 0]) == 1  # an earlier FAIL survives a later PASS
+    assert run_context.worst_exit_code([0, 3]) == 3  # BLOCKED beats PASS
+    assert run_context.worst_exit_code([3, 1]) == 1  # FAIL escalates BLOCKED
+    assert run_context.worst_exit_code([0, 0]) == 0  # all clean stays PASS
+    assert run_context.worst_exit_code([None, None]) is None
+    assert run_context.worst_exit_code([None, 0]) == 0
+
+
+def _fresh_manifest():
+    return run_context.RunManifest(run_id="release-test-attempts", started_at="2020-01-01 00:00:00")
+
+
+def test_record_component_fail_survives_a_later_pass():
+    # Phase 3 requirement 2: an initial API FAIL cannot be replaced by a later
+    # PASS. The Client API suite runs once now, but even a stray second
+    # recording must never launder the FAIL into a PASS.
+    manifest = _fresh_manifest()
+    manifest.record_component("mobile-api", report_path="a.json", exit_code=1)
+    manifest.record_component("mobile-api", report_path="b.json", exit_code=0)
+    assert manifest.exit_codes["mobile-api"] == 1
+    assert manifest.effective_exit_code("mobile-api") == 1
+
+
+def test_record_component_keeps_an_auditable_attempt_history():
+    manifest = _fresh_manifest()
+    manifest.record_component("mobile-api", report_path="a.json", exit_code=1)
+    manifest.record_component("mobile-api", report_path="b.json", exit_code=0)
+    attempts = manifest.component_attempts["mobile-api"]
+    assert [a["exitCode"] for a in attempts] == [1, 0]
+    assert [a["reportPath"] for a in attempts] == ["a.json", "b.json"]
+    # Round-trips through the manifest JSON.
+    restored = run_context.RunManifest.from_dict(manifest.to_dict())
+    assert restored.component_attempts["mobile-api"] == attempts
+    assert restored.exit_codes["mobile-api"] == 1
+
+
+def test_record_component_isolates_distinct_components():
+    # Phase 3 requirements 3 & 4: a platform failure cannot overwrite another
+    # component's recorded evidence -- each component is recorded independently.
+    manifest = _fresh_manifest()
+    manifest.record_component("mobile-api", exit_code=0)
+    manifest.record_component("mobile-ios", exit_code=0)
+    manifest.record_component("mobile-android", exit_code=1)  # Android fails
+    assert manifest.exit_codes["mobile-api"] == 0  # API evidence intact
+    assert manifest.exit_codes["mobile-ios"] == 0  # iOS evidence intact
+    assert manifest.exit_codes["mobile-android"] == 1
+
+    # And symmetrically, a later iOS failure leaves Android/API alone.
+    manifest2 = _fresh_manifest()
+    manifest2.record_component("mobile-api", exit_code=0)
+    manifest2.record_component("mobile-android", exit_code=0)
+    manifest2.record_component("mobile-ios", exit_code=1)
+    assert manifest2.exit_codes["mobile-api"] == 0
+    assert manifest2.exit_codes["mobile-android"] == 0
+    assert manifest2.exit_codes["mobile-ios"] == 1

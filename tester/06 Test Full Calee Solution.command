@@ -42,41 +42,64 @@ python -m calee_regression prepare --config "$CALEE_TEST_CONFIG" --suite tablet-
 PREPARE_STATUS=$?
 
 echo ""
+echo "--- Collecting pre-run build identity ---"
+# Phase 4: capture which builds are about to be tested BEFORE any test runs and
+# save it to reports/runs/$CALEE_RUN_ID/identity/pre.json. A matching post.json
+# is captured after testing (below); consolidate BLOCKS when an in-scope app's
+# identity changed during the run (e.g. the CaleeMobile SHA or the installed
+# tablet package changed mid-run). Never collected only at consolidation time.
+python -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase pre >/dev/null
+
+echo ""
 echo "--- Step 2: Calee Tablet ---"
 python -m calee_regression suite --config "$CALEE_TEST_CONFIG" --suite full-tester --run-id "$CALEE_RUN_ID"
 
+echo ""
+echo "--- Step 3: CaleeMobile Client API (device-independent — run once) ---"
+# The Client API suite is device-independent, so it runs EXACTLY ONCE for the
+# whole release, never once per platform. The Android and iOS steps below run
+# the UI ONLY (--ui-only), so neither can re-run or overwrite this run's one
+# reports/runs/$CALEE_RUN_ID/mobile-api/results.json. An initial API result
+# therefore stands for the whole release; see scripts/test_caleemobile.sh and
+# Phase 3.
+bash scripts/test_caleemobile.sh api-only
+
 if [ "$RELEASE_PLATFORM_ANDROID" = "true" ]; then
     echo ""
-    echo "--- Step 3: CaleeMobile Android ---"
-    bash scripts/test_caleemobile.sh android
+    echo "--- Step 4: CaleeMobile Android UI ---"
+    bash scripts/test_caleemobile.sh android --ui-only
 else
     echo ""
-    echo "--- Step 3: CaleeMobile Android — SKIPPED (not part of this release; see config/release-platforms.yaml) ---"
+    echo "--- Step 4: CaleeMobile Android UI — SKIPPED (not part of this release; see config/release-platforms.yaml) ---"
 fi
 
 if [ "$RELEASE_PLATFORM_IOS" = "true" ]; then
     echo ""
-    echo "--- Step 4: CaleeMobile iPhone ---"
-    bash scripts/test_caleemobile.sh ios
+    echo "--- Step 5: CaleeMobile iPhone UI ---"
+    bash scripts/test_caleemobile.sh ios --ui-only
 else
     echo ""
-    echo "--- Step 4: CaleeMobile iPhone — SKIPPED (not part of this release; see config/release-platforms.yaml) ---"
+    echo "--- Step 5: CaleeMobile iPhone UI — SKIPPED (not part of this release; see config/release-platforms.yaml) ---"
 fi
 
 echo ""
-echo "--- Step 5: Manual Checks ---"
+echo "--- Step 6: Manual Checks ---"
 python -m calee_regression record-manual-checks --run-id "$CALEE_RUN_ID"
 
 echo ""
-echo "--- Recording build identity ---"
-# Automatic build-identity collection (Phase 3). Detect the CaleeMobile
+echo "--- Collecting post-run build identity ---"
+# Automatic build-identity collection (Phase 3/4). Detect the CaleeMobile
 # version/commit/dirty state from its checkout, and the Calee tablet
 # identity from adb/source where available, so a release PASS can prove
 # exactly which builds were tested. A technical owner can still override any
 # value by exporting the matching env var; the AUTO_* values only fill the
 # gaps. Never fabricated: an undetectable identity stays unavailable, which
 # the consolidator turns into BLOCKED for an in-scope app.
-eval "$(python -m calee_regression build-identity)"
+#
+# --phase post also writes reports/runs/$CALEE_RUN_ID/identity/post.json; the
+# consolidator compares it against pre.json (captured before testing) and
+# BLOCKS when an in-scope app's identity changed during the run (Phase 4).
+eval "$(python -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase post)"
 CALEEMOBILE_BUILD_VERSION="${CALEEMOBILE_BUILD_VERSION:-${AUTO_CALEEMOBILE_BUILD_VERSION:-}}"
 CALEEMOBILE_GIT_SHA="${CALEEMOBILE_GIT_SHA:-${AUTO_CALEEMOBILE_GIT_SHA:-}}"
 CALEEMOBILE_DIRTY="${CALEEMOBILE_DIRTY:-${AUTO_CALEEMOBILE_DIRTY:-false}}"

@@ -5,7 +5,12 @@ from click.testing import CliRunner
 
 from calee_regression import run_context
 from calee_regression.cli import main
-from calee_regression.models import EXIT_BLOCKED, EXIT_INVALID_CONFIG, EXIT_SUCCESS
+from calee_regression.models import (
+    EXIT_BLOCKED,
+    EXIT_INVALID_CONFIG,
+    EXIT_REGRESSION,
+    EXIT_SUCCESS,
+)
 
 RUN_ID = "release-test-consolidate-001"
 
@@ -95,9 +100,12 @@ def test_consolidate_passes_when_everything_is_provided_and_clean(tmp_path):
             "--android-optional", "--ios-optional",
             # The tablet IS in scope, so its build identity is mandatory to
             # know (Phase 3): provide the detected version so identity is
-            # available and clean. CaleeMobile identity is not required here
-            # (no mobile platform in scope).
+            # available and clean. A release-gating tablet run must also record
+            # the installed package identity -- application id + versionCode
+            # (Phase 6). CaleeMobile identity is not required here (no mobile
+            # platform in scope).
             "--calee-build-version", "0.3.22",
+            "--calee-application-id", "com.viso.calee", "--calee-version-code", "322",
             "--out-dir", str(tmp_path / "out"),
         ],
     )
@@ -168,6 +176,7 @@ def test_consolidate_passes_on_dirty_build_when_explicitly_approved(tmp_path):
         main,
         ["consolidate", "--run-id", RUN_ID, "--android-optional", "--ios-optional",
          "--calee-build-version", "0.3.22", "--calee-dirty", "--allow-dirty",
+         "--calee-application-id", "com.viso.calee", "--calee-version-code", "322",
          "--out-dir", str(tmp_path / "out")],
     )
     assert result.exit_code == EXIT_SUCCESS
@@ -301,3 +310,126 @@ def test_consolidate_rejects_report_older_than_run_start(tmp_path):
     )
     assert result.exit_code == EXIT_BLOCKED
     assert "before this run started" in result.output.lower()
+
+
+# --- Phase 3: an overwritten API report can't launder a FAIL into a PASS --
+
+
+def test_consolidate_keeps_api_fail_after_report_overwritten_with_pass(tmp_path):
+    # The manifest recorded that the Client API FAILed on its one run; a later
+    # step then overwrote mobile-api/results.json with a PASS. Consolidation
+    # must use the recorded FAIL -- the report overwrite can't launder it.
+    workspace = _make_workspace(tmp_path)
+    _write_full_tablet_only_components(workspace)  # mobile-api report says PASS
+    manifest = run_context.RunManifest.load(workspace.manifest_path)
+    manifest.record_component("mobile-api", report_path="mobile-api/results.json", exit_code=1)
+    manifest.write(workspace.manifest_path)
+
+    result = CliRunner().invoke(
+        main,
+        ["consolidate", "--run-id", RUN_ID, "--android-optional", "--ios-optional",
+         "--calee-build-version", "0.3.22", "--out-dir", str(tmp_path / "out")],
+    )
+    assert result.exit_code == EXIT_REGRESSION
+    assert "CaleeMobile Client API: FAIL" in result.output
+    bundles = list((tmp_path / "out").glob("**/*.zip"))
+    assert len(bundles) == 1 and bundles[0].name.endswith("-FAIL.zip")
+
+
+# --- Phase 4: a pre/post identity change BLOCKS the release ---------------
+
+
+def _write_identity_snapshots(workspace, *, pre, post):
+    identity_dir = workspace.root / "identity"
+    identity_dir.mkdir(parents=True, exist_ok=True)
+    (identity_dir / "pre.json").write_text(json.dumps(pre))
+    (identity_dir / "post.json").write_text(json.dumps(post))
+
+
+def test_consolidate_blocks_on_pre_post_tablet_identity_mismatch(tmp_path):
+    workspace = _make_workspace(tmp_path)
+    _write_full_tablet_only_components(workspace)
+    # The installed tablet package's versionCode changed between the pre-run
+    # and post-run snapshots -- what was tested is not what is being certified.
+    base_tablet = {"applicationId": "com.viso.calee", "buildVersion": "0.3.22", "gitSha": "t1"}
+    _write_identity_snapshots(
+        workspace,
+        pre={"tablet": {**base_tablet, "versionCode": "322"}, "caleemobile": {}},
+        post={"tablet": {**base_tablet, "versionCode": "999"}, "caleemobile": {}},
+    )
+    result = CliRunner().invoke(
+        main,
+        ["consolidate", "--run-id", RUN_ID, "--android-optional", "--ios-optional",
+         "--calee-build-version", "0.3.22", "--out-dir", str(tmp_path / "out")],
+    )
+    assert result.exit_code == EXIT_BLOCKED
+    assert "Build identity stability (pre/post run): BLOCKED" in result.output
+
+
+# --- Phase 5: CaleeMobile commit-SHA agreement across sources ------------
+
+FULL_SHA_A = "a" * 40
+FULL_SHA_B = "b" * 40
+
+
+def test_consolidate_blocks_when_caleemobile_report_sha_disagrees(tmp_path):
+    # CaleeMobile is in scope (Android mandatory). The Android UI report embeds
+    # a DIFFERENT full SHA than the detected one -> which commit was tested?
+    # -> BLOCKED (Phase 5).
+    workspace = _make_workspace(tmp_path)
+    _write_component(workspace, "environment", {"runId": RUN_ID, "status": "pass", "detail": []})
+    _write_component(workspace, "tablet", {
+        "runId": RUN_ID, "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
+        "scenarios": [{"name": "a", "status": "passed"}],
+    })
+    _write_component(workspace, "mobile-api", {
+        "runId": RUN_ID, "counts": {"PASS": 1}, "steps": [{"name": "x", "status": "PASS"}],
+    })
+    _write_component(workspace, "mobile-android", {
+        "runId": RUN_ID, "counts": {"PASS": 1}, "steps": [{"name": "x", "status": "PASS"}],
+        "buildIdentity": {"buildVersion": "0.0.22+22", "gitSha": FULL_SHA_B, "dirty": False},
+    })
+    _write_component(workspace, "manual-checks", {
+        "runId": RUN_ID,
+        "checks": [{"title": "t", "instruction": "i", "expectedResult": "e", "status": "pass"}],
+    })
+
+    result = CliRunner().invoke(
+        main,
+        ["consolidate", "--run-id", RUN_ID, "--android-mandatory", "--ios-optional",
+         "--calee-build-version", "0.3.22",
+         "--caleemobile-build-version", "0.0.22+22", "--caleemobile-git-sha", FULL_SHA_A,
+         "--out-dir", str(tmp_path / "out")],
+    )
+    assert result.exit_code == EXIT_BLOCKED
+    assert "CaleeMobile commit SHA agreement: BLOCKED" in result.output
+
+
+def test_consolidate_blocks_when_required_caleemobile_sha_is_abbreviated(tmp_path):
+    # An in-scope CaleeMobile run with only an abbreviated SHA is ambiguous.
+    workspace = _make_workspace(tmp_path)
+    _write_component(workspace, "environment", {"runId": RUN_ID, "status": "pass", "detail": []})
+    _write_component(workspace, "tablet", {
+        "runId": RUN_ID, "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
+        "scenarios": [{"name": "a", "status": "passed"}],
+    })
+    _write_component(workspace, "mobile-api", {
+        "runId": RUN_ID, "counts": {"PASS": 1}, "steps": [{"name": "x", "status": "PASS"}],
+    })
+    _write_component(workspace, "mobile-android", {
+        "runId": RUN_ID, "counts": {"PASS": 1}, "steps": [{"name": "x", "status": "PASS"}],
+    })
+    _write_component(workspace, "manual-checks", {
+        "runId": RUN_ID,
+        "checks": [{"title": "t", "instruction": "i", "expectedResult": "e", "status": "pass"}],
+    })
+
+    result = CliRunner().invoke(
+        main,
+        ["consolidate", "--run-id", RUN_ID, "--android-mandatory", "--ios-optional",
+         "--calee-build-version", "0.3.22",
+         "--caleemobile-build-version", "0.0.22+22", "--caleemobile-git-sha", "abc1234",
+         "--out-dir", str(tmp_path / "out")],
+    )
+    assert result.exit_code == EXIT_BLOCKED
+    assert "CaleeMobile build identity: BLOCKED" in result.output
