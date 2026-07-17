@@ -855,3 +855,113 @@ def test_identity_stability_ignores_out_of_scope_apps():
         require_caleemobile=True, require_calee=False,
     )
     assert comp.status == STATUS_PASS
+
+
+# --- Phase 5: mandatory, exact (full) CaleeMobile Git SHA ----------------
+
+from calee_regression.consolidated_report import (  # noqa: E402
+    component_from_build_identity,
+    component_from_caleemobile_sha_agreement,
+    is_full_git_sha,
+)
+
+SHA_A = "a" * 40
+SHA_B = "b" * 40
+
+
+def test_is_full_git_sha_requires_40_hex():
+    assert is_full_git_sha(SHA_A)
+    assert not is_full_git_sha("abc1234")  # abbreviated
+    assert not is_full_git_sha("g" * 40)   # not hex
+    assert not is_full_git_sha(None)
+    assert not is_full_git_sha("")
+
+
+def test_build_identity_blocks_when_required_sha_is_missing():
+    comp = component_from_build_identity(
+        "CaleeMobile build identity", detected_version="0.0.22+22",
+        available=True, required=True, require_git_sha=True, detected_git_sha=None,
+    )
+    assert comp.status == STATUS_BLOCKED
+    assert any("no Git SHA" in d for d in comp.detail)
+
+
+def test_build_identity_blocks_when_required_sha_is_abbreviated():
+    comp = component_from_build_identity(
+        "CaleeMobile build identity", detected_version="0.0.22+22",
+        available=True, required=True, require_git_sha=True, detected_git_sha="abc1234",
+    )
+    assert comp.status == STATUS_BLOCKED
+    assert any("abbreviated" in d or "ambiguous" in d for d in comp.detail)
+
+
+def test_build_identity_passes_with_a_full_required_sha():
+    comp = component_from_build_identity(
+        "CaleeMobile build identity", detected_version="0.0.22+22",
+        available=True, required=True, require_git_sha=True, detected_git_sha=SHA_A,
+    )
+    assert comp.status == STATUS_PASS
+
+
+def test_sha_agreement_passes_when_all_present_agree():
+    comp = component_from_caleemobile_sha_agreement(
+        {"Android UI report": SHA_A, "pre-run": SHA_A, "detected": SHA_A}, required=True,
+    )
+    assert comp.status == STATUS_PASS
+
+
+def test_sha_agreement_blocks_on_disagreement():
+    comp = component_from_caleemobile_sha_agreement(
+        {"Android UI report": SHA_A, "iPhone UI report": SHA_B}, required=True,
+    )
+    assert comp.status == STATUS_BLOCKED
+    assert any("disagreement" in d.lower() for d in comp.detail)
+
+
+def test_sha_agreement_blocks_on_abbreviated_value():
+    comp = component_from_caleemobile_sha_agreement(
+        {"Android UI report": "abc1234"}, required=True,
+    )
+    assert comp.status == STATUS_BLOCKED
+    assert any("abbreviated" in d for d in comp.detail)
+
+
+def test_sha_agreement_blocks_when_required_but_none_present():
+    comp = component_from_caleemobile_sha_agreement({"Android UI report": None}, required=True)
+    assert comp.status == STATUS_BLOCKED
+
+
+def test_sha_agreement_is_none_when_not_required_and_absent():
+    assert component_from_caleemobile_sha_agreement({"Android UI report": None}, required=False) is None
+
+
+# --- Phase 6: mandatory installed tablet package identity ----------------
+
+
+def test_tablet_identity_blocks_without_package_identity():
+    comp = component_from_build_identity(
+        "Calee tablet build identity", detected_version="0.3.22",
+        available=True, required=True, require_package_identity=True,
+        application_id=None, version_code=None,
+    )
+    assert comp.status == STATUS_BLOCKED
+    assert any("application id" in d for d in comp.detail)
+
+
+def test_tablet_identity_blocks_without_version_code():
+    comp = component_from_build_identity(
+        "Calee tablet build identity", detected_version="0.3.22",
+        available=True, required=True, require_package_identity=True,
+        application_id="com.viso.calee", version_code=None,
+    )
+    assert comp.status == STATUS_BLOCKED
+    assert any("versionCode" in d for d in comp.detail)
+
+
+def test_tablet_identity_passes_with_full_package_identity():
+    comp = component_from_build_identity(
+        "Calee tablet build identity", detected_version="0.3.22",
+        available=True, required=True, require_package_identity=True,
+        application_id="com.viso.calee", version_code="322",
+    )
+    assert comp.status == STATUS_PASS

@@ -22,6 +22,7 @@ from .consolidated_report import (
     STATUS_PASS,
     ManualCheck,
     build_release_report,
+    component_from_caleemobile_sha_agreement,
     component_from_identity_stability,
     decide_status,
     write_release_bundle,
@@ -844,6 +845,27 @@ def _load_manual_checks(path: "str | None") -> "list[ManualCheck] | None":
     return _manual_checks_from_list(raw)
 
 
+def _report_build_sha(report: "dict | None") -> "str | None":
+    """The CaleeMobile Git SHA embedded in a per-platform UI report at
+    execution time (report["buildIdentity"]["gitSha"]), or None. See Phase 5
+    and CaleeMobile-Regression/ui/run_ui_suite.py."""
+    if isinstance(report, dict):
+        identity = report.get("buildIdentity")
+        if isinstance(identity, dict):
+            return identity.get("gitSha")
+    return None
+
+
+def _snapshot_caleemobile_sha(snapshot: "dict | None") -> "str | None":
+    """The CaleeMobile Git SHA from a pre/post identity snapshot
+    (snapshot["caleemobile"]["gitSha"]), or None."""
+    if isinstance(snapshot, dict):
+        caleemobile = snapshot.get("caleemobile")
+        if isinstance(caleemobile, dict):
+            return caleemobile.get("gitSha")
+    return None
+
+
 def _load_identity_snapshot(workspace: run_context.RunWorkspace, phase: str) -> "dict | None":
     """Load this run's pre/post build-identity snapshot
     (reports/runs/<run-id>/identity/<phase>.json), or None if it was never
@@ -1086,7 +1108,29 @@ def consolidate(
         require_caleemobile=require_caleemobile_identity,
         require_calee=require_calee_identity,
     )
-    identity_stability_components = [identity_stability] if identity_stability is not None else []
+
+    # CaleeMobile commit-SHA agreement (Phase 5): the exact SHA embedded into
+    # each Android/iOS UI report at execution time must agree with the pre/post
+    # snapshots, the expected release SHA, and the detected SHA -- all full,
+    # unambiguous 40-char SHAs. A version alone (e.g. 0.0.22+22) spans many
+    # commits, so an in-scope CaleeMobile run gates on the exact commit.
+    caleemobile_sha_values = {
+        "Android UI report": _report_build_sha(mobile_android),
+        "iPhone UI report": _report_build_sha(mobile_ios),
+        "pre-run snapshot": _snapshot_caleemobile_sha(identity_pre),
+        "post-run snapshot": _snapshot_caleemobile_sha(identity_post),
+        "expected release": eff_expected_caleemobile_sha,
+        "detected": caleemobile_git_sha,
+    }
+    sha_agreement = component_from_caleemobile_sha_agreement(
+        caleemobile_sha_values, required=require_caleemobile_identity,
+    )
+
+    extra_components = []
+    if identity_stability is not None:
+        extra_components.append(identity_stability)
+    if sha_agreement is not None:
+        extra_components.append(sha_agreement)
 
     report = build_release_report(
         environment=env_report,
@@ -1114,10 +1158,12 @@ def consolidate(
         calee_application_id=calee_application_id,
         caleeshell_version=caleeshell_version,
         require_calee_identity=require_calee_identity,
+        require_calee_package_identity=require_calee_identity,
         require_caleemobile_identity=require_caleemobile_identity,
+        require_caleemobile_git_sha=require_caleemobile_identity,
         allow_dirty=allow_dirty,
         mobile_exit_floors=mobile_exit_floors,
-        extra_components=identity_stability_components,
+        extra_components=extra_components,
     )
 
     out = Path(out_dir) if out_dir else workspace.consolidated_dir
