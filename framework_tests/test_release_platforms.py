@@ -55,6 +55,39 @@ def test_invalid_yaml_raises_a_clear_error(tmp_path):
         release_platforms.load_release_platforms(config)
 
 
+# --- Workstream 2: release feature profile --------------------------------
+
+
+def test_absent_config_defaults_every_feature_to_mandatory(tmp_path):
+    features = release_platforms.load_release_features(tmp_path / "does-not-exist.yaml")
+    assert features.synchronization is True
+    assert features.meals is True
+    assert features.onboarding is True
+    assert features.google_calendar is True
+    assert features.kiosk_admin is True
+
+
+def test_features_section_can_opt_a_feature_out(tmp_path):
+    config = tmp_path / "release-platforms.yaml"
+    config.write_text(
+        "release_features:\n  synchronization: false\n  meals: true\n  onboarding: false\n"
+    )
+    features = release_platforms.load_release_features(config)
+    assert features.synchronization is False
+    assert features.meals is True
+    assert features.onboarding is False
+    # Unlisted features still default to mandatory.
+    assert features.google_calendar is True
+    assert features.kiosk_admin is True
+
+
+def test_features_non_mapping_raises(tmp_path):
+    config = tmp_path / "release-platforms.yaml"
+    config.write_text("release_features: [nope]\n")
+    with pytest.raises(release_platforms.ReleasePlatformsError):
+        release_platforms.load_release_features(config)
+
+
 # --- Phase 3: expected build identity in the release profile -------------
 
 
@@ -153,6 +186,11 @@ def _consolidate(tmp_path, *extra_args, run_id=RUN_ID):
             # so a missing --*-build-version doesn't confound the platform
             # assertions. Build-identity gating has its own tests.
             "--allow-unknown-build-identity",
+            # Likewise, they don't exercise cross-device synchronization -- opt
+            # out of the Workstream 1 sync gating (which would otherwise BLOCK
+            # on a missing sync report and confound the platform assertions).
+            # Sync gating has its own tests (test_sync_consolidation.py).
+            "--sync-optional",
             *extra_args,
         ],
     )
@@ -203,6 +241,56 @@ def test_optional_platform_omitted_does_not_block(tmp_path):
     result = _consolidate(tmp_path, "--android-optional", "--ios-optional")
     assert result.exit_code == EXIT_SUCCESS
     assert "(optional)" in result.output
+
+
+# --- Workstream 2: the tablet is unconditionally in scope for a full solution -
+
+
+def _write_tablet_only_pass(workspace):
+    _write_component(workspace, "environment", PASSING_ENVIRONMENT)
+    _write_component(workspace, "tablet", PASSING_TABLET)
+    _write_component(workspace, "mobile-api", PASSING_API)
+    _write_component(workspace, "manual-checks", PASSING_MANUAL)
+
+
+def test_tablet_false_config_does_not_relax_tablet_identity_requirement(tmp_path, monkeypatch):
+    # Even if a config tries to opt the tablet out, the tablet's build identity
+    # stays REQUIRED: execution always runs the tablet and consolidation always
+    # treats it as mandatory, so its identity must be required too (they must
+    # never disagree). No --calee-build-version + identity required -> BLOCKED.
+    config = tmp_path / "release-platforms.yaml"
+    config.write_text("release_platforms:\n  tablet: false\n  mobile_android: false\n  mobile_ios: false\n")
+    monkeypatch.setenv("CALEE_RELEASE_PLATFORMS", str(config))
+
+    workspace = _make_workspace(tmp_path)
+    _write_tablet_only_pass(workspace)
+    result = CliRunner().invoke(
+        main,
+        ["consolidate", "--run-id", RUN_ID, "--sync-optional", "--out-dir", str(tmp_path / "out")],
+    )
+    assert result.exit_code == EXIT_BLOCKED
+    assert "Calee tablet build identity: BLOCKED" in result.output
+
+
+def test_tablet_stays_mandatory_and_passes_with_identity_despite_tablet_false(tmp_path, monkeypatch):
+    # With the tablet identity provided, the same tablet:false config PASSES --
+    # the tablet is run and gated exactly like a normal full solution; the flag
+    # simply doesn't opt it out.
+    config = tmp_path / "release-platforms.yaml"
+    config.write_text("release_platforms:\n  tablet: false\n  mobile_android: false\n  mobile_ios: false\n")
+    monkeypatch.setenv("CALEE_RELEASE_PLATFORMS", str(config))
+
+    workspace = _make_workspace(tmp_path)
+    _write_tablet_only_pass(workspace)
+    result = CliRunner().invoke(
+        main,
+        ["consolidate", "--run-id", RUN_ID, "--sync-optional",
+         "--calee-build-version", "0.3.22",
+         "--calee-application-id", "com.viso.calee", "--calee-version-code", "322",
+         "--out-dir", str(tmp_path / "out")],
+    )
+    assert result.exit_code == EXIT_SUCCESS
+    assert "Calee tablet: PASS" in result.output
 
 
 def test_release_platforms_config_file_drives_mandatory_when_no_cli_override(tmp_path, monkeypatch):

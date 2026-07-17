@@ -624,6 +624,74 @@ def component_from_manual_checks(checks: "list[ManualCheck]", *, name: str = "ma
     return ComponentResult(name=name, status=status, mandatory=True, passed=passed, failed=failed, blocked=blocked, detail=detail)
 
 
+# The per-flow status strings a sync-smoke report uses (see
+# calee_regression/sync_smoke.py). A different namespace from this module's
+# lowercase ComponentResult STATUS_* above -- named separately so the mapping
+# in component_from_sync_report is never confused for a ComponentResult status.
+SYNC_FLOW_OK = "ok"
+SYNC_FLOW_FAILED = "failed"
+SYNC_FLOW_BLOCKED = "blocked"
+
+SYNC_COMPONENT_NAME = "CaleeMobile cross-device synchronization"
+
+
+def component_from_sync_report(
+    name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = True
+) -> ComponentResult:
+    """Build a ComponentResult from a sync-smoke report (Workstream 1).
+
+    The report is either the real flows shape written by the ``sync-smoke``
+    command -- ``{"runId": ..., "flows": [{"flow": ..., "status":
+    ok|failed|blocked, ...}, ...]}`` -- or a marker the command/launcher wrote
+    when it could not (or was asked not to) run the flows: no in-scope mobile
+    platform, missing verified backend/credentials, or an intentionally
+    excluded (optional) release, carrying an explicit top-level ``status``.
+
+    Result rules (mirroring the rest of this module and docs/RELEASE_POLICY.md):
+      * report absent (None) -> NOT_RUN (blocks the release when mandatory --
+        a missing mandatory sync must never read as a pass by omission);
+      * a marker report with no flows -> its explicit top-level ``status`` (an
+        unrecognized/absent one is BLOCKED, never a silent pass);
+      * any flow FAILED -> FAIL (a real cross-device sync regression);
+      * any flow BLOCKED (e.g. the tablet-mutation gap) -> BLOCKED;
+      * flows present and all OK -> PASS.
+
+    A mandatory sync that is missing, stale/rejected (handled upstream by
+    run-ID validation, which turns a rejected report into report_dict=None here),
+    BLOCKED, or FAILED therefore all prevent an overall PASS.
+    """
+    if report_dict is None:
+        return ComponentResult(name=name, status=STATUS_NOT_RUN, mandatory=mandatory, detail=["Not executed."])
+    flows = report_dict.get("flows") or []
+    if not flows:
+        # A marker report: trust the explicit status it recorded. An
+        # unrecognized or absent status is treated as BLOCKED (never silently
+        # trusted), the same defensive default component_from_environment_report
+        # applies to an unrecognized environment status.
+        recorded = report_dict.get("status")
+        status = recorded if recorded in (STATUS_PASS, STATUS_FAIL, STATUS_BLOCKED, STATUS_NOT_RUN) else STATUS_BLOCKED
+        detail = list(report_dict.get("detail", [])) or ["No synchronization flows were run."]
+        return ComponentResult(
+            name=name, status=status, mandatory=mandatory,
+            blocked=1 if status == STATUS_BLOCKED else 0,
+            failed=1 if status == STATUS_FAIL else 0,
+            detail=detail,
+        )
+    passed = sum(1 for f in flows if f.get("status") == SYNC_FLOW_OK)
+    failed = sum(1 for f in flows if f.get("status") == SYNC_FLOW_FAILED)
+    blocked = sum(1 for f in flows if f.get("status") == SYNC_FLOW_BLOCKED)
+    status = decide_status(passed=passed, failed=failed, blocked=blocked, total=len(flows))
+    detail = [
+        f"{f.get('flow', '?')}: {str(f.get('status', '?')).upper()}"
+        for f in flows
+        if f.get("status") != SYNC_FLOW_OK
+    ]
+    return ComponentResult(
+        name=name, status=status, mandatory=mandatory,
+        passed=passed, failed=failed, blocked=blocked, detail=detail,
+    )
+
+
 # The identity fields that must not change between the pre-run and post-run
 # snapshots for an in-scope app. A change in any of these during the run means
 # the thing that was tested is not the thing being certified. See Phase 4.
@@ -736,6 +804,158 @@ def component_from_caleemobile_sha_agreement(
     )
 
 
+def _waiver_is_valid(waiver: "dict | None") -> bool:
+    """A dirty-tree waiver is valid only when it names WHY, WHO, and WHEN
+    (reason, approver, timestamp all non-empty). See Workstream 3 / Waiver."""
+    if not isinstance(waiver, dict):
+        return False
+    return all(str(waiver.get(k, "") or "").strip() for k in ("reason", "approver", "timestamp"))
+
+
+def component_from_release_intent(
+    *,
+    production: bool,
+    caleemobile_in_scope: bool,
+    tablet_in_scope: bool,
+    caleeshell_in_scope: bool,
+    expected_caleemobile_build_version: "str | None" = None,
+    expected_caleemobile_git_sha: "str | None" = None,
+    expected_calee_build_version: "str | None" = None,
+    expected_calee_git_sha: "str | None" = None,
+    expected_calee_application_id: "str | None" = None,
+    expected_calee_version_code: "str | None" = None,
+    expected_caleeshell_version: "str | None" = None,
+    detected_calee_application_id: "str | None" = None,
+    detected_calee_version_code: "str | None" = None,
+    detected_caleeshell_version: "str | None" = None,
+    tablet_source_sha_available: bool = False,
+    caleemobile_dirty: bool = False,
+    calee_dirty: bool = False,
+    waiver: "dict | None" = None,
+    name: str = "Release identity intent (production)",
+) -> "ComponentResult | None":
+    """Prove the INTENDED release identity was stated up front (Workstream 3).
+
+    For a production release profile the *expected* identity is required, not
+    merely checked-if-present: an in-scope app whose expected SHA/version/package
+    identity was never configured BLOCKS, because consistency of the observed
+    build is not evidence of release *intent* -- the target must be stated. The
+    expected/detected version+SHA *match* itself is enforced by
+    component_from_build_identity (it already receives the expected values); this
+    component adds the "must be configured at all" gate, the abbreviated-SHA gate
+    on the expectations, the application-id/versionCode/CaleeShell match not
+    covered there, and the dirty-tree waiver audit.
+
+    Returns None for a non-production profile (nothing to enforce here).
+    """
+    if not production:
+        return None
+
+    evidence = {
+        "profile": "production",
+        "expectedCaleeMobileGitSha": expected_caleemobile_git_sha,
+        "expectedCaleeMobileBuildVersion": expected_caleemobile_build_version,
+        "expectedTabletVersionName": expected_calee_build_version,
+        "expectedTabletApplicationId": expected_calee_application_id,
+        "expectedTabletVersionCode": expected_calee_version_code,
+        "expectedTabletGitSha": expected_calee_git_sha,
+        "expectedCaleeShellVersion": expected_caleeshell_version,
+    }
+    evidence = {k: v for k, v in evidence.items() if v is not None}
+
+    def blocked(detail: "list[str]") -> ComponentResult:
+        return ComponentResult(name=name, status=STATUS_BLOCKED, mandatory=True, detail=detail, evidence=evidence)
+
+    missing: "list[str]" = []
+    abbreviated: "list[str]" = []
+    if caleemobile_in_scope:
+        if not expected_caleemobile_git_sha:
+            missing.append("expected CaleeMobile Git SHA")
+        elif not is_full_git_sha(expected_caleemobile_git_sha):
+            abbreviated.append(f"expected CaleeMobile Git SHA {expected_caleemobile_git_sha!r}")
+        if not expected_caleemobile_build_version:
+            missing.append("expected CaleeMobile version/build")
+    if tablet_in_scope:
+        if not expected_calee_build_version:
+            missing.append("expected tablet versionName")
+        if not expected_calee_application_id:
+            missing.append("expected tablet application id")
+        if not expected_calee_version_code:
+            missing.append("expected tablet versionCode")
+        # The tablet source SHA is required only where the source/build pipeline
+        # can actually provide it (a tablet source checkout was found and a SHA
+        # detected) -- you cannot state an expectation the pipeline can't produce.
+        if tablet_source_sha_available:
+            if not expected_calee_git_sha:
+                missing.append("expected tablet source Git SHA")
+            elif not is_full_git_sha(expected_calee_git_sha):
+                abbreviated.append(f"expected tablet source Git SHA {expected_calee_git_sha!r}")
+    if caleeshell_in_scope and not expected_caleeshell_version:
+        missing.append("expected CaleeShell version")
+
+    if abbreviated:
+        return blocked(
+            [f"{a} is abbreviated/ambiguous; a production release requires the full 40-character SHA." for a in abbreviated]
+        )
+    if missing:
+        return blocked([
+            "Production release is missing required expected identity: "
+            + ", ".join(missing)
+            + ". Consistency of the observed build is not evidence of release intent -- state the intended target."
+        ])
+
+    # Match the expectations this component owns (application id / versionCode /
+    # CaleeShell version) against the detected values. A missing detected value
+    # or a mismatch BLOCKS (the wrong build may have been tested).
+    mismatches: "list[str]" = []
+    if tablet_in_scope:
+        for label, expected_v, detected_v in (
+            ("tablet application id", expected_calee_application_id, detected_calee_application_id),
+            ("tablet versionCode", expected_calee_version_code, detected_calee_version_code),
+        ):
+            if not detected_v:
+                mismatches.append(f"{label}: expected {expected_v!r} but none was detected")
+            elif not _versions_match(detected_v, expected_v):
+                mismatches.append(f"{label}: expected {expected_v!r} but detected {detected_v!r}")
+    if caleeshell_in_scope:
+        if not detected_caleeshell_version:
+            mismatches.append(f"CaleeShell version: expected {expected_caleeshell_version!r} but none was detected")
+        elif not _versions_match(detected_caleeshell_version, expected_caleeshell_version):
+            mismatches.append(
+                f"CaleeShell version: expected {expected_caleeshell_version!r} but detected {detected_caleeshell_version!r}"
+            )
+    if mismatches:
+        return blocked(["The wrong build may have been tested -- " + "; ".join(mismatches) + "."])
+
+    # A dirty tree in a production release needs a named waiver.
+    dirty_apps = []
+    if caleemobile_in_scope and caleemobile_dirty:
+        dirty_apps.append("CaleeMobile")
+    if tablet_in_scope and calee_dirty:
+        dirty_apps.append("Calee tablet")
+    if dirty_apps:
+        if not _waiver_is_valid(waiver):
+            return blocked([
+                f"{' and '.join(dirty_apps)} build has uncommitted changes; a production release requires a named "
+                f"waiver (reason, approver, timestamp) to approve a dirty tree. None (or an incomplete one) was provided."
+            ])
+        evidence["waiver"] = {
+            "reason": waiver.get("reason"), "approver": waiver.get("approver"), "timestamp": waiver.get("timestamp"),
+        }
+        return ComponentResult(
+            name=name, status=STATUS_PASS, mandatory=True, evidence=evidence,
+            detail=[
+                f"Intended release identity is fully specified. Dirty tree ({' and '.join(dirty_apps)}) approved by "
+                f"waiver: {waiver.get('approver')} at {waiver.get('timestamp')} -- {waiver.get('reason')}."
+            ],
+        )
+
+    return ComponentResult(
+        name=name, status=STATUS_PASS, mandatory=True, evidence=evidence,
+        detail=["Intended release identity is fully specified (expected SHA/version/package identity configured and matched)."],
+    )
+
+
 def build_release_report(
     *,
     environment: "dict[str, Any] | None" = None,
@@ -743,11 +963,13 @@ def build_release_report(
     mobile_api: "dict[str, Any] | None" = None,
     mobile_android_ui: "dict[str, Any] | None" = None,
     mobile_ios_ui: "dict[str, Any] | None" = None,
+    sync: "dict[str, Any] | None" = None,
     manual_checks: "list[ManualCheck] | None" = None,
     meta: "dict[str, Any] | None" = None,
     generated_at: "str | None" = None,
     android_mandatory: bool = True,
     ios_mandatory: bool = True,
+    sync_mandatory: "bool | None" = None,
     calee_build_version: "str | None" = None,
     expected_calee_build_version: "str | None" = None,
     caleemobile_build_version: "str | None" = None,
@@ -788,6 +1010,15 @@ def build_release_report(
     mandatory -- unlike every other component here, there is no
     "environment is optional for this release" concept. See
     component_from_environment_report and Workstream 4.
+
+    `sync_mandatory` (Workstream 1) controls the cross-device synchronization
+    component: True -> release-gating (a missing/BLOCKED/FAILED sync prevents a
+    PASS), False -> shown but optional, None -> not included at all (the
+    legacy/ad-hoc caller doesn't deal with sync). The `consolidate` CLI always
+    passes a concrete True/False from the release feature profile
+    (release_features.synchronization), so a real release always includes the
+    sync component -- never silently omitted -- while unit tests that don't
+    exercise sync leave it None.
     """
     # A recorded exit-code floor (from the run manifest's worst-wins history)
     # can only make a mobile component worse, never better -- so a later run
@@ -829,6 +1060,20 @@ def build_release_report(
         if evidence_component is not None:
             components.insert(insert_at, evidence_component)
             insert_at += 1
+
+    # Cross-device synchronization (Workstream 1). Inserted after the platform
+    # UI + backend-evidence components and immediately BEFORE manual checks --
+    # matching the execution order (...Android/iOS UI -> sync -> manual checks).
+    # Included exactly when the caller made an explicit mandatory/optional
+    # decision (sync_mandatory is not None); the CLI always does, so a real
+    # release always shows a sync component. A mandatory sync that is missing,
+    # BLOCKED or FAILED then gates the overall status like any other component.
+    if sync_mandatory is not None:
+        components.insert(
+            insert_at,
+            component_from_sync_report(SYNC_COMPONENT_NAME, sync, mandatory=sync_mandatory),
+        )
+        insert_at += 1
 
     # Build identity (Phase 3). When an app's identity is required (in scope
     # for this release) it must be known, or the release BLOCKS -- a PASS must

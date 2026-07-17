@@ -26,6 +26,7 @@ describes the rule; the code is the source of truth if they ever disagree.
 | CaleeMobile Client API suite | Yes, always |
 | CaleeMobile Android UI suite | Driven by `config/release-platforms.yaml`'s `mobile_android` — **defaults to Yes** if that file is absent |
 | CaleeMobile iPhone UI suite | Driven by `config/release-platforms.yaml`'s `mobile_ios` — **defaults to Yes** if that file is absent |
+| Cross-device synchronization (`sync-smoke`) | Driven by `config/release-platforms.yaml`'s `release_features.synchronization` — **defaults to Yes** if that file is absent. Runs after the mobile UI legs and before manual checks, reusing this run's verified backend/fixture/credentials and the same run ID; its report (`reports/runs/<run-id>/sync/results.json`) is auto-discovered and validated like every other component. A missing/stale/run-ID-mismatched/`BLOCKED`/`FAILED` mandatory sync can never PASS. Currently resolves to `BLOCKED` until the tablet-mutation gap closes (`docs/TABLET_MUTATION_COVERAGE_GAPS.md`) and a real device verifies the flows — the intended safety property, not a silent non-gate. An excluded (`synchronization: false`) sync is still shown as an explicit **optional** component. |
 | Manual guided checks | Yes, whenever any are defined for the release profile in question — see `docs/NON_TECH_TESTER_GUIDE.md` and `config/manual-checks.example.json` |
 
 ### Prepare is mandatory, unconditionally

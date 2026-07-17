@@ -24,6 +24,7 @@ from .consolidated_report import (
     build_release_report,
     component_from_caleemobile_sha_agreement,
     component_from_identity_stability,
+    component_from_release_intent,
     decide_status,
     write_release_bundle,
 )
@@ -143,10 +144,16 @@ def _load_or_init_manifest(
         return run_context.RunManifest.load(workspace.manifest_path)
     try:
         platforms = release_platforms.load_release_platforms()
+        features = release_platforms.load_release_features()
         profile = {
             "tablet": platforms.tablet,
             "mobile_android": platforms.mobile_android,
             "mobile_ios": platforms.mobile_ios,
+            "synchronization": features.synchronization,
+            "meals": features.meals,
+            "onboarding": features.onboarding,
+            "google_calendar": features.google_calendar,
+            "kiosk_admin": features.kiosk_admin,
         }
     except release_platforms.ReleasePlatformsError:
         profile = {}
@@ -618,6 +625,64 @@ def suite(config_path, suite_name, confirm_technical, run_id_opt):
     raise SystemExit(_exit_code_for(result))
 
 
+def _verified_backend_from_environment(
+    workspace: run_context.RunWorkspace, run_id: str
+) -> "str | None":
+    """This run's prepared-and-verified backend, read from
+    reports/runs/<run-id>/environment/results.json (prepare's output), or None.
+
+    Only a backend the regression fixture was actually verified against
+    (``fixtureVerificationStatus == "ok"``) for THIS run id is returned -- sync
+    must talk to the SAME verified backend the rest of the release run did, not
+    an arbitrary or unverified one (Workstream 1). Read-only; never creates the
+    workspace, so the credential/backend guard below can still fire before
+    anything is written.
+    """
+    path = workspace.component_report_path("environment")
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if run_context.extract_report_run_id(data) != run_id:
+        return None
+    if data.get("fixtureVerificationStatus") != "ok":
+        return None
+    backend = data.get("targetEnvironment")
+    return backend or None
+
+
+def _write_sync_marker(
+    workspace: run_context.RunWorkspace, run_id: str, *, status: str, mandatory: bool, detail: "list[str]"
+) -> Path:
+    """Write an explicit sync marker report (no flows) + record the component.
+
+    Used when the flows are not run: an intentionally excluded (optional)
+    release, or no in-scope mobile platform / verified backend for a mandatory
+    one. The marker keeps sync from being silently omitted from consolidation --
+    it appears as an explicit optional/blocked component. See
+    consolidated_report.component_from_sync_report.
+    """
+    workspace.ensure_created()
+    report_dir = workspace.component_dir("sync")
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "results.json"
+    payload = {"runId": run_id, "mandatory": mandatory, "status": status, "flows": [], "detail": detail}
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    exit_code = {
+        STATUS_PASS: EXIT_SUCCESS,
+        "not_run": EXIT_SUCCESS,
+        "fail": EXIT_REGRESSION,
+    }.get(status, EXIT_BLOCKED)
+    manifest = _load_or_init_manifest(workspace)
+    manifest.record_component("sync", report_path=str(report_path), exit_code=exit_code)
+    manifest.write(workspace.manifest_path)
+    return report_path
+
+
 @main.command("sync-smoke")
 @click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
 @click.option(
@@ -628,29 +693,88 @@ def suite(config_path, suite_name, confirm_technical, run_id_opt):
 @click.option("--email", envvar="CALEE_TEST_EMAIL", default=None)
 @click.option("--password", envvar="CALEE_TEST_PASSWORD", default=None)
 @click.option(
-    "--platform", type=click.Choice(["android", "ios"]), default="android",
-    help="Which CaleeMobile platform runs the mobile legs (sync_task_complete_test.dart / sync_chore_complete_test.dart).",
+    "--platform", type=click.Choice(["android", "ios", "none"]), default="android",
+    help="Which CaleeMobile platform runs the mobile legs (sync_task_complete_test.dart / "
+         "sync_chore_complete_test.dart). 'none' means no in-scope mobile platform is available -- "
+         "a mandatory sync then BLOCKS (it needs a mobile surface to verify against).",
+)
+@click.option(
+    "--mandatory/--optional", "mandatory_opt", default=None,
+    help="Whether cross-device synchronization is release-gating for this run. Defaults to "
+         "config/release-platforms.yaml (release_features.synchronization), or True if absent. "
+         "An excluded (optional) sync is recorded as an explicit optional component, never run.",
 )
 @click.option(
     "--task-id", default=None,
     help="REG-TASK-OPEN-001's server-assigned id, for the task flow's API-based cleanup fallback. "
          "Optional -- without it, that fallback is recorded BLOCKED instead of guessing an id.",
 )
-def sync_smoke_cmd(config_path, run_id_opt, base_url, email, password, platform, task_id):
+def sync_smoke_cmd(config_path, run_id_opt, base_url, email, password, platform, mandatory_opt, task_id):
     """Cross-device sync-smoke: event/task/chore flows across the API, CaleeMobile, and the tablet.
 
-    NOT release-gating today -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md.
-    The event and task flows always include one genuinely BLOCKED step
-    because tablet-side mutation isn't possible yet (unconfirmed resource
-    ids); every other leg runs for real. Writes reports/runs/<run-id>/sync/
-    results.json but is not yet auto-discovered by `consolidate` -- this is
-    deliberate, matching how the Workstream 10 draft scenarios are kept out
-    of a real release's mandatory components until that gap closes.
+    Release-gating (Workstream 1): for a full Calee solution release
+    synchronization defaults to mandatory, is invoked by the full launcher
+    after the mobile UI legs and before manual checks, reuses this run's
+    verified backend + fixture + credentials and the same CALEE_RUN_ID, and
+    writes reports/runs/<run-id>/sync/results.json which `consolidate`
+    auto-discovers and gates on.
+
+    The event and task flows still include one genuinely BLOCKED step because
+    tablet-side mutation isn't possible yet (unconfirmed resource ids -- see
+    docs/TABLET_MUTATION_COVERAGE_GAPS.md); every other leg runs for real. That
+    BLOCKED step means a mandatory sync currently BLOCKS the release (never a
+    false PASS) until the tablet-mutation gap closes and a real device verifies
+    it -- which is the intended safety property, not a silent non-gate.
     """
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r} (expected letters/digits/._- only).", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
     run_id = run_id_opt
+
+    # Mandatory-ness: explicit flag wins, else the release feature profile
+    # (release_features.synchronization), which defaults to True when no config
+    # file is present -- an omitted feature must never silently become optional.
+    if mandatory_opt is None:
+        try:
+            mandatory = release_platforms.load_release_features().synchronization
+        except release_platforms.ReleasePlatformsError:
+            mandatory = True
+    else:
+        mandatory = mandatory_opt
+
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+
+    # Reuse this run's verified backend (from prepare's environment report) when
+    # one wasn't passed explicitly -- proving sync talks to the SAME
+    # fixture-verified backend as the rest of the run.
+    if not base_url:
+        base_url = _verified_backend_from_environment(workspace, run_id)
+
+    # Excluded (optional) sync: record an explicit optional marker so it is
+    # never silently omitted from consolidation, and do not run the flows.
+    if not mandatory:
+        _write_sync_marker(
+            workspace, run_id, status="not_run", mandatory=False,
+            detail=[
+                "Cross-device synchronization is optional for this release "
+                "(release_features.synchronization=false) and was not run."
+            ],
+        )
+        click.echo("Cross-device synchronization is OPTIONAL for this release — recorded as optional, not run.")
+        raise SystemExit(EXIT_SUCCESS)
+
+    # No in-scope CaleeMobile platform to drive the sync mobile legs: a
+    # mandatory sync BLOCKS (it has no mobile surface to verify against).
+    if platform == "none":
+        _write_sync_marker(
+            workspace, run_id, status=STATUS_BLOCKED, mandatory=True,
+            detail=[
+                "No in-scope CaleeMobile platform (Android/iOS) available to run the synchronization "
+                "mobile legs -- cannot verify cross-device sync for this release."
+            ],
+        )
+        click.echo("BLOCKED: no in-scope CaleeMobile platform for cross-device synchronization.", err=True)
+        raise SystemExit(EXIT_BLOCKED)
 
     if not base_url or not email or not password:
         click.echo(
@@ -660,7 +784,6 @@ def sync_smoke_cmd(config_path, run_id_opt, base_url, email, password, platform,
         )
         raise SystemExit(EXIT_BLOCKED)
 
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
     workspace.ensure_created()
     report_dir = workspace.component_dir("sync")
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -692,7 +815,9 @@ def sync_smoke_cmd(config_path, run_id_opt, base_url, email, password, platform,
 
     report_path = report_dir / "results.json"
     with open(report_path, "w", encoding="utf-8") as f:
-        json.dump({"runId": run_id, "flows": [r.to_dict() for r in results]}, f, indent=2)
+        json.dump(
+            {"runId": run_id, "mandatory": True, "flows": [r.to_dict() for r in results]}, f, indent=2
+        )
         f.write("\n")
 
     for result in results:
@@ -731,12 +856,22 @@ def release_platforms_cmd():
     """
     try:
         platforms = release_platforms.load_release_platforms()
+        features = release_platforms.load_release_features()
     except release_platforms.ReleasePlatformsError as exc:
         click.echo(f"echo '{exc}' >&2; exit {EXIT_INVALID_CONFIG}")
         raise SystemExit(EXIT_INVALID_CONFIG)
     click.echo(f"RELEASE_PLATFORM_TABLET={'true' if platforms.tablet else 'false'}")
     click.echo(f"RELEASE_PLATFORM_ANDROID={'true' if platforms.mobile_android else 'false'}")
     click.echo(f"RELEASE_PLATFORM_IOS={'true' if platforms.mobile_ios else 'false'}")
+    # Feature scope (Workstream 2). A full-solution launcher branches on
+    # $RELEASE_FEATURE_SYNCHRONIZATION (and the others) to decide whether that
+    # feature's leg is mandatory this release, the same way it branches on the
+    # platform flags above -- without parsing YAML in bash.
+    click.echo(f"RELEASE_FEATURE_SYNCHRONIZATION={'true' if features.synchronization else 'false'}")
+    click.echo(f"RELEASE_FEATURE_MEALS={'true' if features.meals else 'false'}")
+    click.echo(f"RELEASE_FEATURE_ONBOARDING={'true' if features.onboarding else 'false'}")
+    click.echo(f"RELEASE_FEATURE_GOOGLE_CALENDAR={'true' if features.google_calendar else 'false'}")
+    click.echo(f"RELEASE_FEATURE_KIOSK_ADMIN={'true' if features.kiosk_admin else 'false'}")
     raise SystemExit(EXIT_SUCCESS)
 
 
@@ -932,6 +1067,7 @@ def _resolve_component(
 @click.option("--mobile-api-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's mobile-api/results.json")
 @click.option("--mobile-android-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's mobile-android/results.json")
 @click.option("--mobile-ios-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's mobile-ios/results.json")
+@click.option("--sync-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's sync/results.json")
 @click.option("--manual-checks", "manual_checks_path", type=click.Path(exists=True), default=None, help="Override: defaults to this run's manual-checks/results.json")
 @click.option(
     "--environment-report", type=click.Path(exists=True), default=None,
@@ -947,6 +1083,12 @@ def _resolve_component(
     help="Whether the iPhone UI report is release-gating. Defaults to config/release-platforms.yaml "
          "(mobile_ios), or True if that file is absent.",
 )
+@click.option(
+    "--sync-mandatory/--sync-optional", "sync_mandatory", default=None,
+    help="Whether cross-device synchronization is release-gating. Defaults to "
+         "config/release-platforms.yaml (release_features.synchronization), or True if absent. "
+         "An optional sync is still shown in the report, just never blocks a PASS.",
+)
 @click.option("--build-version", default="unknown", help="Combined/overall application build label (used for the bundle filename)")
 @click.option("--calee-build-version", default=None, help="Calee tablet app package version under test")
 @click.option("--expected-calee-build-version", default=None, help="Technical-owner-configured expected Calee build; mismatch BLOCKS")
@@ -957,6 +1099,13 @@ def _resolve_component(
 @click.option("--expected-calee-git-sha", default=None, help="Technical-owner-configured expected Calee tablet commit; mismatch BLOCKS")
 @click.option("--caleemobile-git-sha", default=None, help="CaleeMobile commit SHA under test")
 @click.option("--expected-caleemobile-git-sha", default=None, help="Technical-owner-configured expected CaleeMobile commit; mismatch BLOCKS")
+@click.option("--production/--development", "production", default=None, help="Production release profile (Workstream 3): the expected identity below becomes REQUIRED, and a dirty tree needs a named waiver. Defaults to config/release-platforms.yaml (expected_build_identity.production).")
+@click.option("--expected-calee-application-id", default=None, help="Production: expected Calee tablet application id; mismatch/missing BLOCKS")
+@click.option("--expected-calee-version-code", default=None, help="Production: expected Calee tablet installed versionCode; mismatch/missing BLOCKS")
+@click.option("--expected-caleeshell-version", default=None, help="Production: expected CaleeShell version when CaleeShell is in scope; mismatch/missing BLOCKS")
+@click.option("--waiver-reason", default=None, help="Named waiver reason (Workstream 3): approves a dirty tree in a production release")
+@click.option("--waiver-approver", default=None, help="Named waiver approver")
+@click.option("--waiver-timestamp", default=None, help="Named waiver timestamp")
 @click.option("--calee-version-code", default=None, help="Calee tablet installed versionCode (from adb), where available")
 @click.option("--calee-application-id", default=None, help="Calee tablet Android application id, where available")
 @click.option("--caleemobile-dirty/--caleemobile-clean", "caleemobile_dirty", default=False, help="CaleeMobile build has uncommitted changes (BLOCKS unless --allow-dirty)")
@@ -972,10 +1121,12 @@ def _resolve_component(
 @click.option("--out-dir", type=click.Path(), default=None, help="Where to write the consolidated bundle (default: this run's workspace)")
 def consolidate(
     run_id_opt, tablet_report, mobile_api_report, mobile_android_report, mobile_ios_report,
-    manual_checks_path, environment_report, android_mandatory, ios_mandatory,
+    sync_report, manual_checks_path, environment_report, android_mandatory, ios_mandatory, sync_mandatory,
     build_version, calee_build_version, expected_calee_build_version,
     caleemobile_build_version, expected_caleemobile_build_version, caleeshell_version,
     calee_git_sha, expected_calee_git_sha, caleemobile_git_sha, expected_caleemobile_git_sha,
+    production, expected_calee_application_id, expected_calee_version_code, expected_caleeshell_version,
+    waiver_reason, waiver_approver, waiver_timestamp,
     calee_version_code, calee_application_id, caleemobile_dirty, calee_dirty,
     caleemobile_identity_available, calee_identity_available, require_build_identity, allow_dirty_opt,
     android_device_id, ios_device_id,
@@ -1026,6 +1177,7 @@ def consolidate(
     mobile_api = resolve("mobile-api", mobile_api_report)
     mobile_android = resolve("mobile-android", mobile_android_report)
     mobile_ios = resolve("mobile-ios", mobile_ios_report)
+    sync = resolve("sync", sync_report)
 
     manual_checks_raw = resolve("manual-checks", manual_checks_path)
     manual_checks_list = None
@@ -1064,12 +1216,17 @@ def consolidate(
 
     try:
         platforms = release_platforms.load_release_platforms()
+        features = release_platforms.load_release_features()
         expected_identity = release_platforms.load_expected_build_identity()
     except release_platforms.ReleasePlatformsError as exc:
         click.echo(str(exc), err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
     android_gating = android_mandatory if android_mandatory is not None else platforms.mobile_android
     ios_gating = ios_mandatory if ios_mandatory is not None else platforms.mobile_ios
+    # Cross-device synchronization gating (Workstream 1): explicit
+    # --sync-mandatory/--sync-optional wins, else the release feature profile
+    # (release_features.synchronization), which defaults to True.
+    sync_gating = sync_mandatory if sync_mandatory is not None else features.synchronization
 
     # Expected build identity: an explicit CLI flag wins over the release
     # profile (config/release-platforms.yaml's expected_build_identity).
@@ -1077,13 +1234,49 @@ def consolidate(
     eff_expected_calee_sha = expected_calee_git_sha or expected_identity.calee_git_sha
     eff_expected_caleemobile_build = expected_caleemobile_build_version or expected_identity.caleemobile_build_version
     eff_expected_caleemobile_sha = expected_caleemobile_git_sha or expected_identity.caleemobile_git_sha
-    allow_dirty = allow_dirty_opt if allow_dirty_opt is not None else expected_identity.allow_dirty
+    eff_expected_calee_app_id = expected_calee_application_id or expected_identity.calee_application_id
+    eff_expected_calee_version_code = expected_calee_version_code or expected_identity.calee_version_code
+    eff_expected_caleeshell_version = expected_caleeshell_version or expected_identity.caleeshell_version
 
-    # An app's identity is required (mandatory-to-know) only when that app is
-    # in this release's scope: the tablet when the tablet is gating, CaleeMobile
-    # when at least one mobile platform is gating. A PASS then may never leave
-    # an in-scope build's identity unknown (Phase 3).
-    require_calee_identity = require_build_identity and platforms.tablet
+    # Production release profile (Workstream 3): the expected identity becomes
+    # REQUIRED (a missing expectation BLOCKS), and a dirty tree needs a named
+    # waiver -- allow_dirty alone is not sufficient. An explicit --production/
+    # --development wins over the profile.
+    eff_production = production if production is not None else expected_identity.production
+    try:
+        profile_waiver = release_platforms.load_waiver()
+    except release_platforms.ReleasePlatformsError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    # A CLI-supplied waiver (build pipeline) wins over the profile's, per field.
+    waiver = {
+        "reason": waiver_reason or profile_waiver.reason,
+        "approver": waiver_approver or profile_waiver.approver,
+        "timestamp": waiver_timestamp or profile_waiver.timestamp,
+    }
+    waiver_is_valid = all(str(waiver.get(k) or "").strip() for k in ("reason", "approver", "timestamp"))
+
+    if eff_production:
+        # In production a dirty tree is approved ONLY by a valid named waiver;
+        # --allow-dirty / allow_dirty:true cannot bypass the waiver requirement.
+        allow_dirty = waiver_is_valid
+    else:
+        allow_dirty = allow_dirty_opt if allow_dirty_opt is not None else expected_identity.allow_dirty
+
+    # An app's identity is required (mandatory-to-know) when that app is in this
+    # release's scope. A PASS may never leave an in-scope build's identity
+    # unknown (Phase 3).
+    #
+    # The Calee tablet is UNCONDITIONALLY in scope for the consolidated
+    # Calee-solution report: the tablet suite is always mandatory
+    # (component_from_tablet_report is always mandatory=True) and is
+    # unconditionally executed by the full launcher, so its build identity is
+    # unconditionally required whenever build identity is required at all --
+    # execution scope and consolidation scope must never disagree (Workstream 2).
+    # The release_platforms `tablet` flag is therefore NOT a full-solution
+    # opt-out; it never gated execution or the tablet component's mandatoriness,
+    # and it must not silently relax the tablet's identity requirement either.
+    require_calee_identity = require_build_identity
     require_caleemobile_identity = require_build_identity and (android_gating or ios_gating)
 
     # The manifest's worst-wins effective exit codes for the mobile components
@@ -1126,11 +1319,40 @@ def consolidate(
         caleemobile_sha_values, required=require_caleemobile_identity,
     )
 
+    # Release identity intent (Workstream 3): for a production profile the
+    # *expected* identity must be stated up front (missing -> BLOCKED) and a
+    # dirty tree needs a named waiver. CaleeShell is in scope when the tablet is
+    # and the kiosk/admin feature is included. The tablet source SHA is only
+    # required where the pipeline can provide it (a source SHA was detected).
+    caleeshell_in_scope = require_calee_identity and features.kiosk_admin
+    release_intent = component_from_release_intent(
+        production=eff_production,
+        caleemobile_in_scope=require_caleemobile_identity,
+        tablet_in_scope=require_calee_identity,
+        caleeshell_in_scope=caleeshell_in_scope,
+        expected_caleemobile_build_version=eff_expected_caleemobile_build,
+        expected_caleemobile_git_sha=eff_expected_caleemobile_sha,
+        expected_calee_build_version=eff_expected_calee_build,
+        expected_calee_git_sha=eff_expected_calee_sha,
+        expected_calee_application_id=eff_expected_calee_app_id,
+        expected_calee_version_code=eff_expected_calee_version_code,
+        expected_caleeshell_version=eff_expected_caleeshell_version,
+        detected_calee_application_id=calee_application_id,
+        detected_calee_version_code=calee_version_code,
+        detected_caleeshell_version=caleeshell_version,
+        tablet_source_sha_available=bool(calee_git_sha),
+        caleemobile_dirty=caleemobile_dirty,
+        calee_dirty=calee_dirty,
+        waiver=waiver,
+    )
+
     extra_components = []
     if identity_stability is not None:
         extra_components.append(identity_stability)
     if sha_agreement is not None:
         extra_components.append(sha_agreement)
+    if release_intent is not None:
+        extra_components.append(release_intent)
 
     report = build_release_report(
         environment=env_report,
@@ -1138,10 +1360,12 @@ def consolidate(
         mobile_api=mobile_api,
         mobile_android_ui=mobile_android,
         mobile_ios_ui=mobile_ios,
+        sync=sync,
         manual_checks=manual_checks_list,
         meta=meta,
         android_mandatory=android_gating,
         ios_mandatory=ios_gating,
+        sync_mandatory=sync_gating,
         calee_build_version=calee_build_version,
         expected_calee_build_version=eff_expected_calee_build,
         caleemobile_build_version=caleemobile_build_version,

@@ -48,13 +48,24 @@ response excerpts) — see `SyncStepEvidence`/`SyncFlowResult` there and
 The *italicized* steps above are always recorded `BLOCKED`, never attempted and never faked as
 passing — they need tablet-side mutation resource ids that have never been confirmed against the
 real Calee app, the same gap `calendar_event_mutation`/`tasks_mutation` (above) are blocked on. See
-`docs/TABLET_MUTATION_COVERAGE_GAPS.md`. Because of this, **`sync-smoke` is not yet release-gating**:
-the event and task flows can never reach a clean `ok` status until that gap closes, so making it
-mandatory today would mean no release could ever pass. Its report
-(`reports/runs/<run-id>/sync/results.json`) is written for every run but is not yet auto-discovered
-by `consolidate` — informational only until the tablet-mutation gap closes, at which point it should
-be wired in as a mandatory component the same way `environment`/`tablet`/`mobile-*` already are (see
-`docs/RELEASE_POLICY.md`).
+`docs/TABLET_MUTATION_COVERAGE_GAPS.md`.
+
+**`sync-smoke` is now a release-gating component (Workstream 1).** `06 Test Full Calee Solution`
+invokes it after the mobile UI legs and before manual checks, reusing this run's verified backend +
+regression fixture + credentials and the same `CALEE_RUN_ID`; its report
+(`reports/runs/<run-id>/sync/results.json`) is auto-discovered and validated by `consolidate` like
+every other component, and for a full Calee solution release synchronization defaults to **mandatory**
+(`config/release-platforms.yaml` `release_features.synchronization`). A missing, stale,
+run-ID-mismatched, `BLOCKED` or `FAILED` mandatory sync can never read as a release PASS.
+
+This is *not* a silent non-gate. Because the italicized tablet-mutation steps are still `BLOCKED`
+(unconfirmed resource ids) **and no real device has yet verified the flows in this environment**, a
+mandatory sync currently resolves to `BLOCKED`, so a full-solution release BLOCKS on it — which is
+the intended safety property ("a PASS must not be possible while synchronization is unverified"), not
+an oversight. Once the tablet-mutation gap closes (`docs/TABLET_MUTATION_COVERAGE_GAPS.md`) and a real
+device run reaches a clean `ok`, sync will PASS on its own with no further wiring. A release that
+genuinely does not include cross-device sync can set `release_features.synchronization: false`, which
+keeps sync in the report as an explicit **optional** component rather than silently omitting it.
 
 Every *other* step in all three flows is exercised for real against whatever backend/device the
 caller points it at — `sync_smoke_bridge.py` shells out to CaleeMobile-Regression's

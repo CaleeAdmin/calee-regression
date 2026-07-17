@@ -103,7 +103,37 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     fi
 
     echo ""
-    echo "--- Step 6: Manual Checks ---"
+    echo "--- Step 6: Cross-device synchronization ---"
+    # Sync runs AFTER the mobile UI legs and BEFORE manual checks. It reuses
+    # this run's verified backend + regression fixture + credentials and the
+    # same CALEE_RUN_ID (the sync-smoke command reads the prepared-and-verified
+    # backend from this run's environment report), driving the mobile legs on
+    # ONE in-scope CaleeMobile platform -- Android preferred, else iOS. It writes
+    # reports/runs/$CALEE_RUN_ID/sync/results.json, which consolidate
+    # auto-discovers and, for a full Calee solution release, gates on: sync
+    # defaults to MANDATORY (config/release-platforms.yaml
+    # release_features.synchronization). A missing, stale, run-ID-mismatched,
+    # BLOCKED or FAILED mandatory sync can never read as a release PASS.
+    if [ "$RELEASE_PLATFORM_ANDROID" = "true" ]; then
+        SYNC_PLATFORM="android"
+    elif [ "$RELEASE_PLATFORM_IOS" = "true" ]; then
+        SYNC_PLATFORM="ios"
+    else
+        # No in-scope CaleeMobile platform to drive the sync mobile legs. A
+        # mandatory sync then BLOCKS (it has no mobile surface to verify
+        # against); the sync-smoke command records that explicitly.
+        SYNC_PLATFORM="none"
+    fi
+    SYNC_ARGS=(--config "$CALEE_TEST_CONFIG" --run-id "$CALEE_RUN_ID" --platform "$SYNC_PLATFORM")
+    if [ "$RELEASE_FEATURE_SYNCHRONIZATION" = "false" ]; then
+        SYNC_ARGS+=(--optional)
+    else
+        SYNC_ARGS+=(--mandatory)
+    fi
+    python -m calee_regression sync-smoke "${SYNC_ARGS[@]}"
+
+    echo ""
+    echo "--- Step 7: Manual Checks ---"
     python -m calee_regression record-manual-checks --run-id "$CALEE_RUN_ID"
 else
     echo ""
@@ -167,6 +197,15 @@ if [ "$RELEASE_PLATFORM_IOS" = "true" ]; then
     CONSOLIDATE_ARGS+=(--ios-mandatory)
 else
     CONSOLIDATE_ARGS+=(--ios-optional)
+fi
+# Cross-device synchronization gating (Workstream 1): mandatory for a full
+# Calee solution release unless the technical owner opted it out via
+# config/release-platforms.yaml (release_features.synchronization: false), in
+# which case it is still shown in the report as an explicit optional component.
+if [ "$RELEASE_FEATURE_SYNCHRONIZATION" = "false" ]; then
+    CONSOLIDATE_ARGS+=(--sync-optional)
+else
+    CONSOLIDATE_ARGS+=(--sync-mandatory)
 fi
 # Build/commit identity -- auto-collected above (a technical owner can still
 # override any value via the matching env var). The detected identity is

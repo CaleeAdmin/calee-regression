@@ -14,11 +14,39 @@
 # mobile_android/mobile_ios to false just because you don't want to run
 # the mobile UI suite this time -- that is a real release-scope decision,
 # not a shortcut.
+#
+# NOTE on `tablet` (Workstream 2): the Calee tablet is UNCONDITIONALLY part of
+# a "Full Calee Solution" release -- "06 Test Full Calee Solution" always runs
+# the tablet suite, the consolidated report always treats it as mandatory, and
+# its build identity is always required. `tablet` is therefore NOT a
+# full-solution opt-out; setting it to `false` does not skip the tablet or relax
+# its gating. It remains here only so a non-full-solution/diagnostic scope can
+# read RELEASE_PLATFORM_TABLET; a real Full Calee Solution keeps it `true`.
 
 release_platforms:
   tablet: true
   mobile_android: true
   mobile_ios: true
+
+# Technical-owner configuration: which cross-cutting FEATURES this release
+# includes, beyond the platform selection above (Workstream 2). Like the
+# platforms, an absent file or section defaults every feature to `true`
+# (mandatory/release-gating) -- an omitted feature must block the release, not
+# silently pass by omission. Set a feature to `false` only when this release
+# genuinely does not include it.
+#
+#   synchronization: cross-device sync (event/task/chore) is release-gating and
+#     is invoked by "06 Test Full Calee Solution" after the mobile UI legs and
+#     before manual checks. A missing/BLOCKED/FAILED mandatory sync cannot PASS.
+#   meals / onboarding / google_calendar / kiosk_admin: reach the relevant
+#     mobile/tablet test process as mandatory/optional (see the mobile launcher
+#     and the release feature profile plumbing).
+release_features:
+  synchronization: true
+  meals: true
+  onboarding: true
+  google_calendar: true
+  kiosk_admin: true
 
 # Expected build identity for this release (Phase 3). The launcher
 # auto-detects the CaleeMobile version/commit (and the Calee tablet identity
@@ -32,6 +60,30 @@ release_platforms:
 # expected_build_identity:
 #   calee_build_version: "0.3.22"        # Calee tablet installed versionName
 #   calee_git_sha: "<full tablet commit sha>"
+#   calee_application_id: "com.viso.calee"  # Calee tablet Android application id
+#   calee_version_code: "322"            # Calee tablet installed versionCode
 #   caleemobile_build_version: "0.0.22+22"  # CaleeMobile pubspec version+build
 #   caleemobile_git_sha: "<full CaleeMobile commit sha>"
-#   allow_dirty: false                   # set true ONLY to approve an uncommitted build
+#   caleeshell_version: "1.4.0"          # CaleeShell version (when kiosk/admin is in scope)
+#   allow_dirty: false                   # (development only) set true to approve an uncommitted build
+
+# Production release profile (Workstream 3). Setting `production: true` (below,
+# or top-level `release_profile: production`) makes the expected identity above
+# REQUIRED, not merely checked-if-present: a missing expected CaleeMobile
+# SHA/version, tablet applicationId/versionName/versionCode/source SHA (where the
+# pipeline can provide it), or CaleeShell version (when CaleeShell is in scope)
+# BLOCKS the release. Consistency of the observed build alone is NOT evidence of
+# release intent -- the intended target must be stated up front.
+#
+# expected_build_identity:
+#   production: true
+#   ... (the expected values above) ...
+#
+# In a production profile a dirty/uncommitted source tree is approved ONLY by an
+# explicit named waiver -- `allow_dirty: true` is not sufficient. A waiver must
+# name WHY, WHO approved it, and WHEN, and is recorded verbatim in the report:
+#
+# waiver:
+#   reason: "hotfix cut from an uncommitted tree, approved out-of-band"
+#   approver: "Jane Doe (release manager)"
+#   timestamp: "2026-07-17T10:00:00+08:00"
