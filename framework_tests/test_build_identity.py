@@ -7,6 +7,7 @@ degrade-cleanly paths (missing pubspec, non-git directory, no device).
 
 from __future__ import annotations
 
+import json
 import subprocess
 
 import pytest
@@ -188,3 +189,30 @@ def test_build_identity_command_reports_missing_caleemobile_as_unavailable(_repo
     result = CliRunner().invoke(main, ["build-identity"])
     assert result.exit_code == EXIT_SUCCESS
     assert "AUTO_CALEEMOBILE_IDENTITY_AVAILABLE=false" in result.output
+
+
+def test_build_identity_command_writes_pre_and_post_snapshots(_repo_root):
+    # Phase 4: --run-id + --phase also writes the identity snapshot to the run
+    # workspace, without changing the shell output.
+    cm = _repo_root / "CaleeMobile"
+    _make_git_repo(cm)
+    (cm / "pubspec.yaml").write_text("name: calee_mobile\nversion: 0.0.22+22\n")
+    _git(cm, "add", "-A")
+    _git(cm, "commit", "-q", "-m", "init")
+
+    run_id = "release-20260101-000000-snap01"
+    repo_root = _repo_root / "calee-regression"
+    for phase in ("pre", "post"):
+        result = CliRunner().invoke(
+            main, ["build-identity", "--run-id", run_id, "--phase", phase]
+        )
+        assert result.exit_code == EXIT_SUCCESS
+        # Shell output is still emitted (unchanged behaviour).
+        assert "AUTO_CALEEMOBILE_BUILD_VERSION=0.0.22+22" in result.output
+        snapshot_path = repo_root / "reports" / "runs" / run_id / "identity" / f"{phase}.json"
+        assert snapshot_path.is_file()
+        data = json.loads(snapshot_path.read_text())
+        assert data["phase"] == phase
+        assert data["runId"] == run_id
+        assert data["caleemobile"]["buildVersion"] == "0.0.22+22"
+        assert data["caleemobile"]["gitSha"]  # a real SHA was captured

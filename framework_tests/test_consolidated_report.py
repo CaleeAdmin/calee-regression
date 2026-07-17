@@ -732,3 +732,126 @@ def test_build_identity_evidence_surfaced_in_html(tmp_path):
     for expected in ("Calee tablet build identity", "0.3.22", "tab123", "322",
                      "com.calee.app", "CaleeShell version", "1.4.0"):
         assert expected in html, f"{expected!r} missing from build-identity HTML"
+
+
+# --- Phase 3: API/platform report overwrite protection (exit floors) -----
+
+
+def _api_pass(run_id="r"):
+    return {"runId": run_id, "counts": {"PASS": 1}, "steps": [{"name": "x", "status": "PASS"}]}
+
+
+def _find(report, name):
+    return next(c for c in report.components if c.name == name)
+
+
+def test_exit_floor_downgrades_api_when_manifest_recorded_a_failure():
+    # The mobile-api report file reads PASS (e.g. a later run overwrote the
+    # earlier FAIL's results.json), but the run manifest recorded exit code 1.
+    # Consolidation must use the recorded FAIL -- an initial API FAIL can never
+    # be laundered into a PASS by a later report overwrite (Phase 3).
+    report = build_release_report(
+        environment={"status": "pass"},
+        mobile_api=_api_pass(),
+        android_mandatory=False, ios_mandatory=False,
+        mobile_exit_floors={"mobile-api": 1},
+    )
+    api = _find(report, "CaleeMobile Client API")
+    assert api.status == STATUS_FAIL
+    assert report.overall_status == STATUS_FAIL
+
+
+def test_exit_floor_of_pass_never_improves_a_reported_failure():
+    # The floor can only make a component worse, never better: a report that
+    # FAILs stays FAIL even if the manifest happened to record a 0.
+    failing_api = {"runId": "r", "counts": {"FAIL": 1}, "steps": [{"name": "x", "status": "FAIL"}]}
+    report = build_release_report(
+        environment={"status": "pass"},
+        mobile_api=failing_api,
+        android_mandatory=False, ios_mandatory=False,
+        mobile_exit_floors={"mobile-api": 0},
+    )
+    assert _find(report, "CaleeMobile Client API").status == STATUS_FAIL
+
+
+def test_exit_floor_is_per_component_so_a_platform_failure_is_isolated():
+    # An Android floor of FAIL must not touch the API or iOS components.
+    report = build_release_report(
+        environment={"status": "pass"},
+        mobile_api=_api_pass(),
+        mobile_android_ui=_api_pass(),
+        mobile_ios_ui=_api_pass(),
+        android_mandatory=True, ios_mandatory=True,
+        mobile_exit_floors={"mobile-android": 1},
+    )
+    assert _find(report, "CaleeMobile Android UI").status == STATUS_FAIL
+    assert _find(report, "CaleeMobile Client API").status == STATUS_PASS
+    assert _find(report, "CaleeMobile iPhone UI").status == STATUS_PASS
+
+
+# --- Phase 4: pre/post build-identity stability --------------------------
+
+from calee_regression.consolidated_report import component_from_identity_stability  # noqa: E402
+
+
+def _snapshot(*, cm_sha="cm1", cm_ver="0.0.22+22", cm_dirty=False,
+              app_id="com.viso.calee", tab_ver="0.3.22", tab_code="322", tab_sha="tab1"):
+    return {
+        "caleemobile": {"gitSha": cm_sha, "buildVersion": cm_ver, "dirty": cm_dirty},
+        "tablet": {"applicationId": app_id, "buildVersion": tab_ver,
+                   "versionCode": tab_code, "gitSha": tab_sha},
+    }
+
+
+def test_identity_stability_passes_when_nothing_changed():
+    comp = component_from_identity_stability(
+        _snapshot(), _snapshot(), require_caleemobile=True, require_calee=True,
+    )
+    assert comp is not None
+    assert comp.status == STATUS_PASS
+    assert comp.mandatory is True
+
+
+def test_identity_stability_blocks_when_caleemobile_sha_changes():
+    comp = component_from_identity_stability(
+        _snapshot(cm_sha="cm1"), _snapshot(cm_sha="cm2"),
+        require_caleemobile=True, require_calee=True,
+    )
+    assert comp.status == STATUS_BLOCKED
+    assert any("CaleeMobile gitSha changed" in d for d in comp.detail)
+
+
+def test_identity_stability_blocks_when_tablet_package_changes():
+    # The installed tablet package changed mid-run (versionCode bump).
+    comp = component_from_identity_stability(
+        _snapshot(tab_code="322"), _snapshot(tab_code="323"),
+        require_caleemobile=True, require_calee=True,
+    )
+    assert comp.status == STATUS_BLOCKED
+    assert any("Calee tablet versionCode changed" in d for d in comp.detail)
+
+
+def test_identity_stability_blocks_on_incomplete_capture():
+    # Only a pre snapshot exists (post never captured) -> incomplete -> BLOCKED.
+    comp = component_from_identity_stability(
+        _snapshot(), None, require_caleemobile=True, require_calee=True,
+    )
+    assert comp.status == STATUS_BLOCKED
+    assert any("post-run" in d for d in comp.detail)
+
+
+def test_identity_stability_is_none_without_any_snapshots():
+    # Legacy/ad-hoc consolidation with no identity evidence adds no component.
+    assert component_from_identity_stability(
+        None, None, require_caleemobile=True, require_calee=True,
+    ) is None
+
+
+def test_identity_stability_ignores_out_of_scope_apps():
+    # The tablet SHA changed, but the tablet is not in scope for this release,
+    # so it does not block. Only in-scope apps are compared.
+    comp = component_from_identity_stability(
+        _snapshot(tab_sha="tab1"), _snapshot(tab_sha="tab2"),
+        require_caleemobile=True, require_calee=False,
+    )
+    assert comp.status == STATUS_PASS

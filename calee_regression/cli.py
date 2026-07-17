@@ -22,6 +22,7 @@ from .consolidated_report import (
     STATUS_PASS,
     ManualCheck,
     build_release_report,
+    component_from_identity_stability,
     decide_status,
     write_release_bundle,
 )
@@ -752,7 +753,18 @@ def release_platforms_cmd():
     help="Calee tablet Android application id to query via `adb dumpsys package` for the installed version.",
 )
 @click.option("--caleeshell-version", default=None, envvar="CALEESHELL_VERSION")
-def build_identity_cmd(caleemobile_source, calee_source, android_package, caleeshell_version):
+@click.option(
+    "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None,
+    help="Shared release run ID. Required together with --phase to also write a "
+         "pre/post identity snapshot into this run's workspace.",
+)
+@click.option(
+    "--phase", type=click.Choice(["pre", "post"]), default=None,
+    help="When given (with --run-id), also write this run's build-identity snapshot to "
+         "reports/runs/<run-id>/identity/<phase>.json, so consolidation can prove the "
+         "build was stable across the run (Phase 4).",
+)
+def build_identity_cmd(caleemobile_source, calee_source, android_package, caleeshell_version, run_id_opt, phase):
     """Automatically collect build identity and print it as shell assignments.
 
     A launcher can `eval "$(python -m calee_regression build-identity)"` and
@@ -760,6 +772,12 @@ def build_identity_cmd(caleemobile_source, calee_source, android_package, calees
     (`${CALEEMOBILE_BUILD_VERSION:-$AUTO_CALEEMOBILE_BUILD_VERSION}`), falling
     back to the auto-detected one. This replaces the old "only when an env var
     was manually provided" behaviour -- see Phase 3 and docs/RELEASE_POLICY.md.
+
+    With --run-id and --phase (pre|post) it ALSO writes the collected identity
+    to reports/runs/<run-id>/identity/<phase>.json. The full launcher collects
+    a `pre` snapshot before testing and a `post` snapshot after, and
+    consolidation BLOCKS when an in-scope app's identity changed between them
+    (Phase 4). Writing the snapshot never changes the shell output.
 
     Never fails the run: an unreachable device/adb or a missing checkout just
     yields AUTO_*_IDENTITY_AVAILABLE=false, which the consolidator turns into
@@ -772,6 +790,27 @@ def build_identity_cmd(caleemobile_source, calee_source, android_package, calees
     )
     click.echo(caleemobile.to_shell("CALEEMOBILE"))
     click.echo(tablet.to_shell("CALEE"))
+
+    if phase and run_id_opt:
+        if not run_context.is_valid_run_id(run_id_opt):
+            click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+        identity_dir = workspace.root / "identity"
+        identity_dir.mkdir(parents=True, exist_ok=True)
+        snapshot = {
+            "runId": run_id_opt,
+            "phase": phase,
+            "capturedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "caleemobile": caleemobile.to_dict(),
+            "tablet": tablet.to_dict(),
+        }
+        snapshot_path = identity_dir / f"{phase}.json"
+        snapshot_path.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
+        click.echo(f"[identity] wrote {phase}-run snapshot: {snapshot_path}", err=True)
+    elif phase and not run_id_opt:
+        click.echo("--phase also needs --run-id (or CALEE_RUN_ID) to write an identity snapshot.", err=True)
+
     raise SystemExit(EXIT_SUCCESS)
 
 
@@ -803,6 +842,20 @@ def _load_manual_checks(path: "str | None") -> "list[ManualCheck] | None":
     if isinstance(raw, dict):
         raw = raw.get("checks", [])
     return _manual_checks_from_list(raw)
+
+
+def _load_identity_snapshot(workspace: run_context.RunWorkspace, phase: str) -> "dict | None":
+    """Load this run's pre/post build-identity snapshot
+    (reports/runs/<run-id>/identity/<phase>.json), or None if it was never
+    written or is unreadable. Written by `build-identity --phase pre|post`;
+    consumed by component_from_identity_stability (Phase 4)."""
+    path = workspace.root / "identity" / f"{phase}.json"
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 class _ConsolidationProblem(NamedTuple):
@@ -1011,6 +1064,30 @@ def consolidate(
     require_calee_identity = require_build_identity and platforms.tablet
     require_caleemobile_identity = require_build_identity and (android_gating or ios_gating)
 
+    # The manifest's worst-wins effective exit codes for the mobile components
+    # are passed as floors: a component's report that reads better than the
+    # worst result recorded for it during the run (e.g. a later platform run
+    # overwrote an earlier FAIL) is downgraded back to the recorded result.
+    # See build_release_report / _apply_exit_floor and Phase 3.
+    mobile_exit_floors = {
+        key: manifest.effective_exit_code(key)
+        for key in ("mobile-api", "mobile-android", "mobile-ios")
+    }
+
+    # Pre/post build-identity stability (Phase 4): a snapshot captured before
+    # testing and one captured after. An in-scope app whose identity changed
+    # between them BLOCKS -- what was tested is not what is being certified.
+    # Absent snapshots (legacy/ad-hoc consolidation) add no component; the full
+    # launcher always captures both.
+    identity_pre = _load_identity_snapshot(workspace, "pre")
+    identity_post = _load_identity_snapshot(workspace, "post")
+    identity_stability = component_from_identity_stability(
+        identity_pre, identity_post,
+        require_caleemobile=require_caleemobile_identity,
+        require_calee=require_calee_identity,
+    )
+    identity_stability_components = [identity_stability] if identity_stability is not None else []
+
     report = build_release_report(
         environment=env_report,
         tablet=tablet,
@@ -1039,6 +1116,8 @@ def consolidate(
         require_calee_identity=require_calee_identity,
         require_caleemobile_identity=require_caleemobile_identity,
         allow_dirty=allow_dirty,
+        mobile_exit_floors=mobile_exit_floors,
+        extra_components=identity_stability_components,
     )
 
     out = Path(out_dir) if out_dir else workspace.consolidated_dir

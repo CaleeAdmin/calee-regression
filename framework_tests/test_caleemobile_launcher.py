@@ -617,3 +617,119 @@ def test_fixture_not_ok_prevents_client_api_from_running(tmp_path):
     assert result.returncode == 3
     assert "fixture was not verified" in result.stdout
     assert not order_log.exists()
+
+
+# --- Phase 3: the Client API regression runs EXACTLY ONCE per release -----
+
+
+def _run_script_args(calee_regression_copy, workspace, args, env_overrides=None):
+    """Like _run_script but passes an explicit argv (platform and/or mode)."""
+    env = dict(os.environ)
+    env["PATH"] = "/usr/bin:/bin"
+    for key in _HERMETIC_ENV_KEYS:
+        env.pop(key, None)
+    if env_overrides:
+        env.update(env_overrides)
+    return subprocess.run(
+        ["bash", str(calee_regression_copy / "scripts" / "test_caleemobile.sh"), *args],
+        cwd=str(workspace), env=env, capture_output=True, text=True, timeout=60,
+    )
+
+
+def _run_script_fakebin_args(calee_regression_copy, workspace, args, *, fakebin, extra_env):
+    env = dict(os.environ)
+    env["PATH"] = f"{fakebin}{os.pathsep}/usr/bin:/bin"
+    for key in _HERMETIC_ENV_KEYS:
+        env.pop(key, None)
+    env.update(extra_env)
+    return subprocess.run(
+        ["bash", str(calee_regression_copy / "scripts" / "test_caleemobile.sh"), *args],
+        cwd=str(workspace), env=env, capture_output=True, text=True, timeout=60,
+    )
+
+
+def test_full_solution_runs_client_api_once_and_ui_only_per_platform():
+    # The Client API suite is device-independent, so the full-solution launcher
+    # runs it EXACTLY ONCE (api-only) and then the per-platform UI ONLY
+    # (--ui-only). This is what stops an Android and an iOS run from each
+    # re-running and overwriting the one mobile-api/results.json (Phase 3).
+    text = FULL_SOLUTION_SCRIPT.read_text(encoding="utf-8")
+    assert text.count("test_caleemobile.sh api-only") == 1
+    assert "test_caleemobile.sh android --ui-only" in text
+    assert "test_caleemobile.sh ios --ui-only" in text
+    # The old "run the whole thing (incl. API) per platform" calls are gone.
+    assert "test_caleemobile.sh android\n" not in text
+    assert "test_caleemobile.sh ios\n" not in text
+
+
+def test_full_solution_runs_api_once_before_and_outside_the_platform_blocks():
+    # Requirement 5: excluding an optional platform must not stop or re-run the
+    # API. The single api-only call sits before (and outside) both
+    # per-platform if-blocks, so platform selection can't affect it.
+    text = FULL_SOLUTION_SCRIPT.read_text(encoding="utf-8")
+    api_idx = text.index("test_caleemobile.sh api-only")
+    android_if_idx = text.index('if [ "$RELEASE_PLATFORM_ANDROID" = "true" ]')
+    ios_if_idx = text.index('if [ "$RELEASE_PLATFORM_IOS" = "true" ]')
+    assert api_idx < android_if_idx < ios_if_idx
+
+
+def test_full_solution_captures_pre_and_post_build_identity():
+    # Phase 4: pre-run identity is captured before any test runs; post-run
+    # identity after. Consolidation compares them and BLOCKS on a change.
+    text = FULL_SOLUTION_SCRIPT.read_text(encoding="utf-8")
+    assert 'build-identity --run-id "$CALEE_RUN_ID" --phase pre' in text
+    assert 'build-identity --run-id "$CALEE_RUN_ID" --phase post' in text
+    tablet_marker = "--- Step 2: Calee Tablet ---"
+    assert text.index("--phase pre") < text.index(tablet_marker)
+    assert text.index("--phase post") > text.index(tablet_marker)
+
+
+def test_api_only_mode_runs_api_and_records_only_the_api_report(tmp_path):
+    calee_regression_copy = _copy_calee_regression(tmp_path)
+    _make_fake_sibling(tmp_path, ui_recorder=True)
+    run_id = "release-20260101-000000-apionly"
+    _write_env_report(calee_regression_copy, run_id, fixture_status="ok", backend=DEV_BACKEND)
+    order_log = tmp_path / "order.log"
+
+    result = _run_script_args(
+        calee_regression_copy, tmp_path, ["api-only"],
+        env_overrides={"CALEE_RUN_ID": run_id, "FAKE_ORDER_LOG": str(order_log)},
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    # Only the Client API suite ran, exactly once -- no UI.
+    assert order_log.read_text() == "API\n"
+    runs = calee_regression_copy / "reports" / "runs" / run_id
+    assert (runs / "mobile-api" / "results.json").is_file()
+    # api-only never produces (or touches) any per-platform UI report.
+    assert not (runs / "mobile-android" / "results.json").exists()
+    assert not (runs / "mobile-ios" / "results.json").exists()
+
+
+def test_ui_only_mode_runs_ui_and_never_runs_or_writes_the_api_report(tmp_path):
+    calee_regression_copy = _copy_calee_regression(tmp_path)
+    _make_fake_sibling(tmp_path, ui_recorder=True)
+    fakebin = _make_fakebin(tmp_path, with_flutter=True)
+    run_id = "release-20260101-000000-uionly"
+    _write_env_report(calee_regression_copy, run_id, fixture_status="ok", backend=DEV_BACKEND)
+    order_log = tmp_path / "order.log"
+    ui_record = tmp_path / "ui_record.json"
+
+    result = _run_script_fakebin_args(
+        calee_regression_copy, tmp_path, ["android", "--ui-only"], fakebin=fakebin,
+        extra_env={
+            "CALEE_RUN_ID": run_id,
+            "CALEE_TEST_EMAIL": "demo@example.com",
+            "CALEE_TEST_PASSWORD": "hunter2",
+            "FAKE_ORDER_LOG": str(order_log),
+            "FAKE_UI_RECORD": str(ui_record),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    # The Android UI ran; the Client API suite never ran in this invocation.
+    assert order_log.read_text() == "UI\n"
+    runs = calee_regression_copy / "reports" / "runs" / run_id
+    assert (runs / "mobile-android" / "results.json").is_file()
+    # A --ui-only run must never write (let alone overwrite) the API report.
+    assert not (runs / "mobile-api" / "results.json").exists()

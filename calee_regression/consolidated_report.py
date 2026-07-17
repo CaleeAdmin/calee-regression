@@ -30,7 +30,7 @@ import re
 import time
 import xml.etree.ElementTree as ET
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +74,55 @@ def decide_status(*, passed: int, failed: int, blocked: int, total: "int | None"
         # e.g. every scenario was skipped. That must never read as success.
         return STATUS_BLOCKED
     return STATUS_PASS
+
+
+def status_from_exit_code(code: "int | None") -> "str | None":
+    """A recorded process exit code as a ComponentResult status, or None when
+    no code was recorded. 0 -> pass, 1 -> fail, any other non-zero -> blocked
+    (an environment/tooling problem, never a product FAIL)."""
+    if code is None:
+        return None
+    if code == 0:
+        return STATUS_PASS
+    if code == 1:
+        return STATUS_FAIL
+    return STATUS_BLOCKED
+
+
+# Severity ordering used when reconciling a component's report-derived status
+# with a recorded exit-code floor: FAIL is worse than BLOCKED/NOT_RUN, which
+# are worse than PASS. A floor can only make a component *worse*, never better.
+_STATUS_SEVERITY = {
+    STATUS_PASS: 0,
+    STATUS_NOT_RUN: 1,
+    STATUS_BLOCKED: 1,
+    STATUS_FAIL: 2,
+}
+
+
+def _apply_exit_floor(component: "ComponentResult", floor_code: "int | None") -> "ComponentResult":
+    """Downgrade `component` to at least the severity of a recorded exit-code
+    floor from the run manifest.
+
+    A report file that reads *better* than the worst result the manifest
+    recorded for this component -- e.g. a later platform run overwrote an
+    earlier FAIL's results.json with a PASS -- must not be trusted: the
+    consolidated result is the worse of (report-derived status, recorded
+    floor). This closes the file-overwrite hole end-to-end, so an initial API
+    (or platform) FAIL can never be laundered into a PASS by a later run. See
+    run_context.worst_exit_code and Phase 3.
+    """
+    floor_status = status_from_exit_code(floor_code)
+    if floor_status is None:
+        return component
+    if _STATUS_SEVERITY.get(floor_status, 0) <= _STATUS_SEVERITY.get(component.status, 0):
+        return component
+    detail = list(component.detail) + [
+        f"Run manifest recorded exit code {floor_code} ({floor_status.upper()}) for "
+        f"this component, worse than its report — using the recorded result "
+        f"(a later run may not overwrite an earlier failure)."
+    ]
+    return replace(component, status=floor_status, detail=detail)
 
 
 @dataclass
@@ -528,6 +577,66 @@ def component_from_manual_checks(checks: "list[ManualCheck]", *, name: str = "ma
     return ComponentResult(name=name, status=status, mandatory=True, passed=passed, failed=failed, blocked=blocked, detail=detail)
 
 
+# The identity fields that must not change between the pre-run and post-run
+# snapshots for an in-scope app. A change in any of these during the run means
+# the thing that was tested is not the thing being certified. See Phase 4.
+_IDENTITY_FIELDS_CALEEMOBILE = ("gitSha", "buildVersion", "dirty")
+_IDENTITY_FIELDS_TABLET = ("applicationId", "buildVersion", "versionCode", "gitSha")
+
+
+def component_from_identity_stability(
+    pre: "dict[str, Any] | None",
+    post: "dict[str, Any] | None",
+    *,
+    require_caleemobile: bool,
+    require_calee: bool,
+    name: str = "Build identity stability (pre/post run)",
+) -> "ComponentResult | None":
+    """Compare the pre-run and post-run build-identity snapshots (Phase 4).
+
+    An in-scope app whose identity changed during the run BLOCKS the release:
+    the CaleeMobile source SHA / build changed, or the installed tablet
+    package's applicationId / versionName / versionCode / SHA changed while it
+    was under test -- so what was tested is not what is being certified.
+
+    Snapshots are ``{"caleemobile": {...to_dict...}, "tablet": {...}}`` as
+    written by the ``build-identity --phase pre|post`` command. Returns None
+    when neither snapshot was captured (legacy/ad-hoc consolidation with no
+    identity evidence -- the full launcher always captures both). When exactly
+    one snapshot is present the capture is incomplete, which BLOCKS.
+    """
+    if pre is None and post is None:
+        return None
+    if pre is None or post is None:
+        which = "post-run" if pre is not None else "pre-run"
+        return ComponentResult(
+            name=name, status=STATUS_BLOCKED, mandatory=True,
+            detail=[
+                f"Incomplete build-identity capture: the {which} snapshot is missing "
+                f"-- cannot prove the build was stable across the run."
+            ],
+        )
+    checks = []
+    if require_caleemobile:
+        checks.append(("CaleeMobile", "caleemobile", _IDENTITY_FIELDS_CALEEMOBILE))
+    if require_calee:
+        checks.append(("Calee tablet", "tablet", _IDENTITY_FIELDS_TABLET))
+    changed = []
+    for label, key, fields in checks:
+        pre_app = pre.get(key) or {}
+        post_app = post.get(key) or {}
+        for field_name in fields:
+            pre_value = pre_app.get(field_name)
+            post_value = post_app.get(field_name)
+            if pre_value != post_value:
+                changed.append(
+                    f"{label} {field_name} changed during the run: "
+                    f"{pre_value!r} -> {post_value!r}"
+                )
+    status = STATUS_BLOCKED if changed else STATUS_PASS
+    return ComponentResult(name=name, status=status, mandatory=True, detail=changed)
+
+
 def build_release_report(
     *,
     environment: "dict[str, Any] | None" = None,
@@ -558,6 +667,8 @@ def build_release_report(
     require_calee_identity: bool = False,
     require_caleemobile_identity: bool = False,
     allow_dirty: bool = False,
+    mobile_exit_floors: "dict[str, int | None] | None" = None,
+    extra_components: "list[ComponentResult] | None" = None,
 ) -> ReleaseReport:
     """`android_mandatory`/`ios_mandatory` come from the technical owner's
     release-platform profile (calee_regression/release_platforms.py),
@@ -577,12 +688,26 @@ def build_release_report(
     "environment is optional for this release" concept. See
     component_from_environment_report and Workstream 4.
     """
+    # A recorded exit-code floor (from the run manifest's worst-wins history)
+    # can only make a mobile component worse, never better -- so a later run
+    # can never overwrite an earlier FAIL's report with a PASS. See
+    # _apply_exit_floor and run_context.worst_exit_code (Phase 3).
+    floors = mobile_exit_floors or {}
     components = [
         component_from_environment_report("Test environment and regression fixture", environment, mandatory=True),
         component_from_tablet_report("Calee tablet", tablet, mandatory=True),
-        component_from_api_report("CaleeMobile Client API", mobile_api, mandatory=True),
-        component_from_api_report("CaleeMobile Android UI", mobile_android_ui, mandatory=android_mandatory),
-        component_from_api_report("CaleeMobile iPhone UI", mobile_ios_ui, mandatory=ios_mandatory),
+        _apply_exit_floor(
+            component_from_api_report("CaleeMobile Client API", mobile_api, mandatory=True),
+            floors.get("mobile-api"),
+        ),
+        _apply_exit_floor(
+            component_from_api_report("CaleeMobile Android UI", mobile_android_ui, mandatory=android_mandatory),
+            floors.get("mobile-android"),
+        ),
+        _apply_exit_floor(
+            component_from_api_report("CaleeMobile iPhone UI", mobile_ios_ui, mandatory=ios_mandatory),
+            floors.get("mobile-ios"),
+        ),
         component_from_manual_checks(manual_checks or []),
     ]
 
@@ -627,6 +752,13 @@ def build_release_report(
     ):
         if identity_component is not None:
             components.append(identity_component)
+
+    # Caller-supplied extra components (e.g. the pre/post build-identity
+    # stability check, Phase 4) are appended last so they gate the overall
+    # status the same as any built-in component.
+    for extra in extra_components or []:
+        if extra is not None:
+            components.append(extra)
 
     mandatory_statuses = [c.status for c in components if c.mandatory]
     if any(s == STATUS_FAIL for s in mandatory_statuses):
