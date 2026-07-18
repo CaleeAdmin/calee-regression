@@ -271,6 +271,57 @@ def test_development_gate_accepts_ci_source(tmp_path):
     assert result.exit_code == EXIT_SUCCESS, result.output
 
 
+# ---------------------------------------------------------------------------
+# Priority 2: production must reject a bare --source and require the GitHub
+# artifact authenticity chain (self-declared "ci" is not proof).
+# ---------------------------------------------------------------------------
+
+
+def _clear_tokens(monkeypatch):
+    for var in ("REGRESSION_API_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_production_gate_rejects_bare_source_even_self_declared_ci(tmp_path, monkeypatch):
+    # THE Priority-2 vulnerability: a bare --source JSON that self-declares
+    # generatedBy='ci' with a workflowRunId must NOT be accepted for production.
+    _clear_tokens(monkeypatch)
+    result = _run_gate(tmp_path, _evidence(), extra_args=["--production"])
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    assert "authenticated against GitHub" in result.output
+    assert "--github-run-id" in result.output
+    assert _recorded(tmp_path)["production"] is True
+
+
+def test_production_gate_blocks_github_chain_without_credentials(tmp_path, monkeypatch):
+    # With the GitHub chain requested but no API token, the run BLOCKS naming the
+    # exact missing secret -- never an inferred pass.
+    _clear_tokens(monkeypatch)
+    _make_workspace(tmp_path)
+    result = CliRunner().invoke(
+        main,
+        ["selector-contract", "--run-id", RUN_ID, "--production",
+         "--expected-sha", SHA_RELEASE, "--expected-version", VERSION_RELEASE,
+         "--github-run-id", "29641311999", "--github-artifact-id", "8428705832"],
+    )
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    assert "REGRESSION_API_TOKEN" in result.output
+
+
+def test_production_gate_requires_artifact_id(tmp_path, monkeypatch):
+    # A run id alone cannot authenticate an artifact.
+    _clear_tokens(monkeypatch)
+    _make_workspace(tmp_path)
+    result = CliRunner().invoke(
+        main,
+        ["selector-contract", "--run-id", RUN_ID, "--production",
+         "--expected-sha", SHA_RELEASE, "--expected-version", VERSION_RELEASE,
+         "--github-run-id", "29641311999"],
+    )
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    assert "artifact id" in result.output
+
+
 def test_local_generation_blocks_when_flutter_absent(tmp_path):
     # Development local generation must ACTUALLY run the Flutter toolchain
     # (Problem A). With no flutter on PATH the toolchain cannot be verified, so

@@ -134,6 +134,26 @@ class ReportBuilder:
                 )
                 if step.hint:
                     parts.append(f"<div class='hint'>{_escape(step.hint)}</div>")
+                # Row-scoped runtime diagnostics (Priority 5.9): metrics line +
+                # a link to the captured page source, next to the screenshot.
+                row_metrics = getattr(step, "row_metrics", None)
+                if row_metrics:
+                    parts.append(
+                        "<div class='rowmetrics'>row: "
+                        f"{_escape(row_metrics.get('matchedRows'))} matched, "
+                        f"{_escape(row_metrics.get('attempts'))} attempt(s), "
+                        f"{_escape(row_metrics.get('scrolls'))} scroll(s) "
+                        f"{_escape(row_metrics.get('scrollDirections'))}, "
+                        f"staleAtClick={_escape(row_metrics.get('staleAtClick'))}, "
+                        f"scrollExhausted={_escape(row_metrics.get('scrollExhausted'))}, "
+                        f"{_escape(row_metrics.get('elapsedSeconds'))}s</div>"
+                    )
+                page_source_path = getattr(step, "page_source_path", None)
+                if page_source_path:
+                    rel_src = _relative_to_report(self.dir, page_source_path)
+                    parts.append(
+                        f"<div class='pagesrc'><a href='{_escape(rel_src)}'>page source</a></div>"
+                    )
                 shots = []
                 if step.screenshot_path:
                     shots.append(step.screenshot_path)

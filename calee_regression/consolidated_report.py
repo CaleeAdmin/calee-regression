@@ -641,6 +641,7 @@ def component_from_selector_contract(
     expected_version: "str | None" = None,
     expected_flutter_version: "str | None" = None,
     expected_release_run_id: "str | None" = None,
+    component_dir: "Any | None" = None,
     now: "Any | None" = None,
 ) -> ComponentResult:
     """Build a ComponentResult from the recorded selector-contract gate report
@@ -686,8 +687,31 @@ def component_from_selector_contract(
     provenance = report_dict.get("provenance") if isinstance(report_dict.get("provenance"), dict) else None
     prov_problems: "list[str]" = []
     if provenance is not None:
+        # Priority 3.6: recompute ALL digests at consolidation. The envelope +
+        # semantic content digests are always recomputed; when the raw bundle
+        # files are on disk (the GitHub artifact chain wrote them), their
+        # raw-byte digests are re-hashed against the record too, so altering a
+        # preserved byte after adoption BLOCKS here.
+        result_bytes = None
+        zip_bytes = None
+        if component_dir is not None:
+            from pathlib import Path as _Path
+
+            cdir = _Path(component_dir)
+            rp = cdir / sp.BUNDLE_RESULT_JSON
+            zp = cdir / sp.BUNDLE_ARTIFACT_ZIP
+            if rp.is_file():
+                try:
+                    result_bytes = rp.read_bytes()
+                except OSError:
+                    result_bytes = None
+            if zp.is_file():
+                try:
+                    zip_bytes = zp.read_bytes()
+                except OSError:
+                    zip_bytes = None
         try:
-            prov_problems = sp.verify_provenance_record(provenance)
+            prov_problems = sp.verify_provenance_record(provenance, result_bytes=result_bytes, zip_bytes=zip_bytes)
         except sp.ProvenanceError as exc:
             prov_problems = [str(exc)]
         adoption = provenance.get("adoption") if isinstance(provenance.get("adoption"), dict) else {}
@@ -1266,6 +1290,7 @@ def build_release_report(
     sync_mandatory: "bool | None" = None,
     selector_contract: "dict[str, Any] | None" = None,
     selector_contract_mandatory: "bool | None" = None,
+    selector_contract_dir: "Any | None" = None,
     calee_build_version: "str | None" = None,
     expected_calee_build_version: "str | None" = None,
     caleemobile_build_version: "str | None" = None,
@@ -1361,6 +1386,7 @@ def build_release_report(
                 expected_git_sha=sel_expected_sha,
                 expected_version=sel_expected_version,
                 expected_release_run_id=sel_release_run_id,
+                component_dir=selector_contract_dir,
             ),
         )
 
@@ -1624,7 +1650,41 @@ def write_release_bundle(
     with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for file_path in (json_path, html_path, junit_path):
             zf.write(file_path, arcname=file_path.name)
+        seen_arcs: "set[str]" = set()
         for evidence_path in evidence_paths or []:
             if evidence_path.is_file():
-                zf.write(evidence_path, arcname=f"evidence/{evidence_path.name}")
+                arc = f"evidence/{evidence_path.name}"
+                # Dedup identical basenames (e.g. a screenshot referenced twice)
+                # so the ZIP never carries duplicate entries.
+                if arc in seen_arcs:
+                    continue
+                seen_arcs.add(arc)
+                zf.write(evidence_path, arcname=arc)
     return bundle_path
+
+
+def collect_step_diagnostic_paths(report_dict: "dict[str, Any] | None") -> "list[Path]":
+    """Existing row-diagnostic files (screenshots + page sources) referenced by a
+    runner report's steps, so they travel into the release ZIP (Priority 5.9).
+
+    Reads ``scenarios[].steps[].screenshot_path`` / ``page_source_path`` and
+    returns the ones that exist on disk, de-duplicated, order-preserving."""
+    out: "list[Path]" = []
+    seen: "set[str]" = set()
+    if not isinstance(report_dict, dict):
+        return out
+    for scenario in report_dict.get("scenarios") or []:
+        if not isinstance(scenario, dict):
+            continue
+        for step in scenario.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            for key in ("screenshot_path", "page_source_path"):
+                value = step.get(key)
+                if not value or value in seen:
+                    continue
+                path = Path(value)
+                if path.is_file():
+                    seen.add(value)
+                    out.append(path)
+    return out

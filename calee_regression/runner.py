@@ -440,6 +440,20 @@ def _execute_step(ctx, step: dict) -> StepResult:
         result.status = STATUS_FAILED
         result.message = str(exc)
         result.hint = explain_exception(exc)
+        # Row-scoped runtime diagnostics (Priority 5.8/5.10): a RowResolutionError
+        # / RowAmbiguityError carries the captured screenshot + page source and
+        # the resolution metrics -- attach them to the StepResult so they enter
+        # the JSON/HTML/ZIP evidence, not just the message string.
+        resolution = getattr(exc, "resolution", None)
+        if resolution is not None:
+            if getattr(resolution, "screenshot_path", None):
+                result.screenshot_path = resolution.screenshot_path
+            if getattr(resolution, "page_source_path", None):
+                result.page_source_path = resolution.page_source_path
+            try:
+                result.row_metrics = resolution.to_dict()
+            except AttributeError:
+                pass
         if ctx["scenario"].requires_state == "logged_in_tablet" and action in STATE_SENSITIVE_ACTIONS:
             result.hint = STATE_MISMATCH_HINT
     finally:
@@ -520,6 +534,16 @@ class ScenarioRunner:
 
         if runnable:
             driver = CaleeDriver(self.config)
+            # Point row-failure diagnostics (screenshot + page source) at this
+            # run's evidence directory (Priority 5.7), so they are written
+            # alongside the report and travel into the JSON/HTML/ZIP bundle.
+            if self.report_builder is not None:
+                try:
+                    diag = Path(self.report_builder.diff_dir())
+                    diag.mkdir(parents=True, exist_ok=True)
+                    driver.diagnostics_dir = str(diag)
+                except Exception:  # noqa: BLE001 - diagnostics location is best-effort
+                    pass
             try:
                 driver.start_session()
             except Exception as exc:

@@ -1,38 +1,40 @@
 """Actually execute the Flutter toolchain to back locally-generated selector
-evidence (Priority 1, Problem A).
+evidence (Priority 1 Problem A; local-evidence hardening, Priority 4).
 
 A caller-supplied Flutter version string must never become proof of the
-installed toolchain. The release gate previously handed a hard-coded
-``3.44.1`` to the selector-contract emitter, which recorded it verbatim as
-``flutterVersion`` -- so a machine with no Flutter at all could still emit
-"evidence" claiming it was produced on Flutter 3.44.1. That is fabricated
-toolchain metadata.
+installed toolchain. The release gate previously handed a hard-coded ``3.44.1``
+to the selector-contract emitter, which recorded it verbatim -- so a machine
+with no Flutter at all could still emit "evidence" claiming Flutter 3.44.1.
 
 When selector evidence is generated locally (the development fallback; a
-production release accepts only a CI-produced artifact), this module runs the
-real commands against the *exact* CaleeMobile checkout and records what
-actually happened:
+production release accepts only a GitHub-authenticated CI artifact), this module
+runs the real commands against the *exact* CaleeMobile checkout and records what
+actually happened. Priority 4 additionally requires that local evidence can only
+come from a real, clean, fully-identified pair of checkouts:
 
-  * ``flutter --version --machine`` -> the actual Flutter framework version,
-    the actual Dart SDK version, and the resolved ``flutter`` executable path;
-  * ``flutter pub get``  -> dependencies resolve against this checkout;
-  * ``flutter analyze``  -> the checkout is statically clean;
-  * the CaleeMobile-Regression selector-contract tests
-    (``ui/ python3 -m unittest test_selector_contract``).
+  * both sources are Git repositories (a resolvable HEAD);
+  * both HEAD SHAs are full 40-character SHAs (no ambiguous abbreviations);
+  * both worktrees are clean, unless a NAMED development waiver is supplied
+    (a dirty tree is otherwise unreproducible evidence);
+  * the actual Flutter framework version equals the pinned ``3.44.1``;
+  * the actual Dart SDK version is recorded;
+  * ``flutter pub get`` resolves;
+  * ``flutter analyze --fatal-infos`` is clean (infos are fatal, matching
+    CaleeMobile product CI);
+  * the selector-contract tests pass;
+  * the generated evidence records the exact verified source SHAs.
 
-Every command's argv, working directory and exit code is recorded, along with
-the CaleeMobile and CaleeMobile-Regression source SHAs the verification ran
-against. If ``flutter`` is not on PATH, or any command fails, verification is
-NOT ok -- and the gate BLOCKS rather than trusting an unverified toolchain
-string. The *recorded* ``flutterVersion`` is then the one this module parsed
-from ``flutter --version`` output, never the caller's string.
+The complete verification record is then integrity-protected with its own
+``recordDigest`` (Priority 4), so the SHAs/versions/commands it attests to
+cannot be altered after the fact without detection.
 
-Everything is injectable (``which``/``runner``/``git_sha``) so the policy is
-unit-tested without a real Flutter install.
+Everything is injectable (``which``/``runner``/``git_sha``/``is_clean``) so the
+policy is unit-tested without a real Flutter install or Git repo.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -40,13 +42,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .identity_format import is_full_git_sha
+
 # The Flutter framework version a local release build must actually be built
-# with, mirroring selector_evidence.EXPECTED_FLUTTER_VERSION. Kept here as a
-# default so a caller can tighten/loosen it, but note: this is the version we
-# REQUIRE the real toolchain to report, not a string we record on its behalf.
+# with, mirroring selector_evidence.EXPECTED_FLUTTER_VERSION.
 DEFAULT_EXPECTED_FLUTTER_VERSION = "3.44.1"
 
 CommandRunner = Callable[..., "subprocess.CompletedProcess[str]"]
+# (clean?, dirty file lines). A non-repo path is reported clean here -- the
+# missing-repo / non-full-SHA condition is flagged by the SHA check instead, so
+# it isn't double-reported as "dirty".
+CleanCheck = Callable[[Path], "tuple[bool, list[str]]"]
 
 
 @dataclass
@@ -82,10 +88,14 @@ class ToolchainVerification:
     dart_version: "str | None" = None
     caleemobile_sha: "str | None" = None
     regression_sha: "str | None" = None
+    caleemobile_clean: "bool | None" = None
+    regression_clean: "bool | None" = None
+    dirty_waiver: "str | None" = None
+    dirty_sources: "list[str]" = field(default_factory=list)
     commands: "list[CommandRecord]" = field(default_factory=list)
     problems: "list[str]" = field(default_factory=list)
 
-    def to_dict(self) -> dict:
+    def _payload(self) -> dict:
         return {
             "ok": self.ok,
             "flutterPath": self.flutter_path,
@@ -93,9 +103,51 @@ class ToolchainVerification:
             "dartVersion": self.dart_version,
             "caleemobileSha": self.caleemobile_sha,
             "regressionSha": self.regression_sha,
+            "caleemobileClean": self.caleemobile_clean,
+            "regressionClean": self.regression_clean,
+            "dirtyWaiver": self.dirty_waiver,
+            "dirtySources": list(self.dirty_sources),
             "commands": [c.to_dict() for c in self.commands],
             "problems": list(self.problems),
         }
+
+    def to_dict(self) -> dict:
+        """Serialise the record and protect it with a ``recordDigest`` (Priority 4).
+
+        The digest covers every attested field (versions, SHAs, cleanliness,
+        commands, problems), so the local-verification record cannot be altered
+        without detection -- independently of the provenance envelope that also
+        embeds it.
+        """
+        data = self._payload()
+        data["recordDigest"] = _record_digest(data)
+        return data
+
+
+def _record_digest(payload: "dict[str, Any]") -> str:
+    body = {k: v for k, v in payload.items() if k != "recordDigest"}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def verify_toolchain_record(record: "dict[str, Any]") -> "list[str]":
+    """Re-verify a serialised toolchain record's ``recordDigest`` (Priority 4).
+
+    Returns problems (empty == intact). Used at consolidation / provenance
+    re-verification so a tampered local-verification block BLOCKS.
+    """
+    problems: "list[str]" = []
+    recorded = record.get("recordDigest")
+    if not recorded:
+        problems.append("local-verification record has no recordDigest -- it is not integrity-protected.")
+        return problems
+    actual = _record_digest({k: v for k, v in record.items() if k != "recordDigest"})
+    if actual != recorded:
+        problems.append(
+            f"local-verification record digest mismatch: recorded {recorded}, actual {actual} "
+            f"-- the local toolchain record was modified after it was produced."
+        )
+    return problems
 
 
 def _git_head_sha(repo_path: Path) -> "str | None":
@@ -110,12 +162,25 @@ def _git_head_sha(repo_path: Path) -> "str | None":
     return sha or None
 
 
+def _git_worktree_clean(repo_path: Path) -> "tuple[bool, list[str]]":
+    """(clean?, porcelain lines). A path that is not a Git repo returns clean --
+    the non-repo condition is flagged by the HEAD-SHA check, not here."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_path), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True, []
+    lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    return (not lines), lines
+
+
 def parse_flutter_version_machine(stdout: str) -> "tuple[str | None, str | None]":
     """Parse ``flutter --version --machine`` JSON output.
 
     Returns ``(frameworkVersion, dartSdkVersion)`` -- either may be None if the
-    output is not the expected JSON shape. ``--machine`` is preferred over the
-    human text because it is stable and unambiguous.
+    output is not the expected JSON shape.
     """
     try:
         data = json.loads(stdout)
@@ -130,27 +195,32 @@ def parse_flutter_version_machine(stdout: str) -> "tuple[str | None, str | None]
     return fw, dart
 
 
+def _norm(value: "Any | None") -> "str | None":
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def verify_local_toolchain(
     caleemobile_path: "Path | str",
     regression_path: "Path | str",
     *,
     expected_flutter_version: "str | None" = DEFAULT_EXPECTED_FLUTTER_VERSION,
+    dirty_waiver: "str | None" = None,
     which: "Callable[[str], Optional[str]]" = shutil.which,
     runner: "CommandRunner | None" = None,
     git_sha: "Callable[[Path], Optional[str]]" = _git_head_sha,
+    is_clean: "CleanCheck" = _git_worktree_clean,
     timeout: int = 600,
 ) -> ToolchainVerification:
     """Run the real Flutter toolchain against the exact CaleeMobile checkout and
-    record what actually happened.
+    record what actually happened, enforcing the Priority-4 source requirements.
 
-    ``which``/``runner``/``git_sha`` are injectable so the policy is unit-tested
-    without a real Flutter install. ``runner`` defaults to ``subprocess.run``.
-
-    The verification is OK only when: ``flutter`` resolves on PATH; every command
-    (``flutter --version --machine``, ``flutter pub get``, ``flutter analyze``,
-    the selector-contract tests) exits 0; and the parsed Flutter version matches
-    ``expected_flutter_version`` (when one is required). The recorded
-    ``flutter_version`` is the parsed one -- never a caller-supplied string.
+    ``which``/``runner``/``git_sha``/``is_clean`` are injectable so the policy is
+    unit-tested without a real Flutter install or Git repo. ``runner`` defaults to
+    ``subprocess.run``. ``dirty_waiver`` (a non-empty name) permits a dirty
+    worktree, recorded in the result; without it, a dirty tree is a problem.
     """
     if runner is None:
         runner = subprocess.run
@@ -162,25 +232,53 @@ def verify_local_toolchain(
 
     caleemobile_sha = git_sha(cm_path)
     regression_sha = git_sha(reg_path)
+    waiver = _norm(dirty_waiver)
+
+    # --- P4: both sources are Git repos with full 40-char HEAD SHAs ---------
+    for label, path, sha in (
+        ("CaleeMobile", cm_path, caleemobile_sha),
+        ("CaleeMobile-Regression", reg_path, regression_sha),
+    ):
+        if sha is None:
+            problems.append(
+                f"{label} source at {path} is not a Git repository (no resolvable HEAD) -- "
+                f"local release evidence requires a real, identifiable checkout."
+            )
+        elif not is_full_git_sha(sha):
+            problems.append(
+                f"{label} HEAD {sha!r} is not a full 40-character Git SHA -- an abbreviated/"
+                f"ambiguous identity cannot anchor release evidence."
+            )
+
+    # --- P4: both worktrees clean unless a NAMED development waiver exists ---
+    cm_clean, cm_dirty = is_clean(cm_path)
+    reg_clean, reg_dirty = is_clean(reg_path)
+    dirty_sources: "list[str]" = []
+    if not cm_clean:
+        dirty_sources.append("CaleeMobile")
+    if not reg_clean:
+        dirty_sources.append("CaleeMobile-Regression")
+    if dirty_sources and not waiver:
+        problems.append(
+            f"{', '.join(dirty_sources)} worktree(s) are dirty (uncommitted changes) -- local "
+            f"release evidence requires clean checkouts, or an explicit named --dirty-waiver "
+            f"recording why an exception is acceptable."
+        )
 
     if not cm_path.is_dir():
         problems.append(f"CaleeMobile checkout not found at {cm_path} -- cannot verify the toolchain against it.")
-        return ToolchainVerification(
-            ok=False, caleemobile_sha=caleemobile_sha, regression_sha=regression_sha,
-            commands=commands, problems=problems,
-        )
+        return _result(False, None, None, None, caleemobile_sha, regression_sha,
+                       cm_clean, reg_clean, waiver, dirty_sources, commands, problems)
 
     flutter_path = which("flutter")
     if not flutter_path:
         problems.append(
             "flutter is not on PATH -- a local release build cannot record an actual toolchain. "
-            "Provide a CI-produced selector artifact via --source, or install Flutter "
+            "Provide a GitHub-authenticated CI selector artifact, or install Flutter "
             f"{expected_flutter_version or ''}".strip() + "."
         )
-        return ToolchainVerification(
-            ok=False, flutter_path=None, caleemobile_sha=caleemobile_sha,
-            regression_sha=regression_sha, commands=commands, problems=problems,
-        )
+        return _result(False, None, None, None, caleemobile_sha, regression_sha,
+                       cm_clean, reg_clean, waiver, dirty_sources, commands, problems)
 
     def _run(label: str, argv: "list[str]", cwd: Path) -> "subprocess.CompletedProcess[str] | None":
         try:
@@ -215,10 +313,11 @@ def verify_local_toolchain(
     if pub_get is not None and pub_get.returncode != 0:
         problems.append(f"`flutter pub get` exited {pub_get.returncode} against {cm_path}.")
 
-    # 3. flutter analyze -- the checkout is statically clean.
-    analyze = _run("flutter analyze", [flutter_path, "analyze"], cm_path)
+    # 3. flutter analyze --fatal-infos -- the checkout is statically clean, infos
+    #    fatal (matching CaleeMobile product CI, .github/workflows/flutter-ci.yml).
+    analyze = _run("flutter analyze", [flutter_path, "analyze", "--fatal-infos"], cm_path)
     if analyze is not None and analyze.returncode != 0:
-        problems.append(f"`flutter analyze` exited {analyze.returncode} against {cm_path}.")
+        problems.append(f"`flutter analyze --fatal-infos` exited {analyze.returncode} against {cm_path}.")
 
     # 4. the selector-contract tests (CaleeMobile-Regression ui/).
     reg_ui = reg_path / "ui"
@@ -234,6 +333,12 @@ def verify_local_toolchain(
             problems.append(f"selector-contract tests exited {tests.returncode}.")
 
     ok = not problems
+    return _result(ok, flutter_path, flutter_version, dart_version, caleemobile_sha,
+                   regression_sha, cm_clean, reg_clean, waiver, dirty_sources, commands, problems)
+
+
+def _result(ok, flutter_path, flutter_version, dart_version, caleemobile_sha,
+            regression_sha, cm_clean, reg_clean, waiver, dirty_sources, commands, problems):
     return ToolchainVerification(
         ok=ok,
         flutter_path=flutter_path,
@@ -241,6 +346,10 @@ def verify_local_toolchain(
         dart_version=dart_version,
         caleemobile_sha=caleemobile_sha,
         regression_sha=regression_sha,
+        caleemobile_clean=cm_clean,
+        regression_clean=reg_clean,
+        dirty_waiver=waiver,
+        dirty_sources=list(dirty_sources),
         commands=commands,
         problems=problems,
     )

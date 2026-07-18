@@ -105,8 +105,17 @@ class RecyclerDriver:
         self.visible = visible if visible is not None else len(rows)
         self.offset = 0
         self.swipes = 0
+        self.swipe_dirs = []
         self.screenshots = []
-        self.page_source = "<hierarchy>fake</hierarchy>"
+
+    @property
+    def page_source(self):
+        # Reflects the current scroll position, so a scroll that changed the
+        # viewport is distinguishable from one that revealed nothing (the real
+        # page source changes when a RecyclerView scrolls).
+        window = self.rows[self.offset:self.offset + self.visible]
+        titles = ",".join(r.title for r in window)
+        return f"<hierarchy offset='{self.offset}'>{titles}</hierarchy>"
 
     def find_elements(self, by, xpath):
         card, title, title_id = _parse_row_xpath(xpath)
@@ -122,7 +131,13 @@ class RecyclerDriver:
 
     def swipe(self, sx, sy, ex, ey, dur):
         self.swipes += 1
-        self.offset = min(self.offset + 1, max(0, len(self.rows) - self.visible))
+        max_offset = max(0, len(self.rows) - self.visible)
+        if ey < sy:  # finger swipes up -> content moves up -> reveal rows below
+            self.swipe_dirs.append("down")
+            self.offset = min(self.offset + 1, max_offset)
+        else:        # finger swipes down -> reveal rows above
+            self.swipe_dirs.append("up")
+            self.offset = max(self.offset - 1, 0)
 
     def get_window_size(self):
         return {"width": 1000, "height": 1600}
@@ -329,6 +344,125 @@ def test_id_present_in_row_true_false_and_reraise():
         dupe.id_present_in_row("taskItemCard", "REG-D", "tvName", title_id="tvName")
 
 
+# ── Priority 5: stale-at-click retry (re-resolve, never click a stale element) ─
+
+
+class StaleClickDesc:
+    """A descendant whose .click() raises a stale error while `stale` is set."""
+
+    def __init__(self, stale):
+        self.stale = stale
+        self.clicked = False
+
+    def click(self):
+        if self.stale:
+            raise RuntimeError("StaleElementReferenceException: element is not attached to the page document")
+        self.clicked = True
+
+
+class StaleRowEl:
+    """A row that hands out a NEW descendant element on every resolve. The first
+    `stale_times` are stale-at-click; later ones click cleanly. Records every
+    element handed out so a test can prove the stale ones were never clicked."""
+
+    def __init__(self, stale_times):
+        self.stale_times = stale_times
+        self.resolves = 0
+        self.handed = []
+
+    def find_elements(self, by, xpath):
+        self.resolves += 1
+        el = StaleClickDesc(stale=self.resolves <= self.stale_times)
+        self.handed.append(el)
+        return [el]
+
+
+def test_stale_at_click_reresolves_and_never_clicks_stale():
+    row = Row("REG-STALE-1")
+    row.element = StaleRowEl(stale_times=1)  # first resolve is stale-at-click
+    d = _driver([row])
+    d.row_retry_interval = 0
+    resolution = d.tap_in_row("taskItemCard", "REG-STALE-1", "flCheckboxTarget", title_id="tvName")
+    # Two elements handed out: the first went stale at click, the second (a fresh
+    # RE-RESOLVE) clicked. The stale element was NEVER clicked.
+    assert len(row.element.handed) == 2
+    assert row.element.handed[0].clicked is False
+    assert row.element.handed[1].clicked is True
+    assert resolution.stale_at_click is True
+    assert resolution.click_attempts == 2
+
+
+def test_stale_at_click_exhausts_and_fails_with_diagnostics():
+    row = Row("REG-STALE-2")
+    row.element = StaleRowEl(stale_times=99)  # always stale at click
+    d = _driver([row])
+    d.row_retry_interval = 0
+    with pytest.raises(RowResolutionError) as exc:
+        d.tap_in_row("taskItemCard", "REG-STALE-2", "flCheckboxTarget", title_id="tvName")
+    res = exc.value.resolution
+    assert res.stale_at_click is True
+    assert res.click_attempts == d.row_click_max_retries
+    assert res.screenshot_path is not None and res.page_source_path is not None
+    # Every element handed out was stale and none was ever clicked.
+    assert all(e.clicked is False for e in row.element.handed)
+
+
+# ── Priority 5: bidirectional scroll + no-progress detection ──────────────────
+
+
+def test_bidirectional_scroll_finds_row_above():
+    rows = [Row("REG-UP-0"), Row("REG-UP-1")]
+    d = _driver(rows, visible=1)
+    d.driver.offset = 1  # start below the target; row 0 is above the fold
+    d.row_retry_interval = 0
+    resolution = d.tap_in_row("taskItemCard", "REG-UP-0", "flCheckboxTarget", title_id="tvName")
+    assert rows[0].clicked() is True
+    assert "up" in resolution.scroll_directions
+    assert "up" in d.driver.swipe_dirs
+
+
+def test_scroll_exhaustion_detected_when_list_cannot_move():
+    # A single-row list not containing the target: neither direction can move it.
+    d = _driver([Row("REG-ONLY")], visible=1)
+    d.row_retry_interval = 0
+    with pytest.raises(RowResolutionError) as exc:
+        d.tap_in_row("taskItemCard", "REG-NOPE", "flCheckboxTarget", title_id="tvName")
+    res = exc.value.resolution
+    assert res.scroll_exhausted is True
+    assert "scroll exhausted" in (res.problem or "")
+    assert {"down", "up"} <= set(res.scroll_directions)  # both directions tried
+
+
+def test_scroll_direction_recorded_on_success():
+    rows = [Row(f"REG-DN-{i}") for i in range(3)]
+    d = _driver(rows, visible=1)  # target is last -> scans down
+    d.row_retry_interval = 0
+    resolution = d.tap_in_row("taskItemCard", "REG-DN-2", "flCheckboxTarget", title_id="tvName")
+    assert rows[2].clicked() is True
+    assert "down" in resolution.scroll_directions
+
+
+def test_ambiguity_error_carries_diagnostics():
+    d = _driver([Row("REG-DUP2"), Row("REG-DUP2")])
+    with pytest.raises(RowAmbiguityError) as exc:
+        d.tap_in_row("taskItemCard", "REG-DUP2", "flCheckboxTarget", title_id="tvName")
+    res = exc.value.resolution
+    assert res is not None
+    assert res.matched_rows == 2
+    assert res.screenshot_path is not None  # ambiguity is captured into the bundle
+
+
+def test_resolution_metrics_serialize():
+    row = Row("REG-M")
+    d = _driver([row])
+    md = d.tap_in_row("taskItemCard", "REG-M", "flCheckboxTarget", title_id="tvName").to_dict()
+    for key in ("scrollDirections", "scrollExhausted", "staleAtClick", "clickAttempts",
+                "matchedRows", "elapsedSeconds", "attempts", "scrolls"):
+        assert key in md
+    assert md["clickAttempts"] == 1
+    assert md["matchedRows"] == 1
+
+
 # ── runner actions on top of the resolver ────────────────────────────────────
 
 
@@ -396,3 +530,51 @@ def test_action_row_scoped_missing_arg_is_authoring_error(missing):
     result = runner._execute_step(_ctx(RunnerFakeDriver()), step)
     assert result.status == STATUS_FAILED
     assert "row-scoped action requires" in result.message
+
+
+# ── Priority 5.8/5.9: diagnostics attached to StepResult + bundle inclusion ────
+
+
+def test_row_failure_attaches_diagnostics_to_step_result(tmp_path):
+    from calee_regression.appium_driver import RowResolution, RowResolutionError
+
+    shot = tmp_path / "diag.png"
+    shot.write_bytes(b"png")
+    src = tmp_path / "diag.xml"
+    src.write_text("<hierarchy/>")
+    res = RowResolution(
+        attempts=5, scrolls=2, matched_rows=0, scroll_directions=["down", "up"],
+        scroll_exhausted=True, screenshot_path=str(shot), page_source_path=str(src),
+        problem="not found (scroll exhausted)",
+    )
+
+    class FailDriver:
+        def tap_in_row(self, *a, **k):
+            raise RowResolutionError("could not resolve", res)
+
+    step = {"action": "tap_in_row", "card_id": "c", "title": "t", "target_id": "d"}
+    result = runner._execute_step(_ctx(FailDriver()), step)
+    assert result.status == STATUS_FAILED
+    assert result.screenshot_path == str(shot)
+    assert result.page_source_path == str(src)
+    assert result.row_metrics["scrollExhausted"] is True
+    assert result.row_metrics["matchedRows"] == 0
+    assert result.row_metrics["scrollDirections"] == ["down", "up"]
+
+
+def test_collect_step_diagnostic_paths_for_bundle(tmp_path):
+    from calee_regression.consolidated_report import collect_step_diagnostic_paths
+
+    shot = tmp_path / "s.png"
+    shot.write_bytes(b"x")
+    src = tmp_path / "s.xml"
+    src.write_text("<x/>")
+    report = {"scenarios": [{"steps": [
+        {"screenshot_path": str(shot), "page_source_path": str(src)},
+        {"screenshot_path": None},
+        {"screenshot_path": str(tmp_path / "missing.png")},  # not on disk -> skipped
+        {"screenshot_path": str(shot)},                       # duplicate -> deduped
+    ]}]}
+    paths = collect_step_diagnostic_paths(report)
+    assert shot in paths and src in paths
+    assert len(paths) == 2  # deduped + missing skipped

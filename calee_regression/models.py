@@ -48,6 +48,12 @@ class StepResult:
     screenshot_path: "str | None" = None
     diff_path: "str | None" = None
     hint: "str | None" = None
+    # Row-scoped runtime diagnostics (Priority 5). On a row-resolution failure
+    # the runner attaches the captured page-source path and the resolution
+    # metrics (attempts/scrolls/direction/elapsed/matchedRows/staleAtClick), so
+    # they enter the JSON/HTML/ZIP evidence alongside the screenshot.
+    page_source_path: "str | None" = None
+    row_metrics: "dict | None" = None
 
     def to_dict(self) -> dict:
         return {
@@ -59,6 +65,8 @@ class StepResult:
             "screenshot_path": self.screenshot_path,
             "diff_path": self.diff_path,
             "hint": self.hint,
+            "page_source_path": self.page_source_path,
+            "row_metrics": self.row_metrics,
         }
 
 
