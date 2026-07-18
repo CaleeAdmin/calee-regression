@@ -235,6 +235,7 @@ def verify_provenance_record(
     *,
     result_bytes: "bytes | None" = None,
     zip_bytes: "bytes | None" = None,
+    trusted_envelope_digest: "str | None" = None,
 ) -> "list[str]":
     """Re-verify a recorded provenance record at consolidation (Priority 3.6-3.7).
 
@@ -244,6 +245,17 @@ def verify_provenance_record(
       * (when the raw files are supplied) the raw-byte digests of
         ``source-result.json`` and ``source-artifact.zip``.
     Then re-runs the source provenance rules. Empty list == intact.
+
+    TAMPER-EVIDENCE LIMITATION (Priority 7.8): recomputing ``envelopeDigest``
+    from the record only proves the record is INTERNALLY consistent. An attacker
+    who edits a field AND recomputes ``envelopeDigest`` produces a self-consistent
+    record that passes that recompute. The local envelope checksum is therefore
+    tamper-evident ONLY when its trusted digest is anchored OUTSIDE this mutable
+    bundle -- e.g. re-running the live GitHub artifact chain at consolidation
+    (:func:`github_artifact.acquire_github_artifact`), or a signed/immutable run
+    manifest / release config that records the expected envelope digest. Pass
+    that anchored value as ``trusted_envelope_digest`` and this function BLOCKS
+    when the bundle's ``envelopeDigest`` differs from it.
     """
     problems: "list[str]" = []
     source_evidence = record.get("sourceEvidence")
@@ -260,6 +272,19 @@ def verify_provenance_record(
             problems.append(
                 f"provenance envelope digest mismatch: recorded {recorded_envelope}, actual "
                 f"{actual_envelope} -- a provenance/adoption/local-verification field was modified."
+            )
+
+    # --- P7.8: anchored-digest check (defeats a coordinated re-hash) ---------
+    # The recompute above cannot catch an edit that also recomputes
+    # envelopeDigest. A trusted digest anchored OUTSIDE the bundle can. When one
+    # is supplied it must match the bundle's recorded envelopeDigest.
+    if trusted_envelope_digest is not None:
+        anchored = _norm(trusted_envelope_digest)
+        if anchored is not None and recorded_envelope is not None and anchored != recorded_envelope:
+            problems.append(
+                f"provenance envelopeDigest {recorded_envelope} does not match the trusted anchored "
+                f"digest {anchored} (anchored outside the bundle) -- the bundle was replaced or "
+                f"re-hashed after adoption."
             )
 
     # --- semantic content digest of the preserved evidence ------------------

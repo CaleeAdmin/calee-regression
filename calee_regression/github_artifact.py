@@ -27,13 +27,20 @@ Chain enforced (all must hold, else the verdict is not ok):
 
   workflow run
     * repository is exactly ``CaleeAdmin/CaleeMobile-Regression``;
-    * the workflow is the expected ``ci.yml`` (by path, or by name ``ci``);
-    * the triggering event is an approved dispatch event
-      (``workflow_dispatch`` / ``repository_dispatch``);
-    * the run's ``head_sha`` equals the evidence ``regressionSha``;
-    * the selector-contract job in that run concluded ``success``.
+    * the workflow is the expected ``ci.yml`` **by path exactly** -- a workflow
+      *name* of ``ci`` is diagnostic only and never substitutes for the path
+      (P7.1: any repo can name a workflow ``ci``);
+    * the triggering event is ``workflow_dispatch``; ``repository_dispatch`` is
+      accepted ONLY in explicit legacy-evidence mode
+      (``allow_legacy_repository_dispatch=True``) (P7.2);
+    * the run has ``status == completed`` and ``conclusion == success`` (P7.3);
+    * the run's ``head_sha`` equals the evidence ``regressionSha`` (which must be
+      a full 40-char SHA) (P7.7);
+    * EXACTLY ONE selector-contract job is present, and it is ``completed`` +
+      ``success`` -- duplicate selector-like jobs are refused (P7.3/P7.4).
   artifact
-    * the artifact belongs to that run;
+    * the artifact metadata RECORDS the workflow run it belongs to, and that is
+      the verified run -- a missing relationship is refused (P7.5);
     * its name is exactly ``selector-contract-result``;
     * it is not expired;
     * a GitHub ``digest`` (``sha256:...``) is present.
@@ -71,12 +78,19 @@ from .identity_format import is_full_git_sha
 
 EXPECTED_WORKFLOW_REPO = "CaleeAdmin/CaleeMobile-Regression"
 EXPECTED_WORKFLOW_PATH = ".github/workflows/ci.yml"
+# DIAGNOSTIC ONLY (P7.1): the run is identified by EXPECTED_WORKFLOW_PATH. A
+# workflow *name* of "ci" never substitutes for the path -- any repository can
+# name a workflow "ci".
 EXPECTED_WORKFLOW_NAME = "ci"
-# Only a deliberately-triggered dispatch is accepted as production evidence.
-# A push/pull_request/schedule run is not an "approved dispatch event": the
-# release operator (or the cross-repo sender) must have asked for this exact
-# build to be checked.
-APPROVED_DISPATCH_EVENTS = frozenset({"workflow_dispatch", "repository_dispatch"})
+# P7.2: new production evidence must come from a deliberate workflow_dispatch.
+# A push/pull_request/schedule run is not an approved dispatch event.
+PRODUCTION_DISPATCH_EVENTS = frozenset({"workflow_dispatch"})
+# repository_dispatch is accepted ONLY in explicit legacy-evidence mode
+# (allow_legacy_repository_dispatch=True). The older cross-repo trigger used it;
+# new evidence must not.
+LEGACY_DISPATCH_EVENTS = frozenset({"workflow_dispatch", "repository_dispatch"})
+# Backwards-compatible alias (the legacy set) for any external reader.
+APPROVED_DISPATCH_EVENTS = LEGACY_DISPATCH_EVENTS
 # The selector-contract job's name contains this (case-insensitive). Matching a
 # substring rather than the full title survives cosmetic name edits while still
 # pinning the *selector contract* job specifically, not just any green job.
@@ -326,6 +340,7 @@ def verify_github_artifact_chain(
     expected_version: "str | None" = None,
     expected_run_id: "str | None" = None,
     expected_artifact_id: "str | None" = None,
+    allow_legacy_repository_dispatch: bool = False,
     max_zip_bytes: int = MAX_ARTIFACT_ZIP_BYTES,
 ) -> GithubArtifactChain:
     """Enforce the full authenticity chain over already-fetched inputs.
@@ -346,41 +361,74 @@ def verify_github_artifact_chain(
         problems.append(
             f"workflow run repository {run.repo_full_name!r} != expected {EXPECTED_WORKFLOW_REPO!r}."
         )
-    path_ok = (run.workflow_path or "").strip() == EXPECTED_WORKFLOW_PATH
-    name_ok = (run.workflow_name or "").strip().lower() == EXPECTED_WORKFLOW_NAME
-    if not (path_ok or name_ok):
+    # P7.1: the workflow is identified by PATH exactly. A workflow *name* of
+    # "ci" is diagnostic only and must NOT substitute for the path -- any repo
+    # can name a workflow "ci".
+    if (run.workflow_path or "").strip() != EXPECTED_WORKFLOW_PATH:
         problems.append(
-            f"workflow is {run.workflow_path or run.workflow_name!r} != expected "
-            f"{EXPECTED_WORKFLOW_PATH!r} (name {EXPECTED_WORKFLOW_NAME!r})."
+            f"workflow path {run.workflow_path!r} != expected {EXPECTED_WORKFLOW_PATH!r} "
+            f"(a workflow name of {EXPECTED_WORKFLOW_NAME!r} is diagnostic only and does not "
+            f"substitute for the path)."
         )
-    if (run.event or "").strip() not in APPROVED_DISPATCH_EVENTS:
+    # P7.2: new production evidence must come from a deliberate workflow_dispatch;
+    # repository_dispatch is accepted only in explicit legacy-evidence mode.
+    approved_events = LEGACY_DISPATCH_EVENTS if allow_legacy_repository_dispatch else PRODUCTION_DISPATCH_EVENTS
+    if (run.event or "").strip() not in approved_events:
+        legacy_hint = "" if allow_legacy_repository_dispatch else (
+            " (repository_dispatch is accepted only in explicit legacy-evidence mode)"
+        )
         problems.append(
             f"workflow run event {run.event!r} is not an approved dispatch event "
-            f"({sorted(APPROVED_DISPATCH_EVENTS)}) -- production evidence must come from a "
-            f"deliberate dispatch, not an incidental push/PR/schedule run."
+            f"({sorted(approved_events)}) -- production evidence must come from a deliberate "
+            f"workflow_dispatch, not an incidental push/PR/schedule run{legacy_hint}."
         )
-    if (run.status or "").strip().lower() not in ("", "completed"):
+    # P7.3: the run must have COMPLETED and concluded SUCCESS. A missing status
+    # or conclusion is not acceptable for production evidence.
+    if (run.status or "").strip().lower() != "completed":
         problems.append(f"workflow run has not completed (status={run.status!r}).")
+    if (run.conclusion or "").strip().lower() != "success":
+        problems.append(f"workflow run conclusion {run.conclusion!r} != 'success'.")
+    if not (run.head_sha or "").strip():
+        problems.append("workflow run has no head_sha -- cannot tie evidence to a commit.")
 
-    # --- selector-contract job success -------------------------------------
+    # --- selector-contract job: EXACTLY ONE, completed + success -----------
     selector_jobs = [j for j in jobs if SELECTOR_CONTRACT_JOB_MARKER in (j.name or "").lower()]
     if not selector_jobs:
         problems.append(
             f"no selector-contract job (name containing {SELECTOR_CONTRACT_JOB_MARKER!r}) found in the run -- "
             f"cannot confirm the contract actually ran."
         )
-    elif not any((j.conclusion or "").strip().lower() == "success" for j in selector_jobs):
-        concl = [j.conclusion for j in selector_jobs]
+    elif len(selector_jobs) > 1:
+        # P7.4: duplicate selector-like jobs are ambiguous -- a second job could
+        # shadow a failing first. Refuse rather than accept "any success".
+        names = [j.name for j in selector_jobs]
         problems.append(
-            f"selector-contract job did not conclude success (conclusions={concl!r})."
+            f"multiple selector-contract jobs match {SELECTOR_CONTRACT_JOB_MARKER!r} ({names!r}) -- "
+            f"ambiguous; exactly one is required."
         )
+    else:
+        job = selector_jobs[0]
+        # P7.3: that single job must have completed AND concluded success.
+        if (job.status or "").strip().lower() != "completed":
+            problems.append(f"selector-contract job has not completed (status={job.status!r}).")
+        if (job.conclusion or "").strip().lower() != "success":
+            problems.append(
+                f"selector-contract job did not conclude success (conclusion={job.conclusion!r})."
+            )
 
     # --- artifact identity + freshness -------------------------------------
     if expected_artifact_id is not None and artifact.artifact_id is not None and str(artifact.artifact_id) != str(expected_artifact_id):
         problems.append(
             f"artifact id {artifact.artifact_id!r} != requested artifact id {expected_artifact_id!r}."
         )
-    if artifact.workflow_run_id is not None and run.run_id is not None and str(artifact.workflow_run_id) != str(run.run_id):
+    # P7.5: the artifact MUST record the workflow run it belongs to, and it must
+    # be the verified run. A missing relationship is refused, not accepted.
+    if artifact.workflow_run_id is None:
+        problems.append(
+            "artifact metadata does not record its workflow_run id -- cannot confirm the artifact "
+            "belongs to the verified run."
+        )
+    elif run.run_id is not None and str(artifact.workflow_run_id) != str(run.run_id):
         problems.append(
             f"artifact belongs to run {artifact.workflow_run_id!r}, not the verified run {run.run_id!r}."
         )
@@ -420,13 +468,20 @@ def verify_github_artifact_chain(
     # --- extracted evidence ties back to the run + release target ----------
     if result is not None:
         ev_regression = _opt_str(result.get("regressionSha"))
+        # P7.7: regressionSha must be PRESENT, a full 40-char SHA, and equal to
+        # the run's own head_sha.
         if ev_regression is None:
             problems.append("extracted evidence has no regressionSha -- cannot tie it to the run's own commit.")
-        elif run.head_sha and ev_regression.lower() != run.head_sha.strip().lower():
-            problems.append(
-                f"extracted evidence regressionSha {ev_regression!r} != run head_sha {run.head_sha!r} -- "
-                f"the evidence was not produced by this run."
-            )
+        else:
+            if not is_full_git_sha(ev_regression):
+                problems.append(
+                    f"extracted evidence regressionSha {ev_regression!r} is not a full 40-character SHA."
+                )
+            if run.head_sha and ev_regression.lower() != run.head_sha.strip().lower():
+                problems.append(
+                    f"extracted evidence regressionSha {ev_regression!r} != run head_sha {run.head_sha!r} -- "
+                    f"the evidence was not produced by this run."
+                )
         if expected_regression_sha is not None:
             if not is_full_git_sha(expected_regression_sha):
                 problems.append(f"expected regressionSha {expected_regression_sha!r} is not a full 40-char SHA.")
@@ -434,8 +489,15 @@ def verify_github_artifact_chain(
                 problems.append(
                     f"extracted evidence regressionSha {ev_regression!r} != expected {expected_regression_sha!r}."
                 )
+        # P7.6: workflowRunId must be PRESENT and equal to the verified run -- a
+        # CI-produced result must record which run produced it.
         ev_workflow_run = _opt_str(result.get("workflowRunId"))
-        if ev_workflow_run and run.run_id and str(ev_workflow_run) != str(run.run_id):
+        if ev_workflow_run is None:
+            problems.append(
+                "extracted evidence has no workflowRunId -- a CI-produced result must record which "
+                "workflow run produced it."
+            )
+        elif run.run_id and str(ev_workflow_run) != str(run.run_id):
             problems.append(
                 f"extracted evidence workflowRunId {ev_workflow_run!r} != verified run {run.run_id!r}."
             )
@@ -496,6 +558,7 @@ def acquire_github_artifact(
     expected_tested_sha: "str | None" = None,
     expected_version: "str | None" = None,
     owner_repo: str = EXPECTED_WORKFLOW_REPO,
+    allow_legacy_repository_dispatch: bool = False,
     json_fetcher: "JsonFetcher | None" = None,
     bytes_fetcher: "BytesFetcher | None" = None,
     token: "str | None" = None,
@@ -577,6 +640,7 @@ def acquire_github_artifact(
         expected_version=expected_version,
         expected_run_id=run_id,
         expected_artifact_id=artifact_id,
+        allow_legacy_repository_dispatch=allow_legacy_repository_dispatch,
     )
 
 

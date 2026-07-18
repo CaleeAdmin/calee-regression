@@ -642,10 +642,17 @@ def component_from_selector_contract(
     expected_flutter_version: "str | None" = None,
     expected_release_run_id: "str | None" = None,
     component_dir: "Any | None" = None,
+    expected_envelope_digest: "str | None" = None,
     now: "Any | None" = None,
 ) -> ComponentResult:
     """Build a ComponentResult from the recorded selector-contract gate report
     (Priority 1).
+
+    ``expected_envelope_digest`` (Priority 7.8) is an OPTIONAL trusted provenance
+    envelope digest anchored OUTSIDE the mutable bundle (a signed/immutable run
+    manifest or release config). When supplied it is enforced against the
+    recorded ``provenance.envelopeDigest`` so a coordinated re-hash of the bundle
+    is caught -- a local envelope checksum alone cannot detect that.
 
     The ``selector-contract`` command (release gate) writes
     ``reports/runs/<run-id>/selector-contract/results.json`` with the raw
@@ -711,7 +718,10 @@ def component_from_selector_contract(
                 except OSError:
                     zip_bytes = None
         try:
-            prov_problems = sp.verify_provenance_record(provenance, result_bytes=result_bytes, zip_bytes=zip_bytes)
+            prov_problems = sp.verify_provenance_record(
+                provenance, result_bytes=result_bytes, zip_bytes=zip_bytes,
+                trusted_envelope_digest=expected_envelope_digest,
+            )
         except sp.ProvenanceError as exc:
             prov_problems = [str(exc)]
         adoption = provenance.get("adoption") if isinstance(provenance.get("adoption"), dict) else {}
