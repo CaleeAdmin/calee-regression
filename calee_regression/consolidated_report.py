@@ -629,6 +629,105 @@ SYNC_FLOW_BLOCKED = "blocked"
 
 SYNC_COMPONENT_NAME = "CaleeMobile cross-device synchronization"
 
+SELECTOR_CONTRACT_COMPONENT_NAME = "CaleeMobile selector contract"
+
+
+def component_from_selector_contract(
+    name: str,
+    report_dict: "dict[str, Any] | None",
+    *,
+    mandatory: bool = True,
+    expected_git_sha: "str | None" = None,
+    expected_version: "str | None" = None,
+    expected_flutter_version: "str | None" = None,
+    expected_release_run_id: "str | None" = None,
+    now: "Any | None" = None,
+) -> ComponentResult:
+    """Build a ComponentResult from the recorded selector-contract gate report
+    (Priority 1).
+
+    The ``selector-contract`` command (release gate) writes
+    ``reports/runs/<run-id>/selector-contract/results.json`` with the raw
+    machine-readable selector evidence embedded under ``evidence`` (plus release
+    provenance). This re-validates that embedded evidence INDEPENDENTLY here --
+    it does not merely trust the recorded ``status`` -- so a tampered report that
+    claims ``status: passed`` but embeds evidence for the wrong SHA/version, on
+    the wrong Flutter toolchain, with inconsistent counts, or with a
+    stale/future/invalid timestamp still BLOCKS at consolidation. This is the
+    second, independent gate; the first is the launcher's fail-fast BEFORE the
+    mobile functional tests.
+
+    Result rules (mirroring the rest of this module and docs/RELEASE_POLICY.md):
+      * report absent (None) -> NOT_RUN (blocks when mandatory -- a release must
+        never PASS without selector evidence);
+      * evidence missing/malformed, or failing verification (wrong build,
+        wrong toolchain, not PASS, missing selector, inconsistent counts,
+        bad/stale timestamp, missing provenance) -> BLOCKED;
+      * evidence valid for the expected build -> PASS.
+    """
+    from . import selector_evidence as se
+
+    if expected_flutter_version is None:
+        expected_flutter_version = se.EXPECTED_FLUTTER_VERSION
+
+    if report_dict is None:
+        return ComponentResult(
+            name=name, status=STATUS_NOT_RUN, mandatory=mandatory,
+            detail=["Not executed -- no selector-contract evidence recorded for this run."],
+        )
+
+    evidence = report_dict.get("evidence")
+    if not isinstance(evidence, dict):
+        return ComponentResult(
+            name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
+            detail=["Selector-contract report has no embedded evidence to verify."],
+        )
+
+    try:
+        result = se.parse_selector_contract_result(evidence)
+    except se.SelectorEvidenceError as exc:
+        return ComponentResult(
+            name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
+            detail=[f"Selector-contract evidence is malformed: {exc}"],
+        )
+
+    verdict = se.verify_selector_contract_evidence(
+        result,
+        expected_git_sha=expected_git_sha,
+        expected_version=expected_version,
+        expected_flutter_version=expected_flutter_version,
+        expected_release_run_id=expected_release_run_id,
+        require_release_provenance=True,
+        now=now,
+    )
+    evidence_summary = {
+        "testedSha": result.tested_sha,
+        "pubspecVersion": result.pubspec_version,
+        "flutterVersion": result.flutter_version,
+        "contract": result.contract,
+        "selectorsChecked": result.selectors_checked,
+        "selectorsPresent": result.selectors_present,
+        "timestamp": result.timestamp,
+        "releaseRunId": result.release_run_id,
+        "workflowRunId": result.workflow_run_id,
+        "generatedBy": result.generated_by,
+        "regressionSha": result.regression_sha,
+    }
+    if verdict.ok:
+        detail = [
+            f"Selector contract PASS for CaleeMobile {result.pubspec_version} @ {result.tested_sha} "
+            f"({result.selectors_present}/{result.selectors_checked} selectors present, "
+            f"Flutter {result.flutter_version})."
+        ]
+        return ComponentResult(
+            name=name, status=STATUS_PASS, mandatory=mandatory, passed=1,
+            detail=detail, evidence=evidence_summary,
+        )
+    return ComponentResult(
+        name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
+        detail=list(verdict.problems), evidence=evidence_summary,
+    )
+
 
 def component_from_sync_report(
     name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = True
@@ -1134,6 +1233,8 @@ def build_release_report(
     android_mandatory: bool = True,
     ios_mandatory: bool = True,
     sync_mandatory: "bool | None" = None,
+    selector_contract: "dict[str, Any] | None" = None,
+    selector_contract_mandatory: "bool | None" = None,
     calee_build_version: "str | None" = None,
     expected_calee_build_version: "str | None" = None,
     caleemobile_build_version: "str | None" = None,
@@ -1207,12 +1308,40 @@ def build_release_report(
         component_from_manual_checks(manual_checks or []),
     ]
 
+    # CaleeMobile selector contract (Priority 1). A mobile-functional
+    # precondition, so it reads right after the environment component and before
+    # the tablet/mobile components. Included exactly when the caller made an
+    # explicit mandatory/optional decision (selector_contract_mandatory is not
+    # None); the consolidate CLI passes True for a real release run (and
+    # auto-includes it whenever a selector-contract report exists), while unit
+    # tests that don't exercise it leave it None. A mandatory selector contract
+    # that is missing, malformed, for the wrong build, or otherwise invalid then
+    # BLOCKS the overall status like any other mandatory component -- a release
+    # can never PASS without valid selector evidence for the exact build.
+    if selector_contract_mandatory is not None:
+        sel_expected_sha = expected_caleemobile_git_sha or caleemobile_git_sha
+        sel_expected_version = expected_caleemobile_build_version or caleemobile_build_version
+        sel_release_run_id = (meta or {}).get("runId")
+        components.insert(
+            1,
+            component_from_selector_contract(
+                SELECTOR_CONTRACT_COMPONENT_NAME, selector_contract,
+                mandatory=selector_contract_mandatory,
+                expected_git_sha=sel_expected_sha,
+                expected_version=sel_expected_version,
+                expected_release_run_id=sel_release_run_id,
+            ),
+        )
+
     # Independent per-platform backend verification (Phase 4). Inserted right
     # after the platform UI components so the report reads platform -> its
     # backend evidence. This does NOT rely on the mobile runner's exit code:
     # a backend mismatch or a missing resolved backend for a mandatory
     # platform BLOCKS the release even if that platform's UI checks "passed".
-    insert_at = 5  # after the iPhone UI component, before manual checks
+    # `insert_at` is computed from the current list length (not a fixed index)
+    # so it stays "just before manual checks" regardless of whether the
+    # selector-contract component above was inserted.
+    insert_at = len(components) - 1  # before manual checks (always the last base component)
     for evidence_name, evidence_report, evidence_mandatory in (
         ("CaleeMobile Android UI backend", mobile_android_ui, android_mandatory),
         ("CaleeMobile iPhone UI backend", mobile_ios_ui, ios_mandatory),

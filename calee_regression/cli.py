@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -1170,6 +1172,242 @@ def verify_selector_evidence_cmd(evidence_path, expected_sha, expected_version, 
     raise SystemExit(EXIT_SUCCESS if verdict.ok else EXIT_BLOCKED)
 
 
+@main.command("selector-contract")
+@click.option(
+    "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True,
+    help="Shared release run ID. The evidence is recorded at "
+         "reports/runs/<run-id>/selector-contract/results.json and stamped with this ID.",
+)
+@click.option(
+    "--source", "source_path", type=click.Path(exists=True), default=None,
+    help="Existing selector-contract result JSON to adopt (e.g. a CI artifact "
+         "downloaded for the exact release commit). When omitted, evidence is "
+         "generated locally from the CaleeMobile-Regression + CaleeMobile checkouts.",
+)
+@click.option(
+    "--expected-sha", "expected_sha", default=None,
+    help="Expected full CaleeMobile release SHA. Defaults to config/release-platforms.yaml "
+         "(caleemobile_git_sha), then the detected CaleeMobile checkout HEAD.",
+)
+@click.option(
+    "--expected-version", "expected_version", default=None,
+    help="Expected CaleeMobile release version. Defaults to config "
+         "(caleemobile_build_version), then the detected checkout pubspec version.",
+)
+@click.option(
+    "--expected-ref", "expected_ref", default=None,
+    help="Expected CaleeMobile ref (non-blocking note; SHA/version are authoritative).",
+)
+@click.option(
+    "--caleemobile-source", "caleemobile_source_opt", default=None,
+    help="CaleeMobile checkout (default: ../CaleeMobile). Used to generate evidence "
+         "and/or resolve the detected release identity.",
+)
+@click.option(
+    "--regression-source", "regression_source_opt", default=None,
+    help="CaleeMobile-Regression checkout (default: ../CaleeMobile-Regression). Its "
+         "ui/selector_contract.py generates the evidence when --source is omitted.",
+)
+@click.option(
+    "--flutter-version", "flutter_version_opt", default=None,
+    help="Flutter toolchain to record when generating locally (default: the pinned "
+         "version the schema requires).",
+)
+@click.option(
+    "--mandatory/--optional", "mandatory", default=True,
+    help="Whether this selector contract is release-gating (default: mandatory).",
+)
+def selector_contract_cmd(
+    run_id_opt, source_path, expected_sha, expected_version, expected_ref,
+    caleemobile_source_opt, regression_source_opt, flutter_version_opt, mandatory,
+):
+    """Release gate: obtain/generate CaleeMobile selector evidence for the EXACT
+    release build, validate it, and record it under this run BEFORE any mobile
+    functional test (Priority 1).
+
+    Resolves the expected CaleeMobile SHA+version (flags -> release profile ->
+    detected checkout), obtains evidence (an adopted --source artifact, else a
+    fresh local generation), stamps release-run provenance, and validates it with
+    the hardened schema. Records the result at
+    reports/runs/<run-id>/selector-contract/results.json (stamped with this run
+    ID so consolidation trusts it) and exits:
+
+      * SUCCESS (0)  -- valid selector evidence for the exact build being released;
+      * BLOCKED (3)  -- evidence missing, unreadable, malformed, stale, for another
+                        SHA/version, produced with the wrong Flutter version, not
+                        PASS, or reporting any missing selector.
+
+    A release can never PASS without valid selector evidence for the build being
+    released -- this gate is why.
+    """
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    run_id = run_id_opt
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    component_dir = workspace.component_dir("selector-contract")
+    component_dir.mkdir(parents=True, exist_ok=True)
+    report_path = workspace.component_report_path("selector-contract")
+
+    def _finish(status, detail, problems, evidence, source_label):
+        report = {
+            "component": "caleemobile-selector-contract-gate",
+            "releaseRunId": run_id,
+            "runId": run_id,
+            "status": status,  # "passed" | "blocked"
+            "mandatory": mandatory,
+            "expectedSha": expected_sha,
+            "expectedVersion": expected_version,
+            "source": source_label,
+            "detail": list(detail),
+            "problems": list(problems),
+            "evidence": evidence,
+            "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        # Also write the raw stamped evidence under a clear filename so the
+        # release bundle can retain it as a downloadable artifact
+        # (evidence/selector-contract-result.json) rather than a generic name.
+        if evidence is not None:
+            (component_dir / "selector-contract-result.json").write_text(
+                json.dumps(evidence, indent=2) + "\n", encoding="utf-8"
+            )
+        exit_code = EXIT_SUCCESS if status == "passed" else EXIT_BLOCKED
+        try:
+            manifest = _load_or_init_manifest(workspace)
+            manifest.record_component("selector-contract", report_path=str(report_path), exit_code=exit_code)
+            if evidence and evidence.get("testedSha"):
+                manifest.git_shas["caleemobile-selector"] = evidence["testedSha"]
+            manifest.write(workspace.manifest_path)
+        except Exception:  # noqa: BLE001 - the report file is the authoritative artifact
+            pass
+        for line in problems:
+            click.echo(f"  - {line}", err=(status != "passed"))
+        for line in detail:
+            click.echo(line)
+        click.echo(f"Selector-contract gate: {status.upper()} (run {run_id})")
+        click.echo(f"Recorded: {report_path}")
+        raise SystemExit(exit_code)
+
+    # 1. Resolve the expected CaleeMobile identity: flags -> release profile ->
+    #    the detected checkout HEAD. Without a concrete SHA+version there is no
+    #    "exact build" to prove selectors against, so an unresolved identity is
+    #    itself a BLOCK.
+    cm_source = Path(caleemobile_source_opt) if caleemobile_source_opt else (REPO_ROOT.parent / "CaleeMobile")
+    detected = build_identity_mod.collect_caleemobile_identity(cm_source)
+    if expected_sha is None or expected_version is None:
+        try:
+            configured = release_platforms.load_expected_build_identity()
+        except release_platforms.ReleasePlatformsError as exc:
+            _finish("blocked", [], [f"Invalid release-platforms config: {exc}"], None, "unresolved")
+        if expected_sha is None:
+            expected_sha = configured.caleemobile_git_sha or (detected.git_sha if detected.available else None)
+        if expected_version is None:
+            expected_version = configured.caleemobile_build_version or (
+                detected.build_version if detected.available else None
+            )
+    if not expected_sha or not expected_version:
+        _finish(
+            "blocked", [],
+            ["Cannot resolve the expected CaleeMobile release identity (need both SHA and version). "
+             "Configure expected_build_identity in config/release-platforms.yaml, pass "
+             "--expected-sha/--expected-version, or provide a CaleeMobile checkout."],
+            None, "unresolved",
+        )
+
+    # 2. Obtain evidence: adopt a provided artifact, else generate locally.
+    flutter_version = flutter_version_opt or selector_evidence_mod.EXPECTED_FLUTTER_VERSION
+    if source_path:
+        source_label = str(source_path)
+        try:
+            evidence = json.loads(Path(source_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _finish("blocked", [], [f"Could not read selector evidence from {source_path}: {exc}"], None, source_label)
+        if not isinstance(evidence, dict):
+            _finish("blocked", [], [f"Selector evidence at {source_path} is not a JSON object."], None, source_label)
+    else:
+        source_label = "local-generation"
+        reg_source = (
+            Path(regression_source_opt) if regression_source_opt else (REPO_ROOT.parent / "CaleeMobile-Regression")
+        )
+        script = reg_source / "ui" / "selector_contract.py"
+        if not script.is_file():
+            _finish(
+                "blocked", [],
+                [f"Cannot generate selector evidence: {script} not found. Provide --source or a "
+                 f"CaleeMobile-Regression checkout via --regression-source."],
+                None, source_label,
+            )
+        if not cm_source.is_dir():
+            _finish(
+                "blocked", [],
+                [f"Cannot generate selector evidence: CaleeMobile checkout not found at {cm_source}."],
+                None, source_label,
+            )
+        out_file = component_dir / "generated-evidence.json"
+        env = dict(os.environ)
+        env["CALEE_MOBILE_REPO_PATH"] = str(cm_source)
+        env["CALEE_RUN_ID"] = run_id
+        cmd = [
+            sys.executable or "python3", str(script),
+            "--ref", (expected_ref or expected_sha),
+            "--flutter-version", flutter_version,
+            "--release-run-id", run_id,
+            "--out", str(out_file),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120, cwd=str(script.parent), env=env,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            _finish("blocked", [], [f"Selector-contract generation failed to run: {exc}"], None, source_label)
+        # selector_contract.py exits non-zero when the contract FAILED but still
+        # writes the evidence file; read it regardless and let the verifier BLOCK
+        # on a FAIL. Only a missing/unreadable file is a generation failure.
+        try:
+            evidence = json.loads(out_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _finish(
+                "blocked", [],
+                [f"Selector-contract generation produced no readable evidence: {exc}",
+                 (proc.stderr or "").strip() or "(no stderr)"],
+                None, source_label,
+            )
+
+    # 3. Stamp release-run provenance onto the adopted/generated evidence so the
+    #    recorded proof is tied to THIS release run, and add a content digest.
+    evidence["releaseRunId"] = run_id
+    if not evidence.get("generatedBy"):
+        evidence["generatedBy"] = "local" if source_label == "local-generation" else "ci"
+    digest_input = {k: v for k, v in evidence.items() if k != "artifactDigest"}
+    evidence["artifactDigest"] = "sha256:" + hashlib.sha256(
+        json.dumps(digest_input, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    # 4. Validate: hardened schema + exact-build identity + release provenance.
+    try:
+        result = selector_evidence_mod.parse_selector_contract_result(evidence)
+    except selector_evidence_mod.SelectorEvidenceError as exc:
+        _finish("blocked", [], [f"Selector evidence is malformed: {exc}"], evidence, source_label)
+
+    verdict = selector_evidence_mod.verify_selector_contract_evidence(
+        result,
+        expected_git_sha=expected_sha,
+        expected_version=expected_version,
+        expected_ref=expected_ref,
+        require_release_provenance=True,
+        expected_release_run_id=run_id,
+    )
+    if verdict.ok:
+        detail = [
+            f"Selector contract PASS for CaleeMobile {result.pubspec_version} @ {result.tested_sha} "
+            f"({result.selectors_present}/{result.selectors_checked} selectors present, "
+            f"Flutter {result.flutter_version}). Evidence source: {source_label}."
+        ]
+        _finish("passed", detail, verdict.problems, evidence, source_label)
+    _finish("blocked", [], verdict.problems, evidence, source_label)
+
+
 @main.command("build-identity")
 @click.option(
     "--caleemobile-source", default=None,
@@ -1385,6 +1623,13 @@ def _resolve_component(
          "config/release-platforms.yaml (release_features.synchronization), or True if absent. "
          "An optional sync is still shown in the report, just never blocks a PASS.",
 )
+@click.option(
+    "--selector-contract-mandatory/--selector-contract-optional", "selector_contract_mandatory", default=None,
+    help="Whether CaleeMobile selector evidence is release-gating (Priority 1). The full "
+         "launcher passes --selector-contract-mandatory. When omitted, the component is still "
+         "auto-included as mandatory if a selector-contract report exists for this run; a release "
+         "can never PASS without valid selector evidence for the exact CaleeMobile build.",
+)
 # Independent release-feature gating (Workstream 3). Each defaults to the
 # release feature profile (config/release-platforms.yaml release_features.*),
 # or True if absent -- an omitted feature is mandatory. An optional feature is
@@ -1430,6 +1675,7 @@ def _resolve_component(
 def consolidate(
     run_id_opt, tablet_report, mobile_api_report, mobile_android_report, mobile_ios_report,
     sync_report, kiosk_report, manual_checks_path, environment_report, android_mandatory, ios_mandatory, sync_mandatory,
+    selector_contract_mandatory,
     meals_mandatory, onboarding_mandatory, google_calendar_mandatory, kiosk_admin_mandatory,
     build_version, calee_build_version, expected_calee_build_version,
     caleemobile_build_version, expected_caleemobile_build_version, caleeshell_version,
@@ -1488,6 +1734,19 @@ def consolidate(
     mobile_ios = resolve("mobile-ios", mobile_ios_report)
     sync = resolve("sync", sync_report)
     kiosk = resolve("kiosk-admin", kiosk_report)
+    # CaleeMobile selector contract (Priority 1). Auto-discovered from this run's
+    # workspace and run-ID-validated like every other component. An explicit
+    # --selector-contract-mandatory/--optional wins; otherwise a present report is
+    # always release-gating (a recorded selector gate must never be silently
+    # ignored), and its absence leaves the component out only for legacy/ad-hoc
+    # consolidation that never ran the gate.
+    selector_contract_report = resolve("selector-contract", None)
+    if selector_contract_mandatory is not None:
+        selector_contract_gating = selector_contract_mandatory
+    elif selector_contract_report is not None:
+        selector_contract_gating = True
+    else:
+        selector_contract_gating = None
 
     manual_checks_raw = resolve("manual-checks", manual_checks_path)
     manual_checks_list = None
@@ -1692,6 +1951,8 @@ def consolidate(
         android_mandatory=android_gating,
         ios_mandatory=ios_gating,
         sync_mandatory=sync_gating,
+        selector_contract=selector_contract_report,
+        selector_contract_mandatory=selector_contract_gating,
         calee_build_version=calee_build_version,
         expected_calee_build_version=eff_expected_calee_build,
         caleemobile_build_version=caleemobile_build_version,
@@ -1717,7 +1978,20 @@ def consolidate(
     )
 
     out = Path(out_dir) if out_dir else workspace.consolidated_dir
-    bundle_path = write_release_bundle(report, out, build_label=build_version)
+    # Retain the raw selector-contract evidence inside the release ZIP so the
+    # selector proof travels with the bundle as a downloadable artifact
+    # (Priority 1: "Include it ... in ... ZIP outputs").
+    evidence_paths = []
+    if selector_contract_gating is not None:
+        selector_dir = workspace.component_dir("selector-contract")
+        raw_evidence = selector_dir / "selector-contract-result.json"
+        selector_report_path = workspace.component_report_path("selector-contract")
+        for candidate in (raw_evidence, selector_report_path):
+            if candidate.is_file():
+                evidence_paths.append(candidate)
+    bundle_path = write_release_bundle(
+        report, out, build_label=build_version, evidence_paths=evidence_paths or None
+    )
 
     click.echo(f"Run ID: {run_id}")
     click.echo(f"Overall: {report.overall_status.upper()}")
