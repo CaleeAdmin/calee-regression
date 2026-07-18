@@ -1843,19 +1843,12 @@ def consolidate(
     mobile_ios = resolve("mobile-ios", mobile_ios_report)
     sync = resolve("sync", sync_report)
     kiosk = resolve("kiosk-admin", kiosk_report)
-    # CaleeMobile selector contract (Priority 1). Auto-discovered from this run's
-    # workspace and run-ID-validated like every other component. An explicit
-    # --selector-contract-mandatory/--optional wins; otherwise a present report is
-    # always release-gating (a recorded selector gate must never be silently
-    # ignored), and its absence leaves the component out only for legacy/ad-hoc
-    # consolidation that never ran the gate.
+    # CaleeMobile selector contract (Priority 1/2). Auto-discovered from this
+    # run's workspace and run-ID-validated like every other component. The
+    # gating decision (mandatory in any mobile release, unconditionally so in
+    # production) is deferred below, once the mobile scope, production profile
+    # and any named waiver are resolved.
     selector_contract_report = resolve("selector-contract", None)
-    if selector_contract_mandatory is not None:
-        selector_contract_gating = selector_contract_mandatory
-    elif selector_contract_report is not None:
-        selector_contract_gating = True
-    else:
-        selector_contract_gating = None
 
     manual_checks_raw = resolve("manual-checks", manual_checks_path)
     manual_checks_list = None
@@ -1947,6 +1940,59 @@ def consolidate(
         "timestamp": waiver_timestamp or profile_waiver.timestamp,
     }
     waiver_is_valid = all(str(waiver.get(k) or "").strip() for k in ("reason", "approver", "timestamp"))
+
+    # Selector evidence is unavoidable in a mobile release (Priority 2). It
+    # defaults to MANDATORY whenever a mobile platform is in scope, and is
+    # UNCONDITIONALLY mandatory in a production mobile release -- there,
+    # --selector-contract-optional is rejected outright. In a development /
+    # diagnostic release it may be opted out ONLY through a valid named waiver
+    # (reason + approver + timestamp); a bare --selector-contract-optional
+    # without a waiver is refused and the contract stays mandatory. A missing
+    # report then surfaces as a visible NOT_RUN/BLOCKED component (see
+    # build_release_report), never omission.
+    mobile_in_scope = bool(android_gating or ios_gating)
+    if eff_production and mobile_in_scope:
+        if selector_contract_mandatory is False:
+            click.echo(
+                "--selector-contract-optional is not permitted in a production mobile release; "
+                "selector evidence is unconditionally mandatory for any mobile release.",
+                err=True,
+            )
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        selector_contract_gating = True
+    elif selector_contract_mandatory is False:
+        # Explicit opt-out (development / diagnostic): allowed ONLY with a valid
+        # named waiver. Without one, when a mobile platform is in scope, the
+        # opt-out is refused and the contract stays mandatory -- selector
+        # evidence can never be silently dropped from a mobile release.
+        if mobile_in_scope and not waiver_is_valid:
+            click.echo(
+                "Refusing --selector-contract-optional without a named waiver "
+                "(reason + approver + timestamp); selector evidence stays mandatory for "
+                "this mobile release.",
+                err=True,
+            )
+            selector_contract_gating = True
+        else:
+            selector_contract_gating = False
+            if mobile_in_scope:
+                click.echo(
+                    "NOTE: selector evidence opted out by named waiver "
+                    f"(approver={waiver.get('approver')!r}).",
+                )
+    elif selector_contract_mandatory is True:
+        selector_contract_gating = True
+    elif mobile_in_scope:
+        # Default for any mobile release: mandatory.
+        selector_contract_gating = True
+    elif selector_contract_report is not None:
+        # No mobile platform in scope, but a selector gate was recorded for this
+        # run -- never silently ignore it.
+        selector_contract_gating = True
+    else:
+        # No mobile in scope, no recorded gate: selector evidence is not
+        # applicable to this (non-mobile) release.
+        selector_contract_gating = None
 
     if eff_production:
         # In production a dirty tree is approved ONLY by a valid named waiver;
