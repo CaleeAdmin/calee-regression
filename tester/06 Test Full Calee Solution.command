@@ -75,6 +75,32 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     python -m calee_regression suite --config "$CALEE_TEST_CONFIG" --suite full-tester --run-id "$CALEE_RUN_ID"
 
     echo ""
+    echo "--- Step 2.5: CaleeMobile selector-contract gate (BEFORE any mobile functional test) ---"
+    # Priority 1: a release must never ship CaleeMobile while its selector proof
+    # is for a DIFFERENT build. Before the CaleeMobile Client API, the Android/iOS
+    # UI, or cross-device sync run, obtain (or generate) machine-readable selector
+    # evidence for the EXACT release SHA+version, validate it against the hardened
+    # schema, and record it at reports/runs/$CALEE_RUN_ID/selector-contract/
+    # results.json. The gate BLOCKS (exit 3) when evidence is missing, unreadable,
+    # malformed, stale, for another SHA/version, produced with the wrong Flutter
+    # version, not PASS, or reporting any missing selector -- and then the mobile
+    # functional legs below are SKIPPED, so the consolidated bundle can never read
+    # as a PASS without valid selector evidence for the build being released.
+    #
+    # The expected identity falls back to config/release-platforms.yaml and then
+    # the detected CaleeMobile checkout; a technical owner can pin it via
+    # CALEEMOBILE_EXPECTED_GIT_SHA/CALEEMOBILE_EXPECTED_BUILD_VERSION, or supply a
+    # downloaded CI artifact via CALEEMOBILE_SELECTOR_EVIDENCE (else it generates
+    # locally from the sibling CaleeMobile-Regression + CaleeMobile checkouts).
+    SELECTOR_ARGS=(--run-id "$CALEE_RUN_ID" --mandatory)
+    [ -n "${CALEEMOBILE_EXPECTED_GIT_SHA:-}" ] && SELECTOR_ARGS+=(--expected-sha "$CALEEMOBILE_EXPECTED_GIT_SHA")
+    [ -n "${CALEEMOBILE_EXPECTED_BUILD_VERSION:-}" ] && SELECTOR_ARGS+=(--expected-version "$CALEEMOBILE_EXPECTED_BUILD_VERSION")
+    [ -n "${CALEEMOBILE_SELECTOR_EVIDENCE:-}" ] && SELECTOR_ARGS+=(--source "$CALEEMOBILE_SELECTOR_EVIDENCE")
+    python -m calee_regression selector-contract "${SELECTOR_ARGS[@]}"
+    SELECTOR_GATE_STATUS=$?
+
+    if [ "$SELECTOR_GATE_STATUS" -eq 0 ]; then
+    echo ""
     echo "--- Step 3: CaleeMobile Client API (device-independent — run once) ---"
     # The Client API suite is device-independent, so it runs EXACTLY ONCE for the
     # whole release, never once per platform. The Android and iOS steps below run
@@ -131,6 +157,20 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
         SYNC_ARGS+=(--mandatory)
     fi
     python -m calee_regression sync-smoke "${SYNC_ARGS[@]}"
+    else
+        echo ""
+        echo "=== CaleeMobile selector contract did not pass (status $SELECTOR_GATE_STATUS) — mobile functional tests SKIPPED ==="
+        echo "The CaleeMobile selector proof is missing or not for the exact build being"
+        echo "released, so the mobile functional legs would assert against unverified"
+        echo "selectors (pure noise) or be mistaken for a product result:"
+        echo "  - CaleeMobile Client API:       SKIPPED (selector contract not satisfied)"
+        echo "  - CaleeMobile Android UI:       SKIPPED (selector contract not satisfied)"
+        echo "  - CaleeMobile iPhone UI:        SKIPPED (selector contract not satisfied)"
+        echo "  - Cross-device synchronization: SKIPPED (selector contract not satisfied)"
+        echo "The selector-contract report Step 2.5 wrote is preserved and consolidated"
+        echo "below into a BLOCKED bundle. Selectors passing for another CaleeMobile"
+        echo "build are not evidence about the one being released."
+    fi
 
     echo ""
     echo "--- Step 7: CaleeShell kiosk/admin ---"
@@ -232,6 +272,12 @@ if [ "$RELEASE_FEATURE_SYNCHRONIZATION" = "false" ]; then
 else
     CONSOLIDATE_ARGS+=(--sync-mandatory)
 fi
+# CaleeMobile selector contract (Priority 1) is UNCONDITIONALLY release-gating
+# for a full Calee solution: a release can never PASS without valid selector
+# evidence for the exact CaleeMobile build. Step 2.5 recorded it under this run;
+# consolidate re-validates the embedded evidence independently and BLOCKS on any
+# problem (missing/malformed/wrong-build/not-PASS/stale), exactly like the gate.
+CONSOLIDATE_ARGS+=(--selector-contract-mandatory)
 # Build/commit identity -- auto-collected above (a technical owner can still
 # override any value via the matching env var). The detected identity is
 # always passed so the consolidator can gate on it; see Phase 3.

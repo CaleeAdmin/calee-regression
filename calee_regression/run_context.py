@@ -38,6 +38,11 @@ RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # "not executed").
 COMPONENT_NAMES = (
     "environment",
+    # CaleeMobile selector-contract evidence (Priority 1): the release gate
+    # obtains/generates the machine-readable selector proof for the EXACT
+    # CaleeMobile release SHA+version, validates it, and records it here BEFORE
+    # any mobile functional test runs. A release can never PASS without it.
+    "selector-contract",
     "tablet",
     "mobile-api",
     "mobile-android",
