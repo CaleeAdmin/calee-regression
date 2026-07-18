@@ -221,6 +221,15 @@ def _consolidate(tmp_path, *extra_args, run_id=RUN_ID):
             # Feature gating has its own tests (test_feature_consolidation.py).
             "--meals-optional", "--onboarding-optional",
             "--google-calendar-optional", "--kiosk-admin-optional",
+            # Nor do they exercise the CaleeMobile selector contract (Priority 2),
+            # which is mandatory for any mobile release. Opt out via the named
+            # waiver the diagnostic path requires (selector evidence has its own
+            # tests: test_selector_contract_gate.py) so it doesn't confound the
+            # platform assertions.
+            "--selector-contract-optional",
+            "--waiver-reason", "unit test: platform gating only; selector contract has its own tests",
+            "--waiver-approver", "framework-tests",
+            "--waiver-timestamp", "2026-07-18T00:00:00Z",
             *extra_args,
         ],
     )

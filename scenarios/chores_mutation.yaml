@@ -65,6 +65,7 @@ steps:
   - name: Open the fixture chore's action menu (row-scoped, requires chore edit actions enabled)
     action: tap_in_row
     card_id: choresItemCard
+    title_id: tvTitle
     title: REG-CHORE-REPEATING-001
     target_id: tvActionMenu
 

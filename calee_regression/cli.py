@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -20,7 +19,9 @@ from . import manual_checks as manual_checks_mod
 from . import preflight, release_platforms, reporting, suites
 from . import run_context
 from . import selector_evidence as selector_evidence_mod
+from . import selector_provenance as selector_provenance_mod
 from . import sync_smoke
+from . import toolchain_verify as toolchain_verify_mod
 from .appium_driver import CaleeDriver
 from .consolidated_report import (
     STATUS_BLOCKED,
@@ -1210,8 +1211,28 @@ def verify_selector_evidence_cmd(evidence_path, expected_sha, expected_version, 
 )
 @click.option(
     "--flutter-version", "flutter_version_opt", default=None,
-    help="Flutter toolchain to record when generating locally (default: the pinned "
-         "version the schema requires).",
+    help="Flutter toolchain the local generation must ACTUALLY report (default: the "
+         "pinned version the schema requires). This is verified against `flutter "
+         "--version`, never recorded on the toolchain's behalf.",
+)
+@click.option(
+    "--production/--development", "production_opt", default=None,
+    help="Production release profile (Priority 1, Problem A): production accepts ONLY "
+         "a CI-produced selector artifact (--source with generatedBy=ci); local "
+         "generation is refused. Defaults to config/release-platforms.yaml.",
+)
+@click.option(
+    "--source-artifact-id", "source_artifact_id", default=None,
+    help="GitHub artifact ID of the adopted --source (retained for traceability).",
+)
+@click.option(
+    "--source-artifact-digest", "source_artifact_digest", default=None,
+    help="GitHub-provided digest of the adopted --source artifact (retained for traceability).",
+)
+@click.option(
+    "--adopted-by", "adopted_by", default=None,
+    help="Who/what is adopting the evidence (recorded in adoption provenance; "
+         "default: the selector-contract gate).",
 )
 @click.option(
     "--mandatory/--optional", "mandatory", default=True,
@@ -1219,7 +1240,8 @@ def verify_selector_evidence_cmd(evidence_path, expected_sha, expected_version, 
 )
 def selector_contract_cmd(
     run_id_opt, source_path, expected_sha, expected_version, expected_ref,
-    caleemobile_source_opt, regression_source_opt, flutter_version_opt, mandatory,
+    caleemobile_source_opt, regression_source_opt, flutter_version_opt,
+    production_opt, source_artifact_id, source_artifact_digest, adopted_by, mandatory,
 ):
     """Release gate: obtain/generate CaleeMobile selector evidence for the EXACT
     release build, validate it, and record it under this run BEFORE any mobile
@@ -1249,28 +1271,53 @@ def selector_contract_cmd(
     component_dir.mkdir(parents=True, exist_ok=True)
     report_path = workspace.component_report_path("selector-contract")
 
-    def _finish(status, detail, problems, evidence, source_label):
+    # Production release profile (Problem A): production accepts ONLY a
+    # CI-produced selector artifact; local generation is refused. An explicit
+    # --production/--development wins over config/release-platforms.yaml.
+    try:
+        eff_production = (
+            production_opt if production_opt is not None
+            else release_platforms.load_expected_build_identity().production
+        )
+    except release_platforms.ReleasePlatformsError:
+        eff_production = bool(production_opt)
+
+    def _finish(status, detail, problems, evidence, source_label, provenance=None):
         report = {
             "component": "caleemobile-selector-contract-gate",
             "releaseRunId": run_id,
             "runId": run_id,
             "status": status,  # "passed" | "blocked"
             "mandatory": mandatory,
+            "production": eff_production,
             "expectedSha": expected_sha,
             "expectedVersion": expected_version,
             "source": source_label,
             "detail": list(detail),
             "problems": list(problems),
+            # The evidence used for build-identity verification. This is the
+            # source artifact preserved byte-for-byte -- the gate never mutates
+            # a source artifact's own provenance (Problem B).
             "evidence": evidence,
+            # Immutable source provenance + release adoption (Problem B). When
+            # present, consolidation re-verifies its content digest and rules.
+            "provenance": provenance,
             "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        # Also write the raw stamped evidence under a clear filename so the
+        # Also write the raw source evidence under a clear filename so the
         # release bundle can retain it as a downloadable artifact
         # (evidence/selector-contract-result.json) rather than a generic name.
         if evidence is not None:
             (component_dir / "selector-contract-result.json").write_text(
                 json.dumps(evidence, indent=2) + "\n", encoding="utf-8"
+            )
+        # Retain the immutable provenance record (source + adoption + digest +
+        # any local toolchain verification) alongside it, so the bundle carries
+        # both the original evidence and how it was adopted (Problem B).
+        if provenance is not None:
+            (component_dir / "selector-contract-provenance.json").write_text(
+                json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
             )
         exit_code = EXIT_SUCCESS if status == "passed" else EXIT_BLOCKED
         try:
@@ -1315,18 +1362,43 @@ def selector_contract_cmd(
             None, "unresolved",
         )
 
-    # 2. Obtain evidence: adopt a provided artifact, else generate locally.
-    flutter_version = flutter_version_opt or selector_evidence_mod.EXPECTED_FLUTTER_VERSION
+    # 2. Obtain evidence: adopt a provided CI artifact, else generate locally
+    #    (development only). The required Flutter version below is what the
+    #    toolchain must ACTUALLY report -- it is never recorded on the toolchain's
+    #    behalf (Problem A).
+    required_flutter = flutter_version_opt or selector_evidence_mod.EXPECTED_FLUTTER_VERSION
+    adopted_by_label = adopted_by or "caleemobile-selector-contract-gate"
+    adopted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    local_verification = None  # verified toolchain evidence, for local generation
+
     if source_path:
+        # --- Adopt a provided artifact (the ONLY path allowed in production) ---
         source_label = str(source_path)
         try:
-            evidence = json.loads(Path(source_path).read_text(encoding="utf-8"))
+            source_evidence = json.loads(Path(source_path).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             _finish("blocked", [], [f"Could not read selector evidence from {source_path}: {exc}"], None, source_label)
-        if not isinstance(evidence, dict):
+        if not isinstance(source_evidence, dict):
             _finish("blocked", [], [f"Selector evidence at {source_path} is not a JSON object."], None, source_label)
+        if eff_production and (source_evidence.get("generatedBy") or "").strip() != selector_provenance_mod.GENERATED_BY_CI:
+            _finish(
+                "blocked", [],
+                ["Production release accepts ONLY a CI-produced selector artifact "
+                 f"(generatedBy='ci'); this --source declares generatedBy="
+                 f"{source_evidence.get('generatedBy')!r}."],
+                source_evidence, source_label,
+            )
     else:
+        # --- Generate locally (development fallback; refused in production) ----
         source_label = "local-generation"
+        if eff_production:
+            _finish(
+                "blocked", [],
+                ["Production release accepts ONLY a CI-produced selector artifact. Local "
+                 "generation cannot prove the release toolchain; provide the CI artifact "
+                 "via --source (generatedBy='ci' with a workflowRunId)."],
+                None, source_label,
+            )
         reg_source = (
             Path(regression_source_opt) if regression_source_opt else (REPO_ROOT.parent / "CaleeMobile-Regression")
         )
@@ -1344,6 +1416,29 @@ def selector_contract_cmd(
                 [f"Cannot generate selector evidence: CaleeMobile checkout not found at {cm_source}."],
                 None, source_label,
             )
+        # Actually run the Flutter toolchain against the exact CaleeMobile
+        # checkout BEFORE trusting any generated evidence. A caller-supplied
+        # Flutter string must never become proof of the installed toolchain
+        # (Problem A): the recorded flutterVersion is the one the real
+        # `flutter --version` reports, and generation is refused if the
+        # toolchain cannot be verified.
+        tv = toolchain_verify_mod.verify_local_toolchain(
+            cm_source, reg_source, expected_flutter_version=required_flutter,
+        )
+        local_verification = tv.to_dict()
+        if not tv.ok:
+            _finish(
+                "blocked", [],
+                ["Local toolchain verification failed -- cannot back locally-generated "
+                 "selector evidence with a real Flutter toolchain:", *tv.problems],
+                None, source_label, selector_provenance_mod.build_provenance_record(
+                    {"generatedBy": selector_provenance_mod.GENERATED_BY_LOCAL},
+                    release_run_id=run_id, adopted_at=adopted_at, adopted_by=adopted_by_label,
+                    source_path=source_label, local_verification=local_verification,
+                ),
+            )
+        verified_flutter = tv.flutter_version  # the ACTUAL version, from `flutter --version`
+
         out_file = component_dir / "generated-evidence.json"
         env = dict(os.environ)
         env["CALEE_MOBILE_REPO_PATH"] = str(cm_source)
@@ -1351,8 +1446,9 @@ def selector_contract_cmd(
         cmd = [
             sys.executable or "python3", str(script),
             "--ref", (expected_ref or expected_sha),
-            "--flutter-version", flutter_version,
+            "--flutter-version", verified_flutter,  # verified, not caller-supplied
             "--release-run-id", run_id,
+            "--generated-by", selector_provenance_mod.GENERATED_BY_LOCAL,
             "--out", str(out_file),
         ]
         try:
@@ -1365,7 +1461,7 @@ def selector_contract_cmd(
         # writes the evidence file; read it regardless and let the verifier BLOCK
         # on a FAIL. Only a missing/unreadable file is a generation failure.
         try:
-            evidence = json.loads(out_file.read_text(encoding="utf-8"))
+            source_evidence = json.loads(out_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             _finish(
                 "blocked", [],
@@ -1374,38 +1470,51 @@ def selector_contract_cmd(
                 None, source_label,
             )
 
-    # 3. Stamp release-run provenance onto the adopted/generated evidence so the
-    #    recorded proof is tied to THIS release run, and add a content digest.
-    evidence["releaseRunId"] = run_id
-    if not evidence.get("generatedBy"):
-        evidence["generatedBy"] = "local" if source_label == "local-generation" else "ci"
-    digest_input = {k: v for k, v in evidence.items() if k != "artifactDigest"}
-    evidence["artifactDigest"] = "sha256:" + hashlib.sha256(
-        json.dumps(digest_input, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    # 3. Build the immutable source-provenance + adoption record (Problem B).
+    #    The source artifact is preserved byte-for-byte; a SHA-256 content
+    #    digest is computed and verified now (and re-verified at consolidation);
+    #    this run's adoption context is recorded SEPARATELY, never by overwriting
+    #    the source's own provenance fields.
+    provenance = selector_provenance_mod.build_provenance_record(
+        source_evidence,
+        release_run_id=run_id,
+        adopted_at=adopted_at,
+        adopted_by=adopted_by_label,
+        source_path=source_label,
+        source_artifact_id=source_artifact_id,
+        source_artifact_digest=source_artifact_digest,
+        local_verification=local_verification,
+    )
+    prov_problems = selector_provenance_mod.validate_source_provenance(
+        source_evidence, local_verification=local_verification,
+    )
+    if prov_problems:
+        _finish("blocked", [], prov_problems, source_evidence, source_label, provenance)
 
-    # 4. Validate: hardened schema + exact-build identity + release provenance.
+    # 4. Validate: hardened schema + exact-build identity. Run provenance is
+    #    enforced via the adoption record above, so build identity is verified
+    #    against the preserved source evidence directly (no in-place mutation).
     try:
-        result = selector_evidence_mod.parse_selector_contract_result(evidence)
+        result = selector_evidence_mod.parse_selector_contract_result(source_evidence)
     except selector_evidence_mod.SelectorEvidenceError as exc:
-        _finish("blocked", [], [f"Selector evidence is malformed: {exc}"], evidence, source_label)
+        _finish("blocked", [], [f"Selector evidence is malformed: {exc}"], source_evidence, source_label, provenance)
 
     verdict = selector_evidence_mod.verify_selector_contract_evidence(
         result,
         expected_git_sha=expected_sha,
         expected_version=expected_version,
         expected_ref=expected_ref,
-        require_release_provenance=True,
-        expected_release_run_id=run_id,
+        expected_flutter_version=required_flutter,
     )
     if verdict.ok:
         detail = [
             f"Selector contract PASS for CaleeMobile {result.pubspec_version} @ {result.tested_sha} "
             f"({result.selectors_present}/{result.selectors_checked} selectors present, "
-            f"Flutter {result.flutter_version}). Evidence source: {source_label}."
+            f"Flutter {result.flutter_version}). Evidence source: {source_label}; "
+            f"adopted by {adopted_by_label} for run {run_id}."
         ]
-        _finish("passed", detail, verdict.problems, evidence, source_label)
-    _finish("blocked", [], verdict.problems, evidence, source_label)
+        _finish("passed", detail, verdict.problems, source_evidence, source_label, provenance)
+    _finish("blocked", [], verdict.problems, source_evidence, source_label, provenance)
 
 
 @main.command("build-identity")
@@ -1734,19 +1843,12 @@ def consolidate(
     mobile_ios = resolve("mobile-ios", mobile_ios_report)
     sync = resolve("sync", sync_report)
     kiosk = resolve("kiosk-admin", kiosk_report)
-    # CaleeMobile selector contract (Priority 1). Auto-discovered from this run's
-    # workspace and run-ID-validated like every other component. An explicit
-    # --selector-contract-mandatory/--optional wins; otherwise a present report is
-    # always release-gating (a recorded selector gate must never be silently
-    # ignored), and its absence leaves the component out only for legacy/ad-hoc
-    # consolidation that never ran the gate.
+    # CaleeMobile selector contract (Priority 1/2). Auto-discovered from this
+    # run's workspace and run-ID-validated like every other component. The
+    # gating decision (mandatory in any mobile release, unconditionally so in
+    # production) is deferred below, once the mobile scope, production profile
+    # and any named waiver are resolved.
     selector_contract_report = resolve("selector-contract", None)
-    if selector_contract_mandatory is not None:
-        selector_contract_gating = selector_contract_mandatory
-    elif selector_contract_report is not None:
-        selector_contract_gating = True
-    else:
-        selector_contract_gating = None
 
     manual_checks_raw = resolve("manual-checks", manual_checks_path)
     manual_checks_list = None
@@ -1838,6 +1940,59 @@ def consolidate(
         "timestamp": waiver_timestamp or profile_waiver.timestamp,
     }
     waiver_is_valid = all(str(waiver.get(k) or "").strip() for k in ("reason", "approver", "timestamp"))
+
+    # Selector evidence is unavoidable in a mobile release (Priority 2). It
+    # defaults to MANDATORY whenever a mobile platform is in scope, and is
+    # UNCONDITIONALLY mandatory in a production mobile release -- there,
+    # --selector-contract-optional is rejected outright. In a development /
+    # diagnostic release it may be opted out ONLY through a valid named waiver
+    # (reason + approver + timestamp); a bare --selector-contract-optional
+    # without a waiver is refused and the contract stays mandatory. A missing
+    # report then surfaces as a visible NOT_RUN/BLOCKED component (see
+    # build_release_report), never omission.
+    mobile_in_scope = bool(android_gating or ios_gating)
+    if eff_production and mobile_in_scope:
+        if selector_contract_mandatory is False:
+            click.echo(
+                "--selector-contract-optional is not permitted in a production mobile release; "
+                "selector evidence is unconditionally mandatory for any mobile release.",
+                err=True,
+            )
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        selector_contract_gating = True
+    elif selector_contract_mandatory is False:
+        # Explicit opt-out (development / diagnostic): allowed ONLY with a valid
+        # named waiver. Without one, when a mobile platform is in scope, the
+        # opt-out is refused and the contract stays mandatory -- selector
+        # evidence can never be silently dropped from a mobile release.
+        if mobile_in_scope and not waiver_is_valid:
+            click.echo(
+                "Refusing --selector-contract-optional without a named waiver "
+                "(reason + approver + timestamp); selector evidence stays mandatory for "
+                "this mobile release.",
+                err=True,
+            )
+            selector_contract_gating = True
+        else:
+            selector_contract_gating = False
+            if mobile_in_scope:
+                click.echo(
+                    "NOTE: selector evidence opted out by named waiver "
+                    f"(approver={waiver.get('approver')!r}).",
+                )
+    elif selector_contract_mandatory is True:
+        selector_contract_gating = True
+    elif mobile_in_scope:
+        # Default for any mobile release: mandatory.
+        selector_contract_gating = True
+    elif selector_contract_report is not None:
+        # No mobile platform in scope, but a selector gate was recorded for this
+        # run -- never silently ignore it.
+        selector_contract_gating = True
+    else:
+        # No mobile in scope, no recorded gate: selector evidence is not
+        # applicable to this (non-mobile) release.
+        selector_contract_gating = None
 
     if eff_production:
         # In production a dirty tree is approved ONLY by a valid named waiver;
@@ -1985,8 +2140,11 @@ def consolidate(
     if selector_contract_gating is not None:
         selector_dir = workspace.component_dir("selector-contract")
         raw_evidence = selector_dir / "selector-contract-result.json"
+        # The immutable source-provenance + adoption record (Problem B): the
+        # original evidence and its adoption metadata travel with the bundle.
+        provenance_evidence = selector_dir / "selector-contract-provenance.json"
         selector_report_path = workspace.component_report_path("selector-contract")
-        for candidate in (raw_evidence, selector_report_path):
+        for candidate in (raw_evidence, provenance_evidence, selector_report_path):
             if candidate.is_file():
                 evidence_paths.append(candidate)
     bundle_path = write_release_bundle(

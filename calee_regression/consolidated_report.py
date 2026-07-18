@@ -666,6 +666,7 @@ def component_from_selector_contract(
       * evidence valid for the expected build -> PASS.
     """
     from . import selector_evidence as se
+    from . import selector_provenance as sp
 
     if expected_flutter_version is None:
         expected_flutter_version = se.EXPECTED_FLUTTER_VERSION
@@ -676,7 +677,31 @@ def component_from_selector_contract(
             detail=["Not executed -- no selector-contract evidence recorded for this run."],
         )
 
-    evidence = report_dict.get("evidence")
+    # Immutable source-provenance + adoption record (Priority 1, Problem B).
+    # When present, the source evidence is the authoritative view, and the
+    # record is independently re-verified here: its content digest is recomputed
+    # (tampering with any field after adoption BLOCKS), its provenance rules are
+    # re-checked, and the run scope is enforced via the adoption block -- NOT by
+    # requiring the source artifact to carry this run's ID in its own fields.
+    provenance = report_dict.get("provenance") if isinstance(report_dict.get("provenance"), dict) else None
+    prov_problems: "list[str]" = []
+    if provenance is not None:
+        try:
+            prov_problems = sp.verify_provenance_record(provenance)
+        except sp.ProvenanceError as exc:
+            prov_problems = [str(exc)]
+        adoption = provenance.get("adoption") if isinstance(provenance.get("adoption"), dict) else {}
+        adopted_run = str((adoption or {}).get("releaseRunId") or "").strip()
+        if expected_release_run_id is not None:
+            if not adopted_run:
+                prov_problems.append("provenance adoption has no releaseRunId -- evidence is not tied to this release run.")
+            elif adopted_run != str(expected_release_run_id).strip():
+                prov_problems.append(
+                    f"adoption releaseRunId {adopted_run!r} != current release run "
+                    f"{str(expected_release_run_id).strip()!r} -- this evidence was adopted by a different run."
+                )
+
+    evidence = sp.source_evidence_of(provenance) if provenance is not None else report_dict.get("evidence")
     if not isinstance(evidence, dict):
         return ComponentResult(
             name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
@@ -686,18 +711,24 @@ def component_from_selector_contract(
     try:
         result = se.parse_selector_contract_result(evidence)
     except se.SelectorEvidenceError as exc:
+        # A digest mismatch (tampering) is still surfaced even when the tampered
+        # evidence is now unparseable -- prov_problems is not lost here.
         return ComponentResult(
             name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
-            detail=[f"Selector-contract evidence is malformed: {exc}"],
+            detail=list(prov_problems) + [f"Selector-contract evidence is malformed: {exc}"],
         )
 
+    # With the new provenance model, run provenance is enforced via the adoption
+    # record above; build identity is verified directly against the preserved
+    # source evidence. Legacy reports (no provenance record) keep the embedded
+    # release-provenance requirement so older evidence is not silently relaxed.
     verdict = se.verify_selector_contract_evidence(
         result,
         expected_git_sha=expected_git_sha,
         expected_version=expected_version,
         expected_flutter_version=expected_flutter_version,
-        expected_release_run_id=expected_release_run_id,
-        require_release_provenance=True,
+        expected_release_run_id=None if provenance is not None else expected_release_run_id,
+        require_release_provenance=provenance is None,
         now=now,
     )
     evidence_summary = {
@@ -713,7 +744,7 @@ def component_from_selector_contract(
         "generatedBy": result.generated_by,
         "regressionSha": result.regression_sha,
     }
-    if verdict.ok:
+    if verdict.ok and not prov_problems:
         detail = [
             f"Selector contract PASS for CaleeMobile {result.pubspec_version} @ {result.tested_sha} "
             f"({result.selectors_present}/{result.selectors_checked} selectors present, "
@@ -725,7 +756,7 @@ def component_from_selector_contract(
         )
     return ComponentResult(
         name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
-        detail=list(verdict.problems), evidence=evidence_summary,
+        detail=list(prov_problems) + list(verdict.problems), evidence=evidence_summary,
     )
 
 

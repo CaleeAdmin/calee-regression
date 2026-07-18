@@ -293,31 +293,53 @@ def _step_fail_if_id(ctx, step, result: StepResult):
     result.message = f"id {raw_id!r} not present, as expected"
 
 
-def _row_scoped_args(step: dict) -> "tuple[str, str, str]":
-    """Common (card_id, title, target_id) for the row-scoped actions
-    (Workstream 4). All three are required -- a row-scoped action with a
-    missing field is an authoring error, raised as ScenarioError."""
+def _row_scoped_args(step: dict) -> "tuple[str, str, str, str | None]":
+    """Common (card_id, title, target_id, title_id) for the row-scoped actions
+    (Workstream 4 / Priority 4). card_id/title/target_id are required -- a
+    row-scoped action missing one is an authoring error (ScenarioError).
+    ``title_id`` is optional (``tvName`` for task rows, ``tvTitle`` for chore
+    rows) and, when given, requires the exact title match on that control."""
     card_id = step.get("card_id")
     title = step.get("title")
     target_id = step.get("target_id")
+    title_id = step.get("title_id")
     if not (card_id and title and target_id):
         raise ScenarioError(
             "row-scoped action requires 'card_id' (the row card id), 'title' (the unique "
             "visible fixture title identifying the row), and 'target_id' (the descendant "
             f"control id). Got card_id={card_id!r}, title={title!r}, target_id={target_id!r}."
         )
-    return card_id, title, target_id
+    return card_id, title, target_id, title_id
+
+
+def _row_metrics_suffix(resolution) -> str:
+    """A `(N attempt(s), M scroll(s), Ts)` suffix from a RowResolution, so the
+    step evidence records how hard the resolve worked. Empty when the driver
+    (e.g. a stub) returned no resolution."""
+    if resolution is None:
+        return ""
+    try:
+        return (
+            f" [{resolution.attempts} attempt(s), {resolution.scrolls} scroll(s), "
+            f"{resolution.elapsed_seconds:.2f}s]"
+        )
+    except AttributeError:
+        return ""
 
 
 def _step_tap_in_row(ctx, step, result: StepResult):
-    card_id, title, target_id = _row_scoped_args(step)
-    ctx["driver"].tap_in_row(card_id, title, target_id)
-    result.message = f"tapped {target_id!r} within the {title!r} {card_id!r} row"
+    card_id, title, target_id, title_id = _row_scoped_args(step)
+    resolution = ctx["driver"].tap_in_row(card_id, title, target_id, title_id=title_id)
+    result.message = (
+        f"tapped {target_id!r} within the {title!r} {card_id!r} row"
+        + (f" (title {title_id!r})" if title_id else "")
+        + _row_metrics_suffix(resolution)
+    )
 
 
 def _step_assert_in_row(ctx, step, result: StepResult):
-    card_id, title, target_id = _row_scoped_args(step)
-    if not ctx["driver"].id_present_in_row(card_id, title, target_id):
+    card_id, title, target_id, title_id = _row_scoped_args(step)
+    if not ctx["driver"].id_present_in_row(card_id, title, target_id, title_id=title_id):
         raise AssertionError(
             f"Expected descendant {target_id!r} within the {title!r} {card_id!r} row, but it was absent."
         )
@@ -325,8 +347,8 @@ def _step_assert_in_row(ctx, step, result: StepResult):
 
 
 def _step_fail_if_in_row(ctx, step, result: StepResult):
-    card_id, title, target_id = _row_scoped_args(step)
-    if ctx["driver"].id_present_in_row(card_id, title, target_id):
+    card_id, title, target_id, title_id = _row_scoped_args(step)
+    if ctx["driver"].id_present_in_row(card_id, title, target_id, title_id=title_id):
         raise AssertionError(
             f"Unexpected descendant {target_id!r} within the {title!r} {card_id!r} row -- expected it absent."
         )

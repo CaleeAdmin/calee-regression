@@ -191,10 +191,17 @@ def _write_passing_base(workspace, run_id=RUN_ID):
 
 
 # Isolate the Meals feature: everything else opted out so only Meals gates.
+# The CaleeMobile selector contract is mandatory for any mobile release
+# (Priority 2); opt it out via the named waiver the diagnostic path requires so
+# it doesn't confound the Meals assertions (selector evidence has its own tests).
 _ISOLATE = (
     "--android-mandatory", "--ios-optional", "--allow-unknown-build-identity",
     "--sync-optional", "--onboarding-optional",
     "--google-calendar-optional", "--kiosk-admin-optional",
+    "--selector-contract-optional",
+    "--waiver-reason", "unit test: Meals feature gating only",
+    "--waiver-approver", "framework-tests",
+    "--waiver-timestamp", "2026-07-18T00:00:00Z",
 )
 
 

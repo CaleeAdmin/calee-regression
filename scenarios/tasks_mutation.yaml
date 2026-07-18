@@ -58,6 +58,7 @@ steps:
   - name: Mark the fixture task complete (row-scoped toggle, not the first global one)
     action: tap_in_row
     card_id: taskItemCard
+    title_id: tvName
     title: REG-TASK-OPEN-001
     target_id: flCheckboxTarget
 
@@ -76,12 +77,14 @@ steps:
     # completed-vs-open assertion is the API/sync leg (Workstream 5).
     action: assert_in_row
     card_id: taskItemCard
+    title_id: tvName
     title: REG-TASK-OPEN-001
     target_id: tvName
 
   - name: Reopen the fixture task, restoring its original state (same stateful toggle)
     action: tap_in_row
     card_id: taskItemCard
+    title_id: tvName
     title: REG-TASK-OPEN-001
     target_id: flCheckboxTarget
 
