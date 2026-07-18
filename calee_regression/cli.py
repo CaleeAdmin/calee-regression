@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -838,6 +840,212 @@ def sync_smoke_cmd(config_path, run_id_opt, base_url, email, password, platform,
     raise SystemExit(overall_exit)
 
 
+# ── Kiosk/admin physical suite gating (Workstream 4) ──────────────────────────
+
+KIOSK_COMPONENT = "kiosk-admin"
+KIOSK_FEATURE = "kiosk_admin"
+
+
+def _write_kiosk_marker(
+    workspace: run_context.RunWorkspace, run_id: str, *, status: str, mandatory: bool,
+    steps: "list[dict]", detail: "list[str]",
+    caleeshell_version: "str | None" = None, tablet: "dict | None" = None,
+) -> "tuple[Path, int]":
+    """Write the kiosk-admin component report + record it (Workstream 4).
+
+    The report carries feature-tagged steps (feature="kiosk_admin") so the
+    consolidator's independent kiosk/admin feature component (Workstream 3) reads
+    it exactly like the mobile UI reports. A mandatory kiosk/admin that could not
+    run the real physical PIN/escape suite is BLOCKED here -- never a PASS from
+    the insufficient find.text("Admin") probe."""
+    workspace.ensure_created()
+    report_dir = workspace.component_dir(KIOSK_COMPONENT)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "results.json"
+    payload = {
+        "runId": run_id,
+        "mandatory": mandatory,
+        "status": status,
+        "feature": KIOSK_FEATURE,
+        "caleeShellVersion": caleeshell_version,
+        "tablet": tablet or {},
+        "steps": steps,
+        "detail": detail,
+    }
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    exit_code = {STATUS_PASS: EXIT_SUCCESS, "not_run": EXIT_SUCCESS, "fail": EXIT_REGRESSION}.get(status, EXIT_BLOCKED)
+    manifest = _load_or_init_manifest(workspace)
+    manifest.record_component(KIOSK_COMPONENT, report_path=str(report_path), exit_code=exit_code)
+    manifest.write(workspace.manifest_path)
+    return report_path, exit_code
+
+
+def _detect_disposable_tablet(serial: "str | None") -> "dict | None":
+    """Best-effort, NON-DESTRUCTIVE adb detection of a connected disposable
+    tablet and its device-owner/admin state. Returns a dict of identity/state or
+    None when adb is unavailable, no device is connected, or the match is
+    ambiguous. Never issues a device-owner/factory-reset/wipe command -- only
+    read-only `adb devices` / `dumpsys device_policy` / `getprop` calls."""
+    adb = shutil.which("adb")
+    if adb is None:
+        return None
+    try:
+        listed = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    serials = [
+        line.split("\t")[0]
+        for line in listed.stdout.splitlines()[1:]
+        if "\tdevice" in line
+    ]
+    if serial:
+        if serial not in serials:
+            return None
+        chosen = serial
+    elif len(serials) == 1:
+        chosen = serials[0]
+    else:
+        # Zero or ambiguous (>1) -- never guess which tablet is the disposable one.
+        return None
+
+    def _shell(*args: str) -> "str | None":
+        try:
+            r = subprocess.run([adb, "-s", chosen, "shell", *args], capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    device_policy = _shell("dumpsys", "device_policy") or ""
+    return {
+        "serial": chosen,
+        "model": _shell("getprop", "ro.product.model"),
+        "androidRelease": _shell("getprop", "ro.build.version.release"),
+        # Read-only device-owner/admin snapshot for the record (truncated).
+        "deviceOwnerState": device_policy[:2000],
+        "hasDeviceOwner": "Device Owner:" in device_policy,
+    }
+
+
+@main.command("kiosk-admin")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
+@click.option(
+    "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True,
+    help="Shared release run ID (see run_context.py).",
+)
+@click.option(
+    "--mandatory/--optional", "mandatory_opt", default=None,
+    help="Whether CaleeShell kiosk/admin is release-gating for this run. Defaults to "
+         "config/release-platforms.yaml (release_features.kiosk_admin), or True if absent. "
+         "An excluded (optional) kiosk/admin is recorded as an explicit optional component, never run.",
+)
+@click.option(
+    "--confirm-technical", is_flag=True, default=False,
+    help="Required to run the physical kiosk/admin suite (it drives a real, disposable, "
+         "device-owner-provisioned tablet). Without it -- or allow_release_technical in the config -- "
+         "a mandatory kiosk/admin BLOCKS.",
+)
+@click.option("--tablet-serial", envvar="CALEE_KIOSK_TABLET_SERIAL", default=None,
+              help="adb serial of the disposable kiosk tablet. Auto-detected when exactly one device is connected.")
+@click.option("--caleeshell-version", envvar="CALEESHELL_VERSION", default=None,
+              help="CaleeShell version installed on the kiosk tablet, recorded in the evidence.")
+def kiosk_admin_cmd(config_path, run_id_opt, mandatory_opt, confirm_technical, tablet_serial, caleeshell_version):
+    """CaleeShell kiosk/admin physical-suite gating (Workstream 4).
+
+    When kiosk/admin is mandatory for this release, a real result requires the
+    physical kiosk suite on a disposable, device-owner tablet: the real
+    admin-entry gesture + PIN flow (incorrect and correct PIN), return-to-kiosk,
+    and Home/Back/Recents/notification-shade/Android-Settings escape attempts,
+    plus a record of the device-owner/admin state, CaleeShell version and tablet
+    identity. Until that confirmed physical suite exists and runs, a mandatory
+    kiosk/admin BLOCKS with the specific unmet prerequisite -- it never PASSes
+    from the insufficient optional find.text("Admin") probe. No destructive
+    device-owner or factory-reset operations are ever issued.
+    """
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r} (expected letters/digits/._- only).", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    run_id = run_id_opt
+
+    if mandatory_opt is None:
+        try:
+            mandatory = release_platforms.load_release_features().kiosk_admin
+        except release_platforms.ReleasePlatformsError:
+            mandatory = True
+    else:
+        mandatory = mandatory_opt
+
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    step_name = "CaleeShell kiosk/admin physical suite"
+
+    # Excluded (optional): record an explicit optional not-run marker; never run.
+    if not mandatory:
+        _write_kiosk_marker(
+            workspace, run_id, status="not_run", mandatory=False,
+            steps=[{
+                "name": step_name, "status": "SKIP", "mandatory": False,
+                "skipCategory": "optional_feature", "feature": KIOSK_FEATURE,
+                "detail": "kiosk/admin is optional for this release "
+                          "(release_features.kiosk_admin=false) and was not run.",
+            }],
+            detail=["kiosk/admin is optional for this release and was not run."],
+            caleeshell_version=caleeshell_version,
+        )
+        click.echo("Kiosk/admin is OPTIONAL for this release — recorded as optional, not run.")
+        raise SystemExit(EXIT_SUCCESS)
+
+    # Mandatory. Require the destructive-physical confirmation first.
+    confirmed = confirm_technical
+    if config_path and not confirmed:
+        try:
+            confirmed = bool(getattr(config_mod.load_config(config_path), "allow_release_technical", False))
+        except Exception:  # noqa: BLE001 - a broken config is "not confirmed", still BLOCKS below
+            confirmed = False
+
+    def _block(reason: str) -> None:
+        _write_kiosk_marker(
+            workspace, run_id, status=STATUS_BLOCKED, mandatory=True,
+            steps=[{
+                "name": step_name, "status": "BLOCKED", "mandatory": True,
+                "skipCategory": None, "feature": KIOSK_FEATURE, "detail": reason,
+            }],
+            detail=[reason], caleeshell_version=caleeshell_version, tablet=tablet,
+        )
+        click.echo(f"BLOCKED: kiosk/admin — {reason}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    tablet = None
+    if not confirmed:
+        _block(
+            "kiosk/admin is mandatory for this release, but the physical kiosk suite was not "
+            "confirmed. Re-run with --confirm-technical (or set allow_release_technical in the "
+            "config) on a disposable, device-owner tablet you are willing to have driven."
+        )
+
+    tablet = _detect_disposable_tablet(tablet_serial)
+    if tablet is None:
+        _block(
+            "kiosk/admin is mandatory for this release, but no suitable disposable physical tablet "
+            "is connected (adb detected zero or an ambiguous number of devices, or adb is "
+            "unavailable). Connect exactly one disposable kiosk tablet, or pass --tablet-serial."
+        )
+
+    # Confirmed + a disposable tablet is present, but the real admin-entry
+    # gesture + PIN + escape-attempt suite is not yet implemented with CONFIRMED
+    # selectors (the existing find.text("Admin") probe is an optional scaffold
+    # and is explicitly insufficient -- Workstream 4/5). So a mandatory
+    # kiosk/admin still BLOCKS, now with the tablet identity + device-owner state
+    # recorded as evidence, rather than PASSing on an insufficient probe.
+    _block(
+        "kiosk/admin is mandatory and a disposable tablet is connected, but the real physical "
+        "kiosk suite (admin-entry gesture, incorrect+correct PIN, return-to-kiosk, and "
+        "Home/Back/Recents/notification-shade/Android-Settings escape attempts) is not yet "
+        "implemented with confirmed CaleeShell selectors. The optional find.text(\"Admin\") probe "
+        "is insufficient and must not produce a kiosk/admin PASS (Workstream 4/5)."
+    )
+
+
 def _load_json_report(path: "str | None") -> "dict | None":
     if not path:
         return None
@@ -853,6 +1061,18 @@ def release_platforms_cmd():
     $RELEASE_PLATFORM_ANDROID / $RELEASE_PLATFORM_IOS / $RELEASE_PLATFORM_TABLET
     without parsing YAML in bash. See release_platforms.py and
     config/release-platforms.example.yaml.
+
+    Two flavours of the same single source of truth are emitted:
+
+      * Plain ``RELEASE_PLATFORM_*`` / ``RELEASE_FEATURE_*`` shell variables --
+        for the launcher's own branching (which platform/feature legs to run,
+        which mandatory/optional flags to pass to `consolidate`).
+      * Exported ``CALEE_RELEASE_FEATURE_*`` environment variables (Workstream 1)
+        -- so the feature scope PROPAGATES to every child process the launcher
+        spawns (scripts/test_caleemobile.sh -> run_ui_suite.py -> the Dart
+        integration-test process) without each of them re-parsing the YAML.
+        The values come from the same parsed config/release-platforms.yaml the
+        consolidator uses, never a second bash/ad-hoc parse.
     """
     try:
         platforms = release_platforms.load_release_platforms()
@@ -872,6 +1092,17 @@ def release_platforms_cmd():
     click.echo(f"RELEASE_FEATURE_ONBOARDING={'true' if features.onboarding else 'false'}")
     click.echo(f"RELEASE_FEATURE_GOOGLE_CALENDAR={'true' if features.google_calendar else 'false'}")
     click.echo(f"RELEASE_FEATURE_KIOSK_ADMIN={'true' if features.kiosk_admin else 'false'}")
+    # Exported CALEE_RELEASE_FEATURE_* (Workstream 1): the feature scope that
+    # propagates down to the mobile/tablet test processes. `export` (not a bare
+    # assignment) so a child `bash scripts/test_caleemobile.sh` and, in turn,
+    # run_ui_suite.py and the Dart process all inherit it. Consolidation reads
+    # the same feature profile directly from the YAML, so the report and the
+    # executed scope can never disagree about which features were in scope.
+    click.echo(f"export CALEE_RELEASE_FEATURE_SYNCHRONIZATION={'true' if features.synchronization else 'false'}")
+    click.echo(f"export CALEE_RELEASE_FEATURE_MEALS={'true' if features.meals else 'false'}")
+    click.echo(f"export CALEE_RELEASE_FEATURE_ONBOARDING={'true' if features.onboarding else 'false'}")
+    click.echo(f"export CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR={'true' if features.google_calendar else 'false'}")
+    click.echo(f"export CALEE_RELEASE_FEATURE_KIOSK_ADMIN={'true' if features.kiosk_admin else 'false'}")
     raise SystemExit(EXIT_SUCCESS)
 
 
@@ -1068,6 +1299,7 @@ def _resolve_component(
 @click.option("--mobile-android-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's mobile-android/results.json")
 @click.option("--mobile-ios-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's mobile-ios/results.json")
 @click.option("--sync-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's sync/results.json")
+@click.option("--kiosk-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's kiosk-admin/results.json (kiosk/admin feature evidence)")
 @click.option("--manual-checks", "manual_checks_path", type=click.Path(exists=True), default=None, help="Override: defaults to this run's manual-checks/results.json")
 @click.option(
     "--environment-report", type=click.Path(exists=True), default=None,
@@ -1089,6 +1321,18 @@ def _resolve_component(
          "config/release-platforms.yaml (release_features.synchronization), or True if absent. "
          "An optional sync is still shown in the report, just never blocks a PASS.",
 )
+# Independent release-feature gating (Workstream 3). Each defaults to the
+# release feature profile (config/release-platforms.yaml release_features.*),
+# or True if absent -- an omitted feature is mandatory. An optional feature is
+# still shown as an explicit component, just never blocks a PASS.
+@click.option("--meals-mandatory/--meals-optional", "meals_mandatory", default=None,
+              help="Whether the CaleeMobile Meals feature is release-gating. Defaults to release_features.meals.")
+@click.option("--onboarding-mandatory/--onboarding-optional", "onboarding_mandatory", default=None,
+              help="Whether onboarding + display/mobile handoff is release-gating. Defaults to release_features.onboarding.")
+@click.option("--google-calendar-mandatory/--google-calendar-optional", "google_calendar_mandatory", default=None,
+              help="Whether Google Calendar connection is release-gating. Defaults to release_features.google_calendar.")
+@click.option("--kiosk-admin-mandatory/--kiosk-admin-optional", "kiosk_admin_mandatory", default=None,
+              help="Whether CaleeShell kiosk/admin is release-gating. Defaults to release_features.kiosk_admin.")
 @click.option("--build-version", default="unknown", help="Combined/overall application build label (used for the bundle filename)")
 @click.option("--calee-build-version", default=None, help="Calee tablet app package version under test")
 @click.option("--expected-calee-build-version", default=None, help="Technical-owner-configured expected Calee build; mismatch BLOCKS")
@@ -1121,7 +1365,8 @@ def _resolve_component(
 @click.option("--out-dir", type=click.Path(), default=None, help="Where to write the consolidated bundle (default: this run's workspace)")
 def consolidate(
     run_id_opt, tablet_report, mobile_api_report, mobile_android_report, mobile_ios_report,
-    sync_report, manual_checks_path, environment_report, android_mandatory, ios_mandatory, sync_mandatory,
+    sync_report, kiosk_report, manual_checks_path, environment_report, android_mandatory, ios_mandatory, sync_mandatory,
+    meals_mandatory, onboarding_mandatory, google_calendar_mandatory, kiosk_admin_mandatory,
     build_version, calee_build_version, expected_calee_build_version,
     caleemobile_build_version, expected_caleemobile_build_version, caleeshell_version,
     calee_git_sha, expected_calee_git_sha, caleemobile_git_sha, expected_caleemobile_git_sha,
@@ -1178,6 +1423,7 @@ def consolidate(
     mobile_android = resolve("mobile-android", mobile_android_report)
     mobile_ios = resolve("mobile-ios", mobile_ios_report)
     sync = resolve("sync", sync_report)
+    kiosk = resolve("kiosk-admin", kiosk_report)
 
     manual_checks_raw = resolve("manual-checks", manual_checks_path)
     manual_checks_list = None
@@ -1227,6 +1473,20 @@ def consolidate(
     # --sync-mandatory/--sync-optional wins, else the release feature profile
     # (release_features.synchronization), which defaults to True.
     sync_gating = sync_mandatory if sync_mandatory is not None else features.synchronization
+
+    # Independent release-feature gating (Workstream 3): explicit
+    # --<feature>-mandatory/--<feature>-optional wins, else the release feature
+    # profile (release_features.<feature>), which defaults to True. Each feature
+    # gets its OWN consolidated component built from feature-tagged step
+    # evidence -- a mandatory feature with no evidence BLOCKS.
+    feature_profile = {
+        "meals": meals_mandatory if meals_mandatory is not None else features.meals,
+        "onboarding": onboarding_mandatory if onboarding_mandatory is not None else features.onboarding,
+        "google_calendar": (
+            google_calendar_mandatory if google_calendar_mandatory is not None else features.google_calendar
+        ),
+        "kiosk_admin": kiosk_admin_mandatory if kiosk_admin_mandatory is not None else features.kiosk_admin,
+    }
 
     # Expected build identity: an explicit CLI flag wins over the release
     # profile (config/release-platforms.yaml's expected_build_identity).
@@ -1361,6 +1621,8 @@ def consolidate(
         mobile_android_ui=mobile_android,
         mobile_ios_ui=mobile_ios,
         sync=sync,
+        kiosk_admin=kiosk,
+        feature_profile=feature_profile,
         manual_checks=manual_checks_list,
         meta=meta,
         android_mandatory=android_gating,

@@ -44,6 +44,10 @@ COMPONENT_NAMES = (
     "mobile-ios",
     "manual-checks",
     "sync",
+    # Kiosk/admin evidence (Workstream 4): its own run-scoped component so the
+    # physical kiosk suite (or an explicit BLOCKED marker) is consolidated
+    # independently, exactly like sync.
+    "kiosk-admin",
 )
 
 

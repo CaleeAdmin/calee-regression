@@ -205,7 +205,11 @@ def _production_config(tmp_path, monkeypatch, extra=""):
     config = tmp_path / "release-platforms.yaml"
     config.write_text(
         "release_platforms:\n  tablet: true\n  mobile_android: false\n  mobile_ios: false\n"
+        # Tablet-only scope: the mobile features can't be exercised without a
+        # mobile platform, so this release excludes them (Workstream 3). Only
+        # sync stays mandatory (it has its own passing report in the base).
         "release_features:\n  synchronization: true\n  kiosk_admin: false\n"
+        "  meals: false\n  onboarding: false\n  google_calendar: false\n"
         "expected_build_identity:\n  production: true\n"
         "  calee_build_version: '0.3.22'\n"
         "  calee_application_id: 'com.viso.calee'\n"

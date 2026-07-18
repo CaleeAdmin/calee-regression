@@ -88,6 +88,31 @@ def test_features_non_mapping_raises(tmp_path):
         release_platforms.load_release_features(config)
 
 
+# --- Workstream 1: the release-platforms command exports the feature scope ----
+
+
+def test_release_platforms_command_exports_feature_env_for_children(tmp_path, monkeypatch):
+    # The launcher `eval "$(python -m calee_regression release-platforms)"`s this
+    # output; the exported CALEE_RELEASE_FEATURE_* lines are what propagate the
+    # feature scope down to test_caleemobile.sh -> run_ui_suite.py -> the Dart
+    # process, sourced from the SAME parsed YAML the consolidator uses.
+    config = tmp_path / "release-platforms.yaml"
+    config.write_text("release_features:\n  meals: false\n  kiosk_admin: true\n")
+    monkeypatch.setenv("CALEE_RELEASE_PLATFORMS", str(config))
+
+    result = CliRunner().invoke(main, ["release-platforms"])
+    assert result.exit_code == EXIT_SUCCESS, result.output
+    out = result.output
+    # Exported (child-visible) feature vars, canonical true/false.
+    assert "export CALEE_RELEASE_FEATURE_MEALS=false" in out
+    assert "export CALEE_RELEASE_FEATURE_KIOSK_ADMIN=true" in out
+    # Omitted features default to mandatory=true (never silently optional).
+    assert "export CALEE_RELEASE_FEATURE_ONBOARDING=true" in out
+    assert "export CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR=true" in out
+    # The plain (launcher-branching) vars are still emitted too.
+    assert "RELEASE_FEATURE_MEALS=false" in out
+
+
 # --- Phase 3: expected build identity in the release profile -------------
 
 
@@ -191,6 +216,11 @@ def _consolidate(tmp_path, *extra_args, run_id=RUN_ID):
             # on a missing sync report and confound the platform assertions).
             # Sync gating has its own tests (test_sync_consolidation.py).
             "--sync-optional",
+            # And they don't exercise the independent release-feature components
+            # (Workstream 3) -- opt those optional too, for the same reason.
+            # Feature gating has its own tests (test_feature_consolidation.py).
+            "--meals-optional", "--onboarding-optional",
+            "--google-calendar-optional", "--kiosk-admin-optional",
             *extra_args,
         ],
     )
@@ -285,6 +315,8 @@ def test_tablet_stays_mandatory_and_passes_with_identity_despite_tablet_false(tm
     result = CliRunner().invoke(
         main,
         ["consolidate", "--run-id", RUN_ID, "--sync-optional",
+         "--meals-optional", "--onboarding-optional",
+         "--google-calendar-optional", "--kiosk-admin-optional",
          "--calee-build-version", "0.3.22",
          "--calee-application-id", "com.viso.calee", "--calee-version-code", "322",
          "--out-dir", str(tmp_path / "out")],

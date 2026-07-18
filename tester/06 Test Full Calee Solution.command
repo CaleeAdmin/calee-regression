@@ -133,7 +133,31 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     python -m calee_regression sync-smoke "${SYNC_ARGS[@]}"
 
     echo ""
-    echo "--- Step 7: Manual Checks ---"
+    echo "--- Step 7: CaleeShell kiosk/admin ---"
+    # Kiosk/admin (Workstream 4) gets its own release-gating component, exactly
+    # like sync. When mandatory it runs the physical kiosk suite on a disposable,
+    # device-owner tablet -- NOT just full-tester -- and records a clear BLOCKED
+    # marker (never a false PASS from the optional find.text("Admin") probe) when
+    # the confirmation or a suitable tablet is missing. When excluded it is
+    # recorded as an explicit optional/not-run component.
+    KIOSK_ARGS=(--config "$CALEE_TEST_CONFIG" --run-id "$CALEE_RUN_ID")
+    # Default to mandatory when the profile var is absent (an omitted feature is
+    # release-gating, never silently optional).
+    if [ "${RELEASE_FEATURE_KIOSK_ADMIN:-true}" = "false" ]; then
+        KIOSK_ARGS+=(--optional)
+    else
+        KIOSK_ARGS+=(--mandatory)
+    fi
+    [ -n "${CALEESHELL_VERSION:-}" ] && KIOSK_ARGS+=(--caleeshell-version "$CALEESHELL_VERSION")
+    # The technical owner opts into driving the disposable tablet with
+    # CALEE_CONFIRM_TECHNICAL=1 (or allow_release_technical in the config).
+    if [ "${CALEE_CONFIRM_TECHNICAL:-false}" = "true" ] || [ "${CALEE_CONFIRM_TECHNICAL:-0}" = "1" ]; then
+        KIOSK_ARGS+=(--confirm-technical)
+    fi
+    python -m calee_regression kiosk-admin "${KIOSK_ARGS[@]}"
+
+    echo ""
+    echo "--- Step 8: Manual Checks ---"
     python -m calee_regression record-manual-checks --run-id "$CALEE_RUN_ID"
 else
     echo ""
@@ -145,6 +169,7 @@ else
     echo "  - CaleeMobile Android UI:      SKIPPED (Prepare not ready)"
     echo "  - CaleeMobile iPhone UI:       SKIPPED (Prepare not ready)"
     echo "  - Cross-device synchronization: SKIPPED (Prepare not ready)"
+    echo "  - CaleeShell kiosk/admin:      SKIPPED (Prepare not ready)"
     echo "  - Manual functional checks:    SKIPPED (Prepare not ready)"
     echo "The environment report Prepare wrote is preserved and consolidated"
     echo "below into one BLOCKED bundle."

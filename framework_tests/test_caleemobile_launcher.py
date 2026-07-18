@@ -733,3 +733,60 @@ def test_ui_only_mode_runs_ui_and_never_runs_or_writes_the_api_report(tmp_path):
     assert (runs / "mobile-android" / "results.json").is_file()
     # A --ui-only run must never write (let alone overwrite) the API report.
     assert not (runs / "mobile-api" / "results.json").exists()
+
+
+# --- Workstream 1: the release-feature scope reaches run_ui_suite / Flutter ---
+
+
+def test_script_populates_and_forwards_release_feature_flags():
+    text = _read_script()
+    # No YAML parsing in bash: the scope is sourced from the release-platforms
+    # command (its exported CALEE_RELEASE_FEATURE_* lines), defaulting to
+    # mandatory (true) when the parent launcher didn't already export it.
+    assert "release-platforms" in text
+    for var in (
+        "CALEE_RELEASE_FEATURE_MEALS", "CALEE_RELEASE_FEATURE_ONBOARDING",
+        "CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR", "CALEE_RELEASE_FEATURE_KIOSK_ADMIN",
+    ):
+        assert var in text
+    # The three mobile features are forwarded to run_ui_suite.py as --feature.
+    assert "--feature" in text
+    assert 'meals=$CALEE_RELEASE_FEATURE_MEALS' in text
+    assert 'onboarding=$CALEE_RELEASE_FEATURE_ONBOARDING' in text
+    assert 'google_calendar=$CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR' in text
+
+
+def test_release_feature_flags_with_explicit_values_reach_run_ui_suite(tmp_path):
+    # End-to-end dry run: an explicit CALEE_RELEASE_FEATURE_* scope exported by
+    # the parent launcher must arrive verbatim on run_ui_suite.py's argv.
+    calee_regression_copy = _copy_calee_regression(tmp_path)
+    record = tmp_path / "ui_record.json"
+    _make_fake_sibling(tmp_path, ui_recorder=True)
+    fakebin = _make_fakebin(tmp_path, with_flutter=True)
+    call_log = tmp_path / "prepare_calls.log"
+    run_id = "release-20260101-000000-feat01"
+
+    extra_env = _prepare_env(
+        calee_regression_copy, call_log,
+        exit_code=0, writes_report=True,
+        report={"fixtureVerificationStatus": "ok", "targetEnvironment": DEV_BACKEND},
+    )
+    extra_env["CALEE_RUN_ID"] = run_id
+    extra_env["FAKE_UI_RECORD"] = str(record)
+    # A parent launcher exported a mixed scope: meals excluded, gcal excluded.
+    extra_env["CALEE_RELEASE_FEATURE_MEALS"] = "false"
+    extra_env["CALEE_RELEASE_FEATURE_ONBOARDING"] = "true"
+    extra_env["CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR"] = "false"
+
+    result = _run_script_fakebin(
+        calee_regression_copy, tmp_path, "android", fakebin=fakebin, extra_env=extra_env
+    )
+
+    assert record.is_file(), result.stdout + result.stderr
+    argv = json.loads(record.read_text())["argv"]
+    assert "meals=false" in argv
+    assert "onboarding=true" in argv
+    assert "google_calendar=false" in argv
+    # Each rides on its own --feature flag.
+    assert argv.count("--feature") == 3
+    assert result.returncode == 0

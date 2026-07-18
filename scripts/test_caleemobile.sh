@@ -115,6 +115,23 @@ if [ ! -d "$SIBLING/api" ]; then
 fi
 echo "[OK] CaleeMobile source found"
 
+# --- Release-feature scope (Workstream 1) --------------------------------
+# The full-solution launcher ("06 Test Full Calee Solution") already exported
+# the CALEE_RELEASE_FEATURE_* profile before invoking us. A standalone
+# "03/04 Test CaleeMobile ..." run has not, so populate it here from the SAME
+# parsed config/release-platforms.yaml the consolidator uses -- via the
+# release-platforms command's exported lines, NEVER a second YAML parse in
+# bash. An omitted feature defaults to mandatory=true (see release_platforms.py
+# and the "omitted requirement must never silently become optional" rule).
+if [ -z "${CALEE_RELEASE_FEATURE_MEALS:-}" ]; then
+    eval "$(python -m calee_regression release-platforms)"
+fi
+export CALEE_RELEASE_FEATURE_MEALS="${CALEE_RELEASE_FEATURE_MEALS:-true}"
+export CALEE_RELEASE_FEATURE_ONBOARDING="${CALEE_RELEASE_FEATURE_ONBOARDING:-true}"
+export CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR="${CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR:-true}"
+export CALEE_RELEASE_FEATURE_KIOSK_ADMIN="${CALEE_RELEASE_FEATURE_KIOSK_ADMIN:-true}"
+echo "[OK] Release-feature scope: meals=$CALEE_RELEASE_FEATURE_MEALS onboarding=$CALEE_RELEASE_FEATURE_ONBOARDING google_calendar=$CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR kiosk_admin=$CALEE_RELEASE_FEATURE_KIOSK_ADMIN"
+
 # Default both suites to BLOCKED (exit 3): if the Prepare gate below refuses
 # to let them run, that is exactly the state they must be recorded in --
 # never a silent pass by never having executed.
@@ -242,10 +259,18 @@ else
             else
                 # CALEE_MOBILE_BACKEND / CALEE_EXPECTED_BACKEND / CALEE_FIXTURE_STATUS
                 # are exported above and read by run_ui_suite.py from the environment.
+                # The mobile release features (Workstream 1) are passed explicitly
+                # so run_ui_suite.py forwards them to the Dart process as
+                # --dart-define=CALEE_RELEASE_FEATURE_* and tags each step with the
+                # feature it exercised (kiosk/admin is a tablet feature, handled by
+                # the kiosk-admin command, not the mobile UI suite).
                 (cd "$SIBLING/ui" && python3 run_ui_suite.py \
                     --platform "$PLATFORM" \
                     --report "$SCRIPT_DIR/$UI_REPORT" \
-                    --log "$SCRIPT_DIR/$UI_DIR/flutter.log")
+                    --log "$SCRIPT_DIR/$UI_DIR/flutter.log" \
+                    --feature "meals=$CALEE_RELEASE_FEATURE_MEALS" \
+                    --feature "onboarding=$CALEE_RELEASE_FEATURE_ONBOARDING" \
+                    --feature "google_calendar=$CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR")
                 UI_STATUS=$?
             fi
         fi

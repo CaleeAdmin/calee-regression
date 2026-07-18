@@ -692,6 +692,156 @@ def component_from_sync_report(
     )
 
 
+# Independent release-feature components (Workstream 3). Each declared release
+# feature gets its OWN consolidated component built strictly from the test steps
+# tagged with that feature -- never inferred from the broad Android/iOS (or
+# tablet) component passing. The keys match config/release-platforms.yaml's
+# release_features and the CALEE_RELEASE_FEATURE_* propagation (Workstream 1),
+# and the per-step `feature` tag run_ui_suite.py / the kiosk-admin command emit.
+FEATURE_COMPONENT_NAMES = {
+    "meals": "CaleeMobile Meals",
+    "onboarding": "Calee onboarding and display/mobile handoff",
+    "google_calendar": "Google Calendar connection",
+    "kiosk_admin": "CaleeShell kiosk/admin",
+}
+
+
+def _feature_evidence_source(report_dict: "dict[str, Any] | None", platform_label: "str | None") -> "tuple[list, dict]":
+    """Extract (steps, context) from a component report for feature-evidence
+    scanning. `context` records the device/platform, build SHA and backend so
+    the feature component can show exactly which surface produced the evidence."""
+    if not report_dict:
+        return [], {}
+    backend = (report_dict.get("backend") or {}).get("resolved")
+    identity = report_dict.get("buildIdentity") or {}
+    context = {
+        "platform": report_dict.get("platform") or platform_label,
+        "deviceId": report_dict.get("deviceId"),
+        "buildSha": identity.get("gitSha"),
+        "backend": backend,
+        "reportPath": report_dict.get("reportPath"),
+    }
+    return list(report_dict.get("steps") or []), context
+
+
+def component_from_feature_evidence(
+    feature_key: str,
+    name: str,
+    *,
+    mandatory: bool,
+    sources: "list[tuple[dict[str, Any] | None, str | None]]",
+) -> ComponentResult:
+    """Build an INDEPENDENT per-feature component from feature-tagged step
+    evidence (Workstream 3).
+
+    ``sources`` is a list of ``(report_dict, platform_label)`` -- the in-scope
+    reports whose steps might carry ``step["feature"] == feature_key`` (the
+    mobile Android/iOS UI reports for meals/onboarding/google_calendar; the
+    kiosk-admin report for kiosk_admin). Only steps tagged with this exact
+    feature are used as evidence: a feature's PASS is NEVER inferred from the
+    broad platform component passing.
+
+    Result rules (mirroring the rest of this module and docs/RELEASE_POLICY.md):
+      * no matching step evidence at all -> NOT_RUN (blocks when mandatory -- a
+        mandatory feature with no evidence must never read as a pass by
+        omission, and must never silently become an optional skip);
+      * any tagged step FAILED -> FAIL (a real product regression in the
+        feature);
+      * any tagged step BLOCKED, or a mandatory tagged SKIP -> BLOCKED (an unmet
+        prerequisite, e.g. the feature was unavailable and correctly reported
+        ENVIRONMENT_BLOCKED/FIXTURE_MISSING);
+      * tagged steps present with at least one PASS and no fail/block -> PASS.
+
+    The `evidence` block records the configured applicability, the exact steps
+    used, the device/platform(s), build SHA(s), backend(s), any BLOCKED
+    prerequisite, and screenshot/report references where available.
+    """
+    applicability = "mandatory" if mandatory else "optional"
+    matched: "list[dict]" = []
+    contexts: "list[dict]" = []
+    for report_dict, platform_label in sources:
+        steps, context = _feature_evidence_source(report_dict, platform_label)
+        feature_steps = [s for s in steps if s.get("feature") == feature_key]
+        if feature_steps:
+            contexts.append(context)
+        for step in feature_steps:
+            matched.append({
+                "name": step.get("name", "?"),
+                "status": step.get("status", "?"),
+                "mandatory": step.get("mandatory", True),
+                "skipCategory": step.get("skipCategory"),
+                "platform": context.get("platform"),
+                "deviceId": context.get("deviceId"),
+                "detail": step.get("detail", ""),
+                "screenshot": step.get("screenshot") or step.get("screenshotRef"),
+            })
+
+    def _evidence(status: str, blocked_prereq: "list[str]") -> dict:
+        return {
+            "feature": feature_key,
+            "applicability": applicability,
+            "executionStatus": status,
+            "steps": matched,
+            "platforms": sorted({c.get("platform") for c in contexts if c.get("platform")}),
+            "devices": sorted({c.get("deviceId") for c in contexts if c.get("deviceId")}),
+            "buildShas": sorted({c.get("buildSha") for c in contexts if c.get("buildSha")}),
+            "backends": sorted({c.get("backend") for c in contexts if c.get("backend")}),
+            "reportPaths": sorted({c.get("reportPath") for c in contexts if c.get("reportPath")}),
+            "screenshots": [m["screenshot"] for m in matched if m.get("screenshot")],
+            "blockedPrerequisite": blocked_prereq,
+        }
+
+    if not matched:
+        # No feature-tagged evidence anywhere. A mandatory feature with no
+        # evidence is NOT_RUN (blocks); an optional/excluded one is shown as an
+        # explicit not-run so it's never silently omitted, but does not gate.
+        detail = [
+            f"No test step tagged for the '{feature_key}' feature was found in any in-scope "
+            f"report. A {applicability} feature's result is derived only from its own tagged "
+            f"steps -- never inferred from the broad platform component passing."
+        ]
+        return ComponentResult(
+            name=name, status=STATUS_NOT_RUN, mandatory=mandatory, detail=detail,
+            evidence=_evidence(STATUS_NOT_RUN, detail),
+        )
+
+    # Mobile UI / kiosk report step statuses are the uppercase raw namespace
+    # ("PASS"/"FAIL"/"BLOCKED"/"SKIP"), distinct from this module's lowercase
+    # ComponentResult statuses -- compare against the raw literals here.
+    passed = sum(1 for s in matched if s["status"] == "PASS")
+    failed = sum(1 for s in matched if s["status"] == "FAIL")
+    blocked_steps = sum(1 for s in matched if s["status"] == "BLOCKED")
+    mandatory_skipped = sum(1 for s in matched if s["status"] == STATUS_SKIP_RAW and s.get("mandatory", True))
+    if passed == 0 and failed == 0 and blocked_steps == 0 and mandatory_skipped == 0:
+        # The only evidence is optional skips (an optional/excluded feature that
+        # was intentionally not exercised) -- that is NOT_RUN, not BLOCKED. A
+        # mandatory feature can't legitimately reach here (an unavailable
+        # mandatory feature is a mandatory skip -> mandatory_skipped>0 above);
+        # if it somehow did, NOT_RUN still blocks it, so this never launders a
+        # mandatory feature into a pass.
+        status = STATUS_NOT_RUN
+    else:
+        status = decide_status(
+            passed=passed, failed=failed, blocked=blocked_steps + mandatory_skipped, total=len(matched),
+        )
+    non_pass = [
+        f"[{s.get('platform') or '?'}] {s['name']}: {s['status']}"
+        + (f" — {s['detail']}" if s.get("detail") else "")
+        for s in matched
+        if s["status"] != "PASS"
+    ]
+    blocked_prereq = [
+        f"[{s.get('platform') or '?'}] {s['name']}: {s['detail']}"
+        for s in matched
+        if s["status"] == "BLOCKED" or (s["status"] == STATUS_SKIP_RAW and s.get("mandatory", True))
+    ]
+    return ComponentResult(
+        name=name, status=status, mandatory=mandatory,
+        passed=passed, failed=failed, blocked=blocked_steps, skipped=sum(1 for s in matched if s["status"] == STATUS_SKIP_RAW),
+        detail=non_pass, evidence=_evidence(status, blocked_prereq),
+    )
+
+
 # The identity fields that must not change between the pre-run and post-run
 # snapshots for an in-scope app. A change in any of these during the run means
 # the thing that was tested is not the thing being certified. See Phase 4.
@@ -964,6 +1114,8 @@ def build_release_report(
     mobile_android_ui: "dict[str, Any] | None" = None,
     mobile_ios_ui: "dict[str, Any] | None" = None,
     sync: "dict[str, Any] | None" = None,
+    kiosk_admin: "dict[str, Any] | None" = None,
+    feature_profile: "dict[str, bool] | None" = None,
     manual_checks: "list[ManualCheck] | None" = None,
     meta: "dict[str, Any] | None" = None,
     generated_at: "str | None" = None,
@@ -1074,6 +1226,36 @@ def build_release_report(
             component_from_sync_report(SYNC_COMPONENT_NAME, sync, mandatory=sync_mandatory),
         )
         insert_at += 1
+
+    # Independent release-feature components (Workstream 3). Included exactly
+    # when the caller passes a feature profile (the consolidate CLI always does,
+    # from config/release-platforms.yaml's release_features; unit tests that
+    # don't exercise features leave it None). Each feature's result is derived
+    # ONLY from its own feature-tagged step evidence -- meals/onboarding/
+    # google_calendar from the Android/iOS UI reports, kiosk/admin from the
+    # kiosk-admin report -- never inferred from the broad platform component. A
+    # mandatory feature with no matching evidence becomes NOT_RUN and blocks.
+    if feature_profile is not None:
+        mobile_sources = [(mobile_android_ui, "android"), (mobile_ios_ui, "ios")]
+        feature_sources = {
+            "meals": mobile_sources,
+            "onboarding": mobile_sources,
+            "google_calendar": mobile_sources,
+            "kiosk_admin": [(kiosk_admin, "tablet")],
+        }
+        for feature_key in ("meals", "onboarding", "google_calendar", "kiosk_admin"):
+            if feature_key not in feature_profile:
+                continue
+            components.insert(
+                insert_at,
+                component_from_feature_evidence(
+                    feature_key,
+                    FEATURE_COMPONENT_NAMES[feature_key],
+                    mandatory=feature_profile[feature_key],
+                    sources=feature_sources[feature_key],
+                ),
+            )
+            insert_at += 1
 
     # Build identity (Phase 3). When an app's identity is required (in scope
     # for this release) it must be known, or the release BLOCKS -- a PASS must

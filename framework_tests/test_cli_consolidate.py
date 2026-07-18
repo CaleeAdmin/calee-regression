@@ -102,6 +102,10 @@ def test_consolidate_passes_when_everything_is_provided_and_clean(tmp_path):
             # scope -- opt out of the Workstream 1 sync gating (see
             # test_sync_consolidation.py for that).
             "--sync-optional",
+            # Likewise the independent release-feature components (Workstream 3)
+            # -- opt them optional; feature gating has its own tests.
+            "--meals-optional", "--onboarding-optional",
+            "--google-calendar-optional", "--kiosk-admin-optional",
             # The tablet IS in scope, so its build identity is mandatory to
             # know (Phase 3): provide the detected version so identity is
             # available and clean. A release-gating tablet run must also record
@@ -180,6 +184,8 @@ def test_consolidate_passes_on_dirty_build_when_explicitly_approved(tmp_path):
         main,
         ["consolidate", "--run-id", RUN_ID, "--android-optional", "--ios-optional",
          "--sync-optional",
+         "--meals-optional", "--onboarding-optional",
+         "--google-calendar-optional", "--kiosk-admin-optional",
          "--calee-build-version", "0.3.22", "--calee-dirty", "--allow-dirty",
          "--calee-application-id", "com.viso.calee", "--calee-version-code", "322",
          "--out-dir", str(tmp_path / "out")],
@@ -209,7 +215,10 @@ def test_consolidate_allow_unknown_build_identity_opts_out(tmp_path):
     result = CliRunner().invoke(
         main,
         ["consolidate", "--run-id", RUN_ID, "--android-optional", "--ios-optional",
-         "--allow-unknown-build-identity", "--sync-optional", "--out-dir", str(tmp_path / "out")],
+         "--allow-unknown-build-identity", "--sync-optional",
+         "--meals-optional", "--onboarding-optional",
+         "--google-calendar-optional", "--kiosk-admin-optional",
+         "--out-dir", str(tmp_path / "out")],
     )
     assert result.exit_code == EXIT_SUCCESS
     assert "PASS" in result.output
