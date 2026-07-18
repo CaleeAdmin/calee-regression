@@ -21,6 +21,8 @@ from pathlib import Path
 
 import yaml
 
+from .identity_format import is_full_git_sha, is_wellformed_version
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "release-platforms.yaml"
 
@@ -217,6 +219,43 @@ def load_expected_build_identity(path: "Path | str | None" = None) -> ExpectedBu
         production=production,
         source=str(config_path),
     )
+
+
+def validate_expected_build_identity(identity: ExpectedBuildIdentity) -> "list[str]":
+    """Return a list of *format* problems with a configured expected identity.
+
+    Independent of whether the values match a detected build: this catches an
+    identity that could never be safely matched in the first place -- an
+    abbreviated Git SHA (``abc1234`` names more than one commit) or a version
+    string that isn't a recognisable version (``latest``, ``0.3``). An empty
+    list means every configured value is well-formed (fields left None are
+    "no expectation", not a problem). See Workstream 2.
+
+    ``config/release-platforms.example.yaml`` documents the accepted forms; the
+    production consolidation path (``component_from_release_intent``) enforces
+    the same rules and BLOCKS on them, so a malformed expectation can never
+    silently become a non-matching (and thus ignored) one.
+    """
+    problems: "list[str]" = []
+    for label, sha in (
+        ("caleemobile_git_sha", identity.caleemobile_git_sha),
+        ("calee_git_sha", identity.calee_git_sha),
+    ):
+        if sha is not None and not is_full_git_sha(sha):
+            problems.append(
+                f"{label}={sha!r} is abbreviated/ambiguous; a release requires the full 40-character Git SHA."
+            )
+    for label, version in (
+        ("caleemobile_build_version", identity.caleemobile_build_version),
+        ("calee_build_version", identity.calee_build_version),
+        ("caleeshell_version", identity.caleeshell_version),
+    ):
+        if version is not None and not is_wellformed_version(version):
+            problems.append(
+                f"{label}={version!r} is not a well-formed version identity "
+                f"(expected e.g. 0.0.23+23, founder-v0.3.24)."
+            )
+    return problems
 
 
 def load_waiver(path: "Path | str | None" = None) -> Waiver:

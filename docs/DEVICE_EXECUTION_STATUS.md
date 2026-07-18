@@ -2,6 +2,16 @@
 
 _Recorded: 2026-07-17, from the regression session environment._
 
+> **Update 2026-07-18 (tablet source correction):** the Calee Android tablet
+> app source **is** accessible — `CaleeAdmin/Calee` is the canonical tablet
+> source, and the calendar/task/chore mutation resource ids are now
+> **source-confirmed** against it (Calee release #974,
+> `931beecfc309ff12220185383fa8daae56af30d8`). The earlier claim that the tablet
+> source was inaccessible was wrong and is removed. The remaining blocker for
+> the tablet-mutation workstream is purely **physical execution** (a prepared
+> tablet/emulator + Appium), not source access. See
+> `docs/TABLET_MUTATION_COVERAGE_GAPS.md`.
+
 Workstreams 4–11 require real hardware/toolchains that are **not present** in this session's
 environment. Per the release policy ("do not claim physical execution when no real device or
 simulator was available — record it as BLOCKED with the exact missing prerequisite"), each is
@@ -28,7 +38,7 @@ what is blocked is the **real-device execution** each workstream ultimately requ
 
 | WS | Area | Status | Exact missing prerequisite |
 |---|---|---|---|
-| 4 | Tablet mutation coverage (resolve `UNCONFIRMED_*` selectors) | **BLOCKED** | A real Calee tablet source, or a physical tablet/emulator with Appium Inspector, to confirm the calendar/tasks/chores mutation resource ids. See `docs/TABLET_MUTATION_COVERAGE_GAPS.md`. No tablet/adb/Appium here. |
+| 4 | Tablet mutation coverage | **BLOCKED (physical only)** | Selectors are **source-confirmed** against `CaleeAdmin/Calee` (#974); the remaining blocker is physical execution — a prepared tablet/emulator + Appium to run create/edit/delete, complete/reopen and skip end to end. No tablet/adb/Appium here. See `docs/TABLET_MUTATION_COVERAGE_GAPS.md`. |
 | 5 | Cross-device synchronization (real flows) | **BLOCKED** | WS4 tablet mutation confirmed, **plus** a live backend + a paired tablet and mobile device/emulator + Appium + flutter. The orchestration is wired and gating (Workstream 1); the real flows can't run without devices. |
 | 6 | Real Android suite | **BLOCKED** | An Android emulator or phone + `flutter` + `adb`. None present. |
 | 7 | Real iOS suite | **BLOCKED** | A **Mac with Xcode** and an iOS simulator/device. Host is Linux — iOS cannot run here at all. |

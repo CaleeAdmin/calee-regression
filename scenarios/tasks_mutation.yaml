@@ -1,26 +1,32 @@
 name: calee-tasks-mutation
-tags: [tasks, mutation, tablet, draft-unverified]
+tags: [tasks, mutation, tablet, draft-unverified, source-confirmed]
 requires_state: logged_in_tablet
 default_timeout_seconds: 20
 mandatory: false
-# DRAFT -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md. Even more of this
-# scenario is unconfirmed than calendar_event_mutation.yaml: there is no
-# grounded information anywhere in this framework's existing
-# scenarios/docs about how task completion is actually represented in the
-# UI -- an inline checkbox, a swipe gesture, a detail-screen button, and/or
-# a distinct completed-state indicator (text change, strikethrough,
-# filter/tab change) are all plausible and none is confirmed. Every
-# UNCONFIRMED_* token below is a placeholder -- see the doc for the
-# confirmation checklist. Do not set mandatory: true or add this to a real
-# suite until every placeholder is replaced with a real, confirmed value
-# AND the scenario has passed at least once against a real, prepared
-# tablet.
+# SOURCE-CONFIRMED, PHYSICAL-UNVERIFIED (Workstream 4).
 #
-# Uses the fixture's own REG-TASK-OPEN-001 (see
-# docs/TEST_DATA_RESET_CONTRACT.md) rather than creating a scratch task --
-# completes it, verifies, then reopens it so the fixture is left exactly
-# as it was found. Self-cleaning by design: never leaves the shared
-# fixture mutated for the next run or tester.
+# The task row's controls now come from the real Calee source
+# (item_task_list.xml): the row card is `taskItemCard`, the title cell is
+# `tvName`, and completion is a single stateful toggle target `flCheckboxTarget`
+# (the same target both completes and reopens a task -- there is no separate
+# "reopen" control). See the source_verification block below.
+#
+# Because every task row reuses those same ids, this scenario uses the
+# row-scoped actions (Workstream 4): each `tap_in_row`/`assert_in_row` locates
+# the ONE row whose visible title is the fixture's REG-TASK-OPEN-001 and acts on
+# a descendant within it -- never the first global `flCheckboxTarget`. A zero-
+# or multiple-row match fails loudly instead of toggling the wrong task.
+#
+# Still gated (mandatory: false, draft-unverified, not in any release suite)
+# until a real device pass -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md.
+#
+# Uses the fixture's own REG-TASK-OPEN-001 (see docs/TEST_DATA_RESET_CONTRACT.md)
+# and reopens it at the end, leaving the fixture as found. NOTE: the
+# tablet-side completed/open *state* is asserted authoritatively by the API/sync
+# leg (Workstream 5), not here -- the completed state is shown by swapping the
+# `ivIcon` drawable, which is not a distinct resource-id Appium can assert. The
+# UI evidence this scenario contributes is the row-scoped toggle resolving
+# uniquely, the row surviving the RecyclerView rebind, and the screenshots.
 steps:
   - name: Launch Calee
     action: launch
@@ -49,34 +55,39 @@ steps:
     screenshot_name: 00_before_complete
     compare: false
 
-  - name: Mark the fixture task complete
-    action: tap
-    id: UNCONFIRMED_task_complete_toggle_for_REG_TASK_OPEN_001
+  - name: Mark the fixture task complete (row-scoped toggle, not the first global one)
+    action: tap_in_row
+    card_id: taskItemCard
+    title: REG-TASK-OPEN-001
+    target_id: flCheckboxTarget
 
   - name: Wait a moment for the completion state to take effect
     action: sleep
     seconds: 2
-
-  - name: Assert the task now shows as complete
-    action: assert_id
-    id: UNCONFIRMED_task_completed_indicator_for_REG_TASK_OPEN_001
 
   - name: Capture the tasks screen after completing
     action: screenshot
     screenshot_name: 01_after_complete
     compare: false
 
-  - name: Reopen the fixture task, restoring its original state
-    action: tap
-    id: UNCONFIRMED_task_reopen_toggle_for_REG_TASK_OPEN_001
+  - name: Assert the fixture task row is still present (survived the RecyclerView rebind)
+    # Real verification that the row-scoped resolution still finds exactly the
+    # fixture row after the toggle rebinds the list. The authoritative
+    # completed-vs-open assertion is the API/sync leg (Workstream 5).
+    action: assert_in_row
+    card_id: taskItemCard
+    title: REG-TASK-OPEN-001
+    target_id: tvName
+
+  - name: Reopen the fixture task, restoring its original state (same stateful toggle)
+    action: tap_in_row
+    card_id: taskItemCard
+    title: REG-TASK-OPEN-001
+    target_id: flCheckboxTarget
 
   - name: Wait a moment for the reopened state to take effect
     action: sleep
     seconds: 2
-
-  - name: Assert the task is open again, matching its original fixture state
-    action: fail_if_id
-    id: UNCONFIRMED_task_completed_indicator_for_REG_TASK_OPEN_001
 
   - name: Capture the tasks screen after reopening
     action: screenshot
@@ -86,3 +97,18 @@ steps:
   - name: Assert no crash/error dialog is showing
     action: fail_if_text
     texts: ["Unfortunately", "has stopped", "Force Close", "Error"]
+
+source_verification:
+  calee_source: CaleeAdmin/Calee
+  calee_source_sha: "931beecfc309ff12220185383fa8daae56af30d8"  # Calee release #974 (main)
+  calee_source_ref: "main (release #974); identical layouts on dev @ b32807d"
+  status: source-confirmed
+  physical_confirmation: pending
+  selectors:
+    taskItemCard: app/src/main/res/layout/item_task_list.xml
+    tvName: app/src/main/res/layout/item_task_list.xml
+    flCheckboxTarget: app/src/main/res/layout/item_task_list.xml
+    ivIcon: app/src/main/res/layout/item_task_list.xml
+  notes:
+    - "flCheckboxTarget is a single stateful toggle: the same target completes and reopens a task."
+    - "Completed state swaps the ivIcon drawable (fangkuang -> checked); not a distinct resource id, so tablet completed-state is API-authoritative."

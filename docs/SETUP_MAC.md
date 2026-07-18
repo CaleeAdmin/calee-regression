@@ -132,11 +132,11 @@ Both flags matter — see `docs/TROUBLESHOOTING.md` if you forget one.
 absent):
 
 ```bash
-export CALEE_BUILD_VERSION="0.3.22"              # Calee tablet app version
-export CALEEMOBILE_BUILD_VERSION="0.0.22"        # CaleeMobile app version
-export CALEE_EXPECTED_BUILD_VERSION="0.3.22"     # optional: block if the detected build differs
-export CALEEMOBILE_EXPECTED_BUILD_VERSION="0.0.22"
-export CALEESHELL_VERSION="..."                  # optional
+export CALEE_BUILD_VERSION="founder-v0.3.24"     # Calee tablet versionName (example — use your build's)
+export CALEEMOBILE_BUILD_VERSION="0.0.23+23"     # CaleeMobile pubspec version+build (example)
+export CALEE_EXPECTED_BUILD_VERSION="founder-v0.3.24"  # optional: block if the detected build differs
+export CALEEMOBILE_EXPECTED_BUILD_VERSION="0.0.23+23"
+export CALEESHELL_VERSION="founder-v0.2.11"      # optional (example)
 export CALEE_GIT_SHA="$(git -C /path/to/Calee rev-parse HEAD)"           # optional
 export CALEEMOBILE_GIT_SHA="$(git -C /path/to/CaleeMobile rev-parse HEAD)" # optional
 ```

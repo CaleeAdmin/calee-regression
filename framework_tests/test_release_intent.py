@@ -80,6 +80,39 @@ def test_abbreviated_expected_sha_blocks():
     assert "abbreviated" in " ".join(c.detail).lower()
 
 
+def test_malformed_expected_caleemobile_version_blocks():
+    c = component_from_release_intent(**_full_expected(expected_caleemobile_build_version="latest"))
+    assert c.status == STATUS_BLOCKED
+    joined = " ".join(c.detail).lower()
+    assert "well-formed" in joined and "version" in joined
+
+
+def test_malformed_expected_tablet_version_blocks():
+    c = component_from_release_intent(**_full_expected(expected_calee_build_version="0.3"))
+    assert c.status == STATUS_BLOCKED
+    assert "well-formed" in " ".join(c.detail).lower()
+
+
+def test_malformed_expected_caleeshell_version_blocks():
+    c = component_from_release_intent(**_full_expected(
+        caleeshell_in_scope=True, expected_caleeshell_version="v1", detected_caleeshell_version="v1",
+    ))
+    assert c.status == STATUS_BLOCKED
+    assert "well-formed" in " ".join(c.detail).lower()
+
+
+def test_wellformed_founder_prefixed_versions_pass():
+    # The real current-release shapes (founder-vX.Y.Z + pubspec X.Y.Z+B) are accepted.
+    c = component_from_release_intent(**_full_expected(
+        expected_caleemobile_build_version="0.0.23+23",
+        expected_calee_build_version="founder-v0.3.24",
+        caleeshell_in_scope=True,
+        expected_caleeshell_version="founder-v0.2.11",
+        detected_caleeshell_version="founder-v0.2.11",
+    ))
+    assert c.status == STATUS_PASS
+
+
 def test_expected_tablet_source_sha_required_only_when_available():
     # No source SHA available (pipeline can't provide it) -> not required.
     c = component_from_release_intent(**_full_expected(expected_calee_git_sha=None, tablet_source_sha_available=False))

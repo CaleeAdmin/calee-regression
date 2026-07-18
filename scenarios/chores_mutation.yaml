@@ -1,36 +1,39 @@
 name: calee-chores-mutation
-tags: [chores, mutation, tablet, draft-unverified]
+tags: [chores, mutation, tablet, draft-unverified, source-confirmed]
 requires_state: logged_in_tablet
 default_timeout_seconds: 20
 mandatory: false
-# DRAFT -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md. As with
-# tasks_mutation.yaml, the actual on-screen skip/complete control for a
-# chore row is not confirmed anywhere in this framework's existing
-# scenarios/docs. Every UNCONFIRMED_* token is a placeholder -- see the
-# doc for the confirmation checklist. Do not set mandatory: true or add
-# this to a real suite until every placeholder is replaced with a real,
-# confirmed value AND the scenario has passed at least once against a
-# real, prepared tablet.
+# SOURCE-CONFIRMED, PHYSICAL-UNVERIFIED (Workstream 4).
 #
-# Simplification vs. chores_smoke.yaml: this scenario taps llChores
-# directly rather than using chores_smoke.yaml's tap_if_present/optional
-# handling for accounts with no chores service. That conditional-tab
-# pattern is already solved there and can be copied in once the more
-# fundamental unconfirmed-id gap below is closed -- not duplicated here
-# to keep this draft focused on its actual open problem.
+# The chore row's controls come from the real Calee source
+# (item_chores_list_item.xml): row card `choresItemCard`, title `tvTitle`,
+# per-row action menu `tvActionMenu`. Tapping `tvActionMenu` opens an action
+# sheet (ChoresFragment.showChoreActionMenu) whose "Skip This Time" entry
+# (string chore_action_skip_this_time) skips today's occurrence via a
+# confirmation dialog (dialog_calee_confirm -> btnConfirmAction). See the
+# source_verification block below.
 #
-# Skips (rather than completes) today's occurrence of the fixture's
-# REG-CHORE-REPEATING-001, matching the state REG-CHORE-SKIPPED-001
-# already models as an accepted, expected chore state (see
-# docs/TEST_DATA_RESET_CONTRACT.md). Deliberately one-directional: unlike
-# tasks_mutation.yaml's complete-then-reopen, there is no confirmed (or
-# assumed) "un-skip" UI action, so this scenario does NOT attempt to
-# restore REG-CHORE-REPEATING-001 to its pre-skip state itself. Running
-# this scenario mutates shared fixture state -- the fixture's own reset
-# mechanism (01 Prepare Test Environment / manage_fixture.py reset, see
-# docs/TEST_DATA_RESET_CONTRACT.md) is what restores it, not this
-# scenario. Do not run this back-to-back expecting a clean slate without
-# an intervening fixture reset.
+# IMPORTANT (source-confirmed behaviour): `tvActionMenu` is VISIBLE only when
+# the account has "Show chore edit actions" enabled (AccountMgr
+# .getShowChoreEditOptions() && chore.canToggleCompletion -- ChoresFragment
+# lines ~623/708). The regression account MUST have chore edit actions enabled
+# or the row will have no tvActionMenu and the row-scoped tap fails loudly.
+#
+# Uses the row-scoped actions (Workstream 4) so the menu is opened on the ONE
+# REG-CHORE-REPEATING-001 row, never the first global tvActionMenu.
+#
+# Still gated (mandatory: false, draft-unverified, not in any release suite)
+# until a real device pass -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md.
+#
+# Deliberately one-directional: skips today's occurrence of the fixture's
+# REG-CHORE-REPEATING-001 (matching the accepted REG-CHORE-SKIPPED-001 state,
+# see docs/TEST_DATA_RESET_CONTRACT.md). There is no confirmed "un-skip" UI
+# action, so this scenario does NOT self-restore -- the fixture reset (01
+# Prepare Test Environment / manage_fixture.py reset) is what restores it. Do
+# not run back-to-back without an intervening fixture reset. The authoritative
+# skipped-occurrence state is asserted by the API/sync leg (Workstream 5); this
+# scenario's UI evidence is the action sheet opening on the correct row and the
+# screenshots.
 steps:
   - name: Launch Calee
     action: launch
@@ -59,17 +62,33 @@ steps:
     screenshot_name: 00_before_skip
     compare: false
 
-  - name: Skip today's occurrence of the fixture chore
+  - name: Open the fixture chore's action menu (row-scoped, requires chore edit actions enabled)
+    action: tap_in_row
+    card_id: choresItemCard
+    title: REG-CHORE-REPEATING-001
+    target_id: tvActionMenu
+
+  - name: Wait for the action sheet's "Skip This Time" entry to appear
+    action: wait_for_text
+    text: Skip This Time
+    timeout_seconds: 10
+
+  - name: Choose "Skip This Time"
     action: tap
-    id: UNCONFIRMED_chore_skip_button_for_REG_CHORE_REPEATING_001
+    text: Skip This Time
+
+  - name: Wait for the skip confirmation dialog
+    action: wait_for_id
+    id: btnConfirmAction
+    timeout_seconds: 10
+
+  - name: Confirm the skip
+    action: tap
+    id: btnConfirmAction
 
   - name: Wait a moment for the skip to take effect
     action: sleep
     seconds: 2
-
-  - name: Assert the chore now shows as skipped
-    action: assert_id
-    id: UNCONFIRMED_chore_skipped_indicator_for_REG_CHORE_REPEATING_001
 
   - name: Capture the chores screen after skipping
     action: screenshot
@@ -79,3 +98,20 @@ steps:
   - name: Assert no crash/error dialog is showing
     action: fail_if_text
     texts: ["Unfortunately", "has stopped", "Force Close", "Error"]
+
+source_verification:
+  calee_source: CaleeAdmin/Calee
+  calee_source_sha: "931beecfc309ff12220185383fa8daae56af30d8"  # Calee release #974 (main)
+  calee_source_ref: "main (release #974); identical layouts on dev @ b32807d"
+  status: source-confirmed
+  physical_confirmation: pending
+  selectors:
+    choresItemCard: app/src/main/res/layout/item_chores_list_item.xml
+    tvTitle: app/src/main/res/layout/item_chores_list_item.xml
+    tvActionMenu: app/src/main/res/layout/item_chores_list_item.xml
+    btnConfirmAction: app/src/main/res/layout/dialog_calee_confirm.xml
+  action_text:
+    skip_this_time: "Skip This Time"  # R.string.chore_action_skip_this_time (values/strings.xml)
+  notes:
+    - "tvActionMenu visibility is gated by AccountMgr.getShowChoreEditOptions(); the regression account must enable 'Show chore edit actions'."
+    - "'Skip This Time' is an action-sheet item matched by text, not a resource id."

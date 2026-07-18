@@ -57,15 +57,41 @@ release_features:
 # app whose identity can't be determined at all still BLOCKS (a PASS must
 # prove which build was tested). Uncomment and set these per release-candidate.
 #
+# Accepted formats (validated -- a malformed value BLOCKS rather than silently
+# "not matching", see calee_regression/identity_format.py):
+#   * *_git_sha       : the FULL 40-character commit SHA (an abbreviated SHA is
+#                       ambiguous and is rejected).
+#   * *_build_version : a recognisable version -- CaleeMobile pubspec "X.Y.Z+B"
+#                       (e.g. 0.0.23+23), or a tablet/shell "stage-vX.Y.Z"
+#                       versionName (e.g. founder-v0.3.24). "latest"/"0.3" are
+#                       rejected.
+#
+# --- GENERIC TEMPLATE (copy and fill; angle-bracket placeholders never go stale) ---
 # expected_build_identity:
-#   calee_build_version: "0.3.22"        # Calee tablet installed versionName
-#   calee_git_sha: "<full tablet commit sha>"
-#   calee_application_id: "com.viso.calee"  # Calee tablet Android application id
-#   calee_version_code: "322"            # Calee tablet installed versionCode
-#   caleemobile_build_version: "0.0.22+22"  # CaleeMobile pubspec version+build
-#   caleemobile_git_sha: "<full CaleeMobile commit sha>"
-#   caleeshell_version: "1.4.0"          # CaleeShell version (when kiosk/admin is in scope)
-#   allow_dirty: false                   # (development only) set true to approve an uncommitted build
+#   calee_build_version: "<tablet versionName, e.g. founder-vX.Y.Z>"
+#   calee_git_sha: "<full 40-char Calee tablet commit SHA>"
+#   calee_application_id: "com.viso.calee"   # Calee tablet Android application id
+#   calee_version_code: "<tablet versionCode, e.g. 324>"
+#   caleemobile_build_version: "<CaleeMobile pubspec version+build, e.g. 0.0.23+23>"
+#   caleemobile_git_sha: "<full 40-char CaleeMobile commit SHA>"
+#   caleeshell_version: "<CaleeShell versionName, e.g. founder-vX.Y.Z>"  # when kiosk/admin is in scope
+#   allow_dirty: false                       # (development only) approve an uncommitted build
+#
+# --- CURRENT RELEASE-CANDIDATE SNAPSHOT (verified 2026-07-18) ---
+# A concrete, dated example of the template above. This is a point-in-time
+# snapshot, NOT a value to reuse blindly: re-verify every SHA/version against
+# the actual build you are releasing (the production consolidation would BLOCK
+# on a mismatch anyway). Sources: Calee release #974 on `main`, CaleeMobile
+# 0.0.23 release commit on `main`, CaleeShell `main`.
+# expected_build_identity:
+#   calee_build_version: "founder-v0.3.24"
+#   calee_git_sha: "931beecfc309ff12220185383fa8daae56af30d8"   # Calee main, #974
+#   calee_application_id: "com.viso.calee"
+#   calee_version_code: "324"
+#   caleemobile_build_version: "0.0.23+23"
+#   caleemobile_git_sha: "836b2db3bc8b1314cf9088978386c6ef7423458e"  # CaleeMobile main, 0.0.23 (#463)
+#   caleeshell_version: "founder-v0.2.11"
+#   allow_dirty: false
 
 # Production release profile (Workstream 3). Setting `production: true` (below,
 # or top-level `release_profile: production`) makes the expected identity above

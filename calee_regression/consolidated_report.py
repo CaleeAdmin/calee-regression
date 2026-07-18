@@ -261,15 +261,10 @@ def _versions_match(a: "Any | None", b: "Any | None") -> bool:
     return str(a).strip() == str(b).strip()
 
 
-_FULL_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-
-
-def is_full_git_sha(value: "Any | None") -> bool:
-    """A full, unambiguous git commit SHA is exactly 40 hex characters. An
-    abbreviated SHA (e.g. ``abc1234``) is ambiguous -- it can name more than
-    one commit -- so it is never accepted as a release build identity. See
-    Phase 5 (a CaleeMobile version alone spans multiple commits)."""
-    return bool(value) and bool(_FULL_GIT_SHA_RE.match(str(value).strip()))
+# Re-exported from the shared identity_format module so existing importers
+# (`from calee_regression.consolidated_report import is_full_git_sha`) keep
+# working while the predicate lives in one place shared with the config loader.
+from .identity_format import is_full_git_sha, is_wellformed_version  # noqa: E402
 
 
 def component_from_build_identity(
@@ -1018,6 +1013,11 @@ def component_from_release_intent(
 
     missing: "list[str]" = []
     abbreviated: "list[str]" = []
+    # A present-but-unrecognisable expected version (``""`` slips through as
+    # missing; ``"latest"``/``"0.3"`` do not) can never be safely matched against
+    # a detected value, so it BLOCKS as its own class of misconfiguration rather
+    # than silently "not matching" later (Workstream 2).
+    malformed: "list[str]" = []
     if caleemobile_in_scope:
         if not expected_caleemobile_git_sha:
             missing.append("expected CaleeMobile Git SHA")
@@ -1025,9 +1025,13 @@ def component_from_release_intent(
             abbreviated.append(f"expected CaleeMobile Git SHA {expected_caleemobile_git_sha!r}")
         if not expected_caleemobile_build_version:
             missing.append("expected CaleeMobile version/build")
+        elif not is_wellformed_version(expected_caleemobile_build_version):
+            malformed.append(f"expected CaleeMobile version/build {expected_caleemobile_build_version!r}")
     if tablet_in_scope:
         if not expected_calee_build_version:
             missing.append("expected tablet versionName")
+        elif not is_wellformed_version(expected_calee_build_version):
+            malformed.append(f"expected tablet versionName {expected_calee_build_version!r}")
         if not expected_calee_application_id:
             missing.append("expected tablet application id")
         if not expected_calee_version_code:
@@ -1040,12 +1044,20 @@ def component_from_release_intent(
                 missing.append("expected tablet source Git SHA")
             elif not is_full_git_sha(expected_calee_git_sha):
                 abbreviated.append(f"expected tablet source Git SHA {expected_calee_git_sha!r}")
-    if caleeshell_in_scope and not expected_caleeshell_version:
-        missing.append("expected CaleeShell version")
+    if caleeshell_in_scope:
+        if not expected_caleeshell_version:
+            missing.append("expected CaleeShell version")
+        elif not is_wellformed_version(expected_caleeshell_version):
+            malformed.append(f"expected CaleeShell version {expected_caleeshell_version!r}")
 
     if abbreviated:
         return blocked(
             [f"{a} is abbreviated/ambiguous; a production release requires the full 40-character SHA." for a in abbreviated]
+        )
+    if malformed:
+        return blocked(
+            [f"{m} is not a well-formed version identity; a production release requires a recognisable "
+             f"version (e.g. 0.0.23+23, founder-v0.3.24)." for m in malformed]
         )
     if missing:
         return blocked([

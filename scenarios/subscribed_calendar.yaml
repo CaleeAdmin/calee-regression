@@ -1,0 +1,138 @@
+name: calee-subscribed-calendar
+tags: [calendar, subscription, tablet, draft-unverified, source-confirmed]
+requires_state: logged_in_tablet
+default_timeout_seconds: 20
+mandatory: false
+# SOURCE-CONFIRMED, PHYSICAL-UNVERIFIED (Workstream 3).
+#
+# Proves the tablet side of the subscribed-calendar contract from Calee #973 /
+# calee-hub-core #352/#353: subscribed events render, all-day dates do not shift,
+# Today and Calendar agree, and a subscribed event is READ-ONLY (no Edit, no
+# Delete -- `isEditable = !readOnly && !isSubscription && writableEventId
+# .isNotBlank()`, HubEventDetailDialog hides the controls, and defensive guards
+# back that up).
+#
+# PREREQUISITE (why this stays gated): the regression-owned subscription source
+# (fixtures/subscribed_calendar/reg_sub_calendar.ics, calendarId
+# "regression:regsub") must be PROVISIONED onto the tablet's account first, via
+# an authenticated regression fixture endpoint -- never a customer calendar or
+# an unauthenticated production reset. Provisioning needs the hub backend, which
+# is not available in this environment, so this scenario is BLOCKED from running
+# here (mandatory: false, draft-unverified, not in any release suite). See
+# docs/SUBSCRIBED_CALENDAR_REGRESSION.md for the full API + tablet assertion
+# matrix (incl. the calendar-selection visibility cases 9-16, which additionally
+# need the tablet filter/selection selectors source-confirmed).
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llCalendar
+    timeout_seconds: 20
+
+  # --- render: subscribed timed + all-day + recurring events appear (1,2,3) ---
+  - name: Open Calendar
+    action: tap
+    id: llCalendar
+
+  - name: Switch to Agenda view to list events
+    action: tap
+    id: llSchedule
+
+  - name: Subscribed timed event renders
+    action: wait_for_text
+    text: REG-SUB-TIMED
+    timeout_seconds: 20
+
+  - name: Subscribed single-day all-day event renders
+    action: assert_text
+    text: REG-SUB-ALLDAY-SINGLE
+
+  - name: Subscribed daily recurring event renders
+    action: assert_text
+    text: REG-SUB-ALLDAY-DAILY
+
+  - name: Subscribed recurrence override renders under its overridden title
+    action: assert_text
+    text: REG-SUB-OVERRIDE
+
+  - name: Capture the calendar agenda with subscribed events
+    action: screenshot
+    screenshot_name: 00_calendar_subscribed_events
+    compare: false
+
+  # --- Today and Calendar agree on the visible subscribed event (4) ---
+  - name: Open Today
+    action: tap
+    id: llToday
+
+  - name: The same subscribed timed event is visible on Today
+    action: assert_text
+    text: REG-SUB-TIMED
+
+  - name: Capture Today with the subscribed event
+    action: screenshot
+    screenshot_name: 01_today_subscribed_event
+    compare: false
+
+  # --- read-only: open a subscribed event, Edit + Delete are ABSENT (5,6,7,8) ---
+  - name: Back to Calendar agenda
+    action: tap
+    id: llCalendar
+
+  - name: Switch to Agenda view again
+    action: tap
+    id: llSchedule
+
+  - name: Open the subscribed timed event's detail
+    action: tap
+    text: REG-SUB-TIMED
+
+  - name: Wait for the event-detail dialog
+    action: wait_for_id
+    id: tvEventDetailTitle
+    timeout_seconds: 10
+
+  - name: Subscribed event detail shows its title
+    action: assert_text
+    text: REG-SUB-TIMED
+
+  - name: Edit control is ABSENT for a subscribed (read-only) event
+    action: fail_if_id
+    id: btnEventDetailEdit
+
+  - name: Delete control is ABSENT for a subscribed (read-only) event
+    action: fail_if_id
+    id: btnEventDetailDelete
+
+  - name: Capture the read-only subscribed event detail
+    action: screenshot
+    screenshot_name: 02_subscribed_event_readonly
+    compare: false
+
+  - name: Assert no crash/error dialog is showing
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]
+
+source_verification:
+  calee_source: CaleeAdmin/Calee
+  calee_source_sha: "931beecfc309ff12220185383fa8daae56af30d8"  # Calee release #974 (incl. #973 subscribed-calendar fix)
+  calee_source_ref: "main (release #974); identical layouts on dev @ b32807d"
+  status: source-confirmed
+  physical_confirmation: pending
+  contract:
+    - "isEditable = !readOnly && !isSubscription && writableEventId.isNotBlank() (CaleeHubEvent)"
+    - "HubEventDetailDialog hides Edit/Delete via isEditable; defensive guards before edit/delete flows (#973)"
+  selectors:
+    llToday: app/src/main/res/layout/activity_home.xml
+    llCalendar: app/src/main/res/layout/activity_home.xml
+    tvEventDetailTitle: app/src/main/res/layout/dialog_hub_event_detail.xml
+    btnEventDetailEdit: app/src/main/res/layout/dialog_hub_event_detail.xml
+    btnEventDetailDelete: app/src/main/res/layout/dialog_hub_event_detail.xml
+  fixture:
+    source: fixtures/subscribed_calendar/reg_sub_calendar.ics
+    calendarId: "regression:regsub"
+  notes:
+    - "Requires the REG-SUB subscription source provisioned on the tablet account (hub backend) -- BLOCKED without it."
+    - "Selection-matrix cases 9-16 additionally need the tablet calendar filter/selection selectors source-confirmed."
