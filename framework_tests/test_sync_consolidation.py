@@ -222,11 +222,23 @@ def _write_passing_base(workspace, run_id=RUN_ID):
     })
 
 
+# These tests isolate cross-device *sync* gating; the independent release-feature
+# components (Workstream 3) are a separate concern with their own tests
+# (test_feature_consolidation.py), so opt them optional here exactly as sync
+# itself is opted optional elsewhere -- an optional feature with no evidence is
+# shown but never gates, so it can't confound the sync assertions.
+FEATURES_OPTIONAL = (
+    "--meals-optional", "--onboarding-optional",
+    "--google-calendar-optional", "--kiosk-admin-optional",
+)
+
+
 def _consolidate(tmp_path, *extra, run_id=RUN_ID):
     return CliRunner().invoke(
         main,
         ["consolidate", "--run-id", run_id, "--android-optional", "--ios-optional",
-         "--allow-unknown-build-identity", "--out-dir", str(tmp_path / "out"), *extra],
+         "--allow-unknown-build-identity", *FEATURES_OPTIONAL,
+         "--out-dir", str(tmp_path / "out"), *extra],
     )
 
 

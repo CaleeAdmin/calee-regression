@@ -37,7 +37,7 @@ FULL_SOLUTION_REL = "tester/06 Test Full Calee Solution.command"
 # after a failed Prepare, the fail-fast gate has regressed. ("sync-smoke" is the
 # cross-device synchronization step, Workstream 1 -- it must be gated behind
 # Prepare exactly like the tablet suite and manual checks.)
-DOWNSTREAM_TEST_STEPS = ("suite", "record-manual-checks", "sync-smoke")
+DOWNSTREAM_TEST_STEPS = ("suite", "record-manual-checks", "sync-smoke", "kiosk-admin")
 
 
 def _copy_repo(tmp_path: Path) -> Path:
@@ -78,6 +78,7 @@ def _install_fakes(repo: Path, tmp_path: Path) -> Path:
         '            printf "export RELEASE_PLATFORM_ANDROID=%s\\n" "${FAKE_ANDROID:-true}"\n'
         '            printf "export RELEASE_PLATFORM_IOS=%s\\n" "${FAKE_IOS:-true}"\n'
         '            printf "export RELEASE_FEATURE_SYNCHRONIZATION=%s\\n" "${FAKE_SYNC:-true}"\n'
+        '            printf "export RELEASE_FEATURE_KIOSK_ADMIN=%s\\n" "${FAKE_KIOSK:-true}"\n'
         "            exit 0 ;;\n"
         "        prepare)\n"
         '            run_id=""\n'
@@ -277,6 +278,8 @@ def test_ready_prepare_runs_every_downstream_step(tmp_path):
     # Cross-device synchronization ran (Workstream 1) -- the positive path must
     # prove sync is actually invoked, not just gated behind Prepare.
     assert "sync-smoke" in steps
+    # Kiosk/admin ran (Workstream 4) -- its own gating step after sync.
+    assert "kiosk-admin" in steps
     assert "record-manual-checks" in steps
     assert "consolidate" in steps
     assert "stop-appium" in steps
@@ -293,6 +296,7 @@ def test_ready_prepare_runs_every_downstream_step(tmp_path):
         < steps.index("caleemobile:android --ui-only")
         < steps.index("caleemobile:ios --ui-only")
         < steps.index("sync-smoke")
+        < steps.index("kiosk-admin")
         < steps.index("record-manual-checks")
         < steps.index("consolidate")
     )
