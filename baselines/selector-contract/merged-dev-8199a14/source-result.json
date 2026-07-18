@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "component": "caleemobile-selector-contract",
+  "caleemobileRef": "8199a14a137d4552b23769b04169b1266fa66a4d",
+  "testedSha": "8199a14a137d4552b23769b04169b1266fa66a4d",
+  "pubspecVersion": "0.0.24+24",
+  "flutterVersion": "3.44.1",
+  "contract": "PASS",
+  "selectorsChecked": 62,
+  "selectorsPresent": 62,
+  "missing": [],
+  "timestamp": "2026-07-18T15:23:15Z",
+  "regressionSha": "310145db20d0757777d23ff2791b288891285396",
+  "workflowRunId": "29649862590",
+  "generatedBy": "ci"
+}

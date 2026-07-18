@@ -1,0 +1,12 @@
+{
+  "id": 29649862590,
+  "name": "ci [corr:p1-dev-8199a14-v0024-cert]",
+  "path": ".github/workflows/ci.yml",
+  "event": "workflow_dispatch",
+  "head_sha": "310145db20d0757777d23ff2791b288891285396",
+  "status": "completed",
+  "conclusion": "success",
+  "repository": {
+    "full_name": "CaleeAdmin/CaleeMobile-Regression"
+  }
+}
