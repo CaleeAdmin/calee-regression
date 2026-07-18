@@ -293,6 +293,46 @@ def _step_fail_if_id(ctx, step, result: StepResult):
     result.message = f"id {raw_id!r} not present, as expected"
 
 
+def _row_scoped_args(step: dict) -> "tuple[str, str, str]":
+    """Common (card_id, title, target_id) for the row-scoped actions
+    (Workstream 4). All three are required -- a row-scoped action with a
+    missing field is an authoring error, raised as ScenarioError."""
+    card_id = step.get("card_id")
+    title = step.get("title")
+    target_id = step.get("target_id")
+    if not (card_id and title and target_id):
+        raise ScenarioError(
+            "row-scoped action requires 'card_id' (the row card id), 'title' (the unique "
+            "visible fixture title identifying the row), and 'target_id' (the descendant "
+            f"control id). Got card_id={card_id!r}, title={title!r}, target_id={target_id!r}."
+        )
+    return card_id, title, target_id
+
+
+def _step_tap_in_row(ctx, step, result: StepResult):
+    card_id, title, target_id = _row_scoped_args(step)
+    ctx["driver"].tap_in_row(card_id, title, target_id)
+    result.message = f"tapped {target_id!r} within the {title!r} {card_id!r} row"
+
+
+def _step_assert_in_row(ctx, step, result: StepResult):
+    card_id, title, target_id = _row_scoped_args(step)
+    if not ctx["driver"].id_present_in_row(card_id, title, target_id):
+        raise AssertionError(
+            f"Expected descendant {target_id!r} within the {title!r} {card_id!r} row, but it was absent."
+        )
+    result.message = f"{target_id!r} present within the {title!r} {card_id!r} row, as expected"
+
+
+def _step_fail_if_in_row(ctx, step, result: StepResult):
+    card_id, title, target_id = _row_scoped_args(step)
+    if ctx["driver"].id_present_in_row(card_id, title, target_id):
+        raise AssertionError(
+            f"Unexpected descendant {target_id!r} within the {title!r} {card_id!r} row -- expected it absent."
+        )
+    result.message = f"{target_id!r} not present within the {title!r} {card_id!r} row, as expected"
+
+
 def _step_assert_current_activity(ctx, step):
     expected = step["activity"]
     actual = ctx["driver"].current_activity()
@@ -325,12 +365,16 @@ ACTIONS = {
     "fail_if_text": _step_fail_if_text,
     "fail_if_id": _step_fail_if_id,
     "assert_current_activity": _step_assert_current_activity,
+    "tap_in_row": _step_tap_in_row,
+    "assert_in_row": _step_assert_in_row,
+    "fail_if_in_row": _step_fail_if_in_row,
 }
 
 
 VERIFYING_ACTIONS = {
     "assert_text", "assert_any_text", "assert_id", "wait_for_id", "wait_for_text",
     "fail_if_text", "fail_if_id", "assert_current_activity",
+    "assert_in_row", "fail_if_in_row",
 }
 
 

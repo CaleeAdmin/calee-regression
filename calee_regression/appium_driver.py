@@ -225,3 +225,101 @@ class CaleeDriver:
                 return True
             time.sleep(0.5)
         return False
+
+    # ── Row-scoped element resolution (Workstream 4) ────────────────────────
+    #
+    # A RecyclerView row (a task row `taskItemCard`, a chore row
+    # `choresItemCard`) reuses the SAME descendant resource ids on every row --
+    # `flCheckboxTarget`, `tvActionMenu`, `ivIcon`, `tvName`/`tvTitle`. Tapping
+    # the first global `flCheckboxTarget` would toggle whatever row happens to be
+    # bound first, not the fixture row under test. These helpers resolve a
+    # descendant control *within the one row whose visible title matches*, and
+    # fail loudly on zero or multiple matching rows rather than silently acting
+    # on the wrong one.
+
+    @staticmethod
+    def _xpath_text_literal(text: str) -> str:
+        """An XPath string literal for `text`, safe even when it contains
+        quotes (via concat()). REG-* fixture titles never do, but a chore/task
+        title supplied at runtime might."""
+        if '"' not in text:
+            return f'"{text}"'
+        if "'" not in text:
+            return f"'{text}'"
+        parts = text.split('"')
+        return "concat(" + ', \'"\', '.join(f'"{p}"' for p in parts) + ")"
+
+    def find_rows_by_title(self, card_id: str, title: str) -> list:
+        """Every row card (`card_id`) whose subtree contains `title` as visible
+        text or content-desc. Used to enforce the exactly-one-row contract."""
+        from appium.webdriver.common.appiumby import AppiumBy
+
+        lit = self._xpath_text_literal(title)
+        row_id = self._resource_id(card_id)
+        xpath = (
+            f"//*[@resource-id='{row_id}']"
+            f"[.//*[contains(@text,{lit}) or contains(@content-desc,{lit})]]"
+        )
+        return self.driver.find_elements(AppiumBy.XPATH, xpath)
+
+    def _resolve_unique_row(self, card_id: str, title: str):
+        rows = self.find_rows_by_title(card_id, title)
+        if len(rows) == 0:
+            raise LookupError(
+                f"No {card_id!r} row found whose title contains {title!r}. The fixture row may not be "
+                f"rendered yet (scroll/verify it is visible) or the title is wrong."
+            )
+        if len(rows) > 1:
+            raise LookupError(
+                f"{len(rows)} {card_id!r} rows match title {title!r} -- ambiguous. Row-scoped actions "
+                f"require exactly one match; use a unique fixture title (e.g. a REG-* id)."
+            )
+        return rows[0]
+
+    def _resolve_row_descendant(self, card_id: str, title: str, descendant_id: str):
+        from appium.webdriver.common.appiumby import AppiumBy
+
+        row = self._resolve_unique_row(card_id, title)
+        target_id = self._resource_id(descendant_id)
+        # Relative XPath (leading dot) -> search only within this row's subtree.
+        found = row.find_elements(AppiumBy.XPATH, f".//*[@resource-id='{target_id}']")
+        if len(found) == 0:
+            raise LookupError(
+                f"Row {title!r} ({card_id!r}) has no descendant {descendant_id!r}."
+            )
+        if len(found) > 1:
+            raise LookupError(
+                f"Row {title!r} ({card_id!r}) has {len(found)} descendants {descendant_id!r} -- ambiguous."
+            )
+        return found[0]
+
+    def _row_scoped(self, card_id: str, title: str, descendant_id: str, retries: int = 3):
+        """Resolve `descendant_id` within the unique `title` row, retrying on the
+        transient errors a RecyclerView rebind throws (a stale element or a
+        mid-rebind empty query). A genuine zero/multiple-row LookupError is NOT
+        retried -- it is a real ambiguity to surface immediately."""
+        last_exc = None
+        for attempt in range(max(1, retries)):
+            try:
+                return self._resolve_row_descendant(card_id, title, descendant_id)
+            except LookupError:
+                raise
+            except Exception as exc:  # StaleElementReference et al. during a rebind
+                last_exc = exc
+                time.sleep(0.4)
+        raise last_exc if last_exc else LookupError(f"Could not resolve {descendant_id!r} in row {title!r}")
+
+    def tap_in_row(self, card_id: str, title: str, descendant_id: str) -> None:
+        self._row_scoped(card_id, title, descendant_id).click()
+
+    def id_present_in_row(self, card_id: str, title: str, descendant_id: str) -> bool:
+        """Single-shot presence of a descendant within the unique title row.
+        A missing *row* still raises (that ambiguity must not be swallowed); a
+        present row missing the descendant returns False."""
+        try:
+            self._resolve_row_descendant(card_id, title, descendant_id)
+            return True
+        except LookupError as exc:
+            if "no descendant" in str(exc):
+                return False
+            raise

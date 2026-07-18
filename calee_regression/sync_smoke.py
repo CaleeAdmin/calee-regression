@@ -299,12 +299,13 @@ def run_task_sync_flow(
             )
         )
 
-    # A weak/partial signal only: the tablet has no confirmed indicator
-    # that distinguishes "completed" from "open" beyond the title still
-    # being present -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md
-    # (UNCONFIRMED_task_completed_indicator_for_REG_TASK_OPEN_001). This
-    # step proves the task didn't disappear/error on the tablet, not that
-    # its completed state is visually reflected there.
+    # A weak/partial signal only: on the tablet, "completed" vs "open" is a
+    # drawable swap on the row's ivIcon (item_task_list.xml), not a distinct
+    # resource id Appium can assert -- so the authoritative completed-state
+    # check stays here on the API/mobile side. See
+    # docs/TABLET_MUTATION_COVERAGE_GAPS.md. This step proves the task didn't
+    # disappear/error on the tablet, not that its completed state is visually
+    # reflected there.
     poll_after_complete = poll_until(
         lambda: env.tablet_text_present(title), timeout_seconds=timeout_seconds, interval_seconds=interval_seconds,
     )

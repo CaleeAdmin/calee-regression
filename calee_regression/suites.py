@@ -31,6 +31,13 @@ SCENARIO_GROUPS = {
     "calendar_event_mutation": ["scenarios/calendar_event_mutation.yaml"],
     "tasks_mutation": ["scenarios/tasks_mutation.yaml"],
     "chores_mutation": ["scenarios/chores_mutation.yaml"],
+    # Workstream 3 -- subscribed-calendar tablet coverage. Source-confirmed
+    # selectors, but physically unverified AND requires the REG-SUB fixture
+    # provisioned via the hub backend, so it is gated exactly like the mutation
+    # drafts: mandatory: false, draft-unverified, and NOT in any COMPOSITE_SUITES
+    # entry. See docs/SUBSCRIBED_CALENDAR_REGRESSION.md and
+    # test_tablet_mutation_drafts.py.
+    "subscribed_calendar": ["scenarios/subscribed_calendar.yaml"],
 }
 
 COMPOSITE_SUITES = {

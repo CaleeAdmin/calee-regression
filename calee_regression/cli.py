@@ -17,6 +17,7 @@ from . import config as config_mod
 from . import manual_checks as manual_checks_mod
 from . import preflight, release_platforms, reporting, suites
 from . import run_context
+from . import selector_evidence as selector_evidence_mod
 from . import sync_smoke
 from .appium_driver import CaleeDriver
 from .consolidated_report import (
@@ -1104,6 +1105,69 @@ def release_platforms_cmd():
     click.echo(f"export CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR={'true' if features.google_calendar else 'false'}")
     click.echo(f"export CALEE_RELEASE_FEATURE_KIOSK_ADMIN={'true' if features.kiosk_admin else 'false'}")
     raise SystemExit(EXIT_SUCCESS)
+
+
+@main.command("verify-selector-evidence")
+@click.option(
+    "--evidence", "evidence_path", required=True,
+    help="Path to a CaleeMobile-Regression selector-contract result JSON "
+         "(see selector_evidence.py / config/release-platforms.example.yaml).",
+)
+@click.option(
+    "--expected-sha", "expected_sha", default=None,
+    help="Expected full CaleeMobile release Git SHA. Defaults to the "
+         "caleemobile_git_sha in config/release-platforms.yaml when set.",
+)
+@click.option(
+    "--expected-version", "expected_version", default=None,
+    help="Expected CaleeMobile release version (pubspec version+build). Defaults "
+         "to the caleemobile_build_version in config/release-platforms.yaml when set.",
+)
+@click.option(
+    "--expected-ref", "expected_ref", default=None,
+    help="Expected CaleeMobile ref (non-blocking note only; SHA/version are authoritative).",
+)
+def verify_selector_evidence_cmd(evidence_path, expected_sha, expected_version, expected_ref):
+    """Reject CaleeMobile selector-contract evidence gathered against a
+    DIFFERENT build than the one being released (Workstream 1).
+
+    Selectors passing for commit X are not evidence about commit Y. This reads
+    the machine-readable selector-contract result and BLOCKS (exit 3) when the
+    contract didn't PASS, the tested SHA/version is missing/malformed, or the
+    tested SHA/version differs from the expected CaleeMobile release identity.
+    When --expected-sha/--expected-version are omitted they fall back to the
+    expected identity in config/release-platforms.yaml, so a release run
+    verifies against the same intended target the consolidator does.
+    """
+    if expected_sha is None or expected_version is None:
+        try:
+            configured = release_platforms.load_expected_build_identity()
+        except release_platforms.ReleasePlatformsError as exc:
+            click.echo(f"Invalid release-platforms config: {exc}", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        if expected_sha is None:
+            expected_sha = configured.caleemobile_git_sha
+        if expected_version is None:
+            expected_version = configured.caleemobile_build_version
+
+    try:
+        result = selector_evidence_mod.load_selector_contract_result(evidence_path)
+    except selector_evidence_mod.SelectorEvidenceError as exc:
+        # A missing/malformed evidence file is a framework/pipeline fault, not a
+        # product regression -- BLOCKED, never a fabricated pass.
+        click.echo(f"Selector-contract evidence could not be read: {exc}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    verdict = selector_evidence_mod.verify_selector_contract_evidence(
+        result,
+        expected_git_sha=expected_sha,
+        expected_version=expected_version,
+        expected_ref=expected_ref,
+    )
+    for problem in verdict.problems:
+        click.echo(("  - " + problem), err=not verdict.ok)
+    click.echo(verdict.summary())
+    raise SystemExit(EXIT_SUCCESS if verdict.ok else EXIT_BLOCKED)
 
 
 @main.command("build-identity")
