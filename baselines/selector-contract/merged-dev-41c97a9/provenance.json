@@ -1,0 +1,30 @@
+{
+  "sourceEvidence": {
+    "schemaVersion": 1,
+    "component": "caleemobile-selector-contract",
+    "caleemobileRef": "41c97a97eddaf8676d43bb5efd5b2018d51b7faa",
+    "testedSha": "41c97a97eddaf8676d43bb5efd5b2018d51b7faa",
+    "pubspecVersion": "0.0.24+24",
+    "flutterVersion": "3.44.1",
+    "contract": "PASS",
+    "selectorsChecked": 62,
+    "selectorsPresent": 62,
+    "missing": [],
+    "timestamp": "2026-07-18T14:11:02Z",
+    "regressionSha": "08d5eec88dc020256ecd5cf1715504e35a785f47",
+    "workflowRunId": "29647533154",
+    "generatedBy": "ci"
+  },
+  "sourceContentDigest": "sha256:b9cd9a947ac703789bb1c8bd53b145a6d4e3b5e6eb3e80750fa10be3d6fc5d11",
+  "adoption": {
+    "releaseRunId": "p1-merged-dev-41c97a9-v0024",
+    "adoptedAt": "2026-07-18T14:12:00Z",
+    "adoptedBy": "calee-regression P1 merged-dev evidence retention",
+    "sourcePath": "github-artifact:8430482479@run:29647533154"
+  },
+  "sourceResultSha256": "sha256:61a04066878a106c3c36880347b1c5cbd5304374e1dfd4d5f84906b32bba4592",
+  "sourceArtifactZipSha256": "sha256:ec78e501b640efd2bdbee372d92a33c4d149e8ada741cc85592bd7f4116099ac",
+  "sourceArtifactId": "8430482479",
+  "sourceArtifactDigest": "sha256:ec78e501b640efd2bdbee372d92a33c4d149e8ada741cc85592bd7f4116099ac",
+  "envelopeDigest": "sha256:fa0be356890341325bf519cd1d536732fcb3d70b718b357e5dd5f62df8b868ce"
+}

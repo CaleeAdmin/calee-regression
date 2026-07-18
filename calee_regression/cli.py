@@ -18,6 +18,7 @@ from . import config as config_mod
 from . import manual_checks as manual_checks_mod
 from . import preflight, release_platforms, reporting, suites
 from . import run_context
+from . import github_artifact as github_artifact_mod
 from . import selector_evidence as selector_evidence_mod
 from . import selector_provenance as selector_provenance_mod
 from . import sync_smoke
@@ -28,6 +29,7 @@ from .consolidated_report import (
     STATUS_PASS,
     ManualCheck,
     build_release_report,
+    collect_step_diagnostic_paths,
     component_from_caleemobile_sha_agreement,
     component_from_identity_stability,
     component_from_release_intent,
@@ -1230,6 +1232,30 @@ def verify_selector_evidence_cmd(evidence_path, expected_sha, expected_version, 
     help="GitHub-provided digest of the adopted --source artifact (retained for traceability).",
 )
 @click.option(
+    "--github-run-id", "github_run_id", default=None,
+    help="GitHub Actions workflow run ID that produced the selector artifact "
+         "(Priority 2). Required, with --github-artifact-id, for a PRODUCTION release: "
+         "the run/job/artifact ownership and the artifact digest are verified against "
+         "GitHub before the evidence is accepted. A bare --source is refused in production.",
+)
+@click.option(
+    "--github-artifact-id", "github_artifact_id", default=None,
+    help="GitHub Actions artifact ID of the selector-contract-result artifact (Priority 2). "
+         "Its ZIP bytes are downloaded and hashed against GitHub's recorded digest.",
+)
+@click.option(
+    "--github-artifact-zip", "github_artifact_zip", type=click.Path(exists=True), default=None,
+    help="An already-downloaded artifact ZIP to authenticate locally (Priority 2). Its bytes "
+         "are still hashed against GitHub's digest; run/artifact metadata is still verified "
+         "over the API (so credentials are still required for the ownership checks).",
+)
+@click.option(
+    "--dirty-waiver", "dirty_waiver_opt", default=None,
+    help="Named development waiver (Priority 4) permitting local generation from a "
+         "dirty CaleeMobile/CaleeMobile-Regression worktree. Recorded in the local "
+         "verification record; without it, a dirty worktree BLOCKS local generation.",
+)
+@click.option(
     "--adopted-by", "adopted_by", default=None,
     help="Who/what is adopting the evidence (recorded in adoption provenance; "
          "default: the selector-contract gate).",
@@ -1241,7 +1267,9 @@ def verify_selector_evidence_cmd(evidence_path, expected_sha, expected_version, 
 def selector_contract_cmd(
     run_id_opt, source_path, expected_sha, expected_version, expected_ref,
     caleemobile_source_opt, regression_source_opt, flutter_version_opt,
-    production_opt, source_artifact_id, source_artifact_digest, adopted_by, mandatory,
+    production_opt, source_artifact_id, source_artifact_digest,
+    github_run_id, github_artifact_id, github_artifact_zip, dirty_waiver_opt,
+    adopted_by, mandatory,
 ):
     """Release gate: obtain/generate CaleeMobile selector evidence for the EXACT
     release build, validate it, and record it under this run BEFORE any mobile
@@ -1282,7 +1310,8 @@ def selector_contract_cmd(
     except release_platforms.ReleasePlatformsError:
         eff_production = bool(production_opt)
 
-    def _finish(status, detail, problems, evidence, source_label, provenance=None):
+    def _finish(status, detail, problems, evidence, source_label, provenance=None,
+                raw_result_bytes=None, raw_zip_bytes=None):
         report = {
             "component": "caleemobile-selector-contract-gate",
             "releaseRunId": run_id,
@@ -1295,30 +1324,39 @@ def selector_contract_cmd(
             "source": source_label,
             "detail": list(detail),
             "problems": list(problems),
-            # The evidence used for build-identity verification. This is the
-            # source artifact preserved byte-for-byte -- the gate never mutates
-            # a source artifact's own provenance (Problem B).
+            # The evidence used for build-identity verification -- the parsed
+            # (semantic) view of the source artifact. The gate never mutates a
+            # source artifact's own provenance (Problem B). The exact source
+            # bytes are preserved separately in the evidence bundle below.
             "evidence": evidence,
-            # Immutable source provenance + release adoption (Problem B). When
-            # present, consolidation re-verifies its content digest and rules.
+            # Immutable source provenance + release adoption (Problem B/P3). When
+            # present, consolidation re-verifies its envelope + content digests
+            # and rules.
             "provenance": provenance,
             "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        # Also write the raw source evidence under a clear filename so the
-        # release bundle can retain it as a downloadable artifact
-        # (evidence/selector-contract-result.json) rather than a generic name.
+        # Also write the semantic source evidence under a clear filename (kept
+        # for backward compatibility with existing consumers).
         if evidence is not None:
             (component_dir / "selector-contract-result.json").write_text(
                 json.dumps(evidence, indent=2) + "\n", encoding="utf-8"
             )
-        # Retain the immutable provenance record (source + adoption + digest +
-        # any local toolchain verification) alongside it, so the bundle carries
-        # both the original evidence and how it was adopted (Problem B).
         if provenance is not None:
             (component_dir / "selector-contract-provenance.json").write_text(
                 json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
             )
+            # Priority 3 evidence bundle: raw ZIP + raw JSON bytes (unmodified),
+            # their raw-byte sha256 sidecars, and the envelope-protected
+            # provenance.json. Written only when the raw source bytes exist (the
+            # GitHub artifact chain); local generation has no source ZIP.
+            try:
+                selector_provenance_mod.write_evidence_bundle(
+                    component_dir, provenance,
+                    result_bytes=raw_result_bytes, zip_bytes=raw_zip_bytes,
+                )
+            except Exception:  # noqa: BLE001 - the report file is authoritative
+                pass
         exit_code = EXIT_SUCCESS if status == "passed" else EXIT_BLOCKED
         try:
             manifest = _load_or_init_manifest(workspace)
@@ -1362,17 +1400,61 @@ def selector_contract_cmd(
             None, "unresolved",
         )
 
-    # 2. Obtain evidence: adopt a provided CI artifact, else generate locally
-    #    (development only). The required Flutter version below is what the
-    #    toolchain must ACTUALLY report -- it is never recorded on the toolchain's
-    #    behalf (Problem A).
+    # 2. Obtain evidence. Policy (Priority 2):
+    #    * PRODUCTION accepts ONLY the GitHub artifact authenticity chain
+    #      (--github-run-id + --github-artifact-id [+ --github-artifact-zip]). A
+    #      bare --source JSON -- even one self-declaring generatedBy='ci' with a
+    #      workflowRunId -- is REFUSED: any file can claim that; only GitHub's own
+    #      run/job/artifact record and the artifact digest are proof.
+    #    * DEVELOPMENT: the GitHub chain if given, else an adopted --source
+    #      artifact, else a fresh local generation (real toolchain verified).
+    #    The required Flutter version below is what the toolchain must ACTUALLY
+    #    report -- never recorded on the toolchain's behalf (Problem A).
     required_flutter = flutter_version_opt or selector_evidence_mod.EXPECTED_FLUTTER_VERSION
     adopted_by_label = adopted_by or "caleemobile-selector-contract-gate"
     adopted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     local_verification = None  # verified toolchain evidence, for local generation
+    raw_result_bytes = None    # exact source-result.json bytes (GitHub chain)
+    raw_zip_bytes = None       # exact source-artifact.zip bytes (GitHub chain)
+    use_github = bool(github_run_id or github_artifact_id or github_artifact_zip)
 
-    if source_path:
-        # --- Adopt a provided artifact (the ONLY path allowed in production) ---
+    if eff_production and not use_github:
+        _finish(
+            "blocked", [],
+            ["Production release accepts ONLY a CI-produced selector artifact authenticated "
+             "against GitHub (Priority 2): pass --github-run-id and --github-artifact-id "
+             "(optionally --github-artifact-zip). A bare --source JSON cannot be authenticated "
+             "-- any file can self-declare a CI-produced generatedBy='ci' with a workflowRunId "
+             "-- so it is refused for a production release."],
+            None, "production-requires-github-chain",
+        )
+
+    if use_github:
+        # --- Authenticate a GitHub-produced artifact (the ONLY production path) ---
+        source_label = f"github-artifact:{github_artifact_id or '?'}@run:{github_run_id or '?'}"
+        try:
+            chain = github_artifact_mod.acquire_github_artifact(
+                run_id=github_run_id,
+                artifact_id=github_artifact_id,
+                local_zip_path=github_artifact_zip,
+                expected_tested_sha=expected_sha,
+                expected_version=expected_version,
+            )
+        except github_artifact_mod.GithubArtifactError as exc:
+            # Missing credentials / unreadable metadata / malformed ZIP -> BLOCKED,
+            # naming the exact missing secret where that is the cause.
+            _finish("blocked", [], [str(exc)], None, source_label)
+        if not chain.ok:
+            _finish("blocked", [], list(chain.problems), chain.result, source_label)
+        source_evidence = chain.result
+        raw_result_bytes = chain.result_bytes
+        raw_zip_bytes = chain.zip_bytes
+        # Prefer GitHub's verified artifact identity for the provenance record.
+        if chain.artifact is not None:
+            source_artifact_id = source_artifact_id or chain.artifact.artifact_id
+            source_artifact_digest = source_artifact_digest or chain.artifact.digest
+    elif source_path:
+        # --- Adopt a provided artifact (development only) ---
         source_label = str(source_path)
         try:
             source_evidence = json.loads(Path(source_path).read_text(encoding="utf-8"))
@@ -1380,14 +1462,6 @@ def selector_contract_cmd(
             _finish("blocked", [], [f"Could not read selector evidence from {source_path}: {exc}"], None, source_label)
         if not isinstance(source_evidence, dict):
             _finish("blocked", [], [f"Selector evidence at {source_path} is not a JSON object."], None, source_label)
-        if eff_production and (source_evidence.get("generatedBy") or "").strip() != selector_provenance_mod.GENERATED_BY_CI:
-            _finish(
-                "blocked", [],
-                ["Production release accepts ONLY a CI-produced selector artifact "
-                 f"(generatedBy='ci'); this --source declares generatedBy="
-                 f"{source_evidence.get('generatedBy')!r}."],
-                source_evidence, source_label,
-            )
     else:
         # --- Generate locally (development fallback; refused in production) ----
         source_label = "local-generation"
@@ -1395,8 +1469,8 @@ def selector_contract_cmd(
             _finish(
                 "blocked", [],
                 ["Production release accepts ONLY a CI-produced selector artifact. Local "
-                 "generation cannot prove the release toolchain; provide the CI artifact "
-                 "via --source (generatedBy='ci' with a workflowRunId)."],
+                 "generation cannot prove the release toolchain; provide the GitHub-authenticated "
+                 "CI artifact via --github-run-id/--github-artifact-id."],
                 None, source_label,
             )
         reg_source = (
@@ -1424,6 +1498,7 @@ def selector_contract_cmd(
         # toolchain cannot be verified.
         tv = toolchain_verify_mod.verify_local_toolchain(
             cm_source, reg_source, expected_flutter_version=required_flutter,
+            dirty_waiver=dirty_waiver_opt,
         )
         local_verification = tv.to_dict()
         if not tv.ok:
@@ -1470,11 +1545,12 @@ def selector_contract_cmd(
                 None, source_label,
             )
 
-    # 3. Build the immutable source-provenance + adoption record (Problem B).
-    #    The source artifact is preserved byte-for-byte; a SHA-256 content
-    #    digest is computed and verified now (and re-verified at consolidation);
-    #    this run's adoption context is recorded SEPARATELY, never by overwriting
-    #    the source's own provenance fields.
+    # 3. Build the immutable source-provenance + adoption record (Problem B/P3).
+    #    The semantic evidence is preserved with a canonical content digest; when
+    #    the exact source bytes came from the GitHub chain, their raw-byte digests
+    #    are recorded too, and the whole envelope is digest-protected. This run's
+    #    adoption context is recorded SEPARATELY, never by overwriting the
+    #    source's own provenance fields.
     provenance = selector_provenance_mod.build_provenance_record(
         source_evidence,
         release_run_id=run_id,
@@ -1484,12 +1560,15 @@ def selector_contract_cmd(
         source_artifact_id=source_artifact_id,
         source_artifact_digest=source_artifact_digest,
         local_verification=local_verification,
+        raw_result_bytes=raw_result_bytes,
+        raw_zip_bytes=raw_zip_bytes,
     )
     prov_problems = selector_provenance_mod.validate_source_provenance(
         source_evidence, local_verification=local_verification,
     )
     if prov_problems:
-        _finish("blocked", [], prov_problems, source_evidence, source_label, provenance)
+        _finish("blocked", [], prov_problems, source_evidence, source_label, provenance,
+                raw_result_bytes, raw_zip_bytes)
 
     # 4. Validate: hardened schema + exact-build identity. Run provenance is
     #    enforced via the adoption record above, so build identity is verified
@@ -1497,7 +1576,8 @@ def selector_contract_cmd(
     try:
         result = selector_evidence_mod.parse_selector_contract_result(source_evidence)
     except selector_evidence_mod.SelectorEvidenceError as exc:
-        _finish("blocked", [], [f"Selector evidence is malformed: {exc}"], source_evidence, source_label, provenance)
+        _finish("blocked", [], [f"Selector evidence is malformed: {exc}"], source_evidence, source_label,
+                provenance, raw_result_bytes, raw_zip_bytes)
 
     verdict = selector_evidence_mod.verify_selector_contract_evidence(
         result,
@@ -1513,8 +1593,10 @@ def selector_contract_cmd(
             f"Flutter {result.flutter_version}). Evidence source: {source_label}; "
             f"adopted by {adopted_by_label} for run {run_id}."
         ]
-        _finish("passed", detail, verdict.problems, source_evidence, source_label, provenance)
-    _finish("blocked", [], verdict.problems, source_evidence, source_label, provenance)
+        _finish("passed", detail, verdict.problems, source_evidence, source_label, provenance,
+                raw_result_bytes, raw_zip_bytes)
+    _finish("blocked", [], verdict.problems, source_evidence, source_label, provenance,
+            raw_result_bytes, raw_zip_bytes)
 
 
 @main.command("build-identity")
@@ -2108,6 +2190,10 @@ def consolidate(
         sync_mandatory=sync_gating,
         selector_contract=selector_contract_report,
         selector_contract_mandatory=selector_contract_gating,
+        selector_contract_dir=(
+            str(workspace.component_dir("selector-contract"))
+            if selector_contract_report is not None else None
+        ),
         calee_build_version=calee_build_version,
         expected_calee_build_version=eff_expected_calee_build,
         caleemobile_build_version=caleemobile_build_version,
@@ -2144,9 +2230,21 @@ def consolidate(
         # original evidence and its adoption metadata travel with the bundle.
         provenance_evidence = selector_dir / "selector-contract-provenance.json"
         selector_report_path = workspace.component_report_path("selector-contract")
-        for candidate in (raw_evidence, provenance_evidence, selector_report_path):
+        # Priority 3 evidence bundle: the exact source ZIP + JSON bytes, their
+        # raw-byte sha256 sidecars, and the envelope-protected provenance.json.
+        p3_bundle = [
+            selector_dir / name for name in (
+                "source-artifact.zip", "source-result.json",
+                "source-result.sha256", "source-artifact.sha256", "provenance.json",
+            )
+        ]
+        for candidate in (raw_evidence, provenance_evidence, selector_report_path, *p3_bundle):
             if candidate.is_file():
                 evidence_paths.append(candidate)
+    # Priority 5.9: row-scoped runtime diagnostics (screenshots + page sources)
+    # captured by the tablet/mobile UI runs travel into the release ZIP too.
+    for ui_report in (tablet, mobile_android, mobile_ios):
+        evidence_paths.extend(collect_step_diagnostic_paths(ui_report))
     bundle_path = write_release_bundle(
         report, out, build_label=build_version, evidence_paths=evidence_paths or None
     )

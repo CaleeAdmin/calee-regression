@@ -19,14 +19,20 @@ class LaunchError(Exception):
 class RowAmbiguityError(LookupError):
     """A PERMANENT row-scoping ambiguity: more than one row matches the exact
     title, or a resolved row has more than one matching descendant. Never
-    retried -- acting on any one of them could mutate the wrong fixture."""
+    retried -- acting on any one of them could mutate the wrong fixture. Carries
+    the diagnostic capture so the ambiguity is visible in the evidence bundle."""
+
+    def __init__(self, message: str, resolution: "RowResolution | None" = None):
+        super().__init__(message)
+        self.resolution = resolution
 
 
 class RowResolutionError(LookupError):
     """The row (or its descendant) could not be resolved within the bounded
     retry/scroll budget: a temporary zero-row / missing-descendant / stale-element
-    condition that never settled, or the row is simply not present. Carries the
-    diagnostic capture (screenshot + page source) and attempt/scroll metrics."""
+    condition that never settled, a stale-at-click that never bound, or the row
+    is simply not present. Carries the diagnostic capture (screenshot + page
+    source) and attempt/scroll metrics."""
 
     def __init__(self, message: str, resolution: "RowResolution | None" = None):
         super().__init__(message)
@@ -47,11 +53,20 @@ class RowResolution:
     screenshot_path: "str | None" = None
     page_source_path: "str | None" = None
     problem: "str | None" = None
+    # Priority 5 runtime-safety metrics.
+    scroll_directions: "list[str]" = field(default_factory=list)  # e.g. ["down","up"]
+    scroll_exhausted: bool = False   # both directions made no further progress
+    stale_at_click: bool = False     # element went stale between resolve and click
+    click_attempts: int = 0          # how many re-resolve+click cycles were needed
 
     def to_dict(self) -> dict:
         return {
             "attempts": self.attempts,
             "scrolls": self.scrolls,
+            "scrollDirections": list(self.scroll_directions),
+            "scrollExhausted": self.scroll_exhausted,
+            "staleAtClick": self.stale_at_click,
+            "clickAttempts": self.click_attempts,
             "elapsedSeconds": round(self.elapsed_seconds, 3),
             "matchedRows": self.matched_rows,
             "screenshotPath": self.screenshot_path,
@@ -140,6 +155,10 @@ class CaleeDriver:
         self.row_max_attempts = 5      # bounded retries for transient conditions
         self.row_retry_interval = 0.4  # seconds between attempts
         self.row_max_swipes = 3        # RecyclerView scroll-to-row attempts
+        # Bounded re-resolve+click cycles when the element goes stale between
+        # resolution and .click() (Priority 5). Each cycle RE-RESOLVES the exact
+        # row -- a previously resolved stale element is never clicked.
+        self.row_click_max_retries = 3
         # Where final-failure diagnostics (screenshot + page source) are written.
         # The runner points this at the run workspace; None -> a temp dir.
         self.diagnostics_dir = None
@@ -335,31 +354,65 @@ class CaleeDriver:
         # Relative XPath (leading dot) -> search only within this row's subtree.
         return row.find_elements(AppiumBy.XPATH, f".//*[@resource-id='{target_id}']")
 
-    def _swipe_up_once(self) -> None:
-        """Best-effort RecyclerView scroll: swipe up so a row below the fold
-        comes into view. Uses the W3C touch API; any failure is swallowed (the
-        resolver treats a scroll that changed nothing as simply "no new rows").
-        """
+    def _page_fingerprint(self) -> "str | None":
+        """A cheap fingerprint of the current screen, used to detect a scroll
+        that revealed nothing new (Priority 5.5). Length+hash of the page source;
+        None if it can't be read (then progress can't be disproven, so the caller
+        does not treat it as "no progress")."""
+        import hashlib
+
+        try:
+            source = self.driver.page_source or ""
+        except Exception:
+            return None
+        return f"{len(source)}:{hashlib.md5(source.encode('utf-8', 'replace')).hexdigest()}"
+
+    def _swipe(self, direction: str = "down") -> None:
+        """Best-effort RecyclerView scroll in ``direction`` (Priority 5.4):
+
+          * ``"down"`` -- reveal rows BELOW the fold (finger swipes up);
+          * ``"up"``   -- reveal rows ABOVE the fold (finger swipes down).
+
+        Uses the W3C swipe API, falling back to UiAutomator2's ``mobile:
+        scrollGesture``. Any failure is swallowed (a scroll that changed nothing
+        is detected separately via the page fingerprint)."""
         try:
             size = self.driver.get_window_size()
             width, height = size["width"], size["height"]
         except Exception:
             width, height = 1000, 1600
         start_x = int(width * 0.5)
-        start_y = int(height * 0.75)
-        end_y = int(height * 0.25)
+        if direction == "up":
+            start_y, end_y = int(height * 0.25), int(height * 0.75)
+            gesture_dir = "up"
+        else:
+            start_y, end_y = int(height * 0.75), int(height * 0.25)
+            gesture_dir = "down"
         try:
-            # Prefer UiAutomator2's mobile scroll gesture; fall back to swipe.
             self.driver.swipe(start_x, start_y, start_x, end_y, 400)
         except Exception:
             try:
+                top = min(start_y, end_y)
                 self.driver.execute_script(
                     "mobile: scrollGesture",
-                    {"left": start_x - 5, "top": end_y, "width": 10,
-                     "height": start_y - end_y, "direction": "down", "percent": 0.8},
+                    {"left": start_x - 5, "top": top, "width": 10,
+                     "height": abs(start_y - end_y), "direction": gesture_dir, "percent": 0.8},
                 )
             except Exception:
                 pass
+
+    def _swipe_up_once(self) -> None:
+        """Backwards-compatible alias: scroll to reveal rows below the fold."""
+        self._swipe("down")
+
+    @staticmethod
+    def _is_stale_exception(exc: Exception) -> bool:
+        """True when ``exc`` is a stale-element condition (the element was valid
+        when resolved but its node was recycled before use). Matched by type name
+        so it works whether Selenium's StaleElementReferenceException is raised or
+        a UiAutomator2 'stale' driver error surfaces as a generic exception."""
+        name = type(exc).__name__.lower()
+        return "stale" in name or "stale" in str(exc).lower()
 
     def _capture_diagnostics(self, label: str) -> "tuple[str | None, str | None]":
         """On a final failure, capture a screenshot + page source so a human can
@@ -421,6 +474,14 @@ class CaleeDriver:
         attempts = 0
         scrolls = 0
         last_problem = None
+        last_matched_rows = 0
+        # Bidirectional scroll state (Priority 5.4-5.5): scan down first, switch
+        # to up when a scroll reveals nothing new, and stop scrolling once BOTH
+        # directions make no progress (the list can't move any further).
+        scroll_dir = "down"
+        scroll_directions: "list[str]" = []
+        stuck_dirs: "set[str]" = set()
+        scroll_exhausted = False
         for attempt in range(1, max(1, max_attempts) + 1):
             attempts = attempt
             try:
@@ -432,43 +493,78 @@ class CaleeDriver:
                         f"{len(rows)} {card_id!r} rows match title {title!r} exactly"
                         + (f" (via {title_id!r})" if title_id else "")
                         + " -- ambiguous. Row-scoped actions require exactly one match; use a unique "
-                        "fixture title (e.g. a REG-* id)."
+                        "fixture title (e.g. a REG-* id).",
+                        RowResolution(
+                            attempts=attempts, scrolls=scrolls, matched_rows=len(rows),
+                            elapsed_seconds=time.monotonic() - start,
+                            scroll_directions=list(scroll_directions),
+                            screenshot_path=shot, page_source_path=src,
+                            problem=f"{len(rows)} rows match title {title!r} exactly",
+                        ),
                     )
                 if len(rows) == 1:
+                    last_matched_rows = 1
                     descendants = self._find_row_descendants(rows[0], descendant_id)
                     if len(descendants) > 1:
-                        self._capture_diagnostics(f"ambiguous-descendant-{title}")
+                        shot, src = self._capture_diagnostics(f"ambiguous-descendant-{title}")
                         raise RowAmbiguityError(
                             f"Row {title!r} ({card_id!r}) has {len(descendants)} descendants "
-                            f"{descendant_id!r} -- ambiguous."
+                            f"{descendant_id!r} -- ambiguous.",
+                            RowResolution(
+                                attempts=attempts, scrolls=scrolls, matched_rows=1,
+                                elapsed_seconds=time.monotonic() - start,
+                                scroll_directions=list(scroll_directions),
+                                screenshot_path=shot, page_source_path=src,
+                                problem=f"{len(descendants)} descendants {descendant_id!r} in row {title!r}",
+                            ),
                         )
                     if len(descendants) == 1:
                         return RowResolution(
                             element=descendants[0], attempts=attempts, scrolls=scrolls,
                             elapsed_seconds=time.monotonic() - start, matched_rows=1,
+                            scroll_directions=list(scroll_directions),
+                            scroll_exhausted=scroll_exhausted,
                         )
                     last_problem = f"row {title!r} present but descendant {descendant_id!r} not bound yet"
                 else:
+                    last_matched_rows = 0
                     last_problem = f"no {card_id!r} row with exact title {title!r} visible yet"
             except RowAmbiguityError:
                 raise
             except Exception as exc:  # StaleElementReference et al. mid-rebind
                 last_problem = f"transient driver error: {exc}"
 
-            # Not resolved this attempt: scroll a row into view (bounded), then
-            # wait for the rebind to settle before retrying.
-            if scrolls < max_swipes:
-                self._swipe_up_once()
+            # Not resolved this attempt: scroll a row into view (bounded), with
+            # no-progress detection so we don't keep swiping a list that can't
+            # move, and switch direction to scan the other way.
+            if scrolls < max_swipes and not scroll_exhausted:
+                before = self._page_fingerprint()
+                self._swipe(scroll_dir)
                 scrolls += 1
+                scroll_directions.append(scroll_dir)
+                after = self._page_fingerprint()
+                made_progress = before is None or after is None or before != after
+                if made_progress:
+                    stuck_dirs.discard(scroll_dir)
+                else:
+                    # This direction revealed nothing; remember it and look the
+                    # other way. When BOTH directions are stuck, stop scrolling.
+                    stuck_dirs.add(scroll_dir)
+                    scroll_dir = "up" if scroll_dir == "down" else "down"
+                    if {"down", "up"} <= stuck_dirs:
+                        scroll_exhausted = True
             if attempt < max_attempts and retry_interval:
                 time.sleep(retry_interval)
 
         # Exhausted the budget: capture diagnostics and fail with metrics.
         shot, src = self._capture_diagnostics(f"unresolved-{card_id}-{title}")
+        if scroll_exhausted and last_matched_rows == 0:
+            last_problem = (last_problem or "") + " (scroll exhausted: the list could not be scrolled further in either direction)"
         resolution = RowResolution(
             element=None, attempts=attempts, scrolls=scrolls,
-            elapsed_seconds=time.monotonic() - start, matched_rows=0,
+            elapsed_seconds=time.monotonic() - start, matched_rows=last_matched_rows,
             screenshot_path=shot, page_source_path=src, problem=last_problem,
+            scroll_directions=list(scroll_directions), scroll_exhausted=scroll_exhausted,
         )
         raise RowResolutionError(
             f"Could not resolve {descendant_id!r} in the {title!r} {card_id!r} row after "
@@ -478,10 +574,50 @@ class CaleeDriver:
 
     def tap_in_row(
         self, card_id: str, title: str, descendant_id: str, *, title_id: "str | None" = None,
+        max_click_retries: "int | None" = None,
     ) -> RowResolution:
-        resolution = self.resolve_row_target(card_id, title, descendant_id, title_id=title_id)
-        resolution.element.click()
-        return resolution
+        """Resolve the row's descendant and click it, retrying a stale-at-click
+        (Priority 5.1-5.3): if the element is recycled between resolution and
+        ``.click()``, RE-RESOLVE the exact row from scratch and click the FRESH
+        element -- a previously resolved stale element is never re-clicked.
+        """
+        retries = self.row_click_max_retries if max_click_retries is None else max_click_retries
+        retries = max(1, retries)
+        last_exc: "Exception | None" = None
+        saw_stale = False
+        for click_attempt in range(1, retries + 1):
+            resolution = self.resolve_row_target(card_id, title, descendant_id, title_id=title_id)
+            resolution.click_attempts = click_attempt
+            # Carry forward that an earlier click went stale, so the returned
+            # (successful) resolution still records the retry happened.
+            resolution.stale_at_click = saw_stale
+            try:
+                resolution.element.click()
+                return resolution
+            except Exception as exc:  # noqa: BLE001
+                if not self._is_stale_exception(exc):
+                    raise
+                # Stale between resolve and click: discard this element, loop to
+                # RE-RESOLVE. Never click the stale element again.
+                last_exc = exc
+                saw_stale = True
+                resolution.stale_at_click = True
+                if click_attempt < retries and self.row_retry_interval:
+                    time.sleep(self.row_retry_interval)
+
+        # Every re-resolve produced an element that went stale before the click
+        # landed: capture diagnostics and fail with the stale-at-click metric.
+        shot, src = self._capture_diagnostics(f"stale-at-click-{card_id}-{title}")
+        resolution = RowResolution(
+            element=None, attempts=retries, matched_rows=1, stale_at_click=True,
+            click_attempts=retries, screenshot_path=shot, page_source_path=src,
+            problem=f"element went stale at click after {retries} re-resolve(s): {last_exc}",
+        )
+        raise RowResolutionError(
+            f"Row {title!r} ({card_id!r}) descendant {descendant_id!r} went stale at click "
+            f"after {retries} re-resolve(s): {last_exc}.",
+            resolution,
+        )
 
     def id_present_in_row(
         self, card_id: str, title: str, descendant_id: str, *, title_id: "str | None" = None,

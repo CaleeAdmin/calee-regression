@@ -156,3 +156,105 @@ def test_to_dict_is_json_serializable(tmp_path):
     )
     # Must round-trip through JSON (it is embedded in the gate report).
     json.dumps(result.to_dict())
+
+
+# --- Priority 4: local-evidence hardening -----------------------------------
+
+_ALL_PASS = {
+    "--version --machine": (0, _machine_json("3.44.1", "3.5.0")),
+    "pub get": (0, ""), "analyze": (0, ""), "unittest": (0, ""),
+}
+
+
+def test_blocks_when_source_not_a_git_repo(tmp_path):
+    result = tv.verify_local_toolchain(
+        _cm(tmp_path), _reg(tmp_path),
+        which=lambda name: "/usr/bin/flutter", runner=_fake_runner(_ALL_PASS),
+        git_sha=lambda p: None,  # not a git repo / no HEAD
+        is_clean=lambda p: (True, []),
+    )
+    assert result.ok is False
+    assert any("not a Git repository" in p for p in result.problems)
+
+
+def test_blocks_on_abbreviated_head_sha(tmp_path):
+    result = tv.verify_local_toolchain(
+        _cm(tmp_path), _reg(tmp_path),
+        which=lambda name: "/usr/bin/flutter", runner=_fake_runner(_ALL_PASS),
+        git_sha=lambda p: "abc1234",  # abbreviated
+        is_clean=lambda p: (True, []),
+    )
+    assert result.ok is False
+    assert any("full 40-character Git SHA" in p for p in result.problems)
+
+
+def test_blocks_on_dirty_worktree_without_waiver(tmp_path):
+    result = tv.verify_local_toolchain(
+        _cm(tmp_path), _reg(tmp_path),
+        which=lambda name: "/usr/bin/flutter", runner=_fake_runner(_ALL_PASS),
+        git_sha=lambda p: "a" * 40,
+        is_clean=lambda p: (False, [" M lib/foo.dart"]) if p.name == "CaleeMobile" else (True, []),
+    )
+    assert result.ok is False
+    assert any("worktree(s) are dirty" in p for p in result.problems)
+
+
+def test_dirty_worktree_allowed_with_named_waiver(tmp_path):
+    result = tv.verify_local_toolchain(
+        _cm(tmp_path), _reg(tmp_path),
+        dirty_waiver="LOCAL-DEV-2026-07-18: verifying an in-progress selector fix",
+        which=lambda name: "/usr/bin/flutter", runner=_fake_runner(_ALL_PASS),
+        git_sha=lambda p: "a" * 40,
+        is_clean=lambda p: (False, [" M lib/foo.dart"]) if p.name == "CaleeMobile" else (True, []),
+    )
+    assert result.ok is True, result.problems
+    assert result.dirty_sources == ["CaleeMobile"]
+    assert "LOCAL-DEV-2026-07-18" in result.dirty_waiver
+
+
+def test_analyze_uses_fatal_infos(tmp_path):
+    captured = {}
+
+    def runner(argv, **kwargs):
+        joined = " ".join(argv)
+        if "analyze" in joined:
+            captured["analyze_argv"] = list(argv)
+        for key, (rc, out) in _ALL_PASS.items():
+            if key in joined:
+                return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    tv.verify_local_toolchain(
+        _cm(tmp_path), _reg(tmp_path),
+        which=lambda name: "/usr/bin/flutter", runner=runner,
+        git_sha=lambda p: "a" * 40, is_clean=lambda p: (True, []),
+    )
+    assert "--fatal-infos" in captured["analyze_argv"]
+
+
+def test_record_digest_protects_the_record(tmp_path):
+    result = tv.verify_local_toolchain(
+        _cm(tmp_path), _reg(tmp_path),
+        which=lambda name: "/usr/bin/flutter", runner=_fake_runner(_ALL_PASS),
+        git_sha=lambda p: "a" * 40, is_clean=lambda p: (True, []),
+    )
+    record = result.to_dict()
+    assert record["recordDigest"].startswith("sha256:")
+    assert tv.verify_toolchain_record(record) == []
+    # Tamper an attested field -> digest mismatch BLOCKS.
+    record["flutterVersion"] = "9.9.9"
+    problems = tv.verify_toolchain_record(record)
+    assert any("record digest mismatch" in p for p in problems)
+
+
+def test_records_exact_verified_source_shas(tmp_path):
+    result = tv.verify_local_toolchain(
+        _cm(tmp_path), _reg(tmp_path),
+        which=lambda name: "/usr/bin/flutter", runner=_fake_runner(_ALL_PASS),
+        git_sha=lambda p: ("a" * 40) if p.name == "CaleeMobile" else ("b" * 40),
+        is_clean=lambda p: (True, []),
+    )
+    assert result.ok is True, result.problems
+    d = result.to_dict()
+    assert d["caleemobileSha"] == "a" * 40
+    assert d["regressionSha"] == "b" * 40
