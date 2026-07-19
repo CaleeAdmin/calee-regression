@@ -1,0 +1,162 @@
+name: calee-calendar-appearance-external
+tags: [calendar, appearance, external, tablet, draft-unverified, source-confirmed]
+requires_state: logged_in_tablet
+default_timeout_seconds: 20
+mandatory: false
+# SOURCE-CONFIRMED, PHYSICAL-UNVERIFIED.
+#
+# Proves the tablet side of the calendar appearance contract (Calee PR
+# CaleeAdmin/Calee#978, commit a9c78199c7b24265525c1d303ce280b3633418eb) for
+# an EXTERNAL (Google-connected) calendar, appearanceMode "external_calendar":
+#
+#  1. capabilities.canEditAppearance is true for an external calendar, so
+#     ivEdit is visible/tappable and the edit dialog opens with the
+#     "local display only" appearance note (same string as subscriptions).
+#  2. DESTRUCTIVE-ACTION REGRESSION GUARD (the reason this file exists):
+#     the dialog must NOT offer any destructive control for an external
+#     calendar. The pre-#978 dialog showed the old "Delete Calendar" action
+#     whenever the global create/delete setting was on; for an external
+#     calendar that action targeted the CalDAV source-delete endpoint,
+#     which rejects external: ids -- a button that could only fail.
+#     HubCalendarDestructiveActions.resolve() now returns NONE for
+#     appearanceMode external_calendar even when canRemoveFromCalee=true,
+#     because no supported tablet removal route exists yet (documented
+#     limitation -- see docs/CALENDAR_APPEARANCE_REGRESSION.md).
+#     btnCollectionDelete is asserted ABSENT here regardless of the global
+#     setting: with the setting on, the capability policy hides it; with
+#     the setting off, everything destructive is hidden anyway.
+#
+# Single-device-observable by design; never saves (closes via Cancel).
+# Cross-device partial-update coverage lives in
+# run_partial_appearance_override_flow (calee_regression/sync_smoke.py).
+#
+# PREREQUISITES (why this stays gated even once physically confirmed):
+#  1. FIXTURE GAP: needs an external Google calendar connected to the
+#     regression account. No such fixture exists in this repo yet --
+#     proposed as REG-EXTERNAL-GOOGLE-CALENDAR-001 (a dedicated calendar in
+#     a regression-owned Google account, connected via the hub's external
+#     calendar connection flow). BLOCKED on provisioning.
+#  2. Same navigation-rail expansion mechanism and ROW-SCOPING GAP as
+#     calendar_appearance_subscription.yaml -- ivEdit is targeted by bare
+#     id, correct only while a single editable calendar row is on screen.
+#  3. Colour is never asserted visually (no colour-reading primitive in
+#     CaleeDriver).
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llCalendar
+    timeout_seconds: 20
+
+  - name: Open Calendar
+    action: tap
+    id: llCalendar
+
+  - name: Wait for the calendar toolbar to render
+    action: wait_for_id
+    id: btnAddEvent
+    timeout_seconds: 10
+
+  - name: Expand the navigation rail if it is currently collapsed
+    action: tap_if_absent
+    unless_id: llDay
+    id: ivExpand
+
+  - name: Assert the navigation rail (and its calendar list) is now expanded
+    action: wait_for_id
+    id: llDay
+    timeout_seconds: 10
+
+  - name: The external Google calendar row is visible in the calendar list
+    action: wait_for_text
+    text: REG-EXT Google Calendar
+    timeout_seconds: 20
+
+  - name: Capture the calendar list with the external row
+    action: screenshot
+    screenshot_name: 00_calendar_list_external_row
+    compare: false
+
+  - name: Edit is available for an external calendar (canEditAppearance)
+    action: assert_id
+    id: ivEdit
+
+  - name: Open the edit dialog for the external calendar
+    action: tap
+    id: ivEdit
+
+  - name: Wait for the edit dialog to render
+    action: wait_for_id
+    id: tvCollectionTitle
+    timeout_seconds: 10
+
+  - name: Name input is present
+    action: assert_id
+    id: etCollectionName
+
+  - name: Appearance note is present for an external (local-display-only) calendar
+    action: assert_id
+    id: tvCollectionAppearanceNote
+
+  - name: Appearance note explains this only affects the Calee-local display
+    action: assert_text
+    text: These changes only affect how this calendar appears in Calee.
+
+  - name: Save control is present
+    action: assert_id
+    id: btnCollectionSave
+
+  - name: Cancel control is present
+    action: assert_id
+    id: btnCollectionCancel
+
+  - name: No destructive control is offered for an external calendar
+    action: fail_if_id
+    id: btnCollectionDelete
+
+  - name: The broken source-delete wording never appears
+    action: fail_if_text
+    texts: ["Delete Calendar"]
+
+  - name: Capture the external calendar's edit dialog
+    action: screenshot
+    screenshot_name: 01_edit_dialog_external
+    compare: false
+
+  - name: Close the dialog without saving (never mutate the fixture)
+    action: tap
+    id: btnCollectionCancel
+
+  - name: Assert no crash/error dialog is showing
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]
+
+source_verification:
+  calee_source: CaleeAdmin/Calee
+  calee_source_sha: "a9c78199c7b24265525c1d303ce280b3633418eb"
+  calee_source_ref: "PR CaleeAdmin/Calee#978, branch claude/calendar-appearance-regressions-n5hrnw (based on latest dev)"
+  status: source-confirmed
+  physical_confirmation: pending
+  contract:
+    - "ivEdit VISIBLE+clickable iff capabilities.canEditAppearance == true, else INVISIBLE (CalendarFragment.kt)"
+    - "HubCalendarEditDialog.tvCollectionAppearanceNote text is keyed off appearanceMode; subscription_mapping/external_calendar -> hub_calendar_appearance_note_local_only"
+    - "HubCalendarDestructiveActions.resolve() returns NONE for appearanceMode external_calendar regardless of canRemoveFromCalee and the global setting -> dividerCollectionDelete and btnCollectionDelete GONE (HubCalendarEditDialog.kt)"
+    - "The pre-#978 failure mode this guards against: DELETE /client/v1/calendars/{id} rejects external: ids (calee-hub-core requires a nextcloud_calendar service), so any Delete button shown for an external calendar could only fail"
+  selectors:
+    ivEdit: app/src/main/res/layout/item_calendar_navigation_list.xml
+    tvCollectionTitle: app/src/main/res/layout/dialog_hub_collection_manage.xml
+    etCollectionName: app/src/main/res/layout/dialog_hub_collection_manage.xml
+    tvCollectionAppearanceNote: app/src/main/res/layout/dialog_hub_collection_manage.xml
+    btnCollectionSave: app/src/main/res/layout/dialog_hub_collection_manage.xml
+    btnCollectionCancel: app/src/main/res/layout/dialog_hub_collection_manage.xml
+    btnCollectionDelete: app/src/main/res/layout/dialog_hub_collection_manage.xml
+  fixture:
+    source: "PROPOSED, not yet implemented -- see docs/CALENDAR_APPEARANCE_REGRESSION.md"
+    calendarId: "external:<server-assigned>"
+    calendarDisplayName: "REG-EXT Google Calendar"
+  notes:
+    - "Needs a REG-EXTERNAL-GOOGLE-CALENDAR-001 fixture (external Google calendar connected to the regression account) that does not exist yet -- BLOCKED on provisioning, in addition to the device/backend gates every draft scenario here carries."
+    - "btnCollectionDelete absence is asserted regardless of the global create/delete setting: the capability policy hides it for external calendars even when the setting is on."
+    - "Row-scoping gap and colour-assertion gap as in calendar_appearance_subscription.yaml."

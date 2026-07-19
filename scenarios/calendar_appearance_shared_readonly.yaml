@@ -130,8 +130,8 @@ steps:
 
 source_verification:
   calee_source: CaleeAdmin/Calee
-  calee_source_sha: "f1b92ddae9275cb0abea0f6df34126930e3aa71d"
-  calee_source_ref: "PR CaleeAdmin/Calee#977, branch claude/calendar-name-colour-editing-balgeo (based on latest dev)"
+  calee_source_sha: "a9c78199c7b24265525c1d303ce280b3633418eb"
+  calee_source_ref: "PR CaleeAdmin/Calee#978, branch claude/calendar-appearance-regressions-n5hrnw (based on latest dev; supersedes the #977-era confirmation)"
   status: source-confirmed
   physical_confirmation: pending
   contract:

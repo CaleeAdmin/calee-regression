@@ -54,6 +54,7 @@ SCENARIO_GROUPS = {
         "scenarios/calendar_appearance_subscription.yaml",
         "scenarios/calendar_appearance_owned.yaml",
         "scenarios/calendar_appearance_shared_readonly.yaml",
+        "scenarios/calendar_appearance_external.yaml",
     ],
 }
 

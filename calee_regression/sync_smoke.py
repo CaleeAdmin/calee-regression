@@ -68,6 +68,15 @@ COLOR_ASSERTION_GAP_DETAIL = (
     "docs/CALENDAR_APPEARANCE_REGRESSION.md. Not attempted."
 )
 
+SOURCE_SIMULATION_NOT_WIRED_DETAIL = (
+    "Simulating an upstream source rename/recolour needs fixture plumbing that does not exist "
+    "yet: rewriting the regression-owned REG-SUB ICS feed (X-WR-CALNAME / colour) or renaming a "
+    "connected Google calendar in a regression-owned Google account, then re-serving it to the "
+    "hub. Neither fixture mechanism exists in this repo today -- see "
+    "docs/CALENDAR_APPEARANCE_REGRESSION.md. The orchestration logic is fully exercised with "
+    "fakes in framework_tests/test_sync_smoke.py. Not attempted."
+)
+
 APPEARANCE_API_NOT_WIRED_DETAIL = (
     "build_real_environment() does not wire this leg yet -- it needs new CaleeMobile-Regression "
     "API actions (set-calendar-appearance / get-calendar / trigger-calendar-refresh) that do not "
@@ -161,6 +170,14 @@ class SyncSmokeEnvironment:
     api_set_calendar_appearance: "Callable[[str, dict], dict] | None" = None  # (calendar_id, {field: value}) -> updated calendar
     api_get_calendar: "Callable[[str], dict] | None" = None  # calendar_id -> calendar dict (name/color/sourceName/capabilities/...)
     api_trigger_calendar_refresh: "Callable[[str], dict] | None" = None  # calendar_id -> refresh result
+    # Upstream-source mutation simulators (run_partial_appearance_override_flow).
+    # Optional and default None: a real implementation must actually change the
+    # fixture's upstream source (rewrite the REG-SUB ICS feed's X-WR-CALNAME /
+    # calendar colour, or rename the connected Google calendar) -- fixture
+    # plumbing that does not exist yet (see SOURCE_SIMULATION_NOT_WIRED_DETAIL).
+    # When None, the dependent steps record BLOCKED honestly instead of raising.
+    api_simulate_source_rename: "Callable[[str, str], dict] | None" = None  # (calendar_id, new_source_name) -> result
+    api_simulate_source_color_change: "Callable[[str, str], dict] | None" = None  # (calendar_id, new_source_color) -> result
 
 
 def _now() -> str:
@@ -817,6 +834,313 @@ def run_calendar_appearance_sync_flow(
     return SyncFlowResult(flow="calendar-appearance-sync", steps=steps, started_at=started, finished_at=_now())
 
 
+def run_partial_appearance_override_flow(
+    env: SyncSmokeEnvironment,
+    *,
+    # NOT the shared regression:regsub fixture: run_calendar_appearance_sync_flow
+    # (which run_all_sync_flows executes first) deliberately renames that
+    # calendar, and this flow's precondition is a calendar with NO local name
+    # override. Proposed dedicated fixture: REG-SUB-PARTIAL, a second
+    # regression-owned subscription feed -- see
+    # docs/CALENDAR_APPEARANCE_REGRESSION.md (BLOCKED on provisioning, like
+    # every appearance API leg today).
+    calendar_id: str = "regression:regsub-partial",
+    run_id: str = "adhoc",
+    override_color: str = "#FF9500",
+    source_color_change: str = "#00A878",
+    timeout_seconds: float = 60.0,
+    interval_seconds: float = 2.0,
+) -> SyncFlowResult:
+    """Partial-update (changed-fields-only) contract for the appearance
+    endpoint, cross-device: a colour-only edit must create NO local name
+    override (a later upstream source rename must still flow through to the
+    API surface and the tablet, while the local colour override remains),
+    and a name-only edit must leave the existing colour override untouched
+    even across an upstream source colour change.
+
+    The payload-shape half of the rule ("a colour-only edit's PATCH body
+    omits `name`") is expressed structurally: every api_set_calendar_appearance
+    call below passes exactly the changed field and nothing else, and
+    framework_tests/test_sync_smoke.py asserts the recorded payloads contain
+    only those keys — plus an adversarial test proving a backend that
+    back-fills omitted fields makes this flow FAIL.
+
+    The complementary "name-only edit with NO pre-existing colour override
+    keeps tracking the source colour" case needs a second pristine fixture
+    calendar and is instead pinned at persistence level in calee-hub-core
+    (calendar_appearance_update_test.php tests 18-24) and in
+    CaleeMobile-Regression's fake-server contract tests — see
+    docs/CALENDAR_APPEARANCE_REGRESSION.md.
+
+    Same wiring caveats as run_calendar_appearance_sync_flow: the appearance
+    API callables are optional (BLOCKED when None), and the two upstream-
+    source simulators are additionally fixture-gated
+    (SOURCE_SIMULATION_NOT_WIRED_DETAIL) — no step is ever faked as passing.
+    """
+    flow_name = "calendar-appearance-partial-override"
+    steps: list = []
+    started = _now()
+    new_source_name = f"REG-PARTIAL-SOURCE-RENAME-{run_id}"
+    local_name = f"REG-PARTIAL-LOCAL-NAME-{run_id}"
+
+    def _finish() -> SyncFlowResult:
+        return SyncFlowResult(flow=flow_name, steps=steps, started_at=started, finished_at=_now())
+
+    def _blocked(step: str, surface: str, expected: str, detail: str) -> None:
+        steps.append(
+            SyncStepEvidence(step=step, surface=surface, status=STATUS_BLOCKED, expected_state=expected, detail=detail)
+        )
+
+    # 1. Baseline: the fixture must start with NO local name override, i.e.
+    # the effective name still tracks the provider's own sourceName.
+    if env.api_get_calendar is None:
+        _blocked(
+            "capture_baseline_via_api", "api",
+            f"a baseline GET of {calendar_id!r} with no pre-existing local name override",
+            APPEARANCE_API_NOT_WIRED_DETAIL,
+        )
+        return _finish()
+    try:
+        baseline = env.api_get_calendar(calendar_id)
+    except Exception as exc:
+        steps.append(
+            SyncStepEvidence(
+                step="capture_baseline_via_api", surface="api", status=STATUS_FAILED,
+                expected_state=f"a baseline GET of {calendar_id!r}", detail=str(exc),
+            )
+        )
+        return _finish()
+    no_override = baseline.get("name") == baseline.get("sourceName")
+    steps.append(
+        SyncStepEvidence(
+            step="verify_no_preexisting_name_override_via_api", surface="api",
+            status=STATUS_OK if no_override else STATUS_FAILED,
+            expected_state=f"{calendar_id!r} starts with name == sourceName (no local name override)",
+            observed_state=str(baseline)[:500], api_response_excerpt=str(baseline)[:500],
+        )
+    )
+    if not no_override:
+        return _finish()
+
+    # 2. Colour-only edit: the payload is exactly {"color": ...} — never a
+    # back-filled name (which would pin a permanent local name override).
+    if env.api_set_calendar_appearance is None:
+        _blocked(
+            "change_color_only_via_api", "api",
+            f"calendar {calendar_id!r} colour set to {override_color!r} with a name-free payload",
+            APPEARANCE_API_NOT_WIRED_DETAIL,
+        )
+        return _finish()
+    try:
+        env.api_set_calendar_appearance(calendar_id, {"color": override_color})
+        steps.append(
+            SyncStepEvidence(
+                step="change_color_only_via_api", surface="api", status=STATUS_OK,
+                expected_state=f"calendar {calendar_id!r} colour set to {override_color!r} with a name-free payload",
+                observed_state=f"requested {{'color': {override_color!r}}}",
+            )
+        )
+    except Exception as exc:
+        steps.append(
+            SyncStepEvidence(
+                step="change_color_only_via_api", surface="api", status=STATUS_FAILED,
+                expected_state=f"calendar {calendar_id!r} colour set to {override_color!r}", detail=str(exc),
+            )
+        )
+        return _finish()
+
+    # 3. Immediately after the colour-only edit the mapping must still carry
+    # no local name override.
+    after_color = env.api_get_calendar(calendar_id)
+    color_only_clean = (
+        after_color.get("color") == override_color
+        and after_color.get("name") == baseline.get("sourceName")
+        and after_color.get("sourceName") == baseline.get("sourceName")
+    )
+    steps.append(
+        SyncStepEvidence(
+            step="verify_color_only_edit_created_no_name_override_via_api", surface="api",
+            status=STATUS_OK if color_only_clean else STATUS_FAILED,
+            expected_state=(
+                f"{calendar_id!r} reports colour {override_color!r} while name/sourceName still "
+                f"track {baseline.get('sourceName')!r}"
+            ),
+            observed_state=str(after_color)[:500], api_response_excerpt=str(after_color)[:500],
+        )
+    )
+    if not color_only_clean:
+        return _finish()
+
+    # 4. Upstream source rename + refresh.
+    if env.api_simulate_source_rename is None:
+        _blocked(
+            "simulate_source_rename_via_api", "api",
+            f"the upstream source of {calendar_id!r} renamed to {new_source_name!r}",
+            SOURCE_SIMULATION_NOT_WIRED_DETAIL,
+        )
+        return _finish()
+    try:
+        env.api_simulate_source_rename(calendar_id, new_source_name)
+        steps.append(
+            SyncStepEvidence(
+                step="simulate_source_rename_via_api", surface="api", status=STATUS_OK,
+                expected_state=f"the upstream source of {calendar_id!r} renamed to {new_source_name!r}",
+                observed_state=f"requested source rename to {new_source_name!r}",
+            )
+        )
+    except Exception as exc:
+        steps.append(
+            SyncStepEvidence(
+                step="simulate_source_rename_via_api", surface="api", status=STATUS_FAILED,
+                expected_state=f"the upstream source of {calendar_id!r} renamed to {new_source_name!r}",
+                detail=str(exc),
+            )
+        )
+        return _finish()
+    if env.api_trigger_calendar_refresh is None:
+        _blocked(
+            "trigger_refresh_after_source_rename_via_api", "api",
+            f"calendar {calendar_id!r} refreshed from its renamed source",
+            APPEARANCE_API_NOT_WIRED_DETAIL,
+        )
+        return _finish()
+    try:
+        env.api_trigger_calendar_refresh(calendar_id)
+        steps.append(
+            SyncStepEvidence(
+                step="trigger_refresh_after_source_rename_via_api", surface="api", status=STATUS_OK,
+                expected_state=f"calendar {calendar_id!r} refreshed from its renamed source",
+            )
+        )
+    except Exception as exc:
+        steps.append(
+            SyncStepEvidence(
+                step="trigger_refresh_after_source_rename_via_api", surface="api", status=STATUS_FAILED,
+                expected_state=f"calendar {calendar_id!r} refreshed from its renamed source", detail=str(exc),
+            )
+        )
+        return _finish()
+
+    # 5. Because the colour-only edit created no name override, the source
+    # rename must flow straight through — while the colour override remains.
+    poll_renamed = poll_until(
+        lambda: env.api_get_calendar(calendar_id), timeout_seconds=timeout_seconds,
+        interval_seconds=interval_seconds,
+        is_success=lambda observed: (
+            observed.get("name") == new_source_name and observed.get("color") == override_color
+        ),
+    )
+    steps.append(
+        SyncStepEvidence(
+            step="verify_source_rename_propagates_and_color_override_remains_via_api", surface="api",
+            status=STATUS_OK if poll_renamed.succeeded else STATUS_FAILED,
+            expected_state=(
+                f"{calendar_id!r} reports the new source name {new_source_name!r} (proving the colour-only "
+                f"edit pinned no name override) with colour still {override_color!r}"
+            ),
+            observed_state=str(poll_renamed.last_observed)[:500],
+            timeout_seconds=timeout_seconds, polling_attempts=poll_renamed.attempts,
+            api_response_excerpt=str(poll_renamed.last_observed)[:500],
+        )
+    )
+    if not poll_renamed.succeeded:
+        return _finish()
+
+    # 6. The second client (the tablet) must show the new source name too.
+    poll_tablet = poll_until(
+        lambda: env.tablet_text_present(new_source_name), timeout_seconds=timeout_seconds,
+        interval_seconds=interval_seconds,
+    )
+    steps.append(
+        SyncStepEvidence(
+            step="verify_source_rename_propagates_on_tablet", surface="tablet",
+            status=STATUS_OK if poll_tablet.succeeded else STATUS_FAILED,
+            expected_state=f"{new_source_name!r} visible on the tablet's calendar list",
+            observed_state="visible" if poll_tablet.succeeded else "not visible before timeout",
+            timeout_seconds=timeout_seconds, polling_attempts=poll_tablet.attempts,
+            device_id=env.device_id, build_version=env.build_version,
+            screenshot_paths=_maybe_screenshot(env, "partial_override_after_source_rename"),
+        )
+    )
+
+    # 7. Name-only edit: the payload is exactly {"name": ...}. The existing
+    # colour override must remain untouched.
+    try:
+        env.api_set_calendar_appearance(calendar_id, {"name": local_name})
+        steps.append(
+            SyncStepEvidence(
+                step="change_name_only_via_api", surface="api", status=STATUS_OK,
+                expected_state=f"calendar {calendar_id!r} name set to {local_name!r} with a colour-free payload",
+                observed_state=f"requested {{'name': {local_name!r}}}",
+            )
+        )
+    except Exception as exc:
+        steps.append(
+            SyncStepEvidence(
+                step="change_name_only_via_api", surface="api", status=STATUS_FAILED,
+                expected_state=f"calendar {calendar_id!r} name set to {local_name!r}", detail=str(exc),
+            )
+        )
+        return _finish()
+    after_name = env.api_get_calendar(calendar_id)
+    name_only_clean = after_name.get("name") == local_name and after_name.get("color") == override_color
+    steps.append(
+        SyncStepEvidence(
+            step="verify_name_only_edit_left_color_override_untouched_via_api", surface="api",
+            status=STATUS_OK if name_only_clean else STATUS_FAILED,
+            expected_state=f"{calendar_id!r} reports name {local_name!r} with colour still {override_color!r}",
+            observed_state=str(after_name)[:500], api_response_excerpt=str(after_name)[:500],
+        )
+    )
+    if not name_only_clean:
+        return _finish()
+
+    # 8. Upstream source colour change + refresh: the explicit local colour
+    # override (and the local name) must survive it.
+    if env.api_simulate_source_color_change is None:
+        _blocked(
+            "simulate_source_color_change_via_api", "api",
+            f"the upstream source colour of {calendar_id!r} changed to {source_color_change!r}",
+            SOURCE_SIMULATION_NOT_WIRED_DETAIL,
+        )
+        return _finish()
+    try:
+        env.api_simulate_source_color_change(calendar_id, source_color_change)
+        env.api_trigger_calendar_refresh(calendar_id)
+        steps.append(
+            SyncStepEvidence(
+                step="simulate_source_color_change_via_api", surface="api", status=STATUS_OK,
+                expected_state=(
+                    f"the upstream source colour of {calendar_id!r} changed to {source_color_change!r} "
+                    "and the calendar refreshed"
+                ),
+            )
+        )
+    except Exception as exc:
+        steps.append(
+            SyncStepEvidence(
+                step="simulate_source_color_change_via_api", surface="api", status=STATUS_FAILED,
+                expected_state=f"the upstream source colour of {calendar_id!r} changed to {source_color_change!r}",
+                detail=str(exc),
+            )
+        )
+        return _finish()
+    final = env.api_get_calendar(calendar_id)
+    overrides_survive = final.get("color") == override_color and final.get("name") == local_name
+    steps.append(
+        SyncStepEvidence(
+            step="verify_local_overrides_survive_source_color_change_via_api", surface="api",
+            status=STATUS_OK if overrides_survive else STATUS_FAILED,
+            expected_state=(
+                f"{calendar_id!r} still reports the explicit local colour {override_color!r} and name "
+                f"{local_name!r} after the source colour change"
+            ),
+            observed_state=str(final)[:500], api_response_excerpt=str(final)[:500],
+        )
+    )
+    return _finish()
+
+
 def build_real_environment(
     *,
     repo_root: Path,
@@ -897,7 +1221,8 @@ def run_all_sync_flows(
     docs/RELEASE_POLICY.md) -- component_from_sync_report in
     consolidated_report.py is flow-count-agnostic, so no separate feature
     flag or consolidation wiring is needed for a 4th flow to be
-    release-gating the same way the first three already are.
+    release-gating the same way the first three already are. The same
+    flow-count-agnosticism covers the 5th (partial-override) flow.
     """
     return [
         run_event_sync_flow(env, run_id=run_id, timeout_seconds=timeout_seconds, interval_seconds=interval_seconds),
@@ -907,6 +1232,13 @@ def run_all_sync_flows(
         run_chore_sync_flow(env, timeout_seconds=timeout_seconds, interval_seconds=interval_seconds),
         run_calendar_appearance_sync_flow(
             env, calendar_id=calendar_id, run_id=run_id,
+            timeout_seconds=timeout_seconds, interval_seconds=interval_seconds,
+        ),
+        # Deliberately NOT calendar_id: the appearance flow above renames that
+        # calendar, and the partial-override flow needs a calendar with no
+        # pre-existing local name override (see its docstring).
+        run_partial_appearance_override_flow(
+            env, run_id=run_id,
             timeout_seconds=timeout_seconds, interval_seconds=interval_seconds,
         ),
     ]

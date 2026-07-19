@@ -133,9 +133,17 @@ steps:
     action: assert_id
     id: btnCollectionCancel
 
-  - name: Delete control is present
+  # Destructive area (Calee PR #978): capability-driven. An owned CalDAV
+  # calendar has canDeleteSource=true, so with the tablet's global
+  # create/delete setting enabled the dialog offers the true source-delete
+  # action with deletion wording.
+  - name: Destructive control is present for an owned calendar (canDeleteSource)
     action: assert_id
     id: btnCollectionDelete
+
+  - name: Destructive control reads "Delete Calendar" (true source deletion)
+    action: assert_text
+    text: Delete Calendar
 
   - name: Capture the owned calendar's edit dialog
     action: screenshot
@@ -152,14 +160,15 @@ steps:
 
 source_verification:
   calee_source: CaleeAdmin/Calee
-  calee_source_sha: "f1b92ddae9275cb0abea0f6df34126930e3aa71d"
-  calee_source_ref: "PR CaleeAdmin/Calee#977, branch claude/calendar-name-colour-editing-balgeo (based on latest dev)"
+  calee_source_sha: "a9c78199c7b24265525c1d303ce280b3633418eb"
+  calee_source_ref: "PR CaleeAdmin/Calee#978, branch claude/calendar-appearance-regressions-n5hrnw (based on latest dev; supersedes the #977-era confirmation)"
   status: source-confirmed
   physical_confirmation: pending
   contract:
     - "ivEdit VISIBLE+clickable iff capabilities.canEditAppearance == true, else INVISIBLE (CalendarFragment.kt)"
     - "HubCalendarEditDialog.tvCollectionAppearanceNote text is keyed off appearanceMode; source_metadata -> hub_calendar_appearance_note_source_metadata"
-    - "Saving calls PATCH /client/v1/calendars/{id}/appearance, which PROPPATCHes the real owned calendar for source_metadata mode (backend-internal, not tablet-UI-observable, not asserted here)"
+    - "Saving calls PATCH /client/v1/calendars/{id}/appearance with ONLY the changed fields, which PROPPATCHes only the changed property for source_metadata mode (backend-internal, not tablet-UI-observable, not asserted here)"
+    - "Destructive action resolved by HubCalendarDestructiveActions.resolve(): owned CalDAV (canDeleteSource=true) -> btnCollectionDelete text \"Delete Calendar\" with DELETE_CONFIRM_MESSAGE deletion wording, routed to the existing source-delete endpoint"
   selectors:
     ivEdit: app/src/main/res/layout/item_calendar_navigation_list.xml
     tvCollectionTitle: app/src/main/res/layout/dialog_hub_collection_manage.xml
@@ -176,5 +185,6 @@ source_verification:
     calendarDisplayName: "REG-OWNED-CALENDAR-APPEARANCE-001"
   notes:
     - "Needs a new REG-OWNED-CALENDAR-APPEARANCE-001 fixture calendar that does not exist in this repo yet -- BLOCKED on provisioning, in addition to the device/backend gates every draft scenario here carries. See docs/CALENDAR_APPEARANCE_REGRESSION.md."
+    - "The destructive-control assertions additionally require the tablet's global calendar create/delete setting (AccountMgr.getShowCalendarCreateDeleteOptions) to be ENABLED on the regression account; the setting can hide the action but never grants one."
     - "Row-scoping gap: item_calendar_navigation_list.xml's row-container id is not source-confirmed here, so ivEdit/etc. are targeted by bare id, not row-scoped -- see calendar_appearance_subscription.yaml's header."
     - "Colour is never asserted visually -- no colour-reading primitive exists in CaleeDriver. See docs/CALENDAR_APPEARANCE_REGRESSION.md for the full gap writeup."
