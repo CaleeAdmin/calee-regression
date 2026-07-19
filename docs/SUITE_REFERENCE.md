@@ -103,12 +103,15 @@ backend/device the caller points it at — `sync_smoke_bridge.py` shells out to 
 the project brief ("Cross-device synchronization suite") is the origin of this suite's intended
 shape; this closes it as far as the current tablet-mutation gap allows.
 
-The calendar-appearance flow's API leg is not yet wired into `build_real_environment()` the same way
-(see `docs/CALENDAR_APPEARANCE_REGRESSION.md`'s "Two DISTINCT gaps, not one") — every step needing it
-records `BLOCKED` for that reason on top of the always-`BLOCKED` colour-verification step, so this
-flow currently contributes even less live-exercised coverage than the other three until that wiring
-lands. Its orchestration logic is nonetheless fully exercised with fakes, same as the other three —
-see `framework_tests/test_sync_smoke.py`.
+The calendar-appearance flow's API leg is now partly wired into `build_real_environment()` (see
+`docs/CALENDAR_APPEARANCE_REGRESSION.md`'s "Two DISTINCT gaps, not one"): `get-calendar`/
+`set-calendar-appearance` are real CaleeMobile-Regression actions now, so the flow's rename/
+colour-change/persistence-verification steps run for real against whatever backend the caller points
+it at. `trigger-calendar-refresh` remains unwired — no client-facing endpoint exists in calee-hub-core
+to force-refresh a subscription-type calendar — so the flow still `BLOCKS` from
+`trigger_provider_refresh_via_api` onward, on top of the always-`BLOCKED` colour-verification step.
+Its orchestration logic is nonetheless fully exercised with fakes, same as the other three — see
+`framework_tests/test_sync_smoke.py`.
 
 ## Notes
 

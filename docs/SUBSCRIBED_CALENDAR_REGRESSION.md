@@ -88,13 +88,13 @@ behaviour is unit-tested in-repo at `calee-hub-core`
 | 6 | Edit is absent | in scenario (`fail_if_id btnEventDetailEdit`) |
 | 7 | Delete is absent | in scenario (`fail_if_id btnEventDetailDelete`) |
 | 8 | defensive mutation attempts cannot open the edit form | contract #973 B (guards); needs device to drive |
-| 9 | both calendars selected shows both calendars' events | needs filter/selection selectors + fixture |
-| 10 | unticking one calendar hides only that calendar | needs filter/selection selectors + fixture |
-| 11 | unticking all calendars shows no events | needs filter/selection selectors + fixture |
-| 12 | reticking restores events | needs filter/selection selectors + fixture |
-| 13 | selection survives tab navigation | needs filter/selection selectors + fixture |
-| 14 | selection survives refresh and app restart | needs filter/selection selectors + fixture |
-| 15 | unknown/malformed calendar ID excluded (not all events appear) | needs filter/selection selectors + fixture |
+| 9 | both calendars selected shows both calendars' events | in scenario (baseline, before unticking) |
+| 10 | unticking one calendar hides only that calendar | in scenario (proves REG-SUB's own events hide; does not independently prove another calendar is unaffected -- see the scenario's header comment) |
+| 11 | unticking all calendars shows no events | still needs a row-scoped selector for the account's own primary calendar, whose display name is not a deterministic REG-* fixture value |
+| 12 | reticking restores events | in scenario |
+| 13 | selection survives tab navigation | in scenario |
+| 14 | selection survives refresh and app restart | in scenario for both halves -- see "Product-level risk: selection persistence" below |
+| 15 | unknown/malformed calendar ID excluded (not all events appear) | still needs a backend-response-shape test, not a tablet UI action |
 | 16 | two services sharing the same raw calendar ID isolated | Calee `hubCalendarKey` (#973 C); needs 2-service fixture |
 
 Test **both** a fresh network response and a **Room-cache** response (the #973
@@ -109,7 +109,36 @@ tablet assertions are **BLOCKED**. Screenshots for each visibility state and the
 fixture calendar ids (never the private subscription URL) go into the structured
 report when it runs on a real device.
 
-The calendar-selection matrix (9–16) additionally needs the tablet
-filter/selection selectors source-confirmed (the render + read-only cases 1–8
-are already source-confirmed against `dialog_hub_event_detail.xml` /
-`activity_home.xml`).
+The calendar-selection matrix's tablet filter/selection selectors are now
+source-confirmed: `item_calendar_navigation_list.xml` (`llItem` row
+container, `cbCalendar` checkbox, `tvName` title) and `CalendarFragment.kt`
+(`ivExpand` toggles the sidebar in `fragment_calendar.xml`; tapping
+`cbCalendar` -- or the row itself -- toggles a calendar's visibility via
+`HubCalendarSelectionReconciler`). Cases 9, 10, 12, 13, 14 are covered by
+`subscribed_calendar.yaml`'s calendar-selection steps; cases 11 and 15
+remain out of scope (see the table above and the scenario's own header
+comment for exactly why), and 16 still needs a 2-service fixture. The
+render + read-only cases 1–8 remain source-confirmed against
+`dialog_hub_event_detail.xml` / `activity_home.xml` as before.
+
+### Product-level risk: selection persistence across an app restart
+
+Reading `HubCalendarSelectionReconciler.kt` (the class `CalendarFragment`
+uses to track which calendars are ticked) found no persistence mechanism at
+all: `selectedIds`/`knownIds` are plain in-memory `LinkedHashSet` fields on
+a Fragment-scoped object. A fresh app process constructs a fresh
+`CalendarFragment` and therefore a fresh reconciler with empty sets;
+`reconcile()`'s `isFirstCalendarLoad` branch then falls back to selecting
+**every** visible calendar (`fallbackSelectedAll`) whenever nothing was
+ever explicitly selected in that process's lifetime -- which is always true
+immediately after a restart.
+
+This means case 14's "survives app restart" half may well not hold against
+the real product as it stands today. `subscribed_calendar.yaml`'s
+app-restart step (force-stop + relaunch, then re-assert the previously-
+unticked calendar's events stay hidden) is written to prove this one way or
+the other, not to assume an answer -- per this project's rule against
+weakening assertions to make them pass. If a physical run shows this
+assertion genuinely fails, that is a real, newly-identified product gap
+(calendar visibility selection does not survive an app restart) to report
+to the Calee tablet team, not a regression-framework defect.

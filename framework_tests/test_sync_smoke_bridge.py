@@ -17,9 +17,11 @@ from calee_regression.sync_smoke_bridge import (
     SyncSmokeBridgeError,
     create_scratch_event,
     delete_event,
+    get_calendar,
     get_event,
     reopen_task,
     run_mobile_flow,
+    set_calendar_appearance,
 )
 
 
@@ -47,7 +49,8 @@ def _make_sibling_with_ui_script(tmp_path, script_body: str):
 
 # A fake sync_smoke_actions.py that writes a canned JSON payload to
 # whatever --report path it's given, and echoes back --title/--event-id/
-# --task-id so tests can assert the CLI args were built correctly.
+# --task-id/--calendar-id/--name/--color so tests can assert the CLI args
+# were built correctly.
 _FAKE_API_SCRIPT = """
 import argparse
 import json
@@ -61,6 +64,9 @@ parser.add_argument("--password")
 parser.add_argument("--title", default=None)
 parser.add_argument("--event-id", default=None)
 parser.add_argument("--task-id", default=None)
+parser.add_argument("--calendar-id", default=None)
+parser.add_argument("--name", default=None)
+parser.add_argument("--color", default=None)
 parser.add_argument("--report")
 args = parser.parse_args()
 
@@ -70,8 +76,17 @@ elif args.action == "get-event":
     payload = {"found": True, "id": args.event_id, "title": "whatever"}
 elif args.action == "delete-event":
     payload = {"found": False, "id": args.event_id, "alreadyGone": False}
-else:
+elif args.action == "reopen-task":
     payload = {"found": True, "id": args.task_id, "completed": False}
+elif args.action == "get-calendar":
+    payload = {"found": True, "id": args.calendar_id, "name": "whatever", "color": "#000000"}
+else:  # set-calendar-appearance
+    payload = {
+        "id": args.calendar_id,
+        "name": args.name if args.name is not None else "unchanged-name",
+        "color": args.color if args.color is not None else "unchanged-color",
+        "_sentFields": sorted(k for k, v in [("name", args.name), ("color", args.color)] if v is not None),
+    }
 
 with open(args.report, "w") as f:
     json.dump(payload, f)
@@ -110,6 +125,36 @@ def test_reopen_task_returns_parsed_report(tmp_path):
     repo_root = _make_sibling_with_api_script(tmp_path, _FAKE_API_SCRIPT)
     result = reopen_task(repo_root=repo_root, base_url="https://x", email="a@x", password="p", task_id="task_1")
     assert result == {"found": True, "id": "task_1", "completed": False}
+
+
+def test_get_calendar_returns_parsed_report(tmp_path):
+    repo_root = _make_sibling_with_api_script(tmp_path, _FAKE_API_SCRIPT)
+    result = get_calendar(
+        repo_root=repo_root, base_url="https://x", email="a@x", password="p", calendar_id="regression:regsub",
+    )
+    assert result["id"] == "regression:regsub"
+    assert result["found"] is True
+
+
+def test_set_calendar_appearance_sends_only_supplied_fields(tmp_path):
+    repo_root = _make_sibling_with_api_script(tmp_path, _FAKE_API_SCRIPT)
+    result = set_calendar_appearance(
+        repo_root=repo_root, base_url="https://x", email="a@x", password="p",
+        calendar_id="regression:regsub", fields={"color": "#00A878"},
+    )
+    assert result["_sentFields"] == ["color"]
+    assert result["color"] == "#00A878"
+
+
+def test_set_calendar_appearance_can_send_both_fields(tmp_path):
+    repo_root = _make_sibling_with_api_script(tmp_path, _FAKE_API_SCRIPT)
+    result = set_calendar_appearance(
+        repo_root=repo_root, base_url="https://x", email="a@x", password="p",
+        calendar_id="regression:regsub", fields={"name": "New Name", "color": "#00A878"},
+    )
+    assert result["_sentFields"] == ["color", "name"]
+    assert result["name"] == "New Name"
+    assert result["color"] == "#00A878"
 
 
 def test_raises_when_sibling_missing(tmp_path):

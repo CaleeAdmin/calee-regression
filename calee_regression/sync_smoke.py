@@ -30,14 +30,25 @@ above -- see docs/CALENDAR_APPEARANCE_REGRESSION.md:
     reading, let alone mutating) -- see appium_driver.py. The tablet-side
     colour-verification step is therefore unconditionally BLOCKED, not
     contingent on env wiring like the steps below.
-  - build_real_environment() does not yet wire real implementations of the
-    api_set_calendar_appearance/api_get_calendar/api_trigger_calendar_refresh
-    callables this flow needs -- doing so needs new CaleeMobile-Regression
-    API actions that do not exist today, and CaleeMobile-Regression is out
-    of scope for this change. These callables are OPTIONAL on
-    SyncSmokeEnvironment (default None); every step that needs one records
-    BLOCKED honestly when it is absent, exactly like the tablet-mutation
-    steps below do for their own gap.
+  - build_real_environment() now wires real implementations of
+    api_get_calendar/api_set_calendar_appearance (CaleeMobile-Regression's
+    sync_smoke_actions.py get-calendar/set-calendar-appearance actions,
+    added alongside this change -- see sync_smoke_bridge.py). Every step
+    needing one of those two now runs for real against whatever backend the
+    caller points it at. api_trigger_calendar_refresh stays permanently
+    unwired (None) for a DIFFERENT, more specific reason than before: no
+    client-facing endpoint exists in calee-hub-core to force-refresh a
+    subscription-type calendar (source-confirmed against
+    core_client_api.php/routes_client_api.php -- the only related mechanism,
+    client_subscription_source_mark_refresh_due(), is an internal,
+    non-deterministic side effect of a stale-cache events GET, not something
+    a client can call directly; a distinct "sync now" endpoint exists only
+    for external_calendar (Google-connected) calendars, via
+    external-calendar-connections/{connectionId}, which does not apply to
+    the subscription_mapping REG-SUB fixture this flow targets by default).
+    Every step still needing api_trigger_calendar_refresh records BLOCKED
+    honestly with REFRESH_ENDPOINT_NOT_AVAILABLE_DETAIL when it is absent,
+    the same idiom the tablet-mutation steps use for their own gap.
 """
 
 from __future__ import annotations
@@ -83,6 +94,20 @@ APPEARANCE_API_NOT_WIRED_DETAIL = (
     "exist in sync_smoke_actions.py today, and CaleeMobile-Regression is out of scope for this "
     "change. The orchestration logic itself is fully exercised with fakes in "
     "framework_tests/test_sync_smoke.py. Not attempted."
+)
+
+REFRESH_ENDPOINT_NOT_AVAILABLE_DETAIL = (
+    "api_trigger_calendar_refresh is permanently unwired (None), for a DIFFERENT, more specific "
+    "reason than APPEARANCE_API_NOT_WIRED_DETAIL above (which get-calendar/set-calendar-appearance "
+    "have since closed): no client-facing endpoint exists in calee-hub-core to force-refresh a "
+    "subscription-type calendar -- source-confirmed against core_client_api.php/"
+    "routes_client_api.php. The only related mechanism, client_subscription_source_mark_refresh_due(), "
+    "is an internal, non-deterministic side effect of a stale-cache /client/v1/events GET, not "
+    "something a client can call directly and then reliably poll on. A distinct 'sync now' endpoint "
+    "exists only for external_calendar (Google-connected) calendars, keyed by connection id, which "
+    "does not apply to the subscription_mapping REG-SUB fixture this flow targets by default. See "
+    "docs/CALENDAR_APPEARANCE_REGRESSION.md. The orchestration logic itself is fully exercised with "
+    "fakes in framework_tests/test_sync_smoke.py. Not attempted."
 )
 
 
@@ -544,13 +569,15 @@ def run_calendar_appearance_sync_flow(
       what appearanceMode subscription_mapping/external_calendar promise.
 
     Every callable this flow needs beyond tablet_text_present is OPTIONAL on
-    SyncSmokeEnvironment (defaults to None): unlike the event/task/chore
-    flows, build_real_environment() does not yet wire real implementations
-    (see APPEARANCE_API_NOT_WIRED_DETAIL) -- when one is None, every step
+    SyncSmokeEnvironment (defaults to None): when one is None, every step
     that needs it records BLOCKED honestly instead of raising, and steps
-    that don't need it still run for real. The orchestration/evidence-
-    recording logic itself is fully exercised with fakes in
-    framework_tests/test_sync_smoke.py.
+    that don't need it still run for real. build_real_environment() now
+    wires api_get_calendar/api_set_calendar_appearance for real; only
+    api_trigger_calendar_refresh stays permanently unwired (see
+    REFRESH_ENDPOINT_NOT_AVAILABLE_DETAIL -- a different, more specific
+    reason than the old APPEARANCE_API_NOT_WIRED_DETAIL catch-all). The
+    orchestration/evidence-recording logic itself is fully exercised with
+    fakes in framework_tests/test_sync_smoke.py.
     """
     steps: list = []
     started = _now()
@@ -684,7 +711,7 @@ def run_calendar_appearance_sync_flow(
             SyncStepEvidence(
                 step="trigger_provider_refresh_via_api", surface="api", status=STATUS_BLOCKED,
                 expected_state=f"calendar {calendar_id!r} refreshed from its provider/subscription source",
-                detail=APPEARANCE_API_NOT_WIRED_DETAIL,
+                detail=REFRESH_ENDPOINT_NOT_AVAILABLE_DETAIL,
             )
         )
         return SyncFlowResult(flow="calendar-appearance-sync", steps=steps, started_at=started, finished_at=_now())
@@ -873,9 +900,14 @@ def run_partial_appearance_override_flow(
     docs/CALENDAR_APPEARANCE_REGRESSION.md.
 
     Same wiring caveats as run_calendar_appearance_sync_flow: the appearance
-    API callables are optional (BLOCKED when None), and the two upstream-
-    source simulators are additionally fixture-gated
-    (SOURCE_SIMULATION_NOT_WIRED_DETAIL) — no step is ever faked as passing.
+    API callables are optional (BLOCKED when None) -- api_get_calendar/
+    api_set_calendar_appearance are wired for real by build_real_environment()
+    (this flow's first four steps now run for real against whatever backend
+    the caller points it at), while the two upstream-source simulators remain
+    unwired and additionally fixture-gated (SOURCE_SIMULATION_NOT_WIRED_DETAIL)
+    and api_trigger_calendar_refresh remains unwired
+    (REFRESH_ENDPOINT_NOT_AVAILABLE_DETAIL) -- no step is ever faked as
+    passing.
     """
     flow_name = "calendar-appearance-partial-override"
     steps: list = []
@@ -1001,7 +1033,7 @@ def run_partial_appearance_override_flow(
         _blocked(
             "trigger_refresh_after_source_rename_via_api", "api",
             f"calendar {calendar_id!r} refreshed from its renamed source",
-            APPEARANCE_API_NOT_WIRED_DETAIL,
+            REFRESH_ENDPOINT_NOT_AVAILABLE_DETAIL,
         )
         return _finish()
     try:
@@ -1199,6 +1231,17 @@ def build_real_environment(
         device_id=device_id,
         build_version=build_version,
         take_screenshot=_screenshot if tablet_driver is not None else None,
+        api_get_calendar=lambda calendar_id: sync_smoke_bridge.get_calendar(
+            repo_root=repo_root, base_url=base_url, email=email, password=password, calendar_id=calendar_id,
+        ),
+        api_set_calendar_appearance=lambda calendar_id, fields: sync_smoke_bridge.set_calendar_appearance(
+            repo_root=repo_root, base_url=base_url, email=email, password=password,
+            calendar_id=calendar_id, fields=fields,
+        ),
+        # api_trigger_calendar_refresh, api_simulate_source_rename,
+        # api_simulate_source_color_change stay unwired (None/default) --
+        # see REFRESH_ENDPOINT_NOT_AVAILABLE_DETAIL and
+        # SOURCE_SIMULATION_NOT_WIRED_DETAIL respectively.
     )
 
 

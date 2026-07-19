@@ -46,9 +46,17 @@ steps:
     timeout_seconds: 10
 
   - name: Wait for the deterministic open fixture task to appear
+    # blocks_on_absence: true -- REG-TASK-OPEN-001 not appearing means the
+    # regression fixture was never provisioned/reset on this account, an
+    # environment/fixture precondition problem, not evidence the product
+    # regressed (Phase 3: "treat fixture absence as BLOCKED, not FAIL"). Every
+    # step AFTER this one keeps the framework's default FAILED-on-error
+    # behavior -- once the fixture is confirmed present, a row-scoped
+    # resolution failure is much more likely a real product/UI problem.
     action: wait_for_text
     text: REG-TASK-OPEN-001
     timeout_seconds: 20
+    blocks_on_absence: true
 
   - name: Capture the tasks screen before any change
     action: screenshot

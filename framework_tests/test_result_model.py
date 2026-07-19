@@ -174,6 +174,100 @@ def test_junit_xml_reports_blocked_scenarios_as_errors(tmp_path):
     assert "connection refused" in error_el.attrib["message"]
 
 
+class _WaitForTextFailsDriver:
+    """A step whose wait_for_text never resolves -- e.g. a REG-* fixture
+    record that was never provisioned/reset. Has no capture_diagnostics
+    method, so it also stands in for a driver/test-double that can't supply
+    on-failure diagnostics (the generic capture must degrade silently, never
+    crash, when that capability is absent)."""
+
+    def __init__(self, config):
+        self.config = config
+
+    def start_session(self):
+        pass
+
+    def quit(self):
+        pass
+
+    def wait_for_text(self, text, timeout):
+        return False
+
+
+class _WaitForTextFailsDriverWithDiagnostics(_WaitForTextFailsDriver):
+    def __init__(self, config):
+        super().__init__(config)
+        self.capture_calls = []
+
+    def capture_diagnostics(self, label):
+        self.capture_calls.append(label)
+        return "/tmp/fake-screenshot.png", "/tmp/fake-page-source.xml"
+
+
+def _wait_for_text_scenario(tmp_path, *, blocks_on_absence, filename="scenario.yaml"):
+    step = {"name": "Wait for fixture", "action": "wait_for_text", "text": "REG-TASK-OPEN-001", "timeout_seconds": 1}
+    if blocks_on_absence:
+        step["blocks_on_absence"] = True
+    return _write_scenario(
+        tmp_path, {"name": "s", "requires_state": "any", "steps": [step]}, filename=filename,
+    )
+
+
+def test_step_marked_blocks_on_absence_reports_blocked_not_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "CaleeDriver", _WaitForTextFailsDriver)
+    scenario_path = _wait_for_text_scenario(tmp_path, blocks_on_absence=True)
+
+    result = runner.ScenarioRunner(_make_config()).run_scenarios([scenario_path])
+
+    scenario_result = result.scenarios[0]
+    assert scenario_result.steps[0].status == STATUS_BLOCKED
+    assert scenario_result.status == STATUS_BLOCKED
+    assert result.failed_count == 0
+    assert result.blocked_count == 1
+
+
+def test_step_without_blocks_on_absence_still_reports_failed(tmp_path, monkeypatch):
+    # Regression guard: the default (unmarked) behavior must stay FAILED --
+    # a generic resolution failure could just as easily be a real product
+    # regression, so it must not silently downgrade to BLOCKED.
+    monkeypatch.setattr(runner, "CaleeDriver", _WaitForTextFailsDriver)
+    scenario_path = _wait_for_text_scenario(tmp_path, blocks_on_absence=False)
+
+    result = runner.ScenarioRunner(_make_config()).run_scenarios([scenario_path])
+
+    scenario_result = result.scenarios[0]
+    assert scenario_result.steps[0].status == STATUS_FAILED
+    assert scenario_result.status == STATUS_FAILED
+    assert result.failed_count == 1
+    assert result.blocked_count == 0
+
+
+def test_generic_step_failure_captures_diagnostics_when_driver_supports_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "CaleeDriver", _WaitForTextFailsDriverWithDiagnostics)
+    scenario_path = _wait_for_text_scenario(tmp_path, blocks_on_absence=False)
+
+    result = runner.ScenarioRunner(_make_config()).run_scenarios([scenario_path])
+
+    step_result = result.scenarios[0].steps[0]
+    assert step_result.screenshot_path == "/tmp/fake-screenshot.png"
+    assert step_result.page_source_path == "/tmp/fake-page-source.xml"
+
+
+def test_generic_step_failure_diagnostics_capture_is_best_effort_when_driver_lacks_it(tmp_path, monkeypatch):
+    # _WaitForTextFailsDriver has no capture_diagnostics method at all -- the
+    # generic capture must degrade silently (no screenshot/page_source_path),
+    # never raise and mask the real assertion failure.
+    monkeypatch.setattr(runner, "CaleeDriver", _WaitForTextFailsDriver)
+    scenario_path = _wait_for_text_scenario(tmp_path, blocks_on_absence=False)
+
+    result = runner.ScenarioRunner(_make_config()).run_scenarios([scenario_path])
+
+    step_result = result.scenarios[0].steps[0]
+    assert step_result.status == STATUS_FAILED
+    assert step_result.screenshot_path is None
+    assert step_result.page_source_path is None
+
+
 def test_summary_txt_reports_blocked_count_and_reason(tmp_path):
     config = _make_config(report_dir=str(tmp_path))
     rb = reporting.ReportBuilder(config, run_name="blocked-run")

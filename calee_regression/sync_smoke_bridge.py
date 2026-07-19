@@ -124,6 +124,31 @@ def reopen_task(*, repo_root: Path, base_url: str, email: str, password: str, ta
     )
 
 
+def get_calendar(*, repo_root: Path, base_url: str, email: str, password: str, calendar_id: str) -> dict[str, Any]:
+    return _run_api_action(
+        "get-calendar", repo_root=repo_root, base_url=base_url, email=email, password=password,
+        extra_args=["--calendar-id", calendar_id],
+    )
+
+
+def set_calendar_appearance(
+    *, repo_root: Path, base_url: str, email: str, password: str, calendar_id: str, fields: dict[str, str],
+) -> dict[str, Any]:
+    """`fields` is the changed-fields-only payload (a subset of {"name": ...,
+    "color": ...}) -- passed straight through as CLI flags so the CLI action
+    sends exactly those fields and nothing else (see
+    docs/CALENDAR_APPEARANCE_REGRESSION.md's partial-update contract)."""
+    extra_args = ["--calendar-id", calendar_id]
+    if "name" in fields:
+        extra_args.extend(["--name", fields["name"]])
+    if "color" in fields:
+        extra_args.extend(["--color", fields["color"]])
+    return _run_api_action(
+        "set-calendar-appearance", repo_root=repo_root, base_url=base_url, email=email, password=password,
+        extra_args=extra_args,
+    )
+
+
 def run_mobile_flow(
     *,
     repo_root: Path,

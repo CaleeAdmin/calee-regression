@@ -270,25 +270,44 @@ be `BLOCKED`, and it matters which is which:
   fully-wired, fully-passing run, exactly like `run_event_sync_flow`'s
   `modify_on_tablet`/`run_task_sync_flow`'s `reopen_on_tablet` stay `BLOCKED`
   for the (different) tablet-mutation gap.
-* **The "not wired into `build_real_environment()` yet" gap**: unlike the
-  event/task/chore flows, `api_set_calendar_appearance`/`api_get_calendar`/
-  `api_trigger_calendar_refresh` are `Optional` fields on
-  `SyncSmokeEnvironment` (default `None`) that `build_real_environment()`
-  does not currently populate. Wiring them for real needs new
-  CaleeMobile-Regression API actions (`set-calendar-appearance` /
-  `get-calendar` / `trigger-calendar-refresh`) that do not exist in
-  `sync_smoke_actions.py`/`sync_smoke_cli.py` today (confirmed by reading
-  that sibling script's `argparse` action list: only `create-scratch-event`
-  / `get-event` / `delete-event` / `reopen-task` exist) -- and
-  CaleeMobile-Regression is explicitly out of scope for this change. Every
-  step that needs one of these callables records `BLOCKED` honestly with
-  `APPEARANCE_API_NOT_WIRED_DETAIL` instead of raising; the orchestration
-  logic around them is still fully exercised with fakes (see "Proven
-  offline now"). Closing this gap is future work: add the three actions to
-  `sync_smoke_actions.py`/`sync_smoke_cli.py`, then wire
-  `build_real_environment()` to call them, mirroring
-  `create_scratch_event`/`get_event`/`delete_event`'s existing pattern in
-  `calee_regression/sync_smoke_bridge.py`.
+* **The "not wired into `build_real_environment()`" gap — now CLOSED for
+  two of the three callables.** `api_get_calendar`/`api_set_calendar_appearance`
+  are wired for real: `sync_smoke_actions.py`/`sync_smoke_cli.py` (the
+  sibling CaleeMobile-Regression repo) now implements `get-calendar` (fetches
+  `GET /client/v1/calendars` and filters client-side by id -- there is no
+  single-calendar GET endpoint) and `set-calendar-appearance` (`PATCH
+  /client/v1/calendars/{id}/appearance`, sending only the field(s) the
+  caller actually supplied), and `calee_regression/sync_smoke_bridge.py`
+  gained matching `get_calendar`/`set_calendar_appearance` subprocess-bridge
+  functions that `build_real_environment()` now wires in. Every step needing
+  one of these two callables runs for real against whatever backend the
+  caller points it at (`capture_baseline_via_api`, `rename_via_api`,
+  `change_color_via_api`, `verify_color_persisted_via_api`, and — in
+  `run_partial_appearance_override_flow` — `capture_baseline_via_api`,
+  `change_color_only_via_api`, `verify_color_only_edit_created_no_name_
+  override_via_api`).
+  `api_trigger_calendar_refresh` remains unwired (`None`), for a DIFFERENT,
+  more specific reason than the old blanket "CaleeMobile-Regression is out
+  of scope" one: **no client-facing endpoint exists in calee-hub-core to
+  force-refresh a subscription-type calendar.** Source-confirmed against
+  `core_client_api.php`/`routes_client_api.php`: the only related mechanism,
+  `client_subscription_source_mark_refresh_due()`, is an internal,
+  non-deterministic side effect of a stale-cache `/client/v1/events` GET --
+  not something a client can call directly and then reliably poll on. A
+  distinct "sync now" endpoint exists (`routes_client_api_external_calendars.php`)
+  but is scoped to `external_calendar` (Google-connected) calendars, keyed
+  by *connection* id, and does not apply to the `subscription_mapping`
+  REG-SUB fixture this flow targets by default. Every step needing
+  `api_trigger_calendar_refresh` records `BLOCKED` honestly with
+  `REFRESH_ENDPOINT_NOT_AVAILABLE_DETAIL`, and the flow stops there (steps
+  after `trigger_provider_refresh_via_api` — verifying the override survives
+  a refresh, and that the provider's own `sourceName` was untouched by it —
+  cannot be honestly exercised without a real refresh to have happened).
+  The orchestration logic around all of this is still fully exercised with
+  fakes (see "Proven offline now"). Closing the remaining gap for real would
+  need calee-hub-core to add a genuine client-facing refresh-trigger
+  endpoint for subscription/CalDAV calendars -- out of scope for a
+  regression-framework-only change.
 
 ### Release-gating status
 
@@ -305,11 +324,18 @@ needed. See `docs/SUITE_REFERENCE.md`'s "Partially implemented: `sync-smoke`"
 section, now listing all four flows.
 
 Like the other three flows, this one currently, always resolves to
-`BLOCKED` for its live-device legs (the colour-assertion gap is permanent;
-the API-wiring gap needs sibling-repo work; and even once both close, there
-is no physical tablet/backend in this sandbox to run against) -- by design,
-matching this repo's existing safety property ("a PASS must not be possible
-while a live check is unverified"), not a shortcoming introduced here.
+`BLOCKED` for its live-device legs -- the colour-assertion gap is permanent;
+the refresh-trigger gap needs a calee-hub-core endpoint that does not exist
+today (see above); and even with `get-calendar`/`set-calendar-appearance`
+now wired, there is no physical tablet/backend in this sandbox to run
+against -- by design, matching this repo's existing safety property ("a
+PASS must not be possible while a live check is unverified"), not a
+shortcoming introduced here. Against a real backend (even without a
+tablet), the API-only steps this flow shares with `run_partial_appearance_
+override_flow` (`capture_baseline_via_api`, `change_color_only_via_api`,
+`verify_color_only_edit_created_no_name_override_via_api`, ...) would now
+exercise the real endpoint and could genuinely pass or fail on their own
+merits, rather than blocking immediately.
 
 ## The colour-assertion gap
 
