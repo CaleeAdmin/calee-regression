@@ -1,0 +1,34 @@
+{
+  "jobs": [
+    {
+      "name": "run_ui_suite.py parser/status-mapping tests (no Flutter/device needed)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Check whether CALEEMOBILE_CHECKOUT_TOKEN is configured",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Fixture CLI argument-parsing smoke test",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "API framework self-tests (no network, no credentials)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "CaleeMobile selector contract (must pass before UI analysis)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Flutter analyze on the UI suite (against a real CaleeMobile checkout)",
+      "status": "completed",
+      "conclusion": "success"
+    }
+  ]
+}
