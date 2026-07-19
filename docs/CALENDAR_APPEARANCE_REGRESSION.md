@@ -6,6 +6,22 @@ Proves the calendar appearance-editing contract introduced by
 `claude/calendar-name-colour-editing-balgeo`, commit
 `f1b92ddae9275cb0abea0f6df34126930e3aa71d`, based on latest `dev`).
 
+**Re-confirmed against Calee PR CaleeAdmin/Calee#978** (branch
+`claude/calendar-appearance-regressions-n5hrnw`, commit
+`a9c78199c7b24265525c1d303ce280b3633418eb`), which changed two things the
+scenarios/flows below now cover:
+
+1. **Partial updates**: the tablet (and CaleeMobile) now send ONLY the
+   fields the user actually changed — every field *sent* to the appearance
+   PATCH becomes a permanent local override, so an accidentally-sent
+   unchanged name silently pinned the name and broke provider renames.
+   See "Partial-update (changed-fields-only) coverage" below.
+2. **Capability-driven destructive actions**: the edit dialog's destructive
+   control is now resolved from `canDeleteSource`/`canRemoveFromCalee`
+   (never from `canEditAppearance`/`readOnly`/`isSubscription`), with the
+   global create/delete setting only able to hide it. See "Destructive
+   actions" below.
+
 ## The contract
 
 `GET /client/v1/calendars` calendar objects now carry `sourceName`,
@@ -26,6 +42,73 @@ routed by `appearanceMode`:
 This is a backend contract (`calee-hub-core`) this session does not
 implement or unit-test directly -- it is transcribed, source-confirmed
 context for the tablet (`CaleeAdmin/Calee`) and sync-smoke coverage below.
+
+## Destructive actions (Calee PR #978)
+
+`HubCalendarEditDialog` resolves its destructive control through
+`HubCalendarDestructiveActions.resolve(showCreateDeleteOptions,
+canDeleteSource, canRemoveFromCalee, appearanceMode)`:
+
+| Calendar type | Capabilities | Control shown (setting ON) | Wording / route |
+|---|---|---|---|
+| Owned CalDAV (`source_metadata`) | `canDeleteSource=true` | `btnCollectionDelete` = **"Delete Calendar"** | Deletion wording ("This will delete this calendar and its events…"), existing source-delete route `DELETE /client/v1/calendars/{id}` |
+| Subscription (`subscription_mapping`) | `canDeleteSource=false`, `canRemoveFromCalee=true` | `btnCollectionDelete` = **"Remove Calendar"** | Removal wording ("…does not change the original calendar or its events"), routed via `removeSubscriptionFromCalee()` — same backend route, verified unsubscribe semantics (local synced collection + mapping soft-delete only) |
+| External (`external_calendar`) | any | **None** | No supported tablet removal route exists yet; the pre-#978 Delete targeted the CalDAV endpoint, which rejects `external:` ids — a button that could only fail. Documented limitation. |
+| Shared read-only (`unsupported`) | — | — | Dialog never opens (`canEditAppearance=false`) |
+| Any type, setting OFF | — | **None** | The global setting hides; it never grants |
+
+Scenario coverage (all source-confirmed, physically pending, gated like the
+rest of this feature):
+
+* `calendar_appearance_owned.yaml` — asserts `btnCollectionDelete` present
+  with text "Delete Calendar".
+* `calendar_appearance_subscription.yaml` — asserts `btnCollectionDelete`
+  present with text "Remove Calendar" and `fail_if_text` "Delete Calendar"
+  (removal wording never claims upstream events are deleted).
+* `calendar_appearance_external.yaml` (new) — asserts appearance editing IS
+  offered but `btnCollectionDelete` is ABSENT (`fail_if_id`) and the broken
+  "Delete Calendar" wording never appears.
+* `calendar_appearance_shared_readonly.yaml` — unchanged: the dialog never
+  opens, so it never references the destructive control at all.
+
+The destructive-control assertions in owned/subscription additionally
+require the tablet's global create/delete setting to be ENABLED on the
+regression account (the external scenario's absence assertion holds either
+way).
+
+## Partial-update (changed-fields-only) coverage
+
+`run_partial_appearance_override_flow` (`calee_regression/sync_smoke.py`)
+pins the cross-device consequences of the changed-fields-only rule against
+a pristine fixture calendar (proposed `REG-SUB-PARTIAL`, see the fixture
+table):
+
+1. baseline: no local name override (`name == sourceName`);
+2. colour-only edit — payload exactly `{"color": …}`;
+3. the mapping still has no name override;
+4. simulated upstream source rename + refresh — the new source name flows
+   through to the API surface **and the tablet**, while the local colour
+   override remains (the exact regression: a back-filled name would have
+   pinned an override and frozen the name);
+5. name-only edit — payload exactly `{"name": …}` — leaves the colour
+   override untouched;
+6. simulated upstream source colour change — the explicit local colour
+   override (and local name) survive.
+
+`framework_tests/test_sync_smoke.py` proves the flow end-to-end with an
+override-model fake (effective value = local override else source value),
+asserts the recorded payloads contain ONLY the changed keys, and includes
+an adversarial back-filling backend the flow must FAIL against. The
+upstream-source simulators (`api_simulate_source_rename` /
+`api_simulate_source_color_change`) are fixture-gated and unwired in
+`build_real_environment()` — those steps record BLOCKED honestly
+(`SOURCE_SIMULATION_NOT_WIRED_DETAIL`), never a fabricated pass.
+
+The complementary "name-only edit with NO pre-existing colour override
+keeps tracking the source colour" case needs a second pristine calendar
+mid-flow and is pinned instead at persistence level in calee-hub-core
+(`tests/calendar_appearance_update_test.php`, cases 18–27) and in
+CaleeMobile-Regression's fake-server contract tests (partial-update group).
 
 ## What the tablet shipped (Calee PR #977)
 
@@ -273,7 +356,8 @@ for the subscription type:
 |---|---|---|
 | Subscription | `subscription_mapping` | **Provisioned** -- reuses the existing REG-SUB fixture (`fixtures/subscribed_calendar/reg_sub_calendar.ics`, calendar id `regression:regsub`, display name `REG-SUB Regression Subscription` from its `X-WR-CALNAME`). Still needs the hub backend + a prepared tablet to actually load it -- BLOCKED here, not because the fixture is undefined. |
 | Owned CalDAV | `source_metadata` | **Not provisioned.** No deterministic, uniquely-named REG-* calendar fixture exists in this repo today (only REG-EVENT-*/REG-TASK-*/REG-CHORE-* *records* are documented in `docs/TEST_DATA_RESET_CONTRACT.md`, which imply an owned calendar exists behind them but never name it). This doc **proposes** a new entry, `REG-OWNED-CALENDAR-APPEARANCE-001`, provisioned the same way the rest of the REG-* fixture is -- ordinary `POST /client/v1/calendars` via the Calee Client API (calee-hub-core has no seed/test-data endpoint). **Not implemented anywhere in this repo or `CaleeMobile-Regression` as of this change.** |
-| External calendar | `external_calendar` | **Not provisioned, and no scenario targets it.** Shares its note text with `subscription_mapping` (already exercised by `calendar_appearance_subscription.yaml`), so this was judged lower priority than the other two gaps for this change. Provisioning it for real needs whatever external-provider integration (e.g. OAuth-based sync) `appearanceMode: external_calendar` actually maps to -- out of scope to design here. |
+| External calendar | `external_calendar` | **Not provisioned; now targeted by `calendar_appearance_external.yaml`** (destructive-action absence guard + appearance editing). This doc **proposes** `REG-EXTERNAL-GOOGLE-CALENDAR-001`: a dedicated calendar in a regression-owned Google account, connected via the hub's external calendar connection flow, display name `REG-EXT Google Calendar`. **Not implemented anywhere as of this change** -- the scenario stays BLOCKED on provisioning. |
+| Subscription (partial-override flow) | `subscription_mapping` | **Not provisioned.** `run_partial_appearance_override_flow` needs a SECOND, pristine subscription (`REG-SUB-PARTIAL`, proposed calendar id `regression:regsub-partial`) whose name/colour have never been locally overridden -- the main REG-SUB fixture is renamed by `run_calendar_appearance_sync_flow` earlier in the same `run_all_sync_flows` pass. Also needs the upstream-source mutation plumbing described in `SOURCE_SIMULATION_NOT_WIRED_DETAIL` (rewriting the feed's `X-WR-CALNAME`/colour and re-serving it). **Not implemented as of this change.** |
 | Shared read-only CalDAV | `unsupported` | **Not provisioned -- the hardest of the three.** Proposes `REG-SHARED-READONLY-CALENDAR-001`: a calendar owned by a *second* regression-owned account, shared read-only to the primary regression account under test. Unlike the owned-calendar proposal above, this cannot be provisioned via ordinary single-account CRUD -- it needs either a second regression account to share from, or a backend admin/fixture endpoint that does not exist today. **Not implemented anywhere in this repo or its siblings as of this change.** |
 
 None of these proposed fixture entries are added to

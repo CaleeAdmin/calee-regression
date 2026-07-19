@@ -20,10 +20,12 @@ from calee_regression.sync_smoke import (
     run_calendar_appearance_sync_flow,
     run_chore_sync_flow,
     run_event_sync_flow,
+    run_partial_appearance_override_flow,
     run_task_sync_flow,
 )
 
 DEFAULT_APPEARANCE_CALENDAR_ID = "regression:regsub"
+DEFAULT_PARTIAL_CALENDAR_ID = "regression:regsub-partial"
 
 
 def _make_env(**overrides):
@@ -34,6 +36,16 @@ def _make_env(**overrides):
             "name": "REG-SUB Regression Subscription",
             "color": "#111111",
             "sourceName": "REG-SUB Regression Subscription",
+            "capabilities": {"canEditEvents": False},
+        },
+        # Pristine second fixture for run_partial_appearance_override_flow:
+        # no local overrides yet (name tracks sourceName, colour tracks
+        # sourceColor).
+        DEFAULT_PARTIAL_CALENDAR_ID: {
+            "name": "REG-SUB-PARTIAL Subscription",
+            "color": "#4285F4",
+            "sourceName": "REG-SUB-PARTIAL Subscription",
+            "sourceColor": "#4285F4",
             "capabilities": {"canEditEvents": False},
         },
     }
@@ -66,6 +78,23 @@ def _make_env(**overrides):
     def default_trigger_calendar_refresh(calendar_id):
         return {"calendarId": calendar_id, "refreshed": True}
 
+    def default_simulate_source_rename(calendar_id, new_source_name):
+        # Effective name follows the source only while no local override
+        # exists (name still equal to sourceName) -- mirrors the backend's
+        # COALESCE semantics for subscription mappings.
+        cal = calendars[calendar_id]
+        if cal.get("name") == cal.get("sourceName"):
+            cal["name"] = new_source_name
+        cal["sourceName"] = new_source_name
+        return {"calendarId": calendar_id, "sourceRenamedTo": new_source_name}
+
+    def default_simulate_source_color_change(calendar_id, new_source_color):
+        cal = calendars[calendar_id]
+        if cal.get("color") == cal.get("sourceColor"):
+            cal["color"] = new_source_color
+        cal["sourceColor"] = new_source_color
+        return {"calendarId": calendar_id, "sourceColorChangedTo": new_source_color}
+
     def default_tablet_text_present(text):
         return (
             text in created_events.values()
@@ -87,6 +116,8 @@ def _make_env(**overrides):
         api_set_calendar_appearance=default_set_calendar_appearance,
         api_get_calendar=default_get_calendar,
         api_trigger_calendar_refresh=default_trigger_calendar_refresh,
+        api_simulate_source_rename=default_simulate_source_rename,
+        api_simulate_source_color_change=default_simulate_source_color_change,
     )
     kwargs.update(overrides)
     return SyncSmokeEnvironment(**kwargs)
@@ -467,8 +498,159 @@ def test_calendar_appearance_flow_uses_a_custom_calendar_id():
 # ── run_all_sync_flows ────────────────────────────────────────────────
 
 
-def test_run_all_sync_flows_returns_all_four_in_order():
+def test_run_all_sync_flows_returns_all_five_in_order():
     env = _make_env()
     results = run_all_sync_flows(env, run_id="test-all", task_id="task_1", timeout_seconds=1, interval_seconds=0.01)
 
-    assert [r.flow for r in results] == ["event-sync", "task-sync", "chore-sync", "calendar-appearance-sync"]
+    assert [r.flow for r in results] == [
+        "event-sync",
+        "task-sync",
+        "chore-sync",
+        "calendar-appearance-sync",
+        "calendar-appearance-partial-override",
+    ]
+
+
+# ── run_partial_appearance_override_flow ──────────────────────────────
+
+
+class _OverrideModelBackend:
+    """Override-model fake: effective name/colour = local override or source
+    value, exactly the subscription-mapping/external-calendar semantics the
+    real backend implements with COALESCE / conditional SET.
+    """
+
+    def __init__(self):
+        self.source_name = "REG-SUB-PARTIAL Subscription"
+        self.source_color = "#4285F4"
+        self.local_name = None
+        self.local_color = None
+        self.set_calls = []
+
+    def get(self, calendar_id):
+        return {
+            "id": calendar_id,
+            "name": self.local_name or self.source_name,
+            "color": self.local_color or self.source_color,
+            "sourceName": self.source_name,
+            "sourceColor": self.source_color,
+        }
+
+    def set_appearance(self, calendar_id, fields):
+        self.set_calls.append(dict(fields))
+        if "name" in fields:
+            self.local_name = fields["name"]
+        if "color" in fields:
+            self.local_color = fields["color"]
+        return self.get(calendar_id)
+
+    def set_appearance_backfilling(self, calendar_id, fields):
+        # Adversarial: every PATCH rewrites BOTH fields, back-filling any
+        # omitted one from the current effective value -- pinning overrides
+        # the user never made. The flow must FAIL against this.
+        current = self.get(calendar_id)
+        self.set_calls.append(dict(fields))
+        self.local_name = fields.get("name", current["name"])
+        self.local_color = fields.get("color", current["color"])
+        return self.get(calendar_id)
+
+    def simulate_rename(self, calendar_id, new_source_name):
+        self.source_name = new_source_name
+        return {"sourceRenamedTo": new_source_name}
+
+    def simulate_color_change(self, calendar_id, new_source_color):
+        self.source_color = new_source_color
+        return {"sourceColorChangedTo": new_source_color}
+
+
+def _partial_env(backend, **overrides):
+    kwargs = dict(
+        api_set_calendar_appearance=backend.set_appearance,
+        api_get_calendar=backend.get,
+        api_trigger_calendar_refresh=lambda calendar_id: {"refreshed": True},
+        api_simulate_source_rename=backend.simulate_rename,
+        api_simulate_source_color_change=backend.simulate_color_change,
+        tablet_text_present=lambda text: text == backend.get("any")["name"],
+    )
+    kwargs.update(overrides)
+    return _make_env(**kwargs)
+
+
+def test_partial_override_flow_all_ok_and_payloads_omit_unchanged_fields():
+    backend = _OverrideModelBackend()
+    env = _partial_env(backend)
+
+    result = run_partial_appearance_override_flow(env, run_id="t1", timeout_seconds=1, interval_seconds=0.01)
+
+    assert result.status == STATUS_OK, [s.to_dict() for s in result.steps if s.status != STATUS_OK]
+    # The payload-shape contract itself: a colour-only edit sends EXACTLY
+    # {"color": ...} (no back-filled name) and a name-only edit sends
+    # EXACTLY {"name": ...}.
+    assert backend.set_calls == [
+        {"color": "#FF9500"},
+        {"name": "REG-PARTIAL-LOCAL-NAME-t1"},
+    ]
+    # And the end state: local overrides for both, source values live.
+    final = backend.get("x")
+    assert final["name"] == "REG-PARTIAL-LOCAL-NAME-t1"
+    assert final["color"] == "#FF9500"
+    assert final["sourceName"] == "REG-PARTIAL-SOURCE-RENAME-t1"
+    assert final["sourceColor"] == "#00A878"
+
+
+def test_partial_override_flow_fails_against_a_backend_that_backfills_omitted_fields():
+    backend = _OverrideModelBackend()
+    env = _partial_env(backend, api_set_calendar_appearance=backend.set_appearance_backfilling)
+
+    result = run_partial_appearance_override_flow(env, run_id="t2", timeout_seconds=0.2, interval_seconds=0.01)
+
+    assert result.status == STATUS_FAILED
+    failed = [s.step for s in result.steps if s.status == STATUS_FAILED]
+    # The back-filled name pins a local override, so the upstream source
+    # rename no longer propagates -- exactly where the flow must catch it.
+    assert "verify_source_rename_propagates_and_color_override_remains_via_api" in failed
+
+
+def test_partial_override_flow_fails_when_fixture_already_has_a_name_override():
+    backend = _OverrideModelBackend()
+    backend.local_name = "Someone already renamed me"
+    env = _partial_env(backend)
+
+    result = run_partial_appearance_override_flow(env, run_id="t3", timeout_seconds=0.2, interval_seconds=0.01)
+
+    assert result.status == STATUS_FAILED
+    assert result.steps[0].step == "verify_no_preexisting_name_override_via_api"
+    assert result.steps[0].status == STATUS_FAILED
+    assert len(result.steps) == 1
+
+
+def test_partial_override_flow_blocks_honestly_when_source_simulation_is_not_wired():
+    backend = _OverrideModelBackend()
+    env = _partial_env(backend, api_simulate_source_rename=None, api_simulate_source_color_change=None)
+
+    result = run_partial_appearance_override_flow(env, run_id="t4", timeout_seconds=1, interval_seconds=0.01)
+
+    assert result.status == STATUS_BLOCKED
+    blocked = [s for s in result.steps if s.status == STATUS_BLOCKED]
+    assert [s.step for s in blocked] == ["simulate_source_rename_via_api"]
+    assert "fixture plumbing" in blocked[0].detail
+    # Everything before the missing simulator still ran for real.
+    ok_steps = [s.step for s in result.steps if s.status == STATUS_OK]
+    assert "change_color_only_via_api" in ok_steps
+    assert "verify_color_only_edit_created_no_name_override_via_api" in ok_steps
+
+
+def test_partial_override_flow_blocks_when_appearance_api_is_not_wired_at_all():
+    env = _make_env(
+        api_set_calendar_appearance=None,
+        api_get_calendar=None,
+        api_trigger_calendar_refresh=None,
+        api_simulate_source_rename=None,
+        api_simulate_source_color_change=None,
+    )
+
+    result = run_partial_appearance_override_flow(env, timeout_seconds=0.2, interval_seconds=0.01)
+
+    assert result.status == STATUS_BLOCKED
+    assert result.steps[0].step == "capture_baseline_via_api"
+    assert "build_real_environment" in result.steps[0].detail

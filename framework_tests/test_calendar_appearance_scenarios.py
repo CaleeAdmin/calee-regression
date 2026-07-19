@@ -33,13 +33,17 @@ APPEARANCE_SCENARIOS = [
     REPO_ROOT / "scenarios" / "calendar_appearance_subscription.yaml",
     REPO_ROOT / "scenarios" / "calendar_appearance_owned.yaml",
     REPO_ROOT / "scenarios" / "calendar_appearance_shared_readonly.yaml",
+    REPO_ROOT / "scenarios" / "calendar_appearance_external.yaml",
 ]
 APPEARANCE_DOC = REPO_ROOT / "docs" / "CALENDAR_APPEARANCE_REGRESSION.md"
 UNCONFIRMED_RE = re.compile(r"UNCONFIRMED_[A-Za-z0-9_]+")
 
-# The exact commit the task's source diff was transcribed from -- CaleeAdmin/Calee,
-# branch claude/calendar-name-colour-editing-balgeo, PR #977.
-EXPECTED_CALEE_SOURCE_SHA = "f1b92ddae9275cb0abea0f6df34126930e3aa71d"
+# The exact commit these scenarios' selectors/strings were last confirmed
+# against -- CaleeAdmin/Calee, branch claude/calendar-appearance-regressions-n5hrnw,
+# PR #978 (partial appearance PATCH + capability-driven destructive actions),
+# which supersedes the original #977-era confirmation
+# (f1b92ddae9275cb0abea0f6df34126930e3aa71d).
+EXPECTED_CALEE_SOURCE_SHA = "a9c78199c7b24265525c1d303ce280b3633418eb"
 
 CRASH_GUARD_TEXTS = ["Unfortunately", "has stopped", "Force Close", "Error"]
 
@@ -51,7 +55,7 @@ def _raw_yaml(path) -> dict:
 # ── every scenario file exists and is wired into suites.py ───────────────────
 
 
-def test_all_three_appearance_scenario_files_exist():
+def test_all_appearance_scenario_files_exist():
     for path in APPEARANCE_SCENARIOS:
         assert path.is_file(), f"missing scenario file: {path}"
 
@@ -68,6 +72,7 @@ def test_calendar_appearance_suite_resolves_via_list_suites():
         "scenarios/calendar_appearance_subscription.yaml",
         "scenarios/calendar_appearance_owned.yaml",
         "scenarios/calendar_appearance_shared_readonly.yaml",
+        "scenarios/calendar_appearance_external.yaml",
     ]
 
 
@@ -178,7 +183,11 @@ def test_owned_scenario_asserts_the_source_metadata_appearance_note():
 
 
 def test_subscription_and_owned_scenarios_assert_ivedit_present_not_absent():
-    for name in ("calendar_appearance_subscription.yaml", "calendar_appearance_owned.yaml"):
+    for name in (
+        "calendar_appearance_subscription.yaml",
+        "calendar_appearance_owned.yaml",
+        "calendar_appearance_external.yaml",
+    ):
         scenario = runner.load_scenario(REPO_ROOT / "scenarios" / name)
         ivedit_steps = [s for s in scenario.steps if s.get("id") == "ivEdit"]
         assert ivedit_steps, f"{name} must reference ivEdit"
@@ -210,9 +219,80 @@ def test_shared_readonly_scenario_never_opens_the_edit_dialog():
 
 
 def test_appearance_scenarios_never_save_only_cancel():
-    # None of the three scenarios should tap btnCollectionSave -- they only
+    # None of the scenarios should tap btnCollectionSave -- they only
     # observe dialog contents and close without mutating the shared fixture.
     for path in APPEARANCE_SCENARIOS:
         scenario = runner.load_scenario(path)
         save_taps = [s for s in scenario.steps if s.get("action") == "tap" and s.get("id") == "btnCollectionSave"]
         assert not save_taps, f"{path} must not tap btnCollectionSave (never mutate the shared fixture)"
+
+
+# ── destructive-action content checks (Calee PR #978) ────────────────────────
+
+
+def _steps(name: str) -> list[dict]:
+    return runner.load_scenario(REPO_ROOT / "scenarios" / name).steps
+
+
+def test_subscription_scenario_asserts_remove_calendar_not_delete_calendar():
+    steps = _steps("calendar_appearance_subscription.yaml")
+    assert any(
+        s.get("action") == "assert_id" and s.get("id") == "btnCollectionDelete" for s in steps
+    ), "subscription must assert the destructive control is present (canRemoveFromCalee)"
+    assert any(
+        s.get("action") == "assert_text" and s.get("text") == "Remove Calendar" for s in steps
+    ), "subscription's destructive control must read 'Remove Calendar'"
+    # Source-deletion wording must be asserted ABSENT, never present.
+    assert not any(
+        s.get("action") == "assert_text" and s.get("text") == "Delete Calendar" for s in steps
+    ), "subscription must never assert source-delete wording as present"
+    assert any(
+        s.get("action") == "fail_if_text" and s.get("texts") == ["Delete Calendar"] for s in steps
+    ), "subscription must assert source-delete wording is absent"
+
+
+def test_subscription_removal_wording_never_claims_upstream_events_deleted():
+    sv = _raw_yaml(REPO_ROOT / "scenarios" / "calendar_appearance_subscription.yaml")["source_verification"]
+    contract = " ".join(sv.get("contract") or [])
+    assert "Remove Calendar" in contract
+    assert "upstream feed untouched" in contract
+
+
+def test_owned_scenario_asserts_delete_calendar_wording():
+    steps = _steps("calendar_appearance_owned.yaml")
+    assert any(
+        s.get("action") == "assert_id" and s.get("id") == "btnCollectionDelete" for s in steps
+    ), "owned must assert the destructive control is present (canDeleteSource)"
+    assert any(
+        s.get("action") == "assert_text" and s.get("text") == "Delete Calendar" for s in steps
+    ), "owned's destructive control must read 'Delete Calendar'"
+    assert not any(
+        s.get("action") == "assert_text" and s.get("text") == "Remove Calendar" for s in steps
+    ), "owned must not use removal wording for a true source deletion"
+
+
+def test_external_scenario_asserts_no_destructive_control_at_all():
+    steps = _steps("calendar_appearance_external.yaml")
+    delete_steps = [s for s in steps if s.get("id") == "btnCollectionDelete"]
+    assert delete_steps, "external must reference btnCollectionDelete (to assert its absence)"
+    assert all(
+        s.get("action") == "fail_if_id" for s in delete_steps
+    ), "external's btnCollectionDelete must only ever be asserted ABSENT (fail_if_id)"
+    assert any(
+        s.get("action") == "fail_if_text" and s.get("texts") == ["Delete Calendar"] for s in steps
+    ), "external must assert the broken source-delete wording never appears"
+
+
+def test_external_scenario_still_offers_appearance_editing():
+    steps = _steps("calendar_appearance_external.yaml")
+    ivedit = [s for s in steps if s.get("id") == "ivEdit"]
+    assert ivedit and all(s.get("action") in ("assert_id", "tap") for s in ivedit)
+    text = "\n".join(str(v) for step in steps for v in step.values())
+    assert "These changes only affect how this calendar appears in Calee." in text
+
+
+def test_shared_readonly_scenario_shows_no_destructive_control():
+    # The dialog never opens for an unsupported-mode calendar, so there is no
+    # destructive control to assert on -- the scenario must not reference it.
+    steps = _steps("calendar_appearance_shared_readonly.yaml")
+    assert not any(s.get("id") == "btnCollectionDelete" for s in steps)
