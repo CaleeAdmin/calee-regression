@@ -1,0 +1,150 @@
+name: calee-calendar-appearance-shared-readonly
+tags: [calendar, appearance, shared-readonly, tablet, draft-unverified, source-confirmed]
+requires_state: logged_in_tablet
+default_timeout_seconds: 20
+mandatory: false
+# SOURCE-CONFIRMED, PHYSICAL-UNVERIFIED.
+#
+# Proves the tablet side of the calendar name/colour appearance-editing
+# contract (calee-hub-core PATCH /client/v1/calendars/{id}/appearance; Calee
+# PR CaleeAdmin/Calee#977, commit f1b92ddae9275cb0abea0f6df34126930e3aa71d)
+# for a SHARED READ-ONLY CalDAV calendar (appearanceMode "unsupported"):
+# capabilities.canEditAppearance is false, so ivEdit is INVISIBLE (never
+# reachable/tappable) and the row instead shows tvOwnerManagedNote with the
+# exact owner-managed text. This calendar type never reaches
+# HubCalendarEditDialog at all, so (unlike the subscription/owned scenarios)
+# there is nothing to assert about the edit dialog here.
+#
+# FIXTURE GAP (the biggest of the three calendar_appearance scenarios): there
+# is no existing fixture/provisioning-contract entry in this repo for a
+# calendar SHARED TO the regression account by another party read-only, and
+# unlike calendar_appearance_owned.yaml's proposed fixture, this one cannot
+# be provisioned via ordinary single-account CRUD -- sharing a calendar
+# read-only needs either a second regression account to share FROM, or a
+# backend admin/fixture endpoint that does not exist (calee-hub-core has no
+# seed/test-data endpoint -- see docs/TEST_DATA_RESET_CONTRACT.md). This
+# scenario PROPOSES:
+#
+#   REG-SHARED-READONLY-CALENDAR-001   a calendar owned by a second,
+#                                      regression-owned account and shared
+#                                      read-only to the primary regression
+#                                      account under test.
+#
+# as a new provisioning-contract entry -- see docs/CALENDAR_APPEARANCE_REGRESSION.md.
+# Not implemented anywhere in this repo or its siblings as of this change.
+# This scenario is written against it now (source-confirmed selectors, real
+# structure) so it is ready to run once that fixture exists; until then it
+# is additionally BLOCKED on the fixture, on top of the existing
+# device/backend gates every draft scenario in this repo already carries.
+#
+# Single-device-observable by design (see calendar_appearance_subscription.yaml's
+# header for why genuinely cross-device coverage lives in
+# run_calendar_appearance_sync_flow instead).
+#
+# VISIBILITY NUANCE (needs physical confirmation): the diff describes ivEdit
+# as becoming INVISIBLE (not GONE) for this calendar type, while
+# tvOwnerManagedNote is explicitly GONE/VISIBLE. View.INVISIBLE still
+# occupies layout space and MAY still be exposed in UiAutomator2's
+# accessibility-node tree depending on the OS/driver version -- unlike
+# View.GONE, which reliably drops out. fail_if_id (below, mirroring the
+# existing read-only-enforcement idiom in scenarios/subscribed_calendar.yaml)
+# asserts by PRESENCE, not by a displayed/enabled check CaleeDriver does not
+# have -- so if UiAutomator2 turns out to still surface an INVISIBLE ivEdit
+# on this Android/Appium combination, this assertion would need to change to
+# a visibility-state check, which is a further instance of the same
+# "no such assertion primitive exists yet" gap already called out for
+# colour. This can only be settled by a physical run.
+#
+# ROW-SCOPING CAVEAT: unlike the subscription/owned scenarios (where the
+# row-scoping gap mainly risks tapping/asserting the WRONG row's element),
+# here it risks a FALSE assertion failure in the OTHER direction: on any
+# account that also has another, editable calendar (the common case -- a
+# shared-readonly calendar rarely exists in isolation), that other
+# calendar's visible ivEdit would make the bare `fail_if_id: ivEdit` check
+# below fail even though the shared-readonly row itself correctly hides its
+# own pencil. Confirming item_calendar_navigation_list.xml's row-container id
+# and switching to fail_if_in_row (the same row-scoped action already used
+# for task/chore rows, see docs/TABLET_MUTATION_COVERAGE_GAPS.md) is
+# necessary before this scenario can be trusted on a realistic
+# multi-calendar account; until then, run it only against a fixture account
+# scoped to just this one calendar, or treat a FAIL here as needing manual
+# confirmation of which row's ivEdit was actually found.
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llCalendar
+    timeout_seconds: 20
+
+  - name: Open Calendar
+    action: tap
+    id: llCalendar
+
+  - name: Wait for the calendar toolbar to render
+    action: wait_for_id
+    id: btnAddEvent
+    timeout_seconds: 10
+
+  - name: Expand the navigation rail if it is currently collapsed
+    action: tap_if_absent
+    unless_id: llDay
+    id: ivExpand
+
+  - name: Assert the navigation rail (and its calendar list) is now expanded
+    action: wait_for_id
+    id: llDay
+    timeout_seconds: 10
+
+  - name: The shared read-only calendar row is visible in the calendar list
+    action: wait_for_text
+    text: REG-SHARED-READONLY-CALENDAR-001
+    timeout_seconds: 20
+
+  - name: Capture the calendar list with the shared read-only row
+    action: screenshot
+    screenshot_name: 00_calendar_list_shared_readonly_row
+    compare: false
+
+  - name: Edit is ABSENT for a shared read-only calendar (see the visibility-nuance note above)
+    action: fail_if_id
+    id: ivEdit
+
+  - name: The owner-managed note is present for this calendar
+    action: assert_id
+    id: tvOwnerManagedNote
+
+  - name: The owner-managed note shows the exact expected text
+    action: assert_text
+    text: This shared calendar is managed by its owner.
+
+  - name: Capture the shared read-only calendar's row with its owner-managed note
+    action: screenshot
+    screenshot_name: 01_shared_readonly_owner_managed_note
+    compare: false
+
+  - name: Assert no crash/error dialog is showing
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]
+
+source_verification:
+  calee_source: CaleeAdmin/Calee
+  calee_source_sha: "f1b92ddae9275cb0abea0f6df34126930e3aa71d"
+  calee_source_ref: "PR CaleeAdmin/Calee#977, branch claude/calendar-name-colour-editing-balgeo (based on latest dev)"
+  status: source-confirmed
+  physical_confirmation: pending
+  contract:
+    - "ivEdit VISIBLE+clickable iff capabilities.canEditAppearance == true, else INVISIBLE (CalendarFragment.kt) -- false for appearanceMode == unsupported"
+    - "tvOwnerManagedNote VISIBLE iff appearanceMode == \"unsupported\", else GONE (item_calendar_navigation_list.xml, R.string.hub_calendar_owner_managed_message == \"This shared calendar is managed by its owner.\")"
+    - "unsupported-mode calendars never reach HubCalendarEditDialog at all, since ivEdit is invisible for them -- backend rejects PATCH .../appearance for these with a stable 409 CALENDAR_APPEARANCE_NOT_SUPPORTED (backend-internal, not asserted here)"
+  selectors:
+    ivEdit: app/src/main/res/layout/item_calendar_navigation_list.xml
+    tvOwnerManagedNote: app/src/main/res/layout/item_calendar_navigation_list.xml
+  fixture:
+    source: "PROPOSED, not yet implemented -- see docs/CALENDAR_APPEARANCE_REGRESSION.md"
+    calendarId: "server-assigned (shared from a second regression-owned account)"
+    calendarDisplayName: "REG-SHARED-READONLY-CALENDAR-001"
+  notes:
+    - "Needs a new REG-SHARED-READONLY-CALENDAR-001 fixture calendar that does not exist in this repo yet, and needs cross-account sharing (harder to provision than ordinary single-account CRUD) -- BLOCKED on provisioning, in addition to the device/backend gates every draft scenario here carries. See docs/CALENDAR_APPEARANCE_REGRESSION.md."
+    - "Row-scoping gap and INVISIBLE-vs-GONE visibility nuance -- see the header comment above."

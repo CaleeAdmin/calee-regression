@@ -297,3 +297,17 @@ before ever promoting one of these to the table above.
 | `calendar_event_mutation.yaml` | `logged_in_tablet` | `calendar_event_mutation` |
 | `tasks_mutation.yaml` | `logged_in_tablet` | `tasks_mutation` |
 | `chores_mutation.yaml` | `logged_in_tablet` | `chores_mutation` |
+
+Three further scenario files cover calendar name/colour appearance editing (Calee PR
+CaleeAdmin/Calee#977, calee-hub-core's `PATCH /client/v1/calendars/{id}/appearance`) — also
+`mandatory: false`, tagged `draft-unverified`, and excluded from every composite suite. Their
+selectors are source-confirmed against the real diff; what's still open is physical confirmation
+(same as the mutation drafts above) plus, for two of the three, a fixture calendar that does not
+exist in this repo yet — see `docs/CALENDAR_APPEARANCE_REGRESSION.md` for exactly what's provisioned
+vs. still needed per calendar type.
+
+| File | requires_state | Draft suite (not in `full-tester`/`release-technical`) |
+|---|---|---|
+| `calendar_appearance_subscription.yaml` | `logged_in_tablet` | `calendar_appearance` |
+| `calendar_appearance_owned.yaml` | `logged_in_tablet` | `calendar_appearance` |
+| `calendar_appearance_shared_readonly.yaml` | `logged_in_tablet` | `calendar_appearance` |

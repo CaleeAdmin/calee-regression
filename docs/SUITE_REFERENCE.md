@@ -28,9 +28,24 @@ Each is `mandatory: false` in its own scenario file and deliberately absent from
 `COMPOSITE_SUITES` entry, so no existing launcher or CI job ever runs them. See
 `docs/TABLET_MUTATION_COVERAGE_GAPS.md` for the exact gap and confirmation checklist.
 
+## Draft, non-canonical suite: `calendar_appearance`
+
+Like `subscribed_calendar` below, `calendar_appearance` (three scenario files —
+`calendar_appearance_subscription.yaml` / `calendar_appearance_owned.yaml` /
+`calendar_appearance_shared_readonly.yaml`) is **not** among the ten canonical profiles and is **not**
+release-gating: source-confirmed selectors (Calee PR CaleeAdmin/Calee#977) but physically unverified,
+and two of the three files additionally need a fixture calendar that does not exist in this repo yet.
+Each file is `mandatory: false`, tagged `draft-unverified`, and absent from every `COMPOSITE_SUITES`
+entry. See `docs/CALENDAR_APPEARANCE_REGRESSION.md` and `test_calendar_appearance_scenarios.py`.
+The genuinely cross-device half of this same contract (rename on one surface, verify on another;
+colour change; refresh-preserves-override) is **not** a YAML scenario at all — a single scenario file
+cannot express a cross-device assertion (`ScenarioRunner` drives one `CaleeDriver`/one device per run)
+— it lives in `run_calendar_appearance_sync_flow`, documented in "Partially implemented: `sync-smoke`"
+below.
+
 ## Partially implemented: `sync-smoke`
 
-`calee_regression/sync_smoke.py` orchestrates three flows across the API, CaleeMobile, and the
+`calee_regression/sync_smoke.py` orchestrates four flows across the API, CaleeMobile, and the
 tablet, each with bounded polling (never `sleep`-and-hope) and structured evidence per step (source
 operation, expected/observed state, timeout, polling attempts, device/build info, screenshots, API
 response excerpts) — see `SyncStepEvidence`/`SyncFlowResult` there and
@@ -44,11 +59,25 @@ response excerpts) — see `SyncStepEvidence`/`SyncFlowResult` there and
 - **Chore flow**: poll the tablet baseline → complete then un-complete `REG-CHORE-REPEATING-001` via
   CaleeMobile's row toggle (`sync_chore_complete_test.dart`, fully self-contained and self-cleaning)
   → poll the tablet again. No tablet-side mutation needed at all for this one.
+- **Calendar-appearance flow** (`run_calendar_appearance_sync_flow`, calee-hub-core's `PATCH
+  /client/v1/calendars/{id}/appearance`, Calee PR CaleeAdmin/Calee#977): capture a baseline → rename
+  via the API → poll the tablet for the new name → change colour via the API → verify it persisted →
+  *verify the colour change on the tablet* → trigger a provider/subscription refresh → verify the
+  local name+colour override survived it (API and tablet) and the provider's own `sourceName` was
+  never touched → confirm the calendar's events still report non-editable (API, and a tablet weak
+  signal). See `docs/CALENDAR_APPEARANCE_REGRESSION.md`.
 
 The *italicized* steps above are always recorded `BLOCKED`, never attempted and never faked as
-passing — they need tablet-side mutation resource ids that have never been confirmed against the
-real Calee app, the same gap `calendar_event_mutation`/`tasks_mutation` (above) are blocked on. See
-`docs/TABLET_MUTATION_COVERAGE_GAPS.md`.
+passing. For the event/task flows this is the tablet-mutation resource-id gap
+`calendar_event_mutation`/`tasks_mutation` (above) are also blocked on — see
+`docs/TABLET_MUTATION_COVERAGE_GAPS.md`. The calendar-appearance flow's *verify the colour change on
+the tablet* step is a DIFFERENT, permanent gap: no colour-reading primitive exists in `CaleeDriver` at
+all (not a resource-id problem — there is nothing to read even once ids are confirmed) — see
+`docs/CALENDAR_APPEARANCE_REGRESSION.md`. That flow's API-leg callables
+(`api_set_calendar_appearance`/`api_get_calendar`/`api_trigger_calendar_refresh`) are also not yet
+wired into `build_real_environment()` (needs new CaleeMobile-Regression API actions, out of scope for
+that change) — every step needing one of those records `BLOCKED` for that reason instead, distinct
+from the colour gap.
 
 **`sync-smoke` is now a release-gating component (Workstream 1).** `06 Test Full Calee Solution`
 invokes it after the mobile UI legs and before manual checks, reusing this run's verified backend +
@@ -67,12 +96,19 @@ device run reaches a clean `ok`, sync will PASS on its own with no further wirin
 genuinely does not include cross-device sync can set `release_features.synchronization: false`, which
 keeps sync in the report as an explicit **optional** component rather than silently omitting it.
 
-Every *other* step in all three flows is exercised for real against whatever backend/device the
-caller points it at — `sync_smoke_bridge.py` shells out to CaleeMobile-Regression's
+Every *other* step in the event/task/chore flows is exercised for real against whatever
+backend/device the caller points it at — `sync_smoke_bridge.py` shells out to CaleeMobile-Regression's
 `api/sync_smoke_actions.py` (API leg, `framework_tests/test_sync_smoke_bridge.py`) and `ui/run_ui_suite.py`
 (CaleeMobile leg), and a live `CaleeDriver`/Appium session drives the tablet-read legs. Section 10 of
 the project brief ("Cross-device synchronization suite") is the origin of this suite's intended
 shape; this closes it as far as the current tablet-mutation gap allows.
+
+The calendar-appearance flow's API leg is not yet wired into `build_real_environment()` the same way
+(see `docs/CALENDAR_APPEARANCE_REGRESSION.md`'s "Two DISTINCT gaps, not one") — every step needing it
+records `BLOCKED` for that reason on top of the always-`BLOCKED` colour-verification step, so this
+flow currently contributes even less live-exercised coverage than the other three until that wiring
+lands. Its orchestration logic is nonetheless fully exercised with fakes, same as the other three —
+see `framework_tests/test_sync_smoke.py`.
 
 ## Notes
 

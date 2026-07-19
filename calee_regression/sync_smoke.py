@@ -21,6 +21,23 @@ exactly the blocked step as such; it never fabricates success for a step
 that did not actually run. The orchestration logic itself (this module) is
 fully unit-tested with fakes -- see framework_tests/test_sync_smoke.py --
 independent of whether a real device/backend is available.
+
+run_calendar_appearance_sync_flow (calee-hub-core PATCH
+/client/v1/calendars/{id}/appearance; Calee PR CaleeAdmin/Calee#977) carries
+two further, DISTINCT honesty limits on top of the tablet-mutation gap
+above -- see docs/CALENDAR_APPEARANCE_REGRESSION.md:
+  - No colour-reading primitive exists in CaleeDriver at all (not even for
+    reading, let alone mutating) -- see appium_driver.py. The tablet-side
+    colour-verification step is therefore unconditionally BLOCKED, not
+    contingent on env wiring like the steps below.
+  - build_real_environment() does not yet wire real implementations of the
+    api_set_calendar_appearance/api_get_calendar/api_trigger_calendar_refresh
+    callables this flow needs -- doing so needs new CaleeMobile-Regression
+    API actions that do not exist today, and CaleeMobile-Regression is out
+    of scope for this change. These callables are OPTIONAL on
+    SyncSmokeEnvironment (default None); every step that needs one records
+    BLOCKED honestly when it is absent, exactly like the tablet-mutation
+    steps below do for their own gap.
 """
 
 from __future__ import annotations
@@ -42,6 +59,21 @@ _STATUS_PRECEDENCE = {STATUS_FAILED: 2, STATUS_BLOCKED: 1, STATUS_OK: 0}
 TABLET_MUTATION_GAP_DETAIL = (
     "Tablet-side mutation needs resource ids that have never been confirmed against the real "
     "Calee app -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md. Not attempted."
+)
+
+COLOR_ASSERTION_GAP_DETAIL = (
+    "No colour-reading primitive exists in CaleeDriver (calee_regression/appium_driver.py offers "
+    "only id/text presence, tap, type, clear) -- a tablet-side colour assertion cannot be "
+    "implemented without inventing an action the driver doesn't have. See "
+    "docs/CALENDAR_APPEARANCE_REGRESSION.md. Not attempted."
+)
+
+APPEARANCE_API_NOT_WIRED_DETAIL = (
+    "build_real_environment() does not wire this leg yet -- it needs new CaleeMobile-Regression "
+    "API actions (set-calendar-appearance / get-calendar / trigger-calendar-refresh) that do not "
+    "exist in sync_smoke_actions.py today, and CaleeMobile-Regression is out of scope for this "
+    "change. The orchestration logic itself is fully exercised with fakes in "
+    "framework_tests/test_sync_smoke.py. Not attempted."
 )
 
 
@@ -120,6 +152,15 @@ class SyncSmokeEnvironment:
     device_id: "str | None" = None
     build_version: "str | None" = None
     take_screenshot: "Callable[[str], str] | None" = None  # name -> path; None if unavailable
+    # Calendar-appearance flow callables (run_calendar_appearance_sync_flow).
+    # Optional and default None -- unlike every callable above,
+    # build_real_environment() does not yet wire real implementations (see
+    # APPEARANCE_API_NOT_WIRED_DETAIL); a None here makes the flow record the
+    # dependent steps BLOCKED instead of raising. Tests supply fakes for all
+    # three to exercise the full orchestration logic.
+    api_set_calendar_appearance: "Callable[[str, dict], dict] | None" = None  # (calendar_id, {field: value}) -> updated calendar
+    api_get_calendar: "Callable[[str], dict] | None" = None  # calendar_id -> calendar dict (name/color/sourceName/capabilities/...)
+    api_trigger_calendar_refresh: "Callable[[str], dict] | None" = None  # calendar_id -> refresh result
 
 
 def _now() -> str:
@@ -433,6 +474,349 @@ def run_chore_sync_flow(
     return SyncFlowResult(flow="chore-sync", steps=steps, started_at=started, finished_at=_now())
 
 
+def run_calendar_appearance_sync_flow(
+    env: SyncSmokeEnvironment,
+    *,
+    calendar_id: str = "regression:regsub",
+    run_id: str = "adhoc",
+    new_color: str = "#3E7BFA",
+    timeout_seconds: float = 60.0,
+    interval_seconds: float = 2.0,
+) -> SyncFlowResult:
+    """capture a baseline -> rename via API/mobile -> poll tablet for the new
+    name -> change colour via API -> verify it persisted -> [verify the
+    colour change on the tablet: BLOCKED, no colour-reading primitive] ->
+    trigger a provider/subscription refresh -> verify the local name+colour
+    override survived it (API and tablet) and the provider's own sourceName
+    was never touched -> confirm the calendar's events still report as
+    non-editable (API and a tablet weak signal).
+
+    Models the genuinely cross-device half of the calendar appearance-
+    editing contract (calee-hub-core PATCH /client/v1/calendars/{id}/appearance;
+    Calee PR CaleeAdmin/Calee#977, commit
+    f1b92ddae9275cb0abea0f6df34126930e3aa71d) that a single YAML scenario
+    structurally cannot express -- this repo's ScenarioRunner drives exactly
+    one CaleeDriver/one device per run (runner.py:536). See
+    scenarios/calendar_appearance_subscription.yaml (and its owned/
+    shared-readonly siblings) for the single-device-observable half: does
+    the tablet show the right dialog/note for the right calendar type.
+
+    Design choices, and why:
+
+    * The rename/recolour "via API" leg stands in for "via API or
+      CaleeMobile" -- both ultimately call the same PATCH .../appearance
+      endpoint, and CaleeMobile-Regression has no dedicated appearance-
+      editing UI flow to shell out to yet. This is the same substitution
+      run_event_sync_flow already makes ("created via API" stands for
+      "created from off-tablet").
+    * Colour is changed via the API leg, never the tablet leg: CaleeDriver
+      has no colour-reading primitive at all (see
+      docs/CALENDAR_APPEARANCE_REGRESSION.md), so there is no honest way to
+      verify a tablet-INITIATED colour change either happened or
+      propagated. The colour change is instead exercised for real via the
+      API (set -> a fresh GET confirms the persisted hex value, the same
+      colour-independent proxy the YAML scenarios use), while the tablet-
+      side colour-verification step stays permanently BLOCKED and says so
+      -- never faked as passing, and NOT contingent on env wiring the way
+      the steps below are (it can never become attemptable just because a
+      real API/tablet session is available).
+    * sourceName preservation (the "external-provider name-change-
+      preserves-provider-name" requirement) is checked against a baseline
+      captured before any mutation, proving the rename only ever changed
+      the local Calee display, never the provider's own metadata -- exactly
+      what appearanceMode subscription_mapping/external_calendar promise.
+
+    Every callable this flow needs beyond tablet_text_present is OPTIONAL on
+    SyncSmokeEnvironment (defaults to None): unlike the event/task/chore
+    flows, build_real_environment() does not yet wire real implementations
+    (see APPEARANCE_API_NOT_WIRED_DETAIL) -- when one is None, every step
+    that needs it records BLOCKED honestly instead of raising, and steps
+    that don't need it still run for real. The orchestration/evidence-
+    recording logic itself is fully exercised with fakes in
+    framework_tests/test_sync_smoke.py.
+    """
+    steps: list = []
+    started = _now()
+    new_name = f"REG-SYNC-SMOKE-CALENDAR-APPEARANCE-{run_id}"
+
+    baseline: "dict | None" = None
+    if env.api_get_calendar is None:
+        steps.append(
+            SyncStepEvidence(
+                step="capture_baseline_via_api", surface="api", status=STATUS_BLOCKED,
+                expected_state=f"a baseline GET of {calendar_id!r} before any appearance change",
+                detail=APPEARANCE_API_NOT_WIRED_DETAIL,
+            )
+        )
+    else:
+        try:
+            baseline = env.api_get_calendar(calendar_id)
+            steps.append(
+                SyncStepEvidence(
+                    step="capture_baseline_via_api", surface="api", status=STATUS_OK,
+                    expected_state=f"a baseline GET of {calendar_id!r} before any appearance change",
+                    observed_state=str(baseline)[:500], api_response_excerpt=str(baseline)[:500],
+                )
+            )
+        except Exception as exc:
+            steps.append(
+                SyncStepEvidence(
+                    step="capture_baseline_via_api", surface="api", status=STATUS_FAILED,
+                    expected_state=f"a baseline GET of {calendar_id!r} before any appearance change",
+                    detail=str(exc),
+                )
+            )
+
+    if env.api_set_calendar_appearance is None:
+        steps.append(
+            SyncStepEvidence(
+                step="rename_via_api", surface="api", status=STATUS_BLOCKED,
+                expected_state=f"calendar {calendar_id!r} appearance name set to {new_name!r}",
+                detail=APPEARANCE_API_NOT_WIRED_DETAIL,
+            )
+        )
+        return SyncFlowResult(flow="calendar-appearance-sync", steps=steps, started_at=started, finished_at=_now())
+
+    try:
+        renamed = env.api_set_calendar_appearance(calendar_id, {"name": new_name})
+        steps.append(
+            SyncStepEvidence(
+                step="rename_via_api", surface="api", status=STATUS_OK,
+                expected_state=f"calendar {calendar_id!r} appearance name set to {new_name!r}",
+                observed_state=str(renamed), api_response_excerpt=str(renamed)[:500],
+            )
+        )
+    except Exception as exc:
+        steps.append(
+            SyncStepEvidence(
+                step="rename_via_api", surface="api", status=STATUS_FAILED,
+                expected_state=f"calendar {calendar_id!r} appearance name set to {new_name!r}", detail=str(exc),
+            )
+        )
+        return SyncFlowResult(flow="calendar-appearance-sync", steps=steps, started_at=started, finished_at=_now())
+
+    poll_name = poll_until(
+        lambda: env.tablet_text_present(new_name), timeout_seconds=timeout_seconds, interval_seconds=interval_seconds,
+    )
+    steps.append(
+        SyncStepEvidence(
+            step="poll_tablet_for_renamed_calendar", surface="tablet",
+            status=STATUS_OK if poll_name.succeeded else STATUS_FAILED,
+            expected_state=f"{new_name!r} visible on the tablet's calendar list",
+            observed_state="visible" if poll_name.succeeded else "not visible before timeout",
+            timeout_seconds=timeout_seconds, polling_attempts=poll_name.attempts,
+            device_id=env.device_id, build_version=env.build_version,
+            screenshot_paths=_maybe_screenshot(env, "calendar_appearance_after_rename"),
+        )
+    )
+
+    try:
+        env.api_set_calendar_appearance(calendar_id, {"color": new_color})
+        steps.append(
+            SyncStepEvidence(
+                step="change_color_via_api", surface="api", status=STATUS_OK,
+                expected_state=f"calendar {calendar_id!r} appearance colour set to {new_color!r}",
+                observed_state=f"requested {new_color!r}",
+            )
+        )
+    except Exception as exc:
+        steps.append(
+            SyncStepEvidence(
+                step="change_color_via_api", surface="api", status=STATUS_FAILED,
+                expected_state=f"calendar {calendar_id!r} appearance colour set to {new_color!r}", detail=str(exc),
+            )
+        )
+        return SyncFlowResult(flow="calendar-appearance-sync", steps=steps, started_at=started, finished_at=_now())
+
+    if env.api_get_calendar is None:
+        steps.append(
+            SyncStepEvidence(
+                step="verify_color_persisted_via_api", surface="api", status=STATUS_BLOCKED,
+                expected_state=f"a fresh GET of {calendar_id!r} reports colour {new_color!r}",
+                detail=APPEARANCE_API_NOT_WIRED_DETAIL,
+            )
+        )
+    else:
+        poll_color = poll_until(
+            lambda: env.api_get_calendar(calendar_id), timeout_seconds=timeout_seconds,
+            interval_seconds=interval_seconds, is_success=lambda observed: observed.get("color") == new_color,
+        )
+        steps.append(
+            SyncStepEvidence(
+                step="verify_color_persisted_via_api", surface="api",
+                status=STATUS_OK if poll_color.succeeded else STATUS_FAILED,
+                expected_state=f"a fresh GET of {calendar_id!r} reports colour {new_color!r}",
+                observed_state=str(poll_color.last_observed)[:500],
+                timeout_seconds=timeout_seconds, polling_attempts=poll_color.attempts,
+                api_response_excerpt=str(poll_color.last_observed)[:500],
+            )
+        )
+
+    # A DIFFERENT, permanent gap from tablet-mutation above: no colour-
+    # reading primitive exists in CaleeDriver at all, so this can never be
+    # attempted regardless of env wiring -- see COLOR_ASSERTION_GAP_DETAIL.
+    steps.append(
+        SyncStepEvidence(
+            step="verify_color_change_on_tablet", surface="tablet", status=STATUS_BLOCKED,
+            expected_state="the tablet visually reflects the new colour", detail=COLOR_ASSERTION_GAP_DETAIL,
+        )
+    )
+
+    if env.api_trigger_calendar_refresh is None:
+        steps.append(
+            SyncStepEvidence(
+                step="trigger_provider_refresh_via_api", surface="api", status=STATUS_BLOCKED,
+                expected_state=f"calendar {calendar_id!r} refreshed from its provider/subscription source",
+                detail=APPEARANCE_API_NOT_WIRED_DETAIL,
+            )
+        )
+        return SyncFlowResult(flow="calendar-appearance-sync", steps=steps, started_at=started, finished_at=_now())
+
+    try:
+        refreshed = env.api_trigger_calendar_refresh(calendar_id)
+        steps.append(
+            SyncStepEvidence(
+                step="trigger_provider_refresh_via_api", surface="api", status=STATUS_OK,
+                expected_state=f"calendar {calendar_id!r} refreshed from its provider/subscription source",
+                observed_state=str(refreshed), api_response_excerpt=str(refreshed)[:500],
+            )
+        )
+    except Exception as exc:
+        steps.append(
+            SyncStepEvidence(
+                step="trigger_provider_refresh_via_api", surface="api", status=STATUS_FAILED,
+                expected_state=f"calendar {calendar_id!r} refreshed from its provider/subscription source",
+                detail=str(exc),
+            )
+        )
+        return SyncFlowResult(flow="calendar-appearance-sync", steps=steps, started_at=started, finished_at=_now())
+
+    if env.api_get_calendar is None:
+        steps.append(
+            SyncStepEvidence(
+                step="verify_override_survives_refresh_via_api", surface="api", status=STATUS_BLOCKED,
+                expected_state=f"{calendar_id!r} still reports name {new_name!r} and colour {new_color!r} after refresh",
+                detail=APPEARANCE_API_NOT_WIRED_DETAIL,
+            )
+        )
+    else:
+        poll_survives = poll_until(
+            lambda: env.api_get_calendar(calendar_id), timeout_seconds=timeout_seconds,
+            interval_seconds=interval_seconds,
+            is_success=lambda observed: observed.get("name") == new_name and observed.get("color") == new_color,
+        )
+        steps.append(
+            SyncStepEvidence(
+                step="verify_override_survives_refresh_via_api", surface="api",
+                status=STATUS_OK if poll_survives.succeeded else STATUS_FAILED,
+                expected_state=f"{calendar_id!r} still reports name {new_name!r} and colour {new_color!r} after refresh",
+                observed_state=str(poll_survives.last_observed)[:500],
+                timeout_seconds=timeout_seconds, polling_attempts=poll_survives.attempts,
+                api_response_excerpt=str(poll_survives.last_observed)[:500],
+            )
+        )
+
+    if baseline is None:
+        steps.append(
+            SyncStepEvidence(
+                step="verify_source_name_preserved_via_api", surface="api", status=STATUS_BLOCKED,
+                expected_state="sourceName unchanged from its pre-rename baseline (proves the rename was local-only)",
+                detail="No baseline was captured (capture_baseline_via_api was blocked or failed) -- "
+                       "nothing to compare against.",
+            )
+        )
+    else:
+        original_source_name = baseline.get("sourceName")
+        poll_source = poll_until(
+            lambda: env.api_get_calendar(calendar_id), timeout_seconds=timeout_seconds,
+            interval_seconds=interval_seconds,
+            is_success=lambda observed: observed.get("sourceName") == original_source_name,
+        )
+        steps.append(
+            SyncStepEvidence(
+                step="verify_source_name_preserved_via_api", surface="api",
+                status=STATUS_OK if poll_source.succeeded else STATUS_FAILED,
+                expected_state=f"sourceName remains {original_source_name!r} -- the rename only ever changed "
+                                "the local Calee display, never the provider's own metadata",
+                observed_state=str(poll_source.last_observed)[:500],
+                timeout_seconds=timeout_seconds, polling_attempts=poll_source.attempts,
+                api_response_excerpt=str(poll_source.last_observed)[:500],
+            )
+        )
+
+    # Tablet-side survival is checked by NAME only -- colour still has no
+    # tablet-side assertion primitive (see verify_color_change_on_tablet).
+    poll_survives_tablet = poll_until(
+        lambda: env.tablet_text_present(new_name), timeout_seconds=timeout_seconds, interval_seconds=interval_seconds,
+    )
+    steps.append(
+        SyncStepEvidence(
+            step="verify_override_survives_refresh_on_tablet", surface="tablet",
+            status=STATUS_OK if poll_survives_tablet.succeeded else STATUS_FAILED,
+            expected_state=f"{new_name!r} (name only -- see the colour gap above) still visible on the tablet after refresh",
+            observed_state="visible" if poll_survives_tablet.succeeded else "not visible before timeout",
+            timeout_seconds=timeout_seconds, polling_attempts=poll_survives_tablet.attempts,
+            device_id=env.device_id, build_version=env.build_version,
+            screenshot_paths=_maybe_screenshot(env, "calendar_appearance_after_refresh"),
+        )
+    )
+
+    if env.api_get_calendar is None:
+        steps.append(
+            SyncStepEvidence(
+                step="verify_events_non_editable_via_api", surface="api", status=STATUS_BLOCKED,
+                expected_state=f"{calendar_id!r} capabilities.canEditEvents remains false throughout",
+                detail=APPEARANCE_API_NOT_WIRED_DETAIL,
+            )
+        )
+    else:
+        try:
+            observed = env.api_get_calendar(calendar_id)
+            still_non_editable = not bool((observed.get("capabilities") or {}).get("canEditEvents"))
+            steps.append(
+                SyncStepEvidence(
+                    step="verify_events_non_editable_via_api", surface="api",
+                    status=STATUS_OK if still_non_editable else STATUS_FAILED,
+                    expected_state=f"{calendar_id!r} capabilities.canEditEvents remains false throughout",
+                    observed_state=str(observed)[:500], api_response_excerpt=str(observed)[:500],
+                )
+            )
+        except Exception as exc:
+            steps.append(
+                SyncStepEvidence(
+                    step="verify_events_non_editable_via_api", surface="api", status=STATUS_FAILED,
+                    expected_state=f"{calendar_id!r} capabilities.canEditEvents remains false throughout",
+                    detail=str(exc),
+                )
+            )
+
+    # Weak/partial signal only -- the same idiom run_task_sync_flow/
+    # run_chore_sync_flow use for a tablet-side check with no dedicated
+    # assertion primitive. This proves the calendar's events are still
+    # rendering on the tablet, not independently that Edit/Delete controls
+    # are absent from any one event's detail dialog (that shape is already
+    # proven, single-device, by scenarios/subscribed_calendar.yaml's
+    # fail_if_id btnEventDetailEdit/btnEventDetailDelete for the
+    # subscription type). The authoritative non-editable check for this
+    # flow is verify_events_non_editable_via_api above.
+    poll_events_visible = poll_until(
+        lambda: env.tablet_text_present(new_name), timeout_seconds=timeout_seconds, interval_seconds=interval_seconds,
+    )
+    steps.append(
+        SyncStepEvidence(
+            step="verify_events_non_editable_on_tablet_weak_signal", surface="tablet",
+            status=STATUS_OK if poll_events_visible.succeeded else STATUS_FAILED,
+            expected_state=f"{calendar_id!r} still renders on the tablet (title-presence only, not an editability check)",
+            observed_state="visible" if poll_events_visible.succeeded else "not visible before timeout",
+            timeout_seconds=timeout_seconds, polling_attempts=poll_events_visible.attempts,
+            device_id=env.device_id, build_version=env.build_version,
+            detail="Weak/partial signal -- see docs/CALENDAR_APPEARANCE_REGRESSION.md.",
+        )
+    )
+
+    return SyncFlowResult(flow="calendar-appearance-sync", steps=steps, started_at=started, finished_at=_now())
+
+
 def build_real_environment(
     *,
     repo_root: Path,
@@ -499,13 +883,30 @@ def run_all_sync_flows(
     *,
     run_id: str = "adhoc",
     task_id: "str | None" = None,
+    calendar_id: str = "regression:regsub",
     timeout_seconds: float = 60.0,
     interval_seconds: float = 2.0,
 ) -> "list[SyncFlowResult]":
+    """Runs every sync-smoke flow for one release run, in order.
+
+    Every flow's report feeds into the SAME `sync-smoke` CLI component/
+    report (`reports/runs/<run-id>/sync/results.json`), so
+    run_calendar_appearance_sync_flow rides the existing, already-release-
+    gating `release_features.synchronization` feature (see
+    docs/SUITE_REFERENCE.md's "sync-smoke" section and
+    docs/RELEASE_POLICY.md) -- component_from_sync_report in
+    consolidated_report.py is flow-count-agnostic, so no separate feature
+    flag or consolidation wiring is needed for a 4th flow to be
+    release-gating the same way the first three already are.
+    """
     return [
         run_event_sync_flow(env, run_id=run_id, timeout_seconds=timeout_seconds, interval_seconds=interval_seconds),
         run_task_sync_flow(
             env, task_id=task_id, timeout_seconds=timeout_seconds, interval_seconds=interval_seconds,
         ),
         run_chore_sync_flow(env, timeout_seconds=timeout_seconds, interval_seconds=interval_seconds),
+        run_calendar_appearance_sync_flow(
+            env, calendar_id=calendar_id, run_id=run_id,
+            timeout_seconds=timeout_seconds, interval_seconds=interval_seconds,
+        ),
     ]
