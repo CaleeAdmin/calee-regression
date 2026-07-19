@@ -137,14 +137,28 @@ def test_rejects_wrong_workflow_path_and_name():
     assert any("workflow" in p for p in chain.problems)
 
 
-def test_accepts_when_only_name_matches_and_path_differs():
-    # Real runs may not always expose `path`; matching by name is sufficient.
+def test_rejects_when_only_name_matches_but_path_missing():
+    # P7.1: the workflow name "ci" is diagnostic only and never substitutes for
+    # the path. A run with no path is refused even when it is named "ci".
     zb = _valid_zip()
     chain = ga.verify_github_artifact_chain(
         _run(workflow_path=None, workflow_name="ci"), _jobs(), _artifact(zb), zb,
         expected_regression_sha=RUN_HEAD_SHA,
     )
-    assert chain.ok, chain.problems
+    assert not chain.ok
+    assert any("workflow path" in p for p in chain.problems)
+
+
+def test_rejects_same_repo_wrong_workflow_named_ci():
+    # P7.9: same repository, a DIFFERENT workflow file that is also named "ci".
+    # The name must not launder a foreign workflow past the path check.
+    zb = _valid_zip()
+    chain = ga.verify_github_artifact_chain(
+        _run(workflow_path=".github/workflows/not-ci.yml", workflow_name="ci"),
+        _jobs(), _artifact(zb), zb, expected_regression_sha=RUN_HEAD_SHA,
+    )
+    assert not chain.ok
+    assert any("workflow path" in p for p in chain.problems)
 
 
 @pytest.mark.parametrize("event", ["push", "pull_request", "schedule"])
@@ -368,3 +382,145 @@ def test_acquire_with_injected_fetchers_verifies_end_to_end():
     )
     assert chain.ok, chain.problems
     assert chain.result["pubspecVersion"] == "0.0.24+24"
+
+
+# --- P7 hardening: adversarial rejections -----------------------------------
+
+
+def test_rejects_successful_selector_job_in_failed_overall_run():
+    # P7.3/P7.9: the selector-contract job succeeded but the OVERALL run failed
+    # (another job failed). Production evidence requires the run to conclude
+    # success, not just the one job.
+    zb = _valid_zip()
+    chain = ga.verify_github_artifact_chain(
+        _run(conclusion="failure"), _jobs(conclusion="success"), _artifact(zb), zb,
+        expected_regression_sha=RUN_HEAD_SHA,
+    )
+    assert not chain.ok
+    assert any("conclusion" in p and "success" in p for p in chain.problems)
+
+
+def test_rejects_run_missing_conclusion():
+    zb = _valid_zip()
+    chain = ga.verify_github_artifact_chain(
+        _run(conclusion=None), _jobs(), _artifact(zb), zb, expected_regression_sha=RUN_HEAD_SHA,
+    )
+    assert not chain.ok
+    assert any("conclusion" in p for p in chain.problems)
+
+
+def test_rejects_two_selector_like_jobs():
+    # P7.4/P7.9: two jobs whose names match the selector marker are ambiguous.
+    zb = _valid_zip()
+    jobs = [
+        ga.JobMetadata(name="CaleeMobile selector contract (must pass before UI analysis)",
+                       status="completed", conclusion="success"),
+        ga.JobMetadata(name="CaleeMobile selector contract (shadow copy)",
+                       status="completed", conclusion="failure"),
+    ]
+    chain = ga.verify_github_artifact_chain(_run(), jobs, _artifact(zb), zb,
+                                            expected_regression_sha=RUN_HEAD_SHA)
+    assert not chain.ok
+    assert any("multiple selector-contract jobs" in p for p in chain.problems)
+
+
+def test_rejects_selector_job_not_completed():
+    zb = _valid_zip()
+    jobs = [
+        ga.JobMetadata(name="CaleeMobile selector contract (must pass before UI analysis)",
+                       status="in_progress", conclusion=None),
+    ]
+    chain = ga.verify_github_artifact_chain(_run(), jobs, _artifact(zb), zb,
+                                            expected_regression_sha=RUN_HEAD_SHA)
+    assert not chain.ok
+    assert any("has not completed" in p for p in chain.problems)
+
+
+def test_rejects_artifact_missing_run_ownership():
+    # P7.5/P7.9: artifact metadata that does not record its workflow_run id is
+    # refused -- a missing relationship is not accepted.
+    zb = _valid_zip()
+    chain = ga.verify_github_artifact_chain(
+        _run(), _jobs(), _artifact(zb, workflow_run_id=None), zb,
+        expected_regression_sha=RUN_HEAD_SHA,
+    )
+    assert not chain.ok
+    assert any("does not record its workflow_run id" in p for p in chain.problems)
+
+
+def test_rejects_evidence_missing_workflow_run_id():
+    # P7.6/P7.9: the extracted JSON has no workflowRunId.
+    body = json.dumps({k: v for k, v in _result_json().items() if k != "workflowRunId"}).encode()
+    zb = _zip_with({ga.EXPECTED_RESULT_FILENAME: body})
+    chain = ga.verify_github_artifact_chain(_run(), _jobs(), _artifact(zb), zb,
+                                            expected_regression_sha=RUN_HEAD_SHA)
+    assert not chain.ok
+    assert any("no workflowRunId" in p for p in chain.problems)
+
+
+def test_rejects_evidence_short_regression_sha():
+    # P7.7: regressionSha must be a full 40-char SHA.
+    zb = _valid_zip(regressionSha="25f47d3")
+    chain = ga.verify_github_artifact_chain(_run(head_sha="25f47d3"), _jobs(), _artifact(zb), zb)
+    assert not chain.ok
+    assert any("not a full 40-character SHA" in p for p in chain.problems)
+
+
+def test_rejects_repository_dispatch_without_legacy_mode():
+    # P7.2/P7.9: repository_dispatch evidence is refused by default.
+    zb = _valid_zip()
+    chain = ga.verify_github_artifact_chain(
+        _run(event="repository_dispatch"), _jobs(), _artifact(zb), zb,
+        expected_regression_sha=RUN_HEAD_SHA,
+    )
+    assert not chain.ok
+    assert any("dispatch event" in p for p in chain.problems)
+
+
+def test_accepts_repository_dispatch_in_explicit_legacy_mode():
+    # P7.2: repository_dispatch is accepted ONLY when legacy mode is explicit.
+    zb = _valid_zip()
+    chain = ga.verify_github_artifact_chain(
+        _run(event="repository_dispatch"), _jobs(), _artifact(zb), zb,
+        expected_regression_sha=RUN_HEAD_SHA, allow_legacy_repository_dispatch=True,
+    )
+    assert chain.ok, chain.problems
+
+
+def test_acquire_repository_dispatch_blocked_without_legacy_mode():
+    # P7.2/P7.9 at the acquisition layer: a repository_dispatch run does not
+    # authenticate unless legacy mode is explicitly requested.
+    zb = _valid_zip()
+
+    def json_fetcher(url: str) -> dict:
+        if url.endswith(f"/runs/{RUN_ID}"):
+            return {
+                "id": int(RUN_ID), "repository": {"full_name": ga.EXPECTED_WORKFLOW_REPO},
+                "path": ga.EXPECTED_WORKFLOW_PATH, "name": "ci", "event": "repository_dispatch",
+                "head_sha": RUN_HEAD_SHA, "status": "completed", "conclusion": "success",
+            }
+        if url.endswith(f"/runs/{RUN_ID}/jobs"):
+            return {"jobs": [{"name": "CaleeMobile selector contract (must pass before UI analysis)",
+                              "status": "completed", "conclusion": "success"}]}
+        if url.endswith(f"/artifacts/{ARTIFACT_ID}"):
+            return {"id": int(ARTIFACT_ID), "name": ga.EXPECTED_ARTIFACT_NAME, "expired": False,
+                    "size_in_bytes": len(zb), "digest": "sha256:" + ga.sha256_hex(zb),
+                    "workflow_run": {"id": int(RUN_ID)}, "archive_download_url": "https://api.github.com/x/zip"}
+        raise AssertionError(f"unexpected url {url}")
+
+    def bytes_fetcher(url: str) -> bytes:
+        return zb
+
+    blocked = ga.acquire_github_artifact(
+        run_id=RUN_ID, artifact_id=ARTIFACT_ID, expected_regression_sha=RUN_HEAD_SHA,
+        json_fetcher=json_fetcher, bytes_fetcher=bytes_fetcher, token="fake",
+    )
+    assert not blocked.ok
+    assert any("dispatch event" in p for p in blocked.problems)
+
+    allowed = ga.acquire_github_artifact(
+        run_id=RUN_ID, artifact_id=ARTIFACT_ID, expected_regression_sha=RUN_HEAD_SHA,
+        json_fetcher=json_fetcher, bytes_fetcher=bytes_fetcher, token="fake",
+        allow_legacy_repository_dispatch=True,
+    )
+    assert allowed.ok, allowed.problems

@@ -116,6 +116,47 @@ def test_verify_detects_tampering_after_digest():
     assert any("digest mismatch" in p or "modified after adoption" in p for p in problems)
 
 
+def test_anchored_digest_accepts_matching_record():
+    # P7.8: a trusted digest anchored outside the bundle that matches the
+    # record's envelopeDigest adds no problems.
+    record = sp.build_provenance_record(
+        _ci_source(), release_run_id="run-1", adopted_at="t", adopted_by="gate",
+        source_path="/tmp/a.json",
+    )
+    anchored = record["envelopeDigest"]
+    assert sp.verify_provenance_record(record, trusted_envelope_digest=anchored) == []
+
+
+def test_anchored_digest_catches_coordinated_rehash():
+    # P7.8: the KEY case. An attacker edits a preserved field AND recomputes the
+    # envelopeDigest, producing a self-consistent record. The plain re-verify
+    # cannot detect this (the bundle is internally consistent); a trusted digest
+    # anchored OUTSIDE the bundle does.
+    record = sp.build_provenance_record(
+        _ci_source(), release_run_id="run-1", adopted_at="t", adopted_by="gate",
+        source_path="/tmp/a.json",
+    )
+    trusted = record["envelopeDigest"]  # captured before tampering, kept outside
+    # Coordinated re-hash: change a field, refresh both digests.
+    record["sourceEvidence"]["testedSha"] = "b" * 40
+    record["sourceContentDigest"] = sp.content_digest(record["sourceEvidence"])
+    record["envelopeDigest"] = sp.envelope_digest(record)
+    # Without the anchor, the re-hashed record looks internally consistent.
+    assert sp.verify_provenance_record(record) == []
+    # With the outside anchor, the swap is caught.
+    problems = sp.verify_provenance_record(record, trusted_envelope_digest=trusted)
+    assert any("trusted anchored digest" in p for p in problems)
+
+
+def test_anchored_digest_mismatch_on_untouched_record_flags():
+    record = sp.build_provenance_record(
+        _ci_source(), release_run_id="run-1", adopted_at="t", adopted_by="gate",
+        source_path="/tmp/a.json",
+    )
+    problems = sp.verify_provenance_record(record, trusted_envelope_digest="sha256:" + "0" * 64)
+    assert any("trusted anchored digest" in p for p in problems)
+
+
 def test_build_does_not_mutate_source():
     src = _ci_source()
     sp.build_provenance_record(src, release_run_id="r", adopted_at="t", adopted_by="g", source_path="p")
