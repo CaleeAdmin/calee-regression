@@ -38,6 +38,23 @@ SCENARIO_GROUPS = {
     # entry. See docs/SUBSCRIBED_CALENDAR_REGRESSION.md and
     # test_tablet_mutation_drafts.py.
     "subscribed_calendar": ["scenarios/subscribed_calendar.yaml"],
+    # Calendar name/colour appearance-editing coverage (Calee PR
+    # CaleeAdmin/Calee#977, calee-hub-core's PATCH .../appearance). Source-
+    # confirmed selectors, physically unverified, and two of the three files
+    # additionally need a fixture calendar that does not exist in this repo
+    # yet -- gated exactly like the other draft suites above: mandatory:
+    # false, draft-unverified, and NOT in any COMPOSITE_SUITES entry. See
+    # docs/CALENDAR_APPEARANCE_REGRESSION.md and
+    # test_calendar_appearance_scenarios.py. Genuinely cross-device
+    # appearance-sync coverage lives in calee_regression/sync_smoke.py's
+    # run_calendar_appearance_sync_flow instead, not here -- a single YAML
+    # scenario cannot express a cross-device assertion (see sync_smoke.py's
+    # module docstring).
+    "calendar_appearance": [
+        "scenarios/calendar_appearance_subscription.yaml",
+        "scenarios/calendar_appearance_owned.yaml",
+        "scenarios/calendar_appearance_shared_readonly.yaml",
+    ],
 }
 
 COMPOSITE_SUITES = {

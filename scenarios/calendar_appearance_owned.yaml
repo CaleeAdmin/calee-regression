@@ -1,0 +1,180 @@
+name: calee-calendar-appearance-owned
+tags: [calendar, appearance, owned-caldav, tablet, draft-unverified, source-confirmed]
+requires_state: logged_in_tablet
+default_timeout_seconds: 20
+mandatory: false
+# SOURCE-CONFIRMED, PHYSICAL-UNVERIFIED.
+#
+# Proves the tablet side of the calendar name/colour appearance-editing
+# contract (calee-hub-core PATCH /client/v1/calendars/{id}/appearance; Calee
+# PR CaleeAdmin/Calee#977, commit f1b92ddae9275cb0abea0f6df34126930e3aa71d)
+# for an OWNED CalDAV calendar (appearanceMode "source_metadata" -- the
+# regression account's own writable calendar, where an appearance edit
+# PROPPATCHes the real calendar, not just a local display override).
+#
+# FIXTURE GAP (read this before relying on this scenario): unlike the
+# subscription scenario (scenarios/calendar_appearance_subscription.yaml),
+# there is no existing deterministic, uniquely-named REG-* calendar fixture
+# for an owned CalDAV calendar in this repo today -- only REG-EVENT-*/
+# REG-TASK-*/REG-CHORE-* *records* are documented (docs/
+# TEST_DATA_RESET_CONTRACT.md), which imply an owned calendar exists behind
+# them but never name it deterministically. This scenario PROPOSES a new
+# fixture-provisioning-contract entry, mirroring TEST_DATA_RESET_CONTRACT.md's
+# existing REG-* pattern:
+#
+#   REG-OWNED-CALENDAR-APPEARANCE-001   a regression-owned, writable CalDAV
+#                                       calendar, created via ordinary
+#                                       POST /client/v1/calendars (the same
+#                                       "no seed/test-data endpoint, use
+#                                       ordinary CRUD" pattern the rest of
+#                                       the REG-* fixture uses), with that
+#                                       exact name.
+#
+# This fixture is NOT implemented anywhere in this repo or its siblings as
+# of this change -- see docs/CALENDAR_APPEARANCE_REGRESSION.md's
+# provisioning-contract section. This scenario is written against it now
+# (source-confirmed selectors, real structure) so it is ready to run the
+# moment that fixture exists; until then it is additionally BLOCKED on the
+# fixture, on top of the existing device/backend gates every draft scenario
+# in this repo already carries.
+#
+# Single-device-observable by design (see calendar_appearance_subscription.yaml's
+# header for why genuinely cross-device coverage lives in
+# run_calendar_appearance_sync_flow instead). Does not save/mutate anything
+# (closes via Cancel).
+#
+# Shares the same row-scoping gap and colour-assertion gap documented in
+# calendar_appearance_subscription.yaml's header -- not repeated verbatim
+# here; see that file and docs/CALENDAR_APPEARANCE_REGRESSION.md.
+steps:
+  - name: Launch Calee
+    action: launch
+
+  - name: Wait for home screen to settle
+    action: wait_for_id
+    id: llCalendar
+    timeout_seconds: 20
+
+  - name: Open Calendar
+    action: tap
+    id: llCalendar
+
+  - name: Wait for the calendar toolbar to render
+    action: wait_for_id
+    id: btnAddEvent
+    timeout_seconds: 10
+
+  - name: Expand the navigation rail if it is currently collapsed
+    action: tap_if_absent
+    unless_id: llDay
+    id: ivExpand
+
+  - name: Assert the navigation rail (and its calendar list) is now expanded
+    action: wait_for_id
+    id: llDay
+    timeout_seconds: 10
+
+  - name: The owned regression calendar row is visible in the calendar list
+    action: wait_for_text
+    text: REG-OWNED-CALENDAR-APPEARANCE-001
+    timeout_seconds: 20
+
+  - name: Capture the calendar list with the owned calendar row
+    action: screenshot
+    screenshot_name: 00_calendar_list_owned_row
+    compare: false
+
+  - name: Edit is available for an owned CalDAV calendar (canEditAppearance)
+    action: assert_id
+    id: ivEdit
+
+  - name: Open the edit dialog for the owned calendar
+    action: tap
+    id: ivEdit
+
+  - name: Wait for the edit dialog to render
+    action: wait_for_id
+    id: tvCollectionTitle
+    timeout_seconds: 10
+
+  - name: Dialog title reads "Edit Name & Colour"
+    action: assert_text
+    text: Edit Name & Colour
+
+  - name: Name label reads "Name in Calee"
+    action: assert_text
+    text: Name in Calee
+
+  - name: Name input is present
+    action: assert_id
+    id: etCollectionName
+
+  - name: Colour label is present with its own id (previously unlabelled)
+    action: assert_id
+    id: tvCollectionColorLabel
+
+  - name: Colour label reads "Colour in Calee"
+    action: assert_text
+    text: Colour in Calee
+
+  - name: Appearance note is present for an owned CalDAV calendar
+    action: assert_id
+    id: tvCollectionAppearanceNote
+
+  - name: Appearance note explains this updates the real calendar
+    action: assert_text
+    text: This updates the calendar name and colour.
+
+  - name: Save control is present
+    action: assert_id
+    id: btnCollectionSave
+
+  - name: Cancel control is present
+    action: assert_id
+    id: btnCollectionCancel
+
+  - name: Delete control is present
+    action: assert_id
+    id: btnCollectionDelete
+
+  - name: Capture the owned calendar's edit dialog
+    action: screenshot
+    screenshot_name: 01_edit_dialog_owned
+    compare: false
+
+  - name: Close the dialog without saving (never mutate the shared fixture)
+    action: tap
+    id: btnCollectionCancel
+
+  - name: Assert no crash/error dialog is showing
+    action: fail_if_text
+    texts: ["Unfortunately", "has stopped", "Force Close", "Error"]
+
+source_verification:
+  calee_source: CaleeAdmin/Calee
+  calee_source_sha: "f1b92ddae9275cb0abea0f6df34126930e3aa71d"
+  calee_source_ref: "PR CaleeAdmin/Calee#977, branch claude/calendar-name-colour-editing-balgeo (based on latest dev)"
+  status: source-confirmed
+  physical_confirmation: pending
+  contract:
+    - "ivEdit VISIBLE+clickable iff capabilities.canEditAppearance == true, else INVISIBLE (CalendarFragment.kt)"
+    - "HubCalendarEditDialog.tvCollectionAppearanceNote text is keyed off appearanceMode; source_metadata -> hub_calendar_appearance_note_source_metadata"
+    - "Saving calls PATCH /client/v1/calendars/{id}/appearance, which PROPPATCHes the real owned calendar for source_metadata mode (backend-internal, not tablet-UI-observable, not asserted here)"
+  selectors:
+    ivEdit: app/src/main/res/layout/item_calendar_navigation_list.xml
+    tvCollectionTitle: app/src/main/res/layout/dialog_hub_collection_manage.xml
+    tvCollectionNameLabel: app/src/main/res/layout/dialog_hub_collection_manage.xml
+    etCollectionName: app/src/main/res/layout/dialog_hub_collection_manage.xml
+    tvCollectionColorLabel: app/src/main/res/layout/dialog_hub_collection_manage.xml
+    tvCollectionAppearanceNote: app/src/main/res/layout/dialog_hub_collection_manage.xml
+    btnCollectionSave: app/src/main/res/layout/dialog_hub_collection_manage.xml
+    btnCollectionCancel: app/src/main/res/layout/dialog_hub_collection_manage.xml
+    btnCollectionDelete: app/src/main/res/layout/dialog_hub_collection_manage.xml
+  fixture:
+    source: "PROPOSED, not yet implemented -- see docs/CALENDAR_APPEARANCE_REGRESSION.md"
+    calendarId: "server-assigned (created via POST /client/v1/calendars)"
+    calendarDisplayName: "REG-OWNED-CALENDAR-APPEARANCE-001"
+  notes:
+    - "Needs a new REG-OWNED-CALENDAR-APPEARANCE-001 fixture calendar that does not exist in this repo yet -- BLOCKED on provisioning, in addition to the device/backend gates every draft scenario here carries. See docs/CALENDAR_APPEARANCE_REGRESSION.md."
+    - "Row-scoping gap: item_calendar_navigation_list.xml's row-container id is not source-confirmed here, so ivEdit/etc. are targeted by bare id, not row-scoped -- see calendar_appearance_subscription.yaml's header."
+    - "Colour is never asserted visually -- no colour-reading primitive exists in CaleeDriver. See docs/CALENDAR_APPEARANCE_REGRESSION.md for the full gap writeup."
