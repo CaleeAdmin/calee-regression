@@ -57,6 +57,16 @@ SIGNER_NOT_INSTALLED = "not_installed"  # nothing installed to compare against
 
 _SHA256_RE = re.compile(r"\b([0-9a-fA-F]{64})\b")
 
+# Markers that mean ``pm path`` could not authoritatively answer (a package
+# manager crash/unavailability), as opposed to a clean "no such package". When
+# any of these appear, an empty ``pm path`` result must be read as
+# SIGNER_UNKNOWN (may be installed, unreadable) -- never as "not installed".
+_PM_FAILURE_RE = re.compile(
+    r"error|exception|could not access|package manager|failure|killed|not running|"
+    r"can't find service|securityexception|permission den" ,
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class ToolResult:
@@ -347,17 +357,25 @@ def read_installed_signer(
     pull: "PullFn | None" = None,
     which: "Callable[[str], Optional[str]]" = shutil.which,
     work_dir: "Path | str | None" = None,
+    retain_diagnostics: bool = False,
 ) -> SignerReadResult:
     """Best-effort read of the CURRENTLY INSTALLED app's signing certificate,
     for comparison with the release APK signer.
 
     Steps (all through injected seams, so this is offline-testable):
-      1. ``adb shell pm path <pkg>`` -> the on-device APK path (a not-installed
-         app returns nothing -> SIGNER_NOT_INSTALLED; no device -> SIGNER_UNKNOWN);
-      2. ``adb pull`` that path to a local temp file;
-      3. ``apksigner verify --print-certs`` on the pulled APK -> the digest.
+      1. ``adb shell pm path <pkg>`` -> the on-device APK path. A *clean* empty
+         answer means the app is not installed -> SIGNER_NOT_INSTALLED; a device
+         error (offline/unauthorized/no device) or a package-manager failure
+         means we cannot tell -> SIGNER_UNKNOWN (the installer BLOCKS: the app
+         may be installed with a conflicting signer we simply could not read);
+      2. ``adb pull`` that path to a local temp file (pull failure -> UNKNOWN);
+      3. ``apksigner verify --print-certs`` on the pulled APK -> the digest
+         (missing apksigner / unreadable APK / no digest -> UNKNOWN).
 
-    Never mutates the device (read-only pm path + pull). Never raises."""
+    The pulled APK and any temporary workspace are deleted after the read unless
+    ``retain_diagnostics`` is set (a caller-supplied ``work_dir`` is always left
+    to its owner). Never mutates the device (read-only pm path + pull). Never
+    raises."""
     base = ["adb"] + (["-s", serial] if serial else [])
     path_res = adb_runner(base + ["shell", "pm", "path", package_id])
     combined = f"{path_res.stdout}\n{path_res.stderr}".lower()
@@ -368,7 +386,26 @@ def read_installed_signer(
 
     device_path = parse_pm_path(path_res.stdout)
     if not device_path:
-        # pm path succeeded but printed nothing -> the package is not installed.
+        # No 'package:' path came back. Distinguish a GENUINE not-installed
+        # (pm answered cleanly, nothing to report) from a package-manager
+        # FAILURE (pm crashed / was unreachable / denied). The latter must
+        # NEVER be read as "not installed" -- the package may already be
+        # installed and its signer would then go unverified. A pm failure is
+        # SIGNER_UNKNOWN, which BLOCKS installation.
+        combined_out = f"{path_res.stdout}\n{path_res.stderr}"
+        pm_failed = bool(
+            (path_res.returncode != 0 and (path_res.stderr or "").strip())
+            or _PM_FAILURE_RE.search(combined_out)
+        )
+        if pm_failed:
+            return SignerReadResult(
+                SIGNER_UNKNOWN,
+                detail=(
+                    f"pm path could not authoritatively report whether {package_id} is "
+                    f"installed -- refusing to assume it is absent: "
+                    f"{((path_res.stderr or path_res.stdout) or '').strip()[:200]}"
+                ),
+            )
         return SignerReadResult(SIGNER_NOT_INSTALLED, detail=f"{package_id} is not installed on the device.")
 
     apksigner = which("apksigner")
@@ -377,6 +414,7 @@ def read_installed_signer(
 
     import tempfile
 
+    created_temp = work_dir is None
     out_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="installed-apk-"))
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -384,23 +422,30 @@ def read_installed_signer(
         return SignerReadResult(SIGNER_UNKNOWN, detail=f"Could not create a workspace to pull the installed APK: {exc}")
     local = out_dir / f"{package_id}.installed.apk"
 
-    pull_fn = pull or (lambda dev, dest: adb_runner(base + ["pull", dev, dest]))
-    pull_res = pull_fn(device_path, str(local))
-    if pull_res.returncode != 0:
-        return SignerReadResult(
-            SIGNER_UNKNOWN,
-            detail=f"Could not pull the installed APK ({device_path}) to compare its signer: "
-                   f"{(pull_res.stderr or '').strip()[:200]}",
-        )
+    try:
+        pull_fn = pull or (lambda dev, dest: adb_runner(base + ["pull", dev, dest]))
+        pull_res = pull_fn(device_path, str(local))
+        if pull_res.returncode != 0:
+            return SignerReadResult(
+                SIGNER_UNKNOWN,
+                detail=f"Could not pull the installed APK ({device_path}) to compare its signer: "
+                       f"{(pull_res.stderr or '').strip()[:200]}",
+            )
 
-    certs = apksigner_runner([apksigner, "verify", "--print-certs", str(local)])
-    digest = parse_apksigner_certs(certs.stdout)
-    if not digest:
-        return SignerReadResult(
-            SIGNER_UNKNOWN,
-            detail="apksigner did not report a SHA-256 digest for the installed APK.",
-        )
-    return SignerReadResult(SIGNER_OK, digest=digest, detail="Read the installed signer certificate.")
+        certs = apksigner_runner([apksigner, "verify", "--print-certs", str(local)])
+        digest = parse_apksigner_certs(certs.stdout)
+        if not digest:
+            return SignerReadResult(
+                SIGNER_UNKNOWN,
+                detail="apksigner did not report a SHA-256 digest for the installed APK.",
+            )
+        return SignerReadResult(SIGNER_OK, digest=digest, detail="Read the installed signer certificate.")
+    finally:
+        # Remove the pulled APK and our temp workspace after the read, unless a
+        # diagnostic retention was explicitly requested. A caller-supplied
+        # work_dir is left to its owner. Cleanup never changes the read result.
+        if created_temp and not retain_diagnostics:
+            shutil.rmtree(out_dir, ignore_errors=True)
 
 
 # ── whole-bundle pre-install inspection (the release gate) ─────────────────
@@ -504,7 +549,11 @@ def preinstall_inspect_bundle(
                 "releaseSigner": insp.signer_sha256,
                 "installedSigner": read.digest,
             }
-            if classification == SIGNER_MISMATCH:
+            # Both a MISMATCH and an UNKNOWN installed signer BLOCK. UNKNOWN
+            # means the package may already be installed but its signer could
+            # not be authoritatively read; proceeding could silently install
+            # over a differently-signed app, so no install command may run.
+            if classification in (SIGNER_MISMATCH, SIGNER_UNKNOWN):
                 saw_blocked = True
                 result.detail.append(detail)
         else:
@@ -530,10 +579,15 @@ def device_installed_signer_reader(
     adb_runner: "Callable[[list[str]], ToolResult] | None" = None,
     which: "Callable[[str], Optional[str]]" = shutil.which,
     runner: ToolRunner = real_tool_runner,
+    retain_diagnostics: bool = False,
 ) -> InstalledSignerReader:
     """Build an InstalledSignerReader backed by real adb + apksigner. Used by
-    the installer CLI; offline (no device) each read resolves to SIGNER_UNKNOWN,
-    which never hard-blocks on its own."""
+    the installer CLI. When the installed signer cannot be authoritatively read
+    (no/offline/unauthorized device, package-manager failure, missing apksigner,
+    unreadable APK), each read resolves to SIGNER_UNKNOWN, which the pre-install
+    gate treats as BLOCKED -- an install must never proceed over a possibly
+    conflicting, unverifiable installed signer. ``retain_diagnostics`` keeps the
+    pulled-APK workspace for inspection instead of deleting it."""
     def _adb(argv: "list[str]") -> ToolResult:
         return runner(argv)
 
@@ -542,6 +596,7 @@ def device_installed_signer_reader(
     def _read(package_id: str) -> SignerReadResult:
         return read_installed_signer(
             package_id, serial=serial, adb_runner=adb, apksigner_runner=runner, which=which,
+            retain_diagnostics=retain_diagnostics,
         )
 
     return _read

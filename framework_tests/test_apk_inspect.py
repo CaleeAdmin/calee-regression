@@ -393,3 +393,213 @@ def test_preinstall_refuses_unverified_bundle(tmp_path):
     assert not bad.ok
     result = preinstall_inspect_bundle(bad, which=_which({"aapt2", "apksigner"}), runner=_matching_runner())
     assert result.status == ai.STATUS_INVALID
+
+
+# ── Priority 1: unknown installed signer is a HARD BLOCK ───────────────────
+#
+# The reader classifies every "cannot authoritatively read the installed
+# signer" case as SIGNER_UNKNOWN; the whole-bundle gate then BLOCKS, and the
+# installer runs no install command. These lock in the state machine for the
+# exact failure list in Priority 1.
+
+
+def _reader_adb(*, pm=None, pm_rc=0, pm_err=""):
+    """Fake adb whose `pm path` step returns the given output/rc/stderr."""
+
+    def adb(argv):
+        if "pm" in argv and "path" in argv:
+            return ToolResult(pm_rc, pm if pm is not None else "", pm_err)
+        return ToolResult(1, "", f"unexpected {argv}")
+
+    return adb
+
+
+def _installed_apk_path():
+    return "package:/data/app/com.viso.calee-1/base.apk\n"
+
+
+def test_read_signer_adb_pull_failure_is_unknown(tmp_path):
+    adb = _reader_adb(pm=_installed_apk_path())
+
+    def pull(dev, dest):
+        return ToolResult(1, "", "adb: error: failed to copy: remote object does not exist")
+
+    res = read_installed_signer(
+        "com.viso.calee", adb_runner=adb, apksigner_runner=lambda a: ToolResult(0, ""),
+        pull=pull, which=_which({"apksigner"}), work_dir=tmp_path,
+    )
+    assert res.status == ai.SIGNER_UNKNOWN
+    assert "pull" in res.detail.lower()
+
+
+def test_read_signer_package_manager_failure_is_unknown_not_absent(tmp_path):
+    # pm path FAILED (package manager unreachable) -- must NOT be read as
+    # "not installed"; the package may be installed with an unreadable signer.
+    adb = _reader_adb(
+        pm="", pm_rc=1,
+        pm_err="Error: Could not access the Package Manager. Is the system running?",
+    )
+    res = read_installed_signer(
+        "com.viso.calee", adb_runner=adb, apksigner_runner=lambda a: ToolResult(0, ""),
+        which=_which({"apksigner"}), work_dir=tmp_path,
+    )
+    assert res.status == ai.SIGNER_UNKNOWN, res.detail
+    assert res.status != ai.SIGNER_NOT_INSTALLED
+
+
+def test_read_signer_clean_absence_stays_not_installed(tmp_path):
+    # Modern adb: a missing package returns rc 1 with EMPTY output. That is a
+    # clean "not installed" and must NOT be over-blocked as UNKNOWN.
+    adb = _reader_adb(pm="", pm_rc=1, pm_err="")
+    res = read_installed_signer(
+        "com.viso.calee", adb_runner=adb, apksigner_runner=lambda a: ToolResult(0, ""),
+        which=_which({"apksigner"}), work_dir=tmp_path,
+    )
+    assert res.status == ai.SIGNER_NOT_INSTALLED, res.detail
+
+
+def test_read_signer_missing_apksigner_is_unknown(tmp_path):
+    adb = _reader_adb(pm=_installed_apk_path())
+    res = read_installed_signer(
+        "com.viso.calee", adb_runner=adb, apksigner_runner=lambda a: ToolResult(0, ""),
+        which=_which(set()), work_dir=tmp_path,  # apksigner NOT on PATH
+    )
+    assert res.status == ai.SIGNER_UNKNOWN
+    assert "apksigner" in res.detail.lower()
+
+
+def test_read_signer_digest_missing_is_unknown(tmp_path):
+    adb = _reader_adb(pm=_installed_apk_path())
+
+    def pull(dev, dest):
+        from pathlib import Path
+        Path(dest).write_bytes(b"pulled")
+        return ToolResult(0, "1 file pulled")
+
+    # apksigner runs cleanly but prints no SHA-256 digest line.
+    def apksigner(argv):
+        return ToolResult(0, "Signer #1 certificate DN: CN=Calee\n")
+
+    res = read_installed_signer(
+        "com.viso.calee", adb_runner=adb, apksigner_runner=apksigner,
+        pull=pull, which=_which({"apksigner"}), work_dir=tmp_path,
+    )
+    assert res.status == ai.SIGNER_UNKNOWN
+    assert "digest" in res.detail.lower()
+
+
+def test_read_signer_device_offline_is_unknown(tmp_path):
+    adb = _reader_adb(pm="", pm_rc=1, pm_err="error: device offline")
+    res = read_installed_signer(
+        "com.viso.calee", adb_runner=adb, apksigner_runner=lambda a: ToolResult(0, ""),
+        which=_which({"apksigner"}), work_dir=tmp_path,
+    )
+    assert res.status == ai.SIGNER_UNKNOWN
+
+
+def test_read_signer_device_unauthorized_is_unknown(tmp_path):
+    adb = _reader_adb(pm="", pm_rc=1, pm_err="error: device unauthorized")
+    res = read_installed_signer(
+        "com.viso.calee", adb_runner=adb, apksigner_runner=lambda a: ToolResult(0, ""),
+        which=_which({"apksigner"}), work_dir=tmp_path,
+    )
+    assert res.status == ai.SIGNER_UNKNOWN
+
+
+def test_read_signer_unreadable_installed_apk_is_unknown(tmp_path):
+    adb = _reader_adb(pm=_installed_apk_path())
+
+    def pull(dev, dest):
+        from pathlib import Path
+        Path(dest).write_bytes(b"corrupt")
+        return ToolResult(0, "1 file pulled")
+
+    # apksigner cannot parse the pulled APK (returns an error, no digest).
+    def apksigner(argv):
+        return ToolResult(1, "", "DOES NOT VERIFY / unable to read APK")
+
+    res = read_installed_signer(
+        "com.viso.calee", adb_runner=adb, apksigner_runner=apksigner,
+        pull=pull, which=_which({"apksigner"}), work_dir=tmp_path,
+    )
+    assert res.status == ai.SIGNER_UNKNOWN
+
+
+def test_read_signer_matching_and_mismatching(tmp_path):
+    # Reader returns OK + a digest; classify decides match vs mismatch.
+    adb = _reader_adb(pm=_installed_apk_path())
+
+    def pull(dev, dest):
+        from pathlib import Path
+        Path(dest).write_bytes(b"apk")
+        return ToolResult(0, "ok")
+
+    def apksigner(argv):
+        return ToolResult(0, _apksigner_certs(CALEE_SIGNER))
+
+    res = read_installed_signer(
+        "com.viso.calee", adb_runner=adb, apksigner_runner=apksigner,
+        pull=pull, which=_which({"apksigner"}), work_dir=tmp_path,
+    )
+    assert res.status == ai.SIGNER_OK and res.digest == CALEE_SIGNER
+    assert classify_signer(CALEE_SIGNER, res)[0] == ai.SIGNER_OK
+    assert classify_signer(SHELL_SIGNER, res)[0] == ai.SIGNER_MISMATCH
+
+
+def test_read_signer_cleans_up_temp_workspace_by_default():
+    # With no work_dir supplied, the reader mints a temp dir; it must be gone
+    # after the read (no leftover pulled APK).
+    captured = {}
+
+    def pull(dev, dest):
+        from pathlib import Path
+        Path(dest).write_bytes(b"apk")
+        captured["dir"] = Path(dest).parent
+        return ToolResult(0, "ok")
+
+    adb = _reader_adb(pm=_installed_apk_path())
+    res = read_installed_signer(
+        "com.viso.calee", adb_runner=adb,
+        apksigner_runner=lambda a: ToolResult(0, _apksigner_certs(CALEE_SIGNER)),
+        pull=pull, which=_which({"apksigner"}),  # no work_dir -> internal temp
+    )
+    assert res.status == ai.SIGNER_OK
+    assert not captured["dir"].exists(), "temporary pulled-APK workspace was not cleaned up"
+
+
+def test_read_signer_retains_temp_workspace_when_requested():
+    captured = {}
+
+    def pull(dev, dest):
+        from pathlib import Path
+        Path(dest).write_bytes(b"apk")
+        captured["dest"] = Path(dest)
+        return ToolResult(0, "ok")
+
+    adb = _reader_adb(pm=_installed_apk_path())
+    res = read_installed_signer(
+        "com.viso.calee", adb_runner=adb,
+        apksigner_runner=lambda a: ToolResult(0, _apksigner_certs(CALEE_SIGNER)),
+        pull=pull, which=_which({"apksigner"}), retain_diagnostics=True,
+    )
+    assert res.status == ai.SIGNER_OK
+    assert captured["dest"].exists(), "diagnostic retention should keep the pulled APK"
+    # Clean up what the test asked to retain.
+    import shutil
+    shutil.rmtree(captured["dest"].parent, ignore_errors=True)
+
+
+def test_preinstall_blocks_on_unknown_signer(tmp_path):
+    v = verify_release_bundle(_bundle(tmp_path))
+
+    def reader(pkg):
+        # The installed signer could not be authoritatively read.
+        return SignerReadResult(ai.SIGNER_UNKNOWN, detail="pm path could not be read")
+
+    result = preinstall_inspect_bundle(
+        v, installed_signer_reader=reader, which=_which({"aapt2", "apksigner"}), runner=_matching_runner()
+    )
+    assert result.status == ai.STATUS_BLOCKED, result.detail
+    assert result.signers["calee"]["classification"] == ai.SIGNER_UNKNOWN
+    # The block must be surfaced in the human-readable detail.
+    assert any("could not" in d.lower() or "unknown" in d.lower() for d in result.detail)

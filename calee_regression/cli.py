@@ -2682,13 +2682,18 @@ def _record_installation_component(
 @click.option("--plan-only", is_flag=True, default=False, help="Print/write the ordered install plan without executing it.")
 @click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON result.")
 @click.option(
+    "--retain-diagnostics", is_flag=True, default=False,
+    help="Keep the temporary pulled-APK workspace used to read the installed signer, for diagnosis. "
+         "By default it is deleted after inspection.",
+)
+@click.option(
     "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None,
     help="Shared release run ID (run_context.py). When given, the full installation evidence "
          "(bundle verification + APK content/signer inspection + tablet inspection + plan + "
          "execution) is written into reports/runs/<run-id>/installation/results.json as this run's "
          "mandatory installation component.",
 )
-def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade, plan_only, report_path, run_id_opt):
+def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade, plan_only, report_path, retain_diagnostics, run_id_opt):
     """Verify a release bundle, INSPECT each APK's actual contents + signer, and
     then install it in the correct, data-preserving order (Calee first,
     CaleeShell second, reassert HOME, reboot, verify identities/HOME/launch).
@@ -2739,7 +2744,11 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
         raise SystemExit(EXIT_SUCCESS)
 
     # Priority 5: inspect ACTUAL APK contents + signer before any install.
-    signer_reader = apk_inspect.device_installed_signer_reader(serial=serial)
+    # A signer that cannot be authoritatively read (SIGNER_UNKNOWN) BLOCKS here,
+    # before execute_install_plan is ever reached -- no install command runs.
+    signer_reader = apk_inspect.device_installed_signer_reader(
+        serial=serial, retain_diagnostics=retain_diagnostics
+    )
     inspection = apk_inspect.preinstall_inspect_bundle(verification, installed_signer_reader=signer_reader)
     if inspection.status != apk_inspect.STATUS_OK:
         exit_code = EXIT_INVALID_CONFIG if inspection.status == apk_inspect.STATUS_INVALID else EXIT_BLOCKED
@@ -2764,6 +2773,25 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
         # The install steps succeeded but the pre-install device read did not --
         # record it, but the execution's own verify steps are authoritative.
         detail.append(f"Tablet pre-install inspection: {tablet_inspection.detail}")
+
+    # Priority 2: after a successful install+reboot, verify the COMPLETE tablet
+    # solution -- BOTH Calee and CaleeShell (present/version/signer, plus Calee's
+    # START action and CaleeShell as HOME) -- even when this release replaced
+    # only one of them. A gap in the unchanged app BLOCKS the release.
+    solution = None
+    if status == "ok":
+        solution = release_installer.verify_tablet_solution(
+            verification.expected_app("calee"),
+            verification.expected_app("caleeShell"),
+            release_installer.real_adb_runner,
+            serial=serial,
+            release_id=plan.release_id,
+            installed_signer_reader=signer_reader,
+        )
+        if solution.status != release_installer.STATUS_OK:
+            status = "blocked"
+            detail.append(f"Complete-solution verification: {solution.detail}")
+
     payload = {
         "status": status,
         "detail": detail,
@@ -2772,15 +2800,16 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
         "tabletInspection": tablet_inspection.to_dict(),
         "plan": plan.to_dict(),
         "execution": execution.to_dict(),
+        "solutionVerification": solution.to_dict() if solution is not None else None,
         "releaseId": plan.release_id,
     }
     _write_installer_report(Path(report_path) if report_path else None, payload)
     exit_code = EXIT_SUCCESS if status == "ok" else EXIT_BLOCKED
     _record_installation_component(run_id_opt, payload, exit_code)
     if status == "ok":
-        click.echo(click.style(f"[OK] Installed release {plan.release_id}.", fg="green"))
+        click.echo(click.style(f"[OK] Installed and verified the complete solution for release {plan.release_id}.", fg="green"))
         raise SystemExit(EXIT_SUCCESS)
-    click.echo(click.style(f"[BLOCKED] {execution.detail}", fg="yellow"), err=True)
+    click.echo(click.style(f"[BLOCKED] {'; '.join(detail) or execution.detail}", fg="yellow"), err=True)
     raise SystemExit(EXIT_BLOCKED)
 
 
