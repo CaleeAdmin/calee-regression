@@ -114,6 +114,12 @@ def _install_fakes(repo: Path, tmp_path: Path) -> Path:
         # machine+release composition actually drives 06's platform scope.
         "        release-config)\n"
         '            exec "$REAL_PYTHON" "$@" ;;\n'
+        # report-root (Priority 3) is delegated to the REAL CLI too -- it must
+        # resolve consistently with release-config's own report-root
+        # resolution (both read the same machine.local.yaml), or the two
+        # would silently disagree about where evidence lives.
+        "        report-root)\n"
+        '            exec "$REAL_PYTHON" "$@" ;;\n'
         # build-identity/consolidate helpers 00's early-gate path may call.
         "        build-identity)\n"
         "            exit 0 ;;\n"
@@ -345,7 +351,7 @@ def _write_machine_and_release_scope(repo, *, mobile_platforms, release_ios):
         "release_bundle_dir": str(repo / "bundle"),
         "backend_url": "https://hub-staging.calee.com.au",
         "release_profile": "staging",
-        "report_dir": "reports",
+        "report_dir": ".",
         "mobile_platforms": mobile_platforms,
         "android_device": "R5ANDROID",
         "iphone_device": "",

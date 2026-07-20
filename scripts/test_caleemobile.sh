@@ -90,7 +90,34 @@ cd "$SCRIPT_DIR" || exit 1
 # and docs/RELEASE_POLICY.md).
 CALEE_RUN_ID="${CALEE_RUN_ID:-mobile-standalone-$(date +%Y%m%d-%H%M%S)}"
 export CALEE_RUN_ID
-RUN_DIR="reports/runs/$CALEE_RUN_ID"
+echo "Run ID: $CALEE_RUN_ID"
+echo "Mode: $MODE${PLATFORM:+ ($PLATFORM)}"
+
+# The sibling-repo check is a pure filesystem check -- it must not require a
+# working Python environment (this script can run before any bootstrap has
+# ever installed calee_regression's dependencies), so it comes BEFORE report
+# root resolution below.
+SIBLING="../CaleeMobile-Regression"
+if [ ! -d "$SIBLING/api" ]; then
+    echo "BLOCKED: CaleeMobile-Regression was not found next to this folder."
+    echo "Ask your technical owner to check out CaleeMobile-Regression alongside calee-regression."
+    exit 3
+fi
+echo "[OK] CaleeMobile source found"
+
+# The ONE canonical report root (Priority 3) -- inherited already-resolved
+# from whichever launcher called this script ("06 Test Full Calee Solution",
+# or a standalone "03/04 Test CaleeMobile ..." run, both of which resolve
+# and export it themselves via `report-root` before calling here). This
+# script deliberately never invokes the calee_regression CLI to resolve it
+# itself: none of this script's own gating logic (sibling check, credential
+# check, self-prepare decision, flutter-toolchain check) may depend on a
+# working Python environment being importable -- see
+# calee_regression/report_root.py.
+CALEE_REPORT_ROOT="${CALEE_REPORT_ROOT:-$SCRIPT_DIR}"
+export CALEE_REPORT_ROOT
+
+RUN_DIR="$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID"
 mkdir -p "$RUN_DIR"
 API_DIR="$RUN_DIR/mobile-api"
 API_REPORT="$API_DIR/results.json"
@@ -104,16 +131,6 @@ if [ "$RUN_UI" = true ]; then
     UI_REPORT="$UI_DIR/results.json"
     mkdir -p "$UI_DIR"
 fi
-echo "Run ID: $CALEE_RUN_ID"
-echo "Mode: $MODE${PLATFORM:+ ($PLATFORM)}"
-
-SIBLING="../CaleeMobile-Regression"
-if [ ! -d "$SIBLING/api" ]; then
-    echo "BLOCKED: CaleeMobile-Regression was not found next to this folder."
-    echo "Ask your technical owner to check out CaleeMobile-Regression alongside calee-regression."
-    exit 3
-fi
-echo "[OK] CaleeMobile source found"
 
 # --- Release-feature scope (Workstream 1) --------------------------------
 # The full-solution launcher ("06 Test Full Calee Solution") already exported
@@ -229,7 +246,7 @@ else
     if [ "$RUN_API" = true ]; then
         echo ""
         echo "Running the CaleeMobile backend API checks..."
-        (cd "$SIBLING/api" && python3 run_regression.py --report "$SCRIPT_DIR/$API_REPORT")
+        (cd "$SIBLING/api" && python3 run_regression.py --report "$API_REPORT")
         API_STATUS=$?
     fi
 
@@ -252,7 +269,7 @@ else
         else
             echo ""
             echo "Preparing the CaleeMobile $PLATFORM UI checks..."
-            if ! (cd "$SIBLING/ui" && flutter pub get) >"$SCRIPT_DIR/$UI_DIR/pub-get.log" 2>&1; then
+            if ! (cd "$SIBLING/ui" && flutter pub get) >"$UI_DIR/pub-get.log" 2>&1; then
                 echo "BLOCKED: \`flutter pub get\` failed in CaleeMobile-Regression/ui — a Flutter toolchain/dependency"
                 echo "problem, not a product failure. See $UI_DIR/pub-get.log"
                 UI_STATUS=3
@@ -291,8 +308,8 @@ else
                 (cd "$SIBLING/ui" && python3 run_ui_suite.py \
                     --platform "$PLATFORM" \
                     ${UI_DEVICE_ARGS[@]+"${UI_DEVICE_ARGS[@]}"} \
-                    --report "$SCRIPT_DIR/$UI_REPORT" \
-                    --log "$SCRIPT_DIR/$UI_DIR/flutter.log" \
+                    --report "$UI_REPORT" \
+                    --log "$UI_DIR/flutter.log" \
                     --feature "meals=$CALEE_RELEASE_FEATURE_MEALS" \
                     --feature "onboarding=$CALEE_RELEASE_FEATURE_ONBOARDING" \
                     --feature "google_calendar=$CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR")

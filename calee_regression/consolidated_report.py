@@ -498,6 +498,34 @@ def component_from_environment_report(
 # Human-facing component names for the Priority 4/5/6 additions.
 MACHINE_CONFIG_COMPONENT_NAME = "Machine configuration (config/machine.local.yaml)"
 INSTALLATION_COMPONENT_NAME = "Calee tablet release installation"
+RELEASE_CONFIG_COMPONENT_NAME = "Release configuration (machine + release-candidate composition)"
+
+
+def component_from_release_config_report(
+    name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = True
+) -> ComponentResult:
+    """Build a ComponentResult from the per-run release-config composition
+    (Priority 1/3): the ONE effective configuration merging the machine (how/
+    where) with the release candidate (what), including every conflict
+    decision (profile disagreement, backend pin mismatch, missing required
+    platform capability, ...). A composition that reports ``ok`` is PASS; any
+    other status (a real conflict, or a missing/unreadable release-platforms.yaml)
+    BLOCKS -- a release-config conflict is a setup/configuration blocker, never a
+    product FAIL, but it must gate the release exactly like machine-config and
+    installation: this is a pre-product gate, and no product test may run, or
+    read as contributing to a PASS, once it is BLOCKED."""
+    if report_dict is None:
+        return ComponentResult(
+            name=name, status=STATUS_NOT_RUN, mandatory=mandatory,
+            detail=["No release-configuration composition was recorded for this run."],
+        )
+    status = report_dict.get("status")
+    detail = list(report_dict.get("detail", []))
+    if status == "ok":
+        return ComponentResult(name=name, status=STATUS_PASS, mandatory=mandatory, detail=detail, evidence=report_dict)
+    if status not in (STATUS_BLOCKED, "blocked", "invalid"):
+        detail = detail + [f"Unrecognized release-config status {report_dict.get('status')!r}."]
+    return ComponentResult(name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1, detail=detail, evidence=report_dict)
 
 
 def component_from_machine_config_report(
@@ -1358,6 +1386,8 @@ def build_release_report(
     installation_mandatory: "bool | None" = None,
     machine_config: "dict[str, Any] | None" = None,
     machine_config_mandatory: "bool | None" = None,
+    release_config: "dict[str, Any] | None" = None,
+    release_config_mandatory: "bool | None" = None,
     feature_profile: "dict[str, bool] | None" = None,
     manual_checks: "list[ManualCheck] | None" = None,
     meta: "dict[str, Any] | None" = None,
@@ -1565,14 +1595,26 @@ def build_release_report(
         if extra is not None:
             components.append(extra)
 
-    # Tablet release installation (Priority 6) and the machine-config snapshot
-    # (Priority 4). Prepended so the report reads config -> installation ->
-    # environment -> tests. Included only when the caller made an explicit
-    # mandatory/optional decision (the consolidate CLI always does for a full
-    # release; unit tests that don't exercise them leave both None, so the ~90
-    # existing tests are unaffected). A mandatory installation that is BLOCKED/
-    # FAILED/missing, or a missing/invalid machine-config snapshot, then gates
-    # the overall status like any other mandatory component.
+    # Tablet release installation (Priority 6), the machine-config snapshot
+    # (Priority 4), and the release-config composition (Priority 1/3).
+    # Prepended so the report reads config -> installation -> release-config ->
+    # environment -> tests (matching execution order: machine-config and
+    # installation happen in launcher "00"; release-config happens right after,
+    # at the start of launcher "06"). Included only when the caller made an
+    # explicit mandatory/optional decision (the consolidate CLI always does for
+    # a full release; unit tests that don't exercise them leave all three None,
+    # so existing tests are unaffected). A mandatory installation that is
+    # BLOCKED/FAILED/missing, a missing/invalid machine-config snapshot, or a
+    # BLOCKED/missing release-config composition then gates the overall status
+    # like any other mandatory component -- a release-config conflict is a
+    # pre-product gate, never a product FAIL, but it blocks a PASS exactly like
+    # one.
+    if release_config_mandatory is not None:
+        components.insert(
+            0, component_from_release_config_report(
+                RELEASE_CONFIG_COMPONENT_NAME, release_config, mandatory=release_config_mandatory
+            ),
+        )
     if installation_mandatory is not None:
         components.insert(
             0, component_from_installation_report(

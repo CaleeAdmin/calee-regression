@@ -18,6 +18,7 @@ from . import config as config_mod
 from . import credentials as credentials_mod
 from . import manual_checks as manual_checks_mod
 from . import preflight, release_platforms, reporting, suites
+from . import report_root as report_root_mod
 from . import run_context
 from . import github_artifact as github_artifact_mod
 from . import selector_evidence as selector_evidence_mod
@@ -176,11 +177,11 @@ def _load_or_init_manifest(
 
 
 def _appium_log_path() -> Path:
-    return REPO_ROOT / "reports" / "appium.log"
+    return _resolved_report_root() / "reports" / "appium.log"
 
 
 def _appium_pid_path() -> Path:
-    return REPO_ROOT / "reports" / "appium.pid"
+    return _resolved_report_root() / "reports" / "appium.pid"
 
 
 def _ensure_appium_or_echo_blocked(cfg, *, ready_timeout_seconds: float = 60) -> bool:
@@ -310,7 +311,7 @@ def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suit
     """
     cfg = _load_config_or_exit(config_path)
     run_id = _resolve_run_id(run_id_opt)
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
     workspace.ensure_created()
     manifest = _load_or_init_manifest(workspace, suite_name=suite_name, tester=tester_opt)
     if fixture_base_url:
@@ -465,7 +466,7 @@ def record_component_cmd(run_id_opt, component, report_path, exit_code, device_i
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
     if not workspace.root.is_dir():
         click.echo(f"No run workspace found for run ID {run_id_opt!r} at {workspace.root}.", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
@@ -537,12 +538,12 @@ def record_manual_checks(checks_path, out_path, run_id_opt):
 
     results = manual_checks_mod.run_recorder(definitions)
 
-    out = Path(out_path) if out_path else manual_checks_mod.default_output_path(REPO_ROOT / "reports")
+    out = Path(out_path) if out_path else manual_checks_mod.default_output_path(_resolved_report_root() / "reports")
     manual_checks_mod.write_results(results, out)
 
     if run_id_opt:
         run_id = _resolve_run_id(run_id_opt)
-        workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+        workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
         workspace.ensure_created()
         manual_checks_mod.write_results(results, workspace.component_report_path("manual-checks"), run_id=run_id)
         manifest = _load_or_init_manifest(workspace)
@@ -608,7 +609,7 @@ def _tablet_out_dir(run_id_opt: "str | None") -> "tuple[Path | None, str | None]
     if not run_id_opt:
         return None, None
     run_id = _resolve_run_id(run_id_opt)
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
     workspace.ensure_created()
     return workspace.component_dir("tablet"), run_id
 
@@ -620,7 +621,7 @@ def _load_run_scenario_variables(run_id: "str | None") -> "dict | None":
     None when there is no run or no subscribed-fixture evidence."""
     if not run_id or not run_context.is_valid_run_id(run_id):
         return None
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
     evidence = workspace.component_report_path("subscribed-fixture")
     if not evidence.is_file():
         return None
@@ -635,7 +636,7 @@ def _load_run_scenario_variables(run_id: "str | None") -> "dict | None":
 def _record_tablet_component(run_id: "str | None", report_dir: Path, result) -> None:
     if not run_id:
         return
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
     manifest = _load_or_init_manifest(workspace)
     manifest.record_component("tablet", report_path=str(report_dir / "results.json"), exit_code=_exit_code_for(result))
     manifest.write(workspace.manifest_path)
@@ -806,7 +807,7 @@ def sync_smoke_cmd(config_path, run_id_opt, base_url, email, password, platform,
     else:
         mandatory = mandatory_opt
 
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
 
     # Reuse this run's verified backend (from prepare's environment report) when
     # one wasn't passed explicitly -- proving sync talks to the SAME
@@ -1046,7 +1047,7 @@ def kiosk_admin_cmd(config_path, run_id_opt, mandatory_opt, confirm_technical, t
     else:
         mandatory = mandatory_opt
 
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
     step_name = "CaleeShell kiosk/admin physical suite"
 
     # Excluded (optional): record an explicit optional not-run marker; never run.
@@ -1358,7 +1359,7 @@ def selector_contract_cmd(
         click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
     run_id = run_id_opt
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
     component_dir = workspace.component_dir("selector-contract")
     component_dir.mkdir(parents=True, exist_ok=True)
     report_path = workspace.component_report_path("selector-contract")
@@ -1719,7 +1720,7 @@ def build_identity_cmd(caleemobile_source, calee_source, android_package, calees
         if not run_context.is_valid_run_id(run_id_opt):
             click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
             raise SystemExit(EXIT_INVALID_CONFIG)
-        workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+        workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
         identity_dir = workspace.root / "identity"
         identity_dir.mkdir(parents=True, exist_ok=True)
         snapshot = {
@@ -1858,6 +1859,7 @@ def _resolve_component(
 @click.option("--sync-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's sync/results.json")
 @click.option("--installation-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's installation/results.json (bundle verify + APK inspection + install)")
 @click.option("--machine-config-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's machine-config/results.json (secrets-excluded snapshot)")
+@click.option("--release-config-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's release-config/results.json (machine + release-candidate composition)")
 @click.option("--kiosk-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's kiosk-admin/results.json (kiosk/admin feature evidence)")
 @click.option("--manual-checks", "manual_checks_path", type=click.Path(exists=True), default=None, help="Override: defaults to this run's manual-checks/results.json")
 @click.option(
@@ -1897,6 +1899,14 @@ def _resolve_component(
     "--machine-config-mandatory/--machine-config-optional", "machine_config_mandatory", default=None,
     help="Whether the machine-config snapshot is release-gating (Priority 4). Auto-included as "
          "mandatory if a machine-config snapshot exists for this run.",
+)
+@click.option(
+    "--release-config-mandatory/--release-config-optional", "release_config_mandatory", default=None,
+    help="Whether the release-config composition (machine + release-candidate) is release-gating "
+         "(Priority 1/3). The full launcher passes --release-config-mandatory whenever a machine "
+         "config is present; when omitted it is auto-included as mandatory if a release-config "
+         "report exists. A BLOCKED/missing release-config composition can never read as a release "
+         "PASS, and no product test may run once it is BLOCKED.",
 )
 # Independent release-feature gating (Workstream 3). Each defaults to the
 # release feature profile (config/release-platforms.yaml release_features.*),
@@ -1942,9 +1952,9 @@ def _resolve_component(
 @click.option("--out-dir", type=click.Path(), default=None, help="Where to write the consolidated bundle (default: this run's workspace)")
 def consolidate(
     run_id_opt, tablet_report, mobile_api_report, mobile_android_report, mobile_ios_report,
-    sync_report, installation_report, machine_config_report, kiosk_report, manual_checks_path, environment_report,
+    sync_report, installation_report, machine_config_report, release_config_report, kiosk_report, manual_checks_path, environment_report,
     android_mandatory, ios_mandatory, sync_mandatory,
-    selector_contract_mandatory, installation_mandatory, machine_config_mandatory,
+    selector_contract_mandatory, installation_mandatory, machine_config_mandatory, release_config_mandatory,
     meals_mandatory, onboarding_mandatory, google_calendar_mandatory, kiosk_admin_mandatory,
     build_version, calee_build_version, expected_calee_build_version,
     caleemobile_build_version, expected_caleemobile_build_version, caleeshell_version,
@@ -1974,7 +1984,7 @@ def consolidate(
         click.echo(f"Invalid --run-id {run_id_opt!r} (expected letters/digits/._- only).", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
     run_id = run_id_opt
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
     if not workspace.root.is_dir():
         click.echo(
             f"No run workspace found for run ID {run_id!r} at {workspace.root}. "
@@ -2004,6 +2014,7 @@ def consolidate(
     sync = resolve("sync", sync_report)
     installation = resolve("installation", installation_report)
     machine_config_snapshot = resolve("machine-config", machine_config_report)
+    release_config_composition = resolve("release-config", release_config_report)
     kiosk = resolve("kiosk-admin", kiosk_report)
     # CaleeMobile selector contract (Priority 1/2). Auto-discovered from this
     # run's workspace and run-ID-validated like every other component. The
@@ -2072,6 +2083,10 @@ def consolidate(
     machine_config_gating = (
         machine_config_mandatory if machine_config_mandatory is not None
         else (True if machine_config_snapshot is not None else None)
+    )
+    release_config_gating = (
+        release_config_mandatory if release_config_mandatory is not None
+        else (True if release_config_composition is not None else None)
     )
 
     # Independent release-feature gating (Workstream 3): explicit
@@ -2279,6 +2294,8 @@ def consolidate(
         installation_mandatory=installation_gating,
         machine_config=machine_config_snapshot,
         machine_config_mandatory=machine_config_gating,
+        release_config=release_config_composition,
+        release_config_mandatory=release_config_gating,
         feature_profile=feature_profile,
         manual_checks=manual_checks_list,
         meta=meta,
@@ -2389,7 +2406,7 @@ def consolidate(
         # input (see run_context.py). Refreshed on every consolidate call
         # (not just PASS) so "open latest report" also works for a
         # FAIL/BLOCKED run the tester needs to inspect.
-        latest_link = REPO_ROOT / "reports" / "latest-run"
+        latest_link = _resolved_report_root() / "reports" / "latest-run"
         try:
             if latest_link.is_symlink() or latest_link.exists():
                 latest_link.unlink()
@@ -2440,6 +2457,57 @@ def machine_config_cmd(config_path):
     raise SystemExit(EXIT_SUCCESS)
 
 
+def _resolved_report_root(config_path: "str | None" = None) -> Path:
+    """Resolve the canonical report root for this process (Priority 3): the
+    CALEE_REPORT_ROOT environment variable (already exported once by the
+    tester launchers before any file is written) if set, else this
+    invocation's machine-config report_dir (best-effort -- a missing/invalid
+    machine config here is never itself fatal; commands that require a valid
+    machine config load and validate it separately), else REPO_ROOT/reports
+    -- the original, unchanged default. Every RunWorkspace(...) construction
+    in this module uses this instead of the bare REPO_ROOT constant, so one
+    component can never silently disagree with another about where evidence
+    lives. Exits BLOCKED with a clear reason on an unsafe/unwritable
+    configured root -- never silently falls back to the default."""
+    machine_report_dir = None
+    try:
+        from . import machine_config as machine_config_mod
+
+        machine_path = Path(config_path) if config_path else (REPO_ROOT / "config" / "machine.local.yaml")
+        if machine_path.is_file():
+            machine_report_dir = machine_config_mod.load_machine_config(machine_path).report_dir
+    except Exception:
+        pass
+    try:
+        return report_root_mod.resolve_report_root(repo_root=REPO_ROOT, machine_report_dir=machine_report_dir)
+    except report_root_mod.ReportRootError as exc:
+        click.echo(f"[BLOCKED] Report root problem: {exc}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+
+@main.command("report-root")
+@click.option(
+    "--config", "config_path", default=None, type=click.Path(),
+    help="Path to machine.local.yaml (defaults to config/machine.local.yaml, best-effort).",
+)
+def report_root_cmd(config_path):
+    """Resolve and print the ONE canonical report root for this run (Priority 3).
+
+    Precedence: the CALEE_REPORT_ROOT environment variable, else this
+    machine's config/machine.local.yaml report_dir (best-effort), else this
+    repo's own reports/ directory. Prints ONLY the resolved absolute path to
+    stdout on success (nothing else -- safe to capture with $(...) from a
+    shell launcher) and exits BLOCKED with a clear reason on an unsafe or
+    unwritable configured root -- never silently falling back to the
+    default. The tester launchers call this ONCE, at the very start of a
+    run, and export CALEE_REPORT_ROOT so every downstream process (every
+    delegated calee_regression subcommand, the mobile test scripts, "07 Open
+    Latest Report") inherits and agrees on the same resolved value.
+    """
+    click.echo(str(_resolved_report_root(config_path)))
+    raise SystemExit(EXIT_SUCCESS)
+
+
 @main.command("machine-config-snapshot")
 @click.option("--config", "config_path", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
 @click.option("--legacy-config", "legacy_config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(), help="Legacy tester config to reconcile (defaults to config/tester.local.yaml).")
@@ -2471,7 +2539,7 @@ def machine_config_snapshot_cmd(config_path, legacy_config_path, run_id_opt):
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
     workspace.ensure_created()
 
     def _record_blocked(detail: "list[str]") -> None:
@@ -2579,7 +2647,7 @@ def prepare_subscribed_fixture_cmd(run_id_opt, date_opt, tz_opt, hub_base):
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
     workspace.ensure_created()
 
     target_date = None
@@ -2706,7 +2774,7 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, run_id_opt):
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
     workspace.ensure_created()
 
     def _record(payload: dict, exit_code: int) -> None:
@@ -2914,7 +2982,7 @@ def _record_installation_component(
     command is run standalone without a --run-id."""
     if not run_id_opt or not run_context.is_valid_run_id(run_id_opt):
         return
-    workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
     workspace.ensure_created()
     payload = {"runId": run_id_opt, **payload}
     report_path = workspace.component_report_path("installation")
@@ -2945,7 +3013,14 @@ def _record_installation_component(
          "execution) is written into reports/runs/<run-id>/installation/results.json as this run's "
          "mandatory installation component.",
 )
-def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade, plan_only, report_path, retain_diagnostics, run_id_opt):
+@click.option(
+    "--production/--development", "production_opt", default=None,
+    help="Production release profile (Priority 2): trusted signer identity for BOTH Calee and "
+         "CaleeShell becomes REQUIRED (a missing/malformed/unreadable/mismatching signer BLOCKS the "
+         "complete-solution verification, instead of recording 'not_compared'). Defaults to "
+         "config/release-platforms.yaml (expected_build_identity.production).",
+)
+def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade, plan_only, report_path, retain_diagnostics, run_id_opt, production_opt):
     """Verify a release bundle, INSPECT each APK's actual contents + signer, and
     then install it in the correct, data-preserving order (Calee first,
     CaleeShell second, reassert HOME, reboot, verify identities/HOME/launch).
@@ -2963,9 +3038,30 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     A malformed bundle exits EXIT_INVALID_CONFIG; a tool/signer/device/version/
     HOME problem exits EXIT_BLOCKED. The installer NEVER auto-uninstalls or
     clears data. ``--plan-only`` records the ordered plan without running it.
+
+    Priority 2 -- trusted signer policy: the post-install complete-solution
+    verification requires a trusted ``signerSha256`` for BOTH Calee and
+    CaleeShell (a missing/malformed/unreadable/mismatching signer BLOCKS)
+    whenever this is a release-gating run -- a production release
+    (``--production``, or config/release-platforms.yaml's
+    ``expected_build_identity.production``), or ANY run carrying a ``--run-id``
+    (every real release run through the launcher always does; only a bare
+    ad-hoc/diagnostic invocation with no run ID is treated as non-release
+    development, where an undeclared signer may still record 'not_compared').
     """
     from . import apk_inspect
     from . import release_installer
+
+    try:
+        expected_identity = release_platforms.load_expected_build_identity()
+    except release_platforms.ReleasePlatformsError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    eff_production = production_opt if production_opt is not None else expected_identity.production
+    # Release-gating: unconditionally true in production; for a staging/
+    # development profile, a run carrying a shared run ID is a real
+    # launcher-driven release run (Priority 2 policy -- see docstring above).
+    signer_trust_required = bool(eff_production) or bool(run_id_opt)
 
     verification = release_installer.verify_release_bundle(bundle_path)
     if not verification.ok:
@@ -3061,6 +3157,7 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
             serial=serial,
             release_id=plan.release_id,
             installed_signer_reader=signer_reader,
+            signer_trust_required=signer_trust_required,
             **solution_kwargs,
         )
         if solution.status != release_installer.STATUS_OK:
@@ -3077,6 +3174,8 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
         "execution": execution.to_dict(),
         "solutionVerification": solution.to_dict() if solution is not None else None,
         "releaseId": plan.release_id,
+        "productionProfile": bool(eff_production),
+        "signerTrustRequired": signer_trust_required,
     }
     _write_installer_report(Path(report_path) if report_path else None, payload)
     exit_code = EXIT_SUCCESS if status == "ok" else EXIT_BLOCKED

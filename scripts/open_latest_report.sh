@@ -4,8 +4,26 @@ set -euo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 cd "$SCRIPT_DIR"
 
-if [ ! -d reports ] || [ -z "$(ls -A reports 2>/dev/null)" ]; then
-    echo "No reports found in $SCRIPT_DIR/reports yet. Run a suite first." >&2
+# Resolve the same canonical report root every other component uses
+# (Priority 3), so "Open Latest Report" always looks where a run actually
+# wrote its evidence -- never silently falling back to this repo's own
+# reports/ when a custom root is configured. Best-effort: this is a
+# read-only convenience utility, not a release gate, so an unresolvable
+# root falls back to this repo's own reports/ rather than blocking the
+# tester from viewing anything.
+if [ -z "${CALEE_REPORT_ROOT:-}" ]; then
+    if [ -f .venv/bin/activate ]; then
+        # shellcheck disable=SC1091
+        source .venv/bin/activate
+        CALEE_REPORT_ROOT="$(python3 -m calee_regression report-root 2>/dev/null || echo "$SCRIPT_DIR")"
+    else
+        CALEE_REPORT_ROOT="$SCRIPT_DIR"
+    fi
+fi
+REPORTS_DIR="$CALEE_REPORT_ROOT/reports"
+
+if [ ! -d "$REPORTS_DIR" ] || [ -z "$(ls -A "$REPORTS_DIR" 2>/dev/null)" ]; then
+    echo "No reports found in $REPORTS_DIR yet. Run a suite first." >&2
     exit 1
 fi
 
@@ -15,13 +33,13 @@ fi
 # used to *decide* what belongs to a run (consolidation itself always
 # validates every report's run ID against its own workspace); this is
 # purely "which finished run should a human look at by default."
-if [ -L reports/latest-run ] && [ -f reports/latest-run/consolidated/consolidated-report.html ]; then
-    SUMMARY="reports/latest-run/consolidated/consolidated-report.html"
-elif [ -d reports/runs ] && [ -n "$(ls -A reports/runs 2>/dev/null)" ]; then
+if [ -L "$REPORTS_DIR/latest-run" ] && [ -f "$REPORTS_DIR/latest-run/consolidated/consolidated-report.html" ]; then
+    SUMMARY="$REPORTS_DIR/latest-run/consolidated/consolidated-report.html"
+elif [ -d "$REPORTS_DIR/runs" ] && [ -n "$(ls -A "$REPORTS_DIR/runs" 2>/dev/null)" ]; then
     # No finished full-solution run yet, but at least one run workspace
     # exists (e.g. only "01 Prepare" has been run so far) -- report that
     # plainly rather than falling back to an unrelated single-suite report.
-    echo "No finished 'Test Full Calee Solution' run yet (reports/latest-run isn't set)." >&2
+    echo "No finished 'Test Full Calee Solution' run yet ($REPORTS_DIR/latest-run isn't set)." >&2
     echo "Run '06 Test Full Calee Solution' first, or open a single-suite report directly." >&2
     exit 1
 else
@@ -29,9 +47,9 @@ else
     # (e.g. "02 Test Calee Tablet" run on its own) still write their own
     # timestamped reports/<suite>-<timestamp>/ directory outside any run
     # workspace. Only reachable here since it's the last remaining case.
-    LATEST="$(ls -1dt reports/*/ 2>/dev/null | head -n1 || true)"
+    LATEST="$(ls -1dt "$REPORTS_DIR"/*/ 2>/dev/null | head -n1 || true)"
     if [ -z "$LATEST" ]; then
-        echo "No reports found in $SCRIPT_DIR/reports yet. Run a suite first." >&2
+        echo "No reports found in $REPORTS_DIR yet. Run a suite first." >&2
         exit 1
     fi
     SUMMARY="${LATEST}summary.html"
