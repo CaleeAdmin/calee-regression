@@ -1,0 +1,24 @@
+# Promotion state for the tablet calendar-event mutation scenario (Phase 6).
+# DRAFT: source-confirmed selectors + offline tests, but never run on a real
+# tablet, so it stays out of every release suite. Promote ONLY by flipping
+# physicalConfirmation.status to 'passed' with a fully-populated evidence block
+# AND dropping draft-unverified / setting mandatory / adding to full-tester in
+# the scenario + suites.py. calee_regression/promotion.py enforces this.
+scenario: calendar_event_mutation
+scenarioFile: scenarios/calendar_event_mutation.yaml
+sourceConfirmed: true
+sourceSha: "d5b99712158c27f435681946326f0c7b8df54a3e"
+offlineTestsPassed: true
+physicalConfirmation:
+  status: pending
+  requiredDevice: physical_tablet
+  evidenceRequired:
+    - runId
+    - tabletModel
+    - androidVersion
+    - caleeVersion
+    - caleeGitSha
+    - screenshotPaths
+    - resultsJson
+  evidence: {}
+releaseSuiteEligible: false

@@ -1,0 +1,282 @@
+# Regression coverage manifest (Phase 12) -- the single machine-readable
+# source of truth for what each area of the Calee solution has, offline, and
+# what still needs a physical device.
+#
+# Per-component fields:
+#   automated:        true | partial | draft | false
+#                       true    = fully automated coverage exists and runs
+#                       partial = some automated coverage; more is device-gated
+#                       draft   = scenario/orchestration exists but is
+#                                 draft-unverified (never release-gating)
+#                       false   = no automated coverage yet
+#   offlineTested:    bool -- proven by fakes/contract/unit tests with no device
+#   physicalVerified: bool -- has PASSED on a real device in a recorded session
+#   releaseGating:    bool -- a real release must not ship without this passing
+#   blocked:          bool -- currently BLOCKED on a missing prerequisite
+#   optional:         bool -- explicitly opt-out for a given release scope
+#   unsupported:      bool -- cannot be automated with today's primitives
+#   owningRepo:       which repo owns the implementation
+#   scenarioSuite:    (optional) the calee-regression suite name, cross-checked
+#                     against suites.py by test_coverage_manifest.py
+#   notes:            short human context
+#
+# CONSISTENCY (enforced by framework_tests/test_coverage_manifest.py):
+#   * a draft component is never releaseGating
+#   * an unsupported component is never releaseGating and never automated:true
+#   * a component naming a scenarioSuite that is release-gating must have that
+#     suite inside a COMPOSITE_SUITES entry; a draft one must be OUTSIDE
+#     full-tester/release-technical
+#   * nothing here is physicalVerified: true (no device this session)
+
+meta:
+  generated: "example -- regenerate per session"
+  physicalSession: false
+  note: >
+    No component is physicalVerified in this manifest: no Android tablet,
+    iPhone, emulator or simulator was available. Physical verification is
+    pending a MacBook qualification session.
+
+components:
+  # ── Calee tablet: read/navigation coverage (release-gating) ────────────
+  tablet_calendar_view:
+    automated: true
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: false
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    scenarioSuite: calendar
+    notes: "Calendar smoke/view-modes/event-fields/recurring; asserts REG-* fixture."
+
+  tablet_tasks:
+    automated: true
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: false
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    scenarioSuite: tasks_smoke
+    notes: "Tasks smoke read/navigation."
+
+  tablet_chores:
+    automated: true
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: false
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    scenarioSuite: chores_smoke
+    notes: "Chores kid-safe board smoke."
+
+  # ── Calee tablet: functional mutation (draft, NOT release-gating) ──────
+  tablet_calendar_mutation:
+    automated: draft
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: false
+    blocked: true
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    scenarioSuite: calendar_event_mutation
+    notes: "Create/edit(2 fields)/delete; source-confirmed selectors; needs a physical pass to promote."
+
+  tablet_task_mutation:
+    automated: draft
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: false
+    blocked: true
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    scenarioSuite: tasks_mutation
+    notes: "Complete/reopen row-scoped; fixture-absence blocks; needs physical pass."
+
+  tablet_chore_mutation:
+    automated: draft
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: false
+    blocked: true
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    scenarioSuite: chores_mutation
+    notes: "Skip-this-time row-scoped; needs 'Show chore edit actions' + physical pass."
+
+  subscribed_calendar_rendering:
+    automated: draft
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: false
+    blocked: true
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    scenarioSuite: subscribed_calendar
+    notes: "Render + read-only + visibility selection; needs REG-SUB fixture + physical pass."
+
+  calendar_visibility_selection:
+    automated: draft
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: false
+    blocked: true
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    notes: "Cases 9,10,12,13,14 in subscribed_calendar.yaml; selectors source-confirmed; app-restart persistence is a product risk to confirm physically."
+
+  calendar_appearance:
+    automated: draft
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: false
+    blocked: true
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    scenarioSuite: calendar_appearance
+    notes: "Name/colour editing dialog; tablet colour-read has no primitive (permanent gap)."
+
+  # ── CaleeMobile functional coverage (release-gating) ───────────────────
+  mobile_calendar:
+    automated: true
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: false
+    optional: false
+    unsupported: false
+    owningRepo: CaleeMobile-Regression
+    notes: "Client API + UI calendar flows against the REG-* fixture."
+
+  mobile_tasks:
+    automated: true
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: false
+    optional: false
+    unsupported: false
+    owningRepo: CaleeMobile-Regression
+    notes: "Client API + UI task flows."
+
+  mobile_chores:
+    automated: true
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: false
+    optional: false
+    unsupported: false
+    owningRepo: CaleeMobile-Regression
+    notes: "Client API + UI chore flows."
+
+  meals:
+    automated: partial
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: true
+    optional: false
+    unsupported: false
+    owningRepo: CaleeMobile-Regression
+    notes: "release_features.meals reaches launcher; deterministic meal fixture needs a device."
+
+  onboarding:
+    automated: partial
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: true
+    optional: false
+    unsupported: false
+    owningRepo: CaleeMobile-Regression
+    notes: "Onboarding lifecycle needs a redeem/activation backend + device."
+
+  google_calendar:
+    automated: partial
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: true
+    optional: false
+    unsupported: false
+    owningRepo: CaleeMobile-Regression
+    notes: "App-owned OAuth boundaries; one guided manual real-Google check + Flutter harness."
+
+  # ── cross-cutting (release-gating) ─────────────────────────────────────
+  cross_device_sync:
+    automated: partial
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: true
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    notes: "Event/task/chore/appearance flows orchestrated + fully fake-tested; tablet-mutation legs BLOCKED until a physical pass."
+
+  kiosk_admin:
+    automated: partial
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: true
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    scenarioSuite: kiosk_admin_physical
+    notes: "Physical-only kiosk/admin suite; needs a disposable device-owner tablet."
+
+  notifications:
+    automated: false
+    offlineTested: false
+    physicalVerified: false
+    releaseGating: false
+    blocked: true
+    optional: false
+    unsupported: false
+    owningRepo: CaleeMobile-Regression
+    notes: "Scheduled/permission notification delivery is a guided manual + distributed-build check; not automatable offline."
+
+  build_installation:
+    automated: true
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: false
+    blocked: false
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    notes: "Release-installer subsystem: bundle verify + install-plan construction + classification, fully fake-tested. Actual install needs a device."
+
+  report_consolidation:
+    automated: true
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: false
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    notes: "The PASS/FAIL/BLOCKED consolidation gate itself; synthetic-input tested."
+
+  tablet_colour_assertion:
+    automated: false
+    offlineTested: false
+    physicalVerified: false
+    releaseGating: false
+    blocked: true
+    optional: false
+    unsupported: true
+    owningRepo: calee-regression
+    notes: "No colour-reading primitive exists in CaleeDriver; a permanent gap, verified via API instead."

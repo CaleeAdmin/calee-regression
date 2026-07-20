@@ -159,6 +159,10 @@ def _step_tap(ctx, step):
     _tap_target(ctx["driver"], step)
 
 
+def _step_tap_unique_text(ctx, step):
+    ctx["driver"].tap_unique_text(step["text"])
+
+
 def _step_is_optional(step: dict) -> bool:
     """A step is optional if explicitly marked `optional: true` or
     `required: false`. The default is required -- see Workstream 1's
@@ -170,6 +174,22 @@ def _step_is_optional(step: dict) -> bool:
     if "required" in step:
         return not bool(step["required"])
     return False
+
+
+def _step_is_blocking_precondition(step: dict) -> bool:
+    """A step marked `blocks_on_absence: true` declares that ITS OWN failure
+    means a prerequisite (the deterministic REG-* fixture, or an account-
+    config-gated control like chores' "Show chore edit actions") was not
+    there -- an environment/fixture problem, not evidence the product
+    regressed -- so it must BLOCK rather than FAIL. Unmarked (the default)
+    steps keep failing loudly: a generic element/row resolution failure could
+    just as easily be a real product regression (e.g. a RecyclerView that
+    stopped rendering), and silently downgrading every such failure to
+    BLOCKED would risk masking one. Only a scenario author who can vouch that
+    THIS specific step's absence is a precondition problem, not a product
+    one, should set this flag -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md's
+    "treat fixture absence as BLOCKED, not FAIL" requirement."""
+    return bool(step.get("blocks_on_absence", False))
 
 
 def _step_tap_if_present(ctx, step, result: StepResult):
@@ -375,6 +395,7 @@ ACTIONS = {
     "assert_any_text": _step_assert_any_text,
     "assert_id": _step_assert_id,
     "tap": _step_tap,
+    "tap_unique_text": _step_tap_unique_text,
     "tap_if_present": _step_tap_if_present,
     "tap_if_absent": _step_tap_if_absent,
     "type_text": _step_type_text,
@@ -437,7 +458,11 @@ def _execute_step(ctx, step: dict) -> StepResult:
         if result.status == STATUS_PASSED:
             result.message = result.message or "ok"
     except Exception as exc:
-        result.status = STATUS_FAILED
+        # A step explicitly marked blocks_on_absence: true declares its own
+        # failure as an environment/fixture precondition problem, not a
+        # product regression -- see _step_is_blocking_precondition. Every
+        # other step keeps the existing FAIL-by-default behavior.
+        result.status = STATUS_BLOCKED if _step_is_blocking_precondition(step) else STATUS_FAILED
         result.message = str(exc)
         result.hint = explain_exception(exc)
         # Row-scoped runtime diagnostics (Priority 5.8/5.10): a RowResolutionError
@@ -453,6 +478,21 @@ def _execute_step(ctx, step: dict) -> StepResult:
             try:
                 result.row_metrics = resolution.to_dict()
             except AttributeError:
+                pass
+        else:
+            # Generic on-failure diagnostics for every OTHER step type (plain
+            # tap/assert_text/wait_for_id/...), not just the row-scoped path
+            # above -- best-effort: a driver/test-double without this
+            # capability, or a capture that itself fails, must never mask the
+            # underlying error (mirrors CaleeDriver._capture_diagnostics's own
+            # failure-swallowing).
+            try:
+                capture = getattr(ctx["driver"], "capture_diagnostics", None)
+                if capture is not None:
+                    shot, src = capture(f"step-failure-{name}")
+                    result.screenshot_path = result.screenshot_path or shot
+                    result.page_source_path = result.page_source_path or src
+            except Exception:
                 pass
         if ctx["scenario"].requires_state == "logged_in_tablet" and action in STATE_SENSITIVE_ACTIONS:
             result.hint = STATE_MISMATCH_HINT

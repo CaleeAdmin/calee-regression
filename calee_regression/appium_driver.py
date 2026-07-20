@@ -270,6 +270,49 @@ class CaleeDriver:
     def back(self) -> None:
         self.driver.back()
 
+    def find_all_by_exact_text(self, text: str) -> list:
+        """Every element whose @text or @content-desc EXACTLY equals `text` --
+        used by tap_unique_text so a scenario can act on a uniquely-titled item
+        that has no row-container id to scope by (e.g. a scratch event in an
+        Agenda list) without ever guessing among several matches. Exact
+        equality, like the row-scoped title match in find_rows_by_title --
+        never a substring match, which would let e.g. "...-ALPHA" also match
+        "...-ALPHA-EXTRA"."""
+        from appium.webdriver.common.appiumby import AppiumBy
+
+        lit = self._xpath_text_literal(text)
+        xpath = f"//*[@text={lit} or @content-desc={lit}]"
+        return self.driver.find_elements(AppiumBy.XPATH, xpath)
+
+    def tap_unique_text(self, text: str) -> None:
+        """Tap the ONE element whose text/content-desc exactly equals `text`.
+
+        Fails loudly on zero or multiple matches rather than silently acting
+        on whichever element find_element happens to return first (Appium's
+        find_element has no concept of "ambiguous" -- it just returns the
+        first DOM match) -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md's "never
+        select an arbitrary event row, fail on zero or multiple matching
+        rows" requirement, extended here to a list with no row-container id to
+        scope by (tap_in_row already covers the case where one exists).
+        """
+        matches = self.find_all_by_exact_text(text)
+        if not matches:
+            raise LookupError(f"No element with exact text/content-desc {text!r} found.")
+        if len(matches) > 1:
+            raise LookupError(
+                f"{len(matches)} elements match exact text/content-desc {text!r} exactly -- "
+                f"ambiguous. tap_unique_text requires exactly one match; use a more specific/"
+                f"unique title."
+            )
+        matches[0].click()
+
+    def capture_diagnostics(self, label: str) -> "tuple[str | None, str | None]":
+        """Public entry point for on-failure diagnostics (screenshot + page
+        source), usable by any caller -- not just the row-scoped resolution
+        path that originally motivated _capture_diagnostics. Best-effort: see
+        _capture_diagnostics for the failure-swallowing rationale."""
+        return self._capture_diagnostics(label)
+
     def id_present(self, raw_id: str) -> bool:
         """Single-shot presence check (no wait loop, no tap) -- used to
         decide whether a toggle control needs pressing without flipping it

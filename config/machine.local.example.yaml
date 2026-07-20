@@ -1,0 +1,60 @@
+# One-time machine configuration for a technical owner (Phase 4).
+#
+# Copy this to config/machine.local.yaml (gitignored, like tester.local.yaml)
+# and fill it in ONCE per MacBook that will drive a physical qualification
+# session. It centralises the handful of machine-specific values the launcher
+# and installer need, so a technical owner configures one file instead of
+# several, and a nontechnical tester never edits YAML at all.
+#
+# SECRETS DO NOT GO HERE. The regression username/password, API tokens and
+# AI-analysis keys are resolved at run time by the credential provider
+# (calee_regression/credentials.py) from environment variables or the macOS
+# Keychain. The loader REJECTS this file if it contains a password/token/secret
+# key -- see docs/CONFIGURATION.md.
+
+# ── device / tablet ──────────────────────────────────────────────────────
+# The ADB serial of the Calee tablet (from `adb devices`). Leave blank only if
+# exactly one device is ever attached.
+tablet_serial: "TABLETSERIAL123"
+# What state the tablet is prepared in: "logged_in_tablet" (a signed-in demo
+# account, the norm for a release run) or "fresh" (no account).
+expected_tablet_state: "logged_in_tablet"
+# Application identities and launch wiring for the tablet apps.
+calee_package_id: "com.viso.calee"
+caleeshell_package_id: "com.viso.caleeshell"
+home_activity: "com.viso.caleeshell/.ui.LauncherActivity"
+calee_launch_action: "com.viso.calee.action.START"
+
+# ── release bundle / installer ───────────────────────────────────────────
+# The folder a technical owner drops the signed release bundle into (the one
+# `verify-release-bundle`/`install-tablet-release` read). A nontechnical tester
+# just places the bundle here.
+release_bundle_dir: "~/Calee-Releases/current"
+
+# ── backend / profile ────────────────────────────────────────────────────
+# The Hub backend the fixture is reset against and the apps are built to talk
+# to (e.g. https://hub-dev.calee.com.au for a pre-release environment).
+backend_url: "https://hub-dev.calee.com.au"
+# Which release profile config/release-platforms.yaml to use (a label; the
+# actual platform/feature gating lives in that file).
+release_profile: "production"
+
+# ── mobile platforms ─────────────────────────────────────────────────────
+# Which CaleeMobile UI platforms this machine can run. iOS needs a Mac + a
+# connected iPhone/simulator; drop it on an Android-only setup.
+mobile_platforms:
+  - android
+  - ios
+# Optional explicit iPhone device id/name override (from `xcrun xctrace list
+# devices`); leave blank to auto-resolve the single connected iPhone.
+iphone_device: ""
+
+# ── reports ──────────────────────────────────────────────────────────────
+# Where consolidated reports are written. The tester opens the latest from here.
+report_dir: "reports"
+
+# ── CaleeShell technical test permission ─────────────────────────────────
+# Whether this machine is allowed to run the destructive-adjacent CaleeShell
+# kiosk/admin technical checks (only ever true on a DISPOSABLE tablet, never a
+# customer device). Default false: a tester machine never opts in by accident.
+allow_caleeshell_technical: false

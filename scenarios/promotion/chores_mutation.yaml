@@ -1,0 +1,22 @@
+# Promotion state for the tablet chore skip mutation scenario (Phase 6).
+# DRAFT: source-confirmed selectors + offline tests, physically unverified.
+# Promotion is machine-enforced by calee_regression/promotion.py -- see
+# scenarios/promotion/calendar_event_mutation.yaml for the full contract.
+scenario: chores_mutation
+scenarioFile: scenarios/chores_mutation.yaml
+sourceConfirmed: true
+sourceSha: "931beecfc309ff12220185383fa8daae56af30d8"
+offlineTestsPassed: true
+physicalConfirmation:
+  status: pending
+  requiredDevice: physical_tablet
+  evidenceRequired:
+    - runId
+    - tabletModel
+    - androidVersion
+    - caleeVersion
+    - caleeGitSha
+    - screenshotPaths
+    - resultsJson
+  evidence: {}
+releaseSuiteEligible: false

@@ -1,0 +1,22 @@
+# Promotion state for the subscribed-calendar rendering + visibility selection scenario (Phase 6).
+# DRAFT: source-confirmed selectors + offline tests, physically unverified.
+# Promotion is machine-enforced by calee_regression/promotion.py -- see
+# scenarios/promotion/calendar_event_mutation.yaml for the full contract.
+scenario: subscribed_calendar
+scenarioFile: scenarios/subscribed_calendar.yaml
+sourceConfirmed: true
+sourceSha: "d5b99712158c27f435681946326f0c7b8df54a3e"
+offlineTestsPassed: true
+physicalConfirmation:
+  status: pending
+  requiredDevice: physical_tablet
+  evidenceRequired:
+    - runId
+    - tabletModel
+    - androidVersion
+    - caleeVersion
+    - caleeGitSha
+    - screenshotPaths
+    - resultsJson
+  evidence: {}
+releaseSuiteEligible: false

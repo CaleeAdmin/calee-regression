@@ -85,7 +85,13 @@ steps:
     compare: false
 
   - name: Open the newly created event
-    action: tap
+    # tap_unique_text (not plain tap/text) -- fails loudly on zero or
+    # multiple matching rows instead of silently acting on whichever
+    # find_element happens to return first. The Agenda list has no
+    # row-container resource id to scope by (unlike task/chore rows), so this
+    # is the flat-list equivalent of tap_in_row's "never select an arbitrary
+    # row" guarantee.
+    action: tap_unique_text
     text: REG-SCRATCH-EVENT-MUTATION-ALPHA
 
   - name: Wait for event detail dialog to render
@@ -117,6 +123,24 @@ steps:
     id: etEventTitle
     text: REG-SCRATCH-EVENT-MUTATION-BRAVO
 
+  - name: Expand "More details" to reach the location field
+    # etEventLocation lives inside containerEventMoreDetails, which starts
+    # visibility="gone" until rowEventMoreDetails is tapped (see
+    # dialog_hub_event_form.xml). Editing only the title would not exercise
+    # "edit the title and at least one additional meaningful field".
+    action: tap
+    id: rowEventMoreDetails
+
+  - name: Wait for the location field to render
+    action: wait_for_id
+    id: etEventLocation
+    timeout_seconds: 10
+
+  - name: Type a second, meaningful edited field (location)
+    action: type_text
+    id: etEventLocation
+    text: REG-SCRATCH-EVENT-MUTATION-LOCATION
+
   - name: Hide the keyboard so the save control isn't covered
     action: hide_keyboard
 
@@ -143,7 +167,8 @@ steps:
     compare: false
 
   - name: Open the edited event
-    action: tap
+    # tap_unique_text -- see the "Open the newly created event" step above.
+    action: tap_unique_text
     text: REG-SCRATCH-EVENT-MUTATION-BRAVO
 
   - name: Wait for event detail dialog to render again
@@ -151,15 +176,23 @@ steps:
     id: tvEventDetailTitle
     timeout_seconds: 10
 
+  - name: Assert the second edited field (location) is shown
+    action: assert_text
+    text: REG-SCRATCH-EVENT-MUTATION-LOCATION
+
   - name: Delete this event
     action: tap
     id: btnEventDetailDelete
 
   - name: Confirm deletion
-    # Delete raises the shared confirmation dialog (dialog_calee_confirm) whose
-    # primary action is btnConfirmAction. PHYSICAL-VERIFY: whether confirming
-    # returns straight to the Agenda list or leaves the (now-empty) detail
-    # dialog open needing an explicit back/close first.
+    # Delete raises the shared confirmation dialog (dialog_calee_confirm)
+    # whose primary action is btnConfirmAction. Source-confirmed (not yet
+    # physically confirmed): HubEventDetailDialog.kt's delete-result listener
+    # calls dismissAllowingStateLoss() as soon as RESULT_KEY_DELETE_SUCCESS is
+    # true, so confirming here closes the detail dialog itself and returns
+    # straight to the Agenda list -- no separate back/close tap is needed. The
+    # "Switch to Agenda view" step below is therefore redundant-but-harmless
+    # (already the active screen), not compensating for an open dialog.
     action: tap
     id: btnConfirmAction
 
@@ -185,17 +218,21 @@ steps:
     texts: ["Unfortunately", "has stopped", "Force Close", "Error"]
 
 # Source of every resource id above, read from the canonical Calee tablet
-# source (CaleeAdmin/Calee). Layouts at the release commit and the dev head are
-# identical for these files. See docs/TABLET_MUTATION_COVERAGE_GAPS.md.
+# source (CaleeAdmin/Calee). Re-confirmed against the current checkout (branch
+# claude/tablet-sync-blockers-8oizn3, 0.3.25 "Add calendar appearance editing
+# (name + colour) support (#979)"); unchanged since release #974. See
+# docs/TABLET_MUTATION_COVERAGE_GAPS.md.
 source_verification:
   calee_source: CaleeAdmin/Calee
-  calee_source_sha: "931beecfc309ff12220185383fa8daae56af30d8"  # Calee release #974 (main)
-  calee_source_ref: "main (release #974); identical layouts on dev @ b32807d"
+  calee_source_sha: "d5b99712158c27f435681946326f0c7b8df54a3e"  # Calee main, 0.3.25 (#979)
+  calee_source_ref: "main, 0.3.25 (#979); unchanged since release #974 (931beecf)"
   status: source-confirmed
   physical_confirmation: pending
   selectors:
     etEventTitle: app/src/main/res/layout/dialog_hub_event_form.xml
     btnEventSave: app/src/main/res/layout/dialog_hub_event_form.xml
+    rowEventMoreDetails: app/src/main/res/layout/dialog_hub_event_form.xml
+    etEventLocation: app/src/main/res/layout/dialog_hub_event_form.xml
     btnEventDetailEdit: app/src/main/res/layout/dialog_hub_event_detail.xml
     btnEventDetailDelete: app/src/main/res/layout/dialog_hub_event_detail.xml
     tvEventDetailTitle: app/src/main/res/layout/dialog_hub_event_detail.xml

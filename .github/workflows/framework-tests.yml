@@ -20,6 +20,23 @@ jobs:
       - name: Run pytest
         run: python -m pytest
 
+      - name: Release-metadata consistency (coverage manifest + promotion state machine)
+        run: python -m calee_regression coverage-report --check
+
+      - name: Machine-config example is valid and secret-free
+        run: |
+          python -c "
+          import yaml
+          from calee_regression.machine_config import validate_machine_config
+          raw = yaml.safe_load(open('config/machine.local.example.yaml'))
+          errors = validate_machine_config(raw)
+          if errors:
+              print('machine.local.example.yaml invalid:')
+              for e in errors: print(' -', e)
+              raise SystemExit(1)
+          print('machine.local.example.yaml is valid and secret-free.')
+          "
+
       - name: Validate all scenario files parse cleanly
         run: |
           python -c "

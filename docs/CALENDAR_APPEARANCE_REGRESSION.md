@@ -270,25 +270,44 @@ be `BLOCKED`, and it matters which is which:
   fully-wired, fully-passing run, exactly like `run_event_sync_flow`'s
   `modify_on_tablet`/`run_task_sync_flow`'s `reopen_on_tablet` stay `BLOCKED`
   for the (different) tablet-mutation gap.
-* **The "not wired into `build_real_environment()` yet" gap**: unlike the
-  event/task/chore flows, `api_set_calendar_appearance`/`api_get_calendar`/
-  `api_trigger_calendar_refresh` are `Optional` fields on
-  `SyncSmokeEnvironment` (default `None`) that `build_real_environment()`
-  does not currently populate. Wiring them for real needs new
-  CaleeMobile-Regression API actions (`set-calendar-appearance` /
-  `get-calendar` / `trigger-calendar-refresh`) that do not exist in
-  `sync_smoke_actions.py`/`sync_smoke_cli.py` today (confirmed by reading
-  that sibling script's `argparse` action list: only `create-scratch-event`
-  / `get-event` / `delete-event` / `reopen-task` exist) -- and
-  CaleeMobile-Regression is explicitly out of scope for this change. Every
-  step that needs one of these callables records `BLOCKED` honestly with
-  `APPEARANCE_API_NOT_WIRED_DETAIL` instead of raising; the orchestration
-  logic around them is still fully exercised with fakes (see "Proven
-  offline now"). Closing this gap is future work: add the three actions to
-  `sync_smoke_actions.py`/`sync_smoke_cli.py`, then wire
-  `build_real_environment()` to call them, mirroring
-  `create_scratch_event`/`get_event`/`delete_event`'s existing pattern in
-  `calee_regression/sync_smoke_bridge.py`.
+* **The "not wired into `build_real_environment()`" gap — now CLOSED for
+  two of the three callables.** `api_get_calendar`/`api_set_calendar_appearance`
+  are wired for real: `sync_smoke_actions.py`/`sync_smoke_cli.py` (the
+  sibling CaleeMobile-Regression repo) now implements `get-calendar` (fetches
+  `GET /client/v1/calendars` and filters client-side by id -- there is no
+  single-calendar GET endpoint) and `set-calendar-appearance` (`PATCH
+  /client/v1/calendars/{id}/appearance`, sending only the field(s) the
+  caller actually supplied), and `calee_regression/sync_smoke_bridge.py`
+  gained matching `get_calendar`/`set_calendar_appearance` subprocess-bridge
+  functions that `build_real_environment()` now wires in. Every step needing
+  one of these two callables runs for real against whatever backend the
+  caller points it at (`capture_baseline_via_api`, `rename_via_api`,
+  `change_color_via_api`, `verify_color_persisted_via_api`, and — in
+  `run_partial_appearance_override_flow` — `capture_baseline_via_api`,
+  `change_color_only_via_api`, `verify_color_only_edit_created_no_name_
+  override_via_api`).
+  `api_trigger_calendar_refresh` remains unwired (`None`), for a DIFFERENT,
+  more specific reason than the old blanket "CaleeMobile-Regression is out
+  of scope" one: **no client-facing endpoint exists in calee-hub-core to
+  force-refresh a subscription-type calendar.** Source-confirmed against
+  `core_client_api.php`/`routes_client_api.php`: the only related mechanism,
+  `client_subscription_source_mark_refresh_due()`, is an internal,
+  non-deterministic side effect of a stale-cache `/client/v1/events` GET --
+  not something a client can call directly and then reliably poll on. A
+  distinct "sync now" endpoint exists (`routes_client_api_external_calendars.php`)
+  but is scoped to `external_calendar` (Google-connected) calendars, keyed
+  by *connection* id, and does not apply to the `subscription_mapping`
+  REG-SUB fixture this flow targets by default. Every step needing
+  `api_trigger_calendar_refresh` records `BLOCKED` honestly with
+  `REFRESH_ENDPOINT_NOT_AVAILABLE_DETAIL`, and the flow stops there (steps
+  after `trigger_provider_refresh_via_api` — verifying the override survives
+  a refresh, and that the provider's own `sourceName` was untouched by it —
+  cannot be honestly exercised without a real refresh to have happened).
+  The orchestration logic around all of this is still fully exercised with
+  fakes (see "Proven offline now"). Closing the remaining gap for real would
+  need calee-hub-core to add a genuine client-facing refresh-trigger
+  endpoint for subscription/CalDAV calendars -- out of scope for a
+  regression-framework-only change.
 
 ### Release-gating status
 
@@ -305,11 +324,18 @@ needed. See `docs/SUITE_REFERENCE.md`'s "Partially implemented: `sync-smoke`"
 section, now listing all four flows.
 
 Like the other three flows, this one currently, always resolves to
-`BLOCKED` for its live-device legs (the colour-assertion gap is permanent;
-the API-wiring gap needs sibling-repo work; and even once both close, there
-is no physical tablet/backend in this sandbox to run against) -- by design,
-matching this repo's existing safety property ("a PASS must not be possible
-while a live check is unverified"), not a shortcoming introduced here.
+`BLOCKED` for its live-device legs -- the colour-assertion gap is permanent;
+the refresh-trigger gap needs a calee-hub-core endpoint that does not exist
+today (see above); and even with `get-calendar`/`set-calendar-appearance`
+now wired, there is no physical tablet/backend in this sandbox to run
+against -- by design, matching this repo's existing safety property ("a
+PASS must not be possible while a live check is unverified"), not a
+shortcoming introduced here. Against a real backend (even without a
+tablet), the API-only steps this flow shares with `run_partial_appearance_
+override_flow` (`capture_baseline_via_api`, `change_color_only_via_api`,
+`verify_color_only_edit_created_no_name_override_via_api`, ...) would now
+exercise the real endpoint and could genuinely pass or fail on their own
+merits, rather than blocking immediately.
 
 ## The colour-assertion gap
 
@@ -352,13 +378,25 @@ change; not attempted here, and not faked.
 Stated as plainly as `docs/SUBSCRIBED_CALENDAR_REGRESSION.md` already does
 for the subscription type:
 
+**Update (Phase 5): these fixtures now have machine-readable CONTRACTS** --
+`CaleeMobile-Regression/api/caleemobile_regression/appearance_fixtures.py`
+defines each one deterministically (name, `serviceId:rawCalendarId` public id,
+`appearanceMode`, the exact capability set it must expose, and its precise
+secure provisioning requirement), validated offline against the fake server's
+capability taxonomy (`tests/test_appearance_fixtures.py`) so a fixture's
+declared capabilities can never drift from the backend contract. What is still
+BLOCKED is **real provisioning** (a live backend / second account / Google
+connection), reported honestly by `real_environment_status(...)` -- the
+contract exists; the live fixture does not.
+
 | Calendar type | `appearanceMode` | Fixture status |
 |---|---|---|
-| Subscription | `subscription_mapping` | **Provisioned** -- reuses the existing REG-SUB fixture (`fixtures/subscribed_calendar/reg_sub_calendar.ics`, calendar id `regression:regsub`, display name `REG-SUB Regression Subscription` from its `X-WR-CALNAME`). Still needs the hub backend + a prepared tablet to actually load it -- BLOCKED here, not because the fixture is undefined. |
-| Owned CalDAV | `source_metadata` | **Not provisioned.** No deterministic, uniquely-named REG-* calendar fixture exists in this repo today (only REG-EVENT-*/REG-TASK-*/REG-CHORE-* *records* are documented in `docs/TEST_DATA_RESET_CONTRACT.md`, which imply an owned calendar exists behind them but never name it). This doc **proposes** a new entry, `REG-OWNED-CALENDAR-APPEARANCE-001`, provisioned the same way the rest of the REG-* fixture is -- ordinary `POST /client/v1/calendars` via the Calee Client API (calee-hub-core has no seed/test-data endpoint). **Not implemented anywhere in this repo or `CaleeMobile-Regression` as of this change.** |
-| External calendar | `external_calendar` | **Not provisioned; now targeted by `calendar_appearance_external.yaml`** (destructive-action absence guard + appearance editing). This doc **proposes** `REG-EXTERNAL-GOOGLE-CALENDAR-001`: a dedicated calendar in a regression-owned Google account, connected via the hub's external calendar connection flow, display name `REG-EXT Google Calendar`. **Not implemented anywhere as of this change** -- the scenario stays BLOCKED on provisioning. |
-| Subscription (partial-override flow) | `subscription_mapping` | **Not provisioned.** `run_partial_appearance_override_flow` needs a SECOND, pristine subscription (`REG-SUB-PARTIAL`, proposed calendar id `regression:regsub-partial`) whose name/colour have never been locally overridden -- the main REG-SUB fixture is renamed by `run_calendar_appearance_sync_flow` earlier in the same `run_all_sync_flows` pass. Also needs the upstream-source mutation plumbing described in `SOURCE_SIMULATION_NOT_WIRED_DETAIL` (rewriting the feed's `X-WR-CALNAME`/colour and re-serving it). **Not implemented as of this change.** |
-| Shared read-only CalDAV | `unsupported` | **Not provisioned -- the hardest of the three.** Proposes `REG-SHARED-READONLY-CALENDAR-001`: a calendar owned by a *second* regression-owned account, shared read-only to the primary regression account under test. Unlike the owned-calendar proposal above, this cannot be provisioned via ordinary single-account CRUD -- it needs either a second regression account to share from, or a backend admin/fixture endpoint that does not exist today. **Not implemented anywhere in this repo or its siblings as of this change.** |
+| Subscription | `subscription_mapping` | **Contract: `REG-SUB-APPEARANCE`** (reuses the existing REG-SUB feed, `fixtures/subscribed_calendar/reg_sub_calendar.ics`, public id `regression:regsub`). Real provisioning still needs the hub backend + prepared tablet -- BLOCKED, not undefined. |
+| Owned CalDAV | `source_metadata` | **Contract: `REG-OWNED-APPEARANCE`** (public id `regression-owned:reg-owned-appearance`). Provisionable via ordinary `POST /client/v1/calendars` -- but still needs a live hub backend, so BLOCKED here. |
+| External calendar | `external_calendar` | **Contract: `REG-EXTERNAL-CALENDAR`** (public id `external:reg-external-google`, reader role → events non-editable). Real provisioning needs a regression-owned Google account connected via the hub's external-calendar flow -- BLOCKED. |
+| Subscription (partial-override flow) | `subscription_mapping` | **Contract: `REG-SUB-PARTIAL`** (public id `regression:regsub-partial`, must start with no local override). Real provisioning needs a SECOND pristine feed + upstream-source mutation plumbing (`SOURCE_SIMULATION_NOT_WIRED_DETAIL`) -- BLOCKED. |
+| Shared read-only CalDAV | `unsupported` | **Contract: `REG-SHARED-READONLY`** (public id `regression-shared:reg-shared-readonly`, `canEditAppearance=false`). Real provisioning needs a second regression account to share from (not single-account CRUD) -- BLOCKED, the hardest of the set. |
+| Two services, same raw id | `subscription_mapping` | **Contracts: `REG-SERVICE-A-DUPLICATE-ID` / `REG-SERVICE-B-DUPLICATE-ID`** -- same `rawCalendarId` (`shared-raw-id`), distinct public ids, proving service isolation (Calee `hubCalendarKey` / hub-core `client_api_public_calendar_id`). Real provisioning needs a two-service fixture -- BLOCKED. |
 
 None of these proposed fixture entries are added to
 `docs/TEST_DATA_RESET_CONTRACT.md` itself in this change -- that document

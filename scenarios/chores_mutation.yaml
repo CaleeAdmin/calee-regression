@@ -53,9 +53,14 @@ steps:
     timeout_seconds: 10
 
   - name: Wait for the deterministic repeating fixture chore to appear
+    # blocks_on_absence: true -- REG-CHORE-REPEATING-001 not appearing means
+    # the regression fixture was never provisioned/reset on this account, an
+    # environment/fixture precondition problem, not evidence the product
+    # regressed (Phase 4: "treat fixture absence as BLOCKED, not FAIL").
     action: wait_for_text
     text: REG-CHORE-REPEATING-001
     timeout_seconds: 20
+    blocks_on_absence: true
 
   - name: Capture the chores screen before any change
     action: screenshot
@@ -63,11 +68,21 @@ steps:
     compare: false
 
   - name: Open the fixture chore's action menu (row-scoped, requires chore edit actions enabled)
+    # blocks_on_absence: true -- tvActionMenu is only VISIBLE when the
+    # regression account has "Show chore edit actions" enabled
+    # (AccountMgr.getShowChoreEditOptions(), defaults to false). A missing
+    # required action menu is an account-configuration precondition, not a
+    # product defect (Phase 4: "a missing required action menu must block the
+    # scenario"). This also covers the row itself being absent (fixture not
+    # provisioned) -- by this point the row's title was already confirmed
+    # visible by the wait_for_text step above, so either cause here is a
+    # precondition problem, not a rendering regression.
     action: tap_in_row
     card_id: choresItemCard
     title_id: tvTitle
     title: REG-CHORE-REPEATING-001
     target_id: tvActionMenu
+    blocks_on_absence: true
 
   - name: Wait for the action sheet's "Skip This Time" entry to appear
     action: wait_for_text

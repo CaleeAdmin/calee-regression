@@ -9,6 +9,7 @@ independent of whether a real backend/device happens to be available.
 
 from __future__ import annotations
 
+from calee_regression import sync_smoke_bridge
 from calee_regression.sync_smoke import (
     STATUS_BLOCKED,
     STATUS_FAILED,
@@ -16,6 +17,7 @@ from calee_regression.sync_smoke import (
     SyncFlowResult,
     SyncSmokeEnvironment,
     SyncStepEvidence,
+    build_real_environment,
     run_all_sync_flows,
     run_calendar_appearance_sync_flow,
     run_chore_sync_flow,
@@ -654,3 +656,66 @@ def test_partial_override_flow_blocks_when_appearance_api_is_not_wired_at_all():
     assert result.status == STATUS_BLOCKED
     assert result.steps[0].step == "capture_baseline_via_api"
     assert "build_real_environment" in result.steps[0].detail
+
+
+# ── build_real_environment() wiring ─────────────────────────────────────────
+#
+# No real subprocess is run here -- sync_smoke_bridge.get_calendar/
+# set_calendar_appearance are monkeypatched, matching how the CaleeMobile/
+# tablet legs above are exercised through fakes rather than a real
+# subprocess/Appium session (test_sync_smoke_bridge.py covers the subprocess
+# plumbing itself).
+
+
+def test_build_real_environment_wires_get_calendar_for_real(monkeypatch, tmp_path):
+    calls = []
+
+    def _fake_get_calendar(*, repo_root, base_url, email, password, calendar_id):
+        calls.append((repo_root, base_url, email, password, calendar_id))
+        return {"id": calendar_id, "name": "whatever"}
+
+    monkeypatch.setattr(sync_smoke_bridge, "get_calendar", _fake_get_calendar)
+
+    env = build_real_environment(
+        repo_root=tmp_path, base_url="https://hub-dev.calee.com.au", email="a@x", password="p",
+        platform="android", report_dir=tmp_path / "reports", tablet_driver=None,
+    )
+    result = env.api_get_calendar("regression:regsub")
+
+    assert result == {"id": "regression:regsub", "name": "whatever"}
+    assert calls == [(tmp_path, "https://hub-dev.calee.com.au", "a@x", "p", "regression:regsub")]
+
+
+def test_build_real_environment_wires_set_calendar_appearance_for_real(monkeypatch, tmp_path):
+    calls = []
+
+    def _fake_set_calendar_appearance(*, repo_root, base_url, email, password, calendar_id, fields):
+        calls.append((calendar_id, fields))
+        return {"id": calendar_id, **fields}
+
+    monkeypatch.setattr(sync_smoke_bridge, "set_calendar_appearance", _fake_set_calendar_appearance)
+
+    env = build_real_environment(
+        repo_root=tmp_path, base_url="https://hub-dev.calee.com.au", email="a@x", password="p",
+        platform="android", report_dir=tmp_path / "reports", tablet_driver=None,
+    )
+    result = env.api_set_calendar_appearance("regression:regsub", {"color": "#00A878"})
+
+    assert result == {"id": "regression:regsub", "color": "#00A878"}
+    assert calls == [("regression:regsub", {"color": "#00A878"})]
+
+
+def test_build_real_environment_leaves_refresh_and_source_simulation_unwired(tmp_path):
+    # No client-facing refresh-trigger endpoint exists for a subscription
+    # calendar (REFRESH_ENDPOINT_NOT_AVAILABLE_DETAIL), and no fixture
+    # plumbing exists to simulate an upstream source rename/colour change
+    # (SOURCE_SIMULATION_NOT_WIRED_DETAIL) -- both stay None, never guessed
+    # at or faked.
+    env = build_real_environment(
+        repo_root=tmp_path, base_url="https://hub-dev.calee.com.au", email="a@x", password="p",
+        platform="android", report_dir=tmp_path / "reports", tablet_driver=None,
+    )
+
+    assert env.api_trigger_calendar_refresh is None
+    assert env.api_simulate_source_rename is None
+    assert env.api_simulate_source_color_change is None

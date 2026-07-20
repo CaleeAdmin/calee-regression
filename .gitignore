@@ -14,3 +14,6 @@ config/release-platforms.yaml
 config/manual-checks.json
 
 .DS_Store
+
+# Machine config (Phase 4) -- per-machine, never committed (may reference local paths)
+config/machine.local.yaml

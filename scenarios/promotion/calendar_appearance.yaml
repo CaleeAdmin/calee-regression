@@ -1,0 +1,25 @@
+# Promotion state for the calendar name/colour appearance-editing scenarios
+# (Phase 6). The 'calendar_appearance' suite spans three scenario files; this
+# record tracks the representative subscription file for tag/mandatory checks,
+# while the suite-membership check covers all of them. DRAFT: source-confirmed
+# selectors, physically unverified, and additionally fixture-gated (owned/
+# shared-readonly/external calendars are not provisioned). Machine-enforced by
+# calee_regression/promotion.py.
+scenario: calendar_appearance
+scenarioFile: scenarios/calendar_appearance_subscription.yaml
+sourceConfirmed: true
+sourceSha: "a9c78199c7b24265525c1d303ce280b3633418eb"
+offlineTestsPassed: true
+physicalConfirmation:
+  status: pending
+  requiredDevice: physical_tablet
+  evidenceRequired:
+    - runId
+    - tabletModel
+    - androidVersion
+    - caleeVersion
+    - caleeGitSha
+    - screenshotPaths
+    - resultsJson
+  evidence: {}
+releaseSuiteEligible: false

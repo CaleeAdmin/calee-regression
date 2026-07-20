@@ -20,8 +20,10 @@ mandatory: false
 # is not available in this environment, so this scenario is BLOCKED from running
 # here (mandatory: false, draft-unverified, not in any release suite). See
 # docs/SUBSCRIBED_CALENDAR_REGRESSION.md for the full API + tablet assertion
-# matrix (incl. the calendar-selection visibility cases 9-16, which additionally
-# need the tablet filter/selection selectors source-confirmed).
+# matrix. Calendar-selection visibility cases 9, 10, 12, 13, 14 are now covered
+# below (the tablet filter/selection selectors -- llItem/cbCalendar/tvName/
+# ivExpand -- are source-confirmed); cases 11, 15, 16 remain out of scope, see
+# the dedicated comment ahead of those steps.
 steps:
   - name: Launch Calee
     action: launch
@@ -86,7 +88,9 @@ steps:
     id: llSchedule
 
   - name: Open the subscribed timed event's detail
-    action: tap
+    # tap_unique_text -- fails loudly on zero or multiple matching rows
+    # instead of silently acting on whichever find_element returns first.
+    action: tap_unique_text
     text: REG-SUB-TIMED
 
   - name: Wait for the event-detail dialog
@@ -111,28 +115,198 @@ steps:
     screenshot_name: 02_subscribed_event_readonly
     compare: false
 
+  # --- calendar selection/filter visibility (9,10,12,13,14; see
+  # docs/SUBSCRIBED_CALENDAR_REGRESSION.md's assertion matrix). Selectors
+  # source-confirmed from item_calendar_navigation_list.xml (llItem row
+  # container, cbCalendar checkbox, tvName title) and CalendarFragment.kt
+  # (ivExpand toggles the sidebar; tapping cbCalendar -- or the row itself --
+  # toggles a calendar's visibility). Cases 11 (untick ALL calendars) and 15
+  # (unknown/malformed calendar id) are NOT covered here: 11 would need a
+  # row-scoped action against the account's own primary calendar, whose exact
+  # display name is not a deterministic REG-* fixture value documented
+  # anywhere (unlike REG-SUB's fixed X-WR-CALNAME); 15 is a backend-response-
+  # shape concern, not a tablet UI action. Case 16 (two services sharing a
+  # raw calendar id) needs a second-service fixture that does not exist yet,
+  # same as before.
+  #
+  # PRODUCT-LEVEL RISK, source-confirmed (not yet physically confirmed):
+  # HubCalendarSelectionReconciler.kt's `selectedIds`/`knownIds` are plain
+  # in-memory LinkedHashSet fields on a Fragment-scoped object -- no
+  # SharedPreferences/database persistence mechanism was found anywhere in
+  # the tablet source. A fresh app process creates a fresh CalendarFragment
+  # -> a fresh reconciler -> `isFirstCalendarLoad` triggers
+  # `fallbackSelectedAll` (every calendar re-selected). The "survives app
+  # restart" assertion below is written to Phase 8's spec exactly as
+  # requested, not weakened or skipped: if the tablet does not actually
+  # persist calendar selection across a process restart, this step will
+  # genuinely FAIL on a physical run -- the correct, honest outcome, and a
+  # real product finding worth reporting, not a reason to soften the check.
+
+  - name: Close the event-detail dialog before touching the calendar sidebar
+    action: tap
+    id: btnEventDetailClose
+
+  - name: Ensure the calendar sidebar is expanded (idempotent -- tap_if_absent never collapses an already-expanded sidebar)
+    action: tap_if_absent
+    id: ivExpand
+    unless_id: llDay
+
+  - name: Wait for the subscribed calendar's row to render in the sidebar
+    action: wait_for_text
+    text: "REG-SUB Regression Subscription"
+    timeout_seconds: 10
+
+  - name: The subscribed calendar's checkbox is present in its row (row-scoped)
+    action: assert_in_row
+    card_id: llItem
+    title_id: tvName
+    title: "REG-SUB Regression Subscription"
+    target_id: cbCalendar
+
+  - name: Baseline (9) -- the subscribed calendar's events are visible while selected
+    action: assert_text
+    text: REG-SUB-TIMED
+
+  - name: Untick the subscribed calendar (row-scoped -- never the first global checkbox)
+    action: tap_in_row
+    card_id: llItem
+    title_id: tvName
+    title: "REG-SUB Regression Subscription"
+    target_id: cbCalendar
+
+  - name: Wait a moment for the visibility change to take effect
+    action: sleep
+    seconds: 2
+
+  - name: Back to Agenda view to observe the filtered list
+    action: tap
+    id: llSchedule
+
+  - name: Unticking (10) hides the subscribed calendar's own events
+    action: fail_if_text
+    text: REG-SUB-TIMED
+
+  - name: Capture the agenda with the subscribed calendar unticked
+    action: screenshot
+    screenshot_name: 03_calendar_unticked
+    compare: false
+
+  - name: Selection survives tab navigation (13) -- open Today
+    action: tap
+    id: llToday
+
+  - name: Back to Calendar
+    action: tap
+    id: llCalendar
+
+  - name: Switch to Agenda view again
+    action: tap
+    id: llSchedule
+
+  - name: Unticked calendar's events remain hidden after tab navigation (13)
+    action: fail_if_text
+    text: REG-SUB-TIMED
+
+  - name: Trigger a manual refresh (14, refresh half)
+    action: tap
+    id: ivRefreshCalendar
+
+  - name: Wait a moment for the refresh to settle
+    action: sleep
+    seconds: 3
+
+  - name: Unticked calendar's events remain hidden after a manual refresh (14)
+    action: fail_if_text
+    text: REG-SUB-TIMED
+
+  - name: Retick the subscribed calendar (row-scoped) (12)
+    action: tap_in_row
+    card_id: llItem
+    title_id: tvName
+    title: "REG-SUB Regression Subscription"
+    target_id: cbCalendar
+
+  - name: Wait a moment for the visibility change to take effect
+    action: sleep
+    seconds: 2
+
+  - name: Switch to Agenda view to observe the restored list
+    action: tap
+    id: llSchedule
+
+  - name: Reticking (12) restores the subscribed calendar's events
+    action: wait_for_text
+    text: REG-SUB-TIMED
+    timeout_seconds: 10
+
+  - name: Untick the subscribed calendar again, ahead of the app-restart check
+    action: tap_in_row
+    card_id: llItem
+    title_id: tvName
+    title: "REG-SUB Regression Subscription"
+    target_id: cbCalendar
+
+  - name: Wait a moment for the visibility change to take effect
+    action: sleep
+    seconds: 2
+
+  - name: Force-stop Calee (non-destructive -- no data/account/app-storage loss, equivalent to a user swiping it away from Recents)
+    action: shell
+    command: "am force-stop com.viso.calee"
+
+  - name: Relaunch Calee
+    action: launch
+
+  - name: Wait for home screen to settle again
+    action: wait_for_id
+    id: llCalendar
+    timeout_seconds: 20
+
+  - name: Open Calendar again
+    action: tap
+    id: llCalendar
+
+  - name: Switch to Agenda view once more
+    action: tap
+    id: llSchedule
+
+  - name: Selection survives app restart (14, restart half) -- see the PRODUCT-LEVEL RISK note above
+    action: fail_if_text
+    text: REG-SUB-TIMED
+
   - name: Assert no crash/error dialog is showing
     action: fail_if_text
     texts: ["Unfortunately", "has stopped", "Force Close", "Error"]
 
 source_verification:
   calee_source: CaleeAdmin/Calee
-  calee_source_sha: "931beecfc309ff12220185383fa8daae56af30d8"  # Calee release #974 (incl. #973 subscribed-calendar fix)
-  calee_source_ref: "main (release #974); identical layouts on dev @ b32807d"
+  calee_source_sha: "d5b99712158c27f435681946326f0c7b8df54a3e"  # Calee main, 0.3.25 (#979)
+  calee_source_ref: "main, 0.3.25 (#979); event/detail selectors unchanged since release #974 (931beecf, incl. #973 subscribed-calendar fix)"
   status: source-confirmed
   physical_confirmation: pending
   contract:
     - "isEditable = !readOnly && !isSubscription && writableEventId.isNotBlank() (CaleeHubEvent)"
     - "HubEventDetailDialog hides Edit/Delete via isEditable; defensive guards before edit/delete flows (#973)"
+    - "HubCalendarSelectionReconciler.selectedIds/knownIds are in-memory only (LinkedHashSet fields) -- no persistence found; a fresh process falls back to selecting every calendar (fallbackSelectedAll)"
   selectors:
     llToday: app/src/main/res/layout/activity_home.xml
     llCalendar: app/src/main/res/layout/activity_home.xml
+    llSchedule: app/src/main/res/layout/layout_calendar_navigation.xml
     tvEventDetailTitle: app/src/main/res/layout/dialog_hub_event_detail.xml
     btnEventDetailEdit: app/src/main/res/layout/dialog_hub_event_detail.xml
     btnEventDetailDelete: app/src/main/res/layout/dialog_hub_event_detail.xml
+    btnEventDetailClose: app/src/main/res/layout/dialog_hub_event_detail.xml
+    ivExpand: app/src/main/res/layout/fragment_calendar.xml
+    llDay: app/src/main/res/layout/layout_calendar_navigation.xml
+    ivRefreshCalendar: app/src/main/res/layout/fragment_calendar.xml
+    llItem: app/src/main/res/layout/item_calendar_navigation_list.xml
+    cbCalendar: app/src/main/res/layout/item_calendar_navigation_list.xml
+    tvName: app/src/main/res/layout/item_calendar_navigation_list.xml
   fixture:
     source: fixtures/subscribed_calendar/reg_sub_calendar.ics
     calendarId: "regression:regsub"
+    calendarDisplayName: "REG-SUB Regression Subscription"  # X-WR-CALNAME
   notes:
     - "Requires the REG-SUB subscription source provisioned on the tablet account (hub backend) -- BLOCKED without it."
-    - "Selection-matrix cases 9-16 additionally need the tablet calendar filter/selection selectors source-confirmed."
+    - "Selection-matrix cases 9, 10, 12, 13, 14 are covered by the calendar-selection steps above; 11/15/16 are not, see the comment ahead of those steps."
+    - "The 'survives app restart' half of case 14 is a genuine product-behaviour risk per source analysis (HubCalendarSelectionReconciler has no persistence) -- written to spec, not weakened; a physical run is the actual arbiter."
