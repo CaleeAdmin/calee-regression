@@ -16,7 +16,7 @@ from datetime import date, timedelta
 
 import yaml
 
-from calee_regression import ics_contract, runner, suites
+from calee_regression import ics_contract, runner, subscribed_fixture, suites
 from calee_regression.identity_format import is_full_git_sha
 from calee_regression.suites import REPO_ROOT
 
@@ -152,3 +152,91 @@ def test_subscribed_scenario_parses_and_uses_known_actions():
 
 def test_ws3_doc_exists():
     assert SUB_DOC.is_file()
+
+
+# ── Priority 7: the Today assertion is date-correct, not pinned to a fixed date ──
+
+
+def test_today_view_never_asserts_a_fixed_date_subscribed_event():
+    """The old bug: 'Open Today' then assert_text REG-SUB-TIMED -- true only on
+    the fixture's single fixed date (2026-08-06). A DATE assertion on the Today
+    view is one that immediately follows opening Today (no intervening view
+    switch); it must never target a fixed-date subscribed REG-SUB-* event.
+    (Later llToday taps that merely navigate -- e.g. to prove a filter selection
+    survives tab navigation -- are fine; the visibility check that follows runs
+    in the Agenda, not against the day-scoped Today view.)"""
+    scenario = runner.load_scenario(SUB_SCENARIO)
+    steps = scenario.steps
+    today_idxs = [i for i, s in enumerate(steps) if s.get("action") == "tap" and s.get("id") == "llToday"]
+    assert today_idxs, "scenario no longer opens the Today view"
+    for i in today_idxs:
+        nxt = steps[i + 1] if i + 1 < len(steps) else {}
+        if nxt.get("action") in ("assert_text", "wait_for_text"):
+            assert not nxt.get("text", "").startswith("REG-SUB-"), (
+                f"Today view asserts fixed-date subscribed event {nxt.get('text')!r} -- date-fragile."
+            )
+
+
+def test_today_calendar_agreement_uses_a_genuinely_today_event():
+    """The first Today block verifies Today<->Calendar agreement, and does so
+    with the owned today-relative event REG-EVENT-TIMED-001 (provisioned on
+    ctx.today), so it is date-correct on any execution date."""
+    scenario = runner.load_scenario(SUB_SCENARIO)
+    steps = scenario.steps
+    i = next(idx for idx, s in enumerate(steps) if s.get("action") == "tap" and s.get("id") == "llToday")
+    nxt = steps[i + 1]
+    assert nxt.get("action") == "assert_text"
+    assert nxt.get("text") == "REG-EVENT-TIMED-001"
+
+
+def test_scenario_hardcodes_no_calendar_date_for_today():
+    # No literal 2026-08-xx date is used to gate a Today assertion anywhere.
+    text = SUB_SCENARIO.read_text(encoding="utf-8")
+    assert "2026-08-06" not in text
+    assert "20260806" not in text
+
+
+# ── Priority 7: the today-relative generator is date-correct on ANY date ─────
+
+
+def test_generator_is_date_correct_and_timezone_safe_for_any_date():
+    for target in (date(2027, 1, 1), date(2030, 6, 15), date.today() + timedelta(days=365)):
+        ics = subscribed_fixture.generate_today_relative_ics(target, run_token="RUN1")
+        occ = ics_contract.expand(ics)
+        timed = [o for o in occ if o.summary == "REG-SUB-TIMED-RUN1"]
+        assert timed, f"no timed event for {target}"
+        assert timed[0].all_day is False
+        # Timezone-safe: the timed event's visible day is exactly the target date.
+        assert timed[0].visible_dates == [target]
+        allday = [o for o in occ if o.summary == "REG-SUB-ALLDAY-RUN1"]
+        assert allday and allday[0].all_day is True
+        assert allday[0].visible_dates == [target]
+
+
+def test_generator_event_names_are_unique_per_run_token():
+    a = subscribed_fixture.generate_today_relative_ics(date(2027, 1, 1), run_token="RUNA")
+    b = subscribed_fixture.generate_today_relative_ics(date(2027, 1, 1), run_token="RUNB")
+    assert "REG-SUB-TIMED-RUNA" in a and "REG-SUB-TIMED-RUNB" in b
+    assert "RUNA" not in b and "RUNB" not in a
+
+
+def test_generator_requires_a_run_token():
+    import pytest
+
+    with pytest.raises(ValueError):
+        subscribed_fixture.generate_today_relative_ics(date(2027, 1, 1), run_token="")
+
+
+def test_resolve_target_date_defaults_to_today_and_honours_explicit():
+    assert subscribed_fixture.resolve_target_date() == date.today()
+    fixed = date(2029, 3, 3)
+    assert subscribed_fixture.resolve_target_date(fixed) == fixed
+
+
+def test_fixture_evidence_records_resolved_date_and_timezone():
+    ev = subscribed_fixture.fixture_evidence(date(2027, 1, 1), run_token="RUN1")
+    assert ev["resolvedDate"] == "2027-01-01"
+    assert ev["timezone"] == "Australia/Perth"
+    assert ev["runToken"] == "RUN1"
+    assert ev["events"]["timed"] == "REG-SUB-TIMED-RUN1"
+    assert ev["events"]["allDay"] == "REG-SUB-ALLDAY-RUN1"

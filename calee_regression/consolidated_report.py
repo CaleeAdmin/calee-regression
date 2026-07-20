@@ -495,6 +495,69 @@ def component_from_environment_report(
     return ComponentResult(name=name, status=status, mandatory=mandatory, detail=detail)
 
 
+# Human-facing component names for the Priority 4/5/6 additions.
+MACHINE_CONFIG_COMPONENT_NAME = "Machine configuration (config/machine.local.yaml)"
+INSTALLATION_COMPONENT_NAME = "Calee tablet release installation"
+
+
+def component_from_machine_config_report(
+    name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = True
+) -> ComponentResult:
+    """Build a ComponentResult from the per-run machine-config snapshot
+    (Priority 4). The snapshot records the single authoritative configuration
+    resolved for this run (backend, devices, package ids, release profile),
+    with secrets excluded. A loaded+valid snapshot is PASS; a missing/invalid
+    one BLOCKS -- the run's authoritative config was never established, so the
+    release cannot be certified. There is no product "fail" here.
+    """
+    if report_dict is None:
+        return ComponentResult(
+            name=name, status=STATUS_NOT_RUN, mandatory=mandatory,
+            detail=["No machine-configuration snapshot was recorded for this run."],
+        )
+    status = report_dict.get("status")
+    detail = list(report_dict.get("detail", []))
+    if status == "ok":
+        return ComponentResult(name=name, status=STATUS_PASS, mandatory=mandatory, detail=detail, evidence=report_dict)
+    if status not in (STATUS_BLOCKED, "blocked", "invalid"):
+        detail = detail + [f"Unrecognized machine-config status {report_dict.get('status')!r}."]
+    return ComponentResult(name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1, detail=detail, evidence=report_dict)
+
+
+def component_from_installation_report(
+    name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = True
+) -> ComponentResult:
+    """Build a ComponentResult from the run-scoped installation report
+    (Priority 5/6): bundle verification + actual APK content/signer inspection +
+    tablet pre-install inspection + install plan + execution + post-install
+    verification, all under reports/runs/<run-id>/installation/results.json.
+
+    Mapping (installer vocabulary -> release vocabulary):
+      * ``ok``            -> PASS (the release was installed and verified);
+      * ``fail``          -> FAIL (a genuine product-level install failure);
+      * anything else     -> BLOCKED (bundle invalid, SDK tool missing, signer
+                             mismatch, no device/adb, version/HOME mismatch).
+
+    Installation is release-gating: a non-``ok`` install can never read as a
+    release PASS, and a signer/version mismatch is BLOCKED, never 'fixed' by
+    wiping data.
+    """
+    if report_dict is None:
+        return ComponentResult(
+            name=name, status=STATUS_NOT_RUN, mandatory=mandatory,
+            detail=["Tablet release installation was not executed for this run."],
+        )
+    status = report_dict.get("status")
+    detail = list(report_dict.get("detail", []))
+    if status in ("ok", STATUS_PASS):
+        return ComponentResult(name=name, status=STATUS_PASS, mandatory=mandatory, passed=1, detail=detail, evidence=report_dict)
+    if status in ("fail", STATUS_FAIL):
+        return ComponentResult(name=name, status=STATUS_FAIL, mandatory=mandatory, failed=1, detail=detail, evidence=report_dict)
+    if status not in (STATUS_BLOCKED, "blocked", "invalid"):
+        detail = detail + [f"Unrecognized installation status {report_dict.get('status')!r}."]
+    return ComponentResult(name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1, detail=detail, evidence=report_dict)
+
+
 def _normalize_backend(value: "Any | None") -> "str | None":
     """Normalize a backend URL for equality: trimmed, lower-cased, and with a
     single trailing slash removed, so `https://Hub.calee.com.au/` and
@@ -1291,6 +1354,10 @@ def build_release_report(
     mobile_ios_ui: "dict[str, Any] | None" = None,
     sync: "dict[str, Any] | None" = None,
     kiosk_admin: "dict[str, Any] | None" = None,
+    installation: "dict[str, Any] | None" = None,
+    installation_mandatory: "bool | None" = None,
+    machine_config: "dict[str, Any] | None" = None,
+    machine_config_mandatory: "bool | None" = None,
     feature_profile: "dict[str, bool] | None" = None,
     manual_checks: "list[ManualCheck] | None" = None,
     meta: "dict[str, Any] | None" = None,
@@ -1497,6 +1564,27 @@ def build_release_report(
     for extra in extra_components or []:
         if extra is not None:
             components.append(extra)
+
+    # Tablet release installation (Priority 6) and the machine-config snapshot
+    # (Priority 4). Prepended so the report reads config -> installation ->
+    # environment -> tests. Included only when the caller made an explicit
+    # mandatory/optional decision (the consolidate CLI always does for a full
+    # release; unit tests that don't exercise them leave both None, so the ~90
+    # existing tests are unaffected). A mandatory installation that is BLOCKED/
+    # FAILED/missing, or a missing/invalid machine-config snapshot, then gates
+    # the overall status like any other mandatory component.
+    if installation_mandatory is not None:
+        components.insert(
+            0, component_from_installation_report(
+                INSTALLATION_COMPONENT_NAME, installation, mandatory=installation_mandatory
+            ),
+        )
+    if machine_config_mandatory is not None:
+        components.insert(
+            0, component_from_machine_config_report(
+                MACHINE_CONFIG_COMPONENT_NAME, machine_config, mandatory=machine_config_mandatory
+            ),
+        )
 
     mandatory_statuses = [c.status for c in components if c.mandatory]
     if any(s == STATUS_FAIL for s in mandatory_statuses):

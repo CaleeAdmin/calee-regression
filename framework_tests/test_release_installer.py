@@ -392,6 +392,118 @@ def test_no_serial_omits_the_s_flag(tmp_path):
         assert "-s" not in step.argv
 
 
+# ── Priority 1: install commands use the verified ABSOLUTE APK path ───────
+
+
+def test_verified_apps_carry_absolute_apk_paths_inside_the_bundle_root(tmp_path):
+    v = _verified(tmp_path)
+    from pathlib import Path
+
+    root = Path(v.bundle_root)
+    for app in v.verified_apps:
+        assert app.apk_path is not None, f"{app.key} has no resolved apk_path"
+        p = Path(app.apk_path)
+        assert p.is_absolute(), f"{app.key} apk_path is not absolute: {app.apk_path}"
+        assert p.is_file(), f"{app.key} apk_path does not point at a real file"
+        # Stays inside the verified bundle root.
+        assert p == root / app.apk or p.parent == root
+
+
+def test_install_command_uses_absolute_path_not_bare_filename(tmp_path):
+    plan = build_install_plan(_verified(tmp_path), serial="TAB1")
+    from pathlib import Path
+
+    for step in plan.steps:
+        if step.label.startswith("install-"):
+            apk_arg = step.argv[-1]
+            assert Path(apk_arg).is_absolute(), f"install arg is not absolute: {apk_arg!r}"
+            assert apk_arg.endswith(".apk")
+            # The bare filename must never be what adb is handed.
+            assert apk_arg not in ("calee.apk", "caleeshell.apk")
+
+
+def test_install_works_when_cwd_differs_from_bundle_dir(tmp_path, monkeypatch):
+    """The whole point of Priority 1: the bundle lives OUTSIDE the repo (e.g.
+    ~/Calee-Releases/current) and the launcher's cwd is the repo, so a bare
+    `adb install -r calee.apk` would fail. Verify + plan + execute from a
+    completely unrelated working directory, and prove adb was handed a path
+    that exists regardless of cwd."""
+    bundle = _write_bundle(tmp_path)
+    v = verify_release_bundle(bundle)
+    assert v.ok, v.errors
+    plan = build_install_plan(v, serial="TAB1")
+
+    # Move to an unrelated cwd -- the bundle is not reachable by relative name.
+    elsewhere = tmp_path / "somewhere" / "else"
+    elsewhere.mkdir(parents=True)
+    monkeypatch.chdir(elsewhere)
+
+    from pathlib import Path
+
+    for step in plan.steps:
+        if step.label.startswith("install-"):
+            apk_arg = step.argv[-1]
+            # Absolute AND resolvable from this unrelated cwd.
+            assert Path(apk_arg).is_absolute()
+            assert Path(apk_arg).is_file(), f"{apk_arg} not resolvable from cwd {elsewhere}"
+
+    # And a full execute (with a fake adb) succeeds from the foreign cwd.
+    adb = FakeAdb(_healthy_device_rules())
+    execution = ri.execute_install_plan(plan, v, adb)
+    assert execution.status == ri.STATUS_OK, execution.detail
+    # adb was literally invoked with the absolute path.
+    install_calls = [c for c in adb.calls if "install" in c]
+    assert install_calls, "no install command was issued"
+    for call in install_calls:
+        assert Path(call[-1]).is_absolute()
+
+
+def test_symlink_apk_escaping_the_bundle_is_rejected(tmp_path):
+    """Path traversal remains impossible even via a symlink: the manifest names
+    a plain `calee.apk` (passes the filename check), but that entry is a symlink
+    whose target is OUTSIDE the bundle. Resolution + containment reject it, so no
+    install command can ever point outside the verified root."""
+    import os
+    import platform
+
+    if platform.system() == "Windows":  # pragma: no cover - symlink perms differ
+        pytest.skip("symlink semantics differ on Windows")
+
+    # A real file outside the bundle we must never resolve to.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    evil = outside / "evil-real.apk"
+    evil.write_bytes(b"malicious")
+
+    bundle = tmp_path / "Calee-Tablet-Release"
+    bundle.mkdir()
+    # calee.apk is a SYMLINK to the outside file.
+    link = bundle / "calee.apk"
+    os.symlink(evil, link)
+    calee_sha = _sha256(b"malicious")
+    manifest = {
+        "releaseId": "2026.07.20-evil",
+        "calee": {
+            "included": True, "packageId": "com.viso.calee", "versionName": "founder-v0.3.25",
+            "versionCode": 325, "gitSha": CALEE_SHA, "apk": "calee.apk", "sha256": calee_sha,
+        },
+    }
+    (bundle / "release-manifest.json").write_text(json.dumps(manifest))
+    (bundle / "checksums.sha256").write_text(f"{calee_sha}  calee.apk\n")
+
+    result = verify_release_bundle(bundle)
+    assert not result.ok
+    assert any("OUTSIDE the verified bundle root" in e for e in result.errors), result.errors
+
+
+def test_build_install_command_refuses_app_without_verified_path():
+    """Belt-and-suspenders: an AppRelease that never went through verification
+    (so apk_path is None) can never yield an install command."""
+    unverified = AppRelease(key="calee", included=True, package_id="com.viso.calee", apk="calee.apk")
+    with pytest.raises(ReleaseInstallerError, match="verified absolute APK path"):
+        ri.build_install_command(unverified, serial=None, allow_downgrade=False)
+
+
 # ── post-install verification parsing ────────────────────────────────────
 
 _DUMPSYS_CALEE = """

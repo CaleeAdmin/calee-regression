@@ -1,26 +1,29 @@
 #!/bin/bash
 # The MACHINE_* variables below are populated at run time by
-# `eval "$(python3 -m calee_regression machine-config)"`, so shellcheck cannot
-# see their assignment; SC2154 (referenced but not assigned) is expected here.
+# `eval "$(python3 -m calee_regression machine-config-snapshot ...)"`, whose
+# assignment the linter cannot see; SC2154 (referenced but not assigned) is
+# expected here and disabled on the next line.
 # shellcheck disable=SC2154
 # ============================================================================
 # 00 Run Calee Release Regression
 # ----------------------------------------------------------------------------
 # The ONE thing a nontechnical tester double-clicks. It:
-#   1. reads the technical owner's machine config,
-#   2. verifies the release bundle you dropped in the release folder,
-#   3. installs it on the connected tablet (data-preserving),
-#   4. runs the full Calee regression (delegates to "06 Test Full Calee
-#      Solution", which drives Prepare -> tablet -> CaleeMobile -> sync ->
-#      manual checks -> consolidation),
-#   5. opens the final report.
+#   1. creates ONE release run ID up front (before any verification),
+#   2. loads the technical owner's machine config as the single authoritative
+#      source and records a secrets-excluded snapshot into the run,
+#   3. installs the release bundle on the connected tablet (verifying the actual
+#      APK contents + signer first), recording all installer evidence INTO the
+#      same run,
+#   4. runs the full Calee regression under the SAME run (delegates to "06 Test
+#      Full Calee Solution", inheriting the run ID and the reconciled config),
+#   5. opens the final consolidated report.
 #
 # You never edit YAML/JSON/env. Every outcome is shown in plain language:
 #   Ready / Installing / Testing / Passed / Failed / Blocked / Needs technical owner
 #
 # When a device is missing, this reports "Needs technical owner" and stops --
-# it never pretends a device was present. Raw logs for the technical owner are
-# under reports/<run>/ and the advanced diagnostics folder.
+# it never pretends a device was present. All evidence for the technical owner
+# is under reports/runs/<run-id>/.
 # ============================================================================
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$DIR/.." || exit 1
@@ -41,70 +44,101 @@ needs_owner()  {
 }
 
 say "Calee Release Regression"
-echo "Reading your machine configuration…"
 
-# ── 1. machine config ───────────────────────────────────────────────────────
-if ! MACHINE_VARS="$(python3 -m calee_regression machine-config 2>machine_config_error.txt)"; then
-    needs_owner "The machine configuration is missing or invalid." \
+# ── 0. environment bootstrap (venv + dependencies) ──────────────────────────
+# shellcheck source=../scripts/ensure_environment.sh
+source scripts/ensure_environment.sh
+BOOTSTRAP_STATUS=$?
+if [ $BOOTSTRAP_STATUS -ne 0 ]; then
+    needs_owner "The test environment could not be set up on this Mac." \
+                "No — this is a one-time setup problem, not a product failure." \
+                "Ask your technical owner to complete the one-time setup (see docs/SETUP_MAC.md)." \
+                "reports/setup.log"
+    read -r -p "Press Enter to close..." _
+    exit $BOOTSTRAP_STATUS
+fi
+
+# ── 1. ONE run ID, created BEFORE any release verification (Priority 6) ──────
+# Everything below -- the machine-config snapshot, bundle verification, APK
+# inspection, installation, and the full regression delegated to "06" -- writes
+# into reports/runs/$CALEE_RUN_ID/. There is no second run ID created later.
+CALEE_RUN_ID="release-$(date +%Y%m%d-%H%M%S)-$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
+export CALEE_RUN_ID
+mkdir -p "reports/runs/$CALEE_RUN_ID"
+echo "Run ID: $CALEE_RUN_ID"
+echo "Workspace: reports/runs/$CALEE_RUN_ID/"
+
+# ── 2. machine config = the single authoritative source (Priority 4) ─────────
+echo ""
+echo "Reading your machine configuration…"
+if ! MACHINE_VARS="$(python3 -m calee_regression machine-config-snapshot --run-id "$CALEE_RUN_ID" 2>machine_config_error.txt)"; then
+    needs_owner "The machine configuration is missing or invalid (or contains a secret it must not)." \
                 "No — this is a setup problem, not a product failure." \
-                "Ask your technical owner to create config/machine.local.yaml (see config/machine.local.example.yaml)." \
-                "machine_config_error.txt"
+                "Ask your technical owner to fix config/machine.local.yaml (see config/machine.local.example.yaml)." \
+                "reports/runs/$CALEE_RUN_ID/machine-config/results.json"
     cat machine_config_error.txt
+    rm -f machine_config_error.txt
     read -r -p "Press Enter to close..." _
     exit 3
 fi
 eval "$MACHINE_VARS"
 rm -f machine_config_error.txt
-state_ready "Machine configuration loaded. Backend: ${MACHINE_BACKEND_URL}"
-
-# ── 2. verify the release bundle ────────────────────────────────────────────
-state_doing "Checking the release bundle you placed in: ${MACHINE_RELEASE_BUNDLE_DIR}" "READY"
-mkdir -p reports
-if ! python3 -m calee_regression verify-release-bundle \
-        --bundle "$MACHINE_RELEASE_BUNDLE_DIR" \
-        --report "reports/bundle-verification.json"; then
-    needs_owner "The release bundle did not pass verification (see the problems listed above)." \
-                "No — the bundle the technical owner supplied is malformed; nothing was installed or tested." \
-                "Ask your technical owner to rebuild/re-sign the release bundle and drop it back in the folder." \
-                "reports/bundle-verification.json"
-    read -r -p "Press Enter to close..." _
-    exit 2
+# The reconciled effective config drives EVERY downstream command, so machine
+# config actually controls execution with no second, conflicting source.
+export CALEE_TEST_CONFIG="$MACHINE_EFFECTIVE_CONFIG"
+export CALEE_EXPECTED_BACKEND="$MACHINE_BACKEND_URL"
+export CALEE_API_BASE="$MACHINE_BACKEND_URL"
+if [ "$MACHINE_ALLOW_CALEESHELL_TECHNICAL" = "true" ]; then
+    export CALEE_CONFIRM_TECHNICAL=1
 fi
-state_pass "Release bundle verified."
+state_ready "Machine configuration loaded (authoritative). Backend: ${MACHINE_BACKEND_URL}"
 
-# ── 3. install on the tablet ────────────────────────────────────────────────
+# ── 3. install the release into the SAME run (Priority 1/5/6) ────────────────
+# verify-bundle (absolute APK paths) -> inspect actual APK contents + signer ->
+# read-only tablet inspection -> ordered data-preserving install. Every piece of
+# installer evidence is written to reports/runs/$CALEE_RUN_ID/installation/.
 state_doing "Installing the release on the tablet (your data is preserved)…" "INSTALLING"
 SERIAL_ARG=()
 [ -n "$MACHINE_TABLET_SERIAL" ] && SERIAL_ARG=(--serial "$MACHINE_TABLET_SERIAL")
 python3 -m calee_regression install-tablet-release \
     --bundle "$MACHINE_RELEASE_BUNDLE_DIR" \
     "${SERIAL_ARG[@]}" \
-    --report "reports/tablet-install.json"
+    --run-id "$CALEE_RUN_ID"
 INSTALL_STATUS=$?
-if [ $INSTALL_STATUS -eq 3 ]; then
-    needs_owner "The release could not be installed on the tablet (no device, a signature mismatch, or a version/HOME mismatch)." \
-                "No — this is a device/installation problem, not a Calee product failure." \
-                "Connect and unlock the prepared Calee tablet, then run this again. If it still can't install, send the report." \
-                "reports/tablet-install.json"
+
+if [ $INSTALL_STATUS -eq 2 ]; then
+    # A malformed/mislabelled bundle: nothing was installed, and running the
+    # regression against whatever is on the tablet would be misleading. Stop.
+    needs_owner "The release bundle failed verification or its actual APK contents/signer did not match the manifest." \
+                "No — the bundle the technical owner supplied is malformed; nothing was installed or tested." \
+                "Ask your technical owner to rebuild/re-sign the release bundle and drop it back in the folder." \
+                "reports/runs/$CALEE_RUN_ID/installation/results.json"
     read -r -p "Press Enter to close..." _
     exit 3
-elif [ $INSTALL_STATUS -ne 0 ]; then
-    needs_owner "The installer reported an unexpected problem." \
-                "No — installation problem, not a product failure." \
-                "Send the install report to your technical owner." \
-                "reports/tablet-install.json"
-    read -r -p "Press Enter to close..." _
-    exit $INSTALL_STATUS
 fi
-state_pass "Release installed on the tablet."
+if [ $INSTALL_STATUS -eq 0 ]; then
+    state_pass "Release installed on the tablet and verified."
+else
+    # BLOCKED (no device, missing SDK tools, signer mismatch, version/HOME
+    # mismatch): the installation evidence is already recorded into the run. We
+    # still delegate to "06" so the release produces ONE consolidated bundle
+    # that INCLUDES this BLOCKED installation -- installation can never read as a
+    # release PASS, and the tester gets a complete report.
+    state_block "The release could not be installed (see the installation report). Continuing to produce a full report…"
+fi
 
-# ── 4. run the full regression (delegate to 06) ─────────────────────────────
+# ── 4. run the full regression under the SAME run (delegate to 06) ───────────
 state_doing "Running the full Calee regression. This takes a while — leave it running…" "TESTING"
-# "06 Test Full Calee Solution" owns the Prepare -> tablet -> mobile -> sync ->
-# manual -> consolidate orchestration and already produces one consolidated
-# PASS/FAIL/BLOCKED report. We delegate to it rather than duplicate it, then
-# translate its exit code into plain language below.
-bash "$DIR/06 Test Full Calee Solution.command" </dev/null
+# "06 Test Full Calee Solution" owns Prepare -> tablet -> mobile -> sync ->
+# kiosk -> manual -> consolidate, INHERITS $CALEE_RUN_ID (so the installation +
+# machine-config evidence recorded above are consolidated in the SAME run), and
+# produces one consolidated PASS/FAIL/BLOCKED report.
+#
+# Priority 2: NO `</dev/null` here. The delegated launcher contains mandatory
+# interactive manual checks; the tester's terminal input must reach them. An
+# EOF'd stdin would let those checks pass without being answered (a false PASS),
+# so this launcher inherits the real terminal stdin instead.
+bash "$DIR/06 Test Full Calee Solution.command"
 REGRESSION_STATUS=$?
 
 # ── 5. plain-language final state ───────────────────────────────────────────
@@ -120,7 +154,7 @@ case $REGRESSION_STATUS in
                     "reports/latest-run/"
         ;;
     *)
-        needs_owner "Some required checks could not run (a missing device, credential, or fixture)." \
+        needs_owner "Some required checks could not run (a missing device, credential, fixture, or installation)." \
                     "No — these are environment/setup blockers, not proven product failures." \
                     "Make sure the tablet AND iPhone are connected and prepared, then run this again." \
                     "reports/latest-run/"

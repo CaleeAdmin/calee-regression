@@ -101,6 +101,13 @@ class AppRelease:
     git_sha: "str | None" = None
     apk: "str | None" = None
     sha256: "str | None" = None
+    # The ABSOLUTE path of this app's APK inside the verified bundle root,
+    # resolved once during verify_release_bundle and proven to stay inside that
+    # root. Install commands use THIS, never the manifest-declared ``apk``
+    # filename -- so an install works regardless of the process's cwd, and an
+    # APK path is never reconstructed from the (untrusted) manifest after the
+    # bundle has been verified. None until a bundle passes verification.
+    apk_path: "str | None" = None
 
     def to_dict(self) -> dict:
         return {
@@ -111,6 +118,7 @@ class AppRelease:
             "versionCode": self.version_code,
             "gitSha": self.git_sha,
             "apk": self.apk,
+            "apkPath": self.apk_path,
             "sha256": self.sha256,
         }
 
@@ -225,6 +233,11 @@ def parse_manifest(raw: Any) -> "tuple[ReleaseManifest, list[str]]":
 class BundleVerification:
     status: str = STATUS_INVALID
     bundle_dir: "str | None" = None
+    # The bundle directory RESOLVED to a single absolute path, computed once at
+    # the start of verification. Every verified APK's absolute path is proven to
+    # live inside this root, and install commands are built from those absolute
+    # paths -- so the resolved root is the trust boundary recorded in evidence.
+    bundle_root: "str | None" = None
     manifest: "ReleaseManifest | None" = None
     errors: "list[str]" = field(default_factory=list)
     # The exact APK identities the plan may install, recorded SEPARATELY per
@@ -245,6 +258,7 @@ class BundleVerification:
         return {
             "status": self.status,
             "bundleDir": self.bundle_dir,
+            "bundleRoot": self.bundle_root,
             "releaseId": self.manifest.release_id if self.manifest else None,
             "manifest": self.manifest.to_dict() if self.manifest else None,
             "errors": list(self.errors),
@@ -290,6 +304,22 @@ def _is_safe_bundle_name(name: str) -> bool:
     return "/" not in name and "\\" not in name and ".." not in Path(name).parts
 
 
+def _is_within(child: Path, root: Path) -> bool:
+    """True when ``child`` (already resolved) is ``root`` itself or lives inside
+    it. Defense in depth on top of ``_is_safe_bundle_name``: even if a bundle
+    entry is a symlink whose target escapes the bundle, the resolved path is
+    proven to stay inside the verified root before any install command is built
+    from it."""
+    try:
+        return child == root or child.is_relative_to(root)
+    except AttributeError:  # pragma: no cover - Path.is_relative_to is 3.9+
+        try:
+            child.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+
 def verify_release_bundle(bundle_dir: "Path | str") -> BundleVerification:
     """Fully verify a release bundle directory. Returns a BundleVerification
     whose ``ok`` is True only when every check passed. Never raises for a bad
@@ -300,6 +330,13 @@ def verify_release_bundle(bundle_dir: "Path | str") -> BundleVerification:
     if not bundle.is_dir():
         result.errors.append(f"Bundle directory not found: {bundle}")
         return result
+
+    # Resolve the bundle root to a single absolute path ONCE. Every verified
+    # APK's absolute path is derived from and proven to stay inside this root,
+    # and install commands are built from those absolute paths -- so an install
+    # works no matter what the current working directory is when it runs.
+    bundle_root = bundle.resolve()
+    result.bundle_root = str(bundle_root)
 
     # Enumerate the bundle root (non-recursively). A subdirectory is itself
     # unexpected -- a release bundle is flat.
@@ -361,6 +398,19 @@ def verify_release_bundle(bundle_dir: "Path | str") -> BundleVerification:
         if not apk_path.is_file():
             errors.append(f"APK referenced by manifest.{app.key} is missing from the bundle: {app.apk}")
             continue
+        # Resolve to an absolute path and PROVE it stays inside the verified
+        # bundle root before it can ever back an install command (defense in
+        # depth over the filename check above -- catches e.g. a symlink whose
+        # target escapes the bundle). Record the absolute path on the app so the
+        # installer never rebuilds it from the manifest filename afterwards.
+        resolved_apk = apk_path.resolve()
+        if not _is_within(resolved_apk, bundle_root):
+            errors.append(
+                f"manifest.{app.key}.apk {app.apk!r} resolves to {resolved_apk} which is OUTSIDE the "
+                f"verified bundle root {bundle_root} -- refusing to treat it as an installable APK."
+            )
+            continue
+        app.apk_path = str(resolved_apk)
         actual = sha256_of_file(apk_path).lower()
         if app.sha256 and actual != app.sha256.lower():
             errors.append(
@@ -438,11 +488,24 @@ def build_install_command(app: AppRelease, *, serial: "str | None", allow_downgr
     (allow version downgrade) is added ONLY when a downgrade was explicitly
     authorised -- never by default, and never together with an
     uninstall/clear. A signature mismatch is left for the caller to classify
-    as BLOCKED; this function never emits a destructive recovery command."""
+    as BLOCKED; this function never emits a destructive recovery command.
+
+    The APK argument is the ABSOLUTE path recorded on the app during bundle
+    verification (``apk_path``), never the manifest-declared filename -- so the
+    command works from any working directory and is never reconstructed from
+    untrusted manifest input after verification. An app with no verified
+    ``apk_path`` cannot yield an install command (only a passed verification
+    populates it)."""
+    if not app.apk_path:
+        raise ReleaseInstallerError(
+            f"Refusing to build an install command for {app.key!r}: no verified absolute APK path. "
+            f"Install commands must use the path resolved and containment-checked during "
+            f"verify_release_bundle, never a filename reconstructed from the manifest."
+        )
     cmd = _adb_base(serial) + ["install", "-r"]
     if allow_downgrade:
         cmd.append("-d")
-    cmd.append(app.apk or "")
+    cmd.append(app.apk_path)
     return cmd
 
 

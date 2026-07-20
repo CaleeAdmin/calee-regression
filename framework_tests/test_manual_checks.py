@@ -231,11 +231,18 @@ def test_one_button_launcher_uses_plain_language_and_installer_and_delegates():
     # Plain-language states the tester sees (Phase 3).
     for state in ("READY", "INSTALLING", "TESTING", "PASSED", "FAILED", "BLOCKED", "NEEDS TECHNICAL OWNER"):
         assert state in text, state
-    # It drives the installer subsystem and delegates the regression to "06".
-    assert "verify-release-bundle" in text
+    # It drives the installer subsystem (bundle verification + APK content/signer
+    # inspection now live inside install-tablet-release) and delegates the
+    # regression to "06". One run ID is created before installation, and the
+    # installer + machine-config snapshot are written INTO that run (Priority 4/6).
     assert "install-tablet-release" in text
-    assert "machine-config" in text
+    assert "machine-config-snapshot" in text
+    assert "--run-id" in text
+    assert "CALEE_RUN_ID" in text
     assert "06 Test Full Calee Solution.command" in text
+    # Priority 2: the delegation to "06" must NOT swallow the tester's terminal
+    # input with </dev/null (the delegated launcher has mandatory manual checks).
+    assert '06 Test Full Calee Solution.command" </dev/null' not in text
     # Every blocker path tells the tester whether it is a product failure and
     # what safe action to take (the needs_owner helper carries all three).
     assert "Is this a product failure?" in text

@@ -17,14 +17,19 @@ if [ $BOOTSTRAP_STATUS -ne 0 ]; then
     exit $BOOTSTRAP_STATUS
 fi
 
-# One run ID for this entire release run, generated once at startup and
-# shared by every component (Prepare, tablet, CaleeMobile API/UI, manual
-# checks, consolidation). Every component writes to a fixed path inside
-# reports/runs/$CALEE_RUN_ID/ -- never a timestamped directory a later
-# step has to rediscover by listing and sorting, and never a shared
-# always-overwritten file another run could be racing against. See
-# calee_regression/run_context.py.
-CALEE_RUN_ID="release-$(date +%Y%m%d-%H%M%S)-$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
+# One run ID for this entire release run, shared by every component (Prepare,
+# tablet, CaleeMobile API/UI, manual checks, consolidation). Every component
+# writes to a fixed path inside reports/runs/$CALEE_RUN_ID/ -- never a
+# timestamped directory a later step has to rediscover by listing and sorting,
+# and never a shared always-overwritten file another run could be racing
+# against. See calee_regression/run_context.py.
+#
+# Priority 6: when the one-button launcher ("00 Run Calee Release Regression")
+# already created the run ID and recorded the machine-config snapshot +
+# installation evidence under it, we INHERIT that run ID here (never mint a
+# second one) so the whole release -- installation included -- lives in ONE
+# workspace. Run standalone, we generate one.
+CALEE_RUN_ID="${CALEE_RUN_ID:-release-$(date +%Y%m%d-%H%M%S)-$(python3 -c 'import secrets; print(secrets.token_hex(3))')}"
 export CALEE_RUN_ID
 echo "Run ID: $CALEE_RUN_ID"
 echo "Workspace: reports/runs/$CALEE_RUN_ID/"
@@ -278,6 +283,18 @@ fi
 # consolidate re-validates the embedded evidence independently and BLOCKS on any
 # problem (missing/malformed/wrong-build/not-PASS/stale), exactly like the gate.
 CONSOLIDATE_ARGS+=(--selector-contract-mandatory)
+# Machine-config snapshot (Priority 4) and tablet release installation
+# (Priority 5/6). When the one-button launcher ("00") created this run and
+# recorded them under it, they are release-gating consolidated components: a
+# missing/invalid machine-config snapshot, or a BLOCKED/FAILED installation,
+# can never read as a release PASS. (Auto-included as mandatory by consolidate
+# when the reports exist; passed explicitly here so the intent is on the record.)
+if [ -f "reports/runs/$CALEE_RUN_ID/machine-config/results.json" ]; then
+    CONSOLIDATE_ARGS+=(--machine-config-mandatory)
+fi
+if [ -f "reports/runs/$CALEE_RUN_ID/installation/results.json" ]; then
+    CONSOLIDATE_ARGS+=(--installation-mandatory)
+fi
 # Build/commit identity -- auto-collected above (a technical owner can still
 # override any value via the matching env var). The detected identity is
 # always passed so the consolidator can gate on it; see Phase 3.

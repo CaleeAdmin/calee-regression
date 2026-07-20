@@ -159,6 +159,13 @@ class CaleeDriver:
         # resolution and .click() (Priority 5). Each cycle RE-RESOLVES the exact
         # row -- a previously resolved stale element is never clicked.
         self.row_click_max_retries = 3
+        # Unique-exact-text resolution budget (Priority 8). tap_unique_text waits
+        # up to unique_text_timeout for the ONE exact match to appear, re-querying
+        # every unique_text_retry_interval, and (when a step opts in) scrolls up
+        # to unique_text_max_swipes to bring an off-screen item into view.
+        self.unique_text_timeout = 5.0
+        self.unique_text_retry_interval = 0.4
+        self.unique_text_max_swipes = 3
         # Where final-failure diagnostics (screenshot + page source) are written.
         # The runner points this at the run workspace; None -> a temp dir.
         self.diagnostics_dir = None
@@ -284,27 +291,182 @@ class CaleeDriver:
         xpath = f"//*[@text={lit} or @content-desc={lit}]"
         return self.driver.find_elements(AppiumBy.XPATH, xpath)
 
-    def tap_unique_text(self, text: str) -> None:
-        """Tap the ONE element whose text/content-desc exactly equals `text`.
+    def resolve_unique_text(
+        self, text: str, *,
+        timeout: "float | None" = None,
+        retry_interval: "float | None" = None,
+        scroll: bool = False,
+        max_swipes: "int | None" = None,
+    ) -> RowResolution:
+        """Resolve the ONE element whose @text/@content-desc EXACTLY equals
+        ``text``, robust to a live/dynamic Android list (Priority 8):
 
-        Fails loudly on zero or multiple matches rather than silently acting
-        on whichever element find_element happens to return first (Appium's
-        find_element has no concept of "ambiguous" -- it just returns the
-        first DOM match) -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md's "never
-        select an arbitrary event row, fail on zero or multiple matching
-        rows" requirement, extended here to a list with no row-container id to
-        scope by (tap_in_row already covers the case where one exists).
+          * RE-QUERY on every attempt -- a match is never cached across attempts,
+            so a recycled/rebound list can't hand back a stale node;
+          * bounded wait up to ``timeout`` for a DELAYED appearance (the item
+            renders a beat after the screen settles), re-querying every
+            ``retry_interval``;
+          * EXACTLY one exact match required -- zero keeps waiting, more than one
+            is a PERMANENT ambiguity that fails immediately (never tap an
+            arbitrary first match);
+          * optional BOUNDED scrolling (``scroll=True``) to bring an off-screen
+            item into view, with bidirectional no-progress detection so it never
+            swipes a list that can't move;
+          * STALE-element recovery -- a query that raises a stale condition is
+            simply retried on the next attempt;
+          * on final failure: a diagnostic screenshot + page source, plus the
+            attempt count, elapsed time, matches-on-final-attempt, scroll count
+            and diagnostic paths, all on the returned/attached RowResolution.
+
+        Returns the RowResolution (``.element`` set) on success; raises
+        RowAmbiguityError (permanent) or RowResolutionError (budget exhausted),
+        each carrying the RowResolution for the evidence bundle.
         """
-        matches = self.find_all_by_exact_text(text)
-        if not matches:
-            raise LookupError(f"No element with exact text/content-desc {text!r} found.")
-        if len(matches) > 1:
-            raise LookupError(
-                f"{len(matches)} elements match exact text/content-desc {text!r} exactly -- "
-                f"ambiguous. tap_unique_text requires exactly one match; use a more specific/"
-                f"unique title."
+        timeout = self.unique_text_timeout if timeout is None else timeout
+        retry_interval = self.unique_text_retry_interval if retry_interval is None else retry_interval
+        max_swipes = self.unique_text_max_swipes if max_swipes is None else max_swipes
+
+        start = time.monotonic()
+        deadline = start + max(0.0, timeout)
+        attempts = 0
+        scrolls = 0
+        last_matched = 0
+        last_problem: "str | None" = None
+        scroll_dir = "down"
+        scroll_directions: "list[str]" = []
+        stuck_dirs: "set[str]" = set()
+        scroll_exhausted = False
+
+        while True:
+            attempts += 1
+            try:
+                matches = self.find_all_by_exact_text(text)
+                last_matched = len(matches)
+                if len(matches) > 1:
+                    # Permanent ambiguity -- surface immediately, never tap one.
+                    shot, src = self._capture_diagnostics(f"ambiguous-text-{text}")
+                    raise RowAmbiguityError(
+                        f"{len(matches)} elements match exact text/content-desc {text!r} exactly -- "
+                        f"ambiguous. tap_unique_text requires exactly one match; use a more specific/"
+                        f"unique title.",
+                        RowResolution(
+                            attempts=attempts, scrolls=scrolls, matched_rows=len(matches),
+                            elapsed_seconds=time.monotonic() - start,
+                            scroll_directions=list(scroll_directions),
+                            screenshot_path=shot, page_source_path=src,
+                            problem=f"{len(matches)} elements match {text!r} exactly",
+                        ),
+                    )
+                if len(matches) == 1:
+                    return RowResolution(
+                        element=matches[0], attempts=attempts, scrolls=scrolls,
+                        elapsed_seconds=time.monotonic() - start, matched_rows=1,
+                        scroll_directions=list(scroll_directions), scroll_exhausted=scroll_exhausted,
+                    )
+                last_problem = f"no element with exact text/content-desc {text!r} visible yet"
+            except RowAmbiguityError:
+                raise
+            except Exception as exc:  # StaleElementReference et al. mid-rebind
+                last_problem = f"transient driver error: {exc}"
+
+            # Not resolved this attempt: optionally scroll a row into view
+            # (bounded), with no-progress detection and direction switching.
+            if scroll and scrolls < max_swipes and not scroll_exhausted:
+                before = self._page_fingerprint()
+                self._swipe(scroll_dir)
+                scrolls += 1
+                scroll_directions.append(scroll_dir)
+                after = self._page_fingerprint()
+                made_progress = before is None or after is None or before != after
+                if made_progress:
+                    stuck_dirs.discard(scroll_dir)
+                else:
+                    stuck_dirs.add(scroll_dir)
+                    scroll_dir = "up" if scroll_dir == "down" else "down"
+                    if {"down", "up"} <= stuck_dirs:
+                        scroll_exhausted = True
+
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            if retry_interval:
+                time.sleep(min(retry_interval, max(0.0, deadline - now)))
+
+        # Budget exhausted: capture diagnostics and fail with the metrics.
+        shot, src = self._capture_diagnostics(f"unresolved-text-{text}")
+        if scroll_exhausted and last_matched == 0:
+            last_problem = (last_problem or "") + " (scroll exhausted: the list could not be scrolled further in either direction)"
+        resolution = RowResolution(
+            element=None, attempts=attempts, scrolls=scrolls,
+            elapsed_seconds=time.monotonic() - start, matched_rows=last_matched,
+            screenshot_path=shot, page_source_path=src, problem=last_problem,
+            scroll_directions=list(scroll_directions), scroll_exhausted=scroll_exhausted,
+        )
+        raise RowResolutionError(
+            f"No element with exact text/content-desc {text!r} found after {attempts} attempt(s) "
+            f"and {scrolls} scroll(s): {last_problem}.",
+            resolution,
+        )
+
+    def tap_unique_text(
+        self, text: str, *,
+        timeout: "float | None" = None,
+        scroll: bool = False,
+        max_swipes: "int | None" = None,
+        max_click_retries: "int | None" = None,
+    ) -> RowResolution:
+        """Tap the ONE element whose text/content-desc exactly equals ``text``.
+
+        Fails loudly on zero or multiple matches rather than silently acting on
+        whichever element find_element happens to return first (Appium's
+        find_element has no concept of "ambiguous" -- it just returns the first
+        DOM match) -- see docs/TABLET_MUTATION_COVERAGE_GAPS.md's "never select
+        an arbitrary event row, fail on zero or multiple matching rows"
+        requirement, extended here to a flat list with no row-container id to
+        scope by (tap_in_row already covers the case where one exists).
+
+        Priority 8: resolution is bounded-retry + optional-scroll (see
+        resolve_unique_text), and if the resolved element goes stale between
+        resolution and ``.click()`` the exact match is RE-RESOLVED from scratch
+        and the FRESH element clicked -- a previously resolved stale element is
+        never re-clicked. Returns the RowResolution so the caller can record how
+        hard the resolve worked.
+        """
+        retries = self.row_click_max_retries if max_click_retries is None else max_click_retries
+        retries = max(1, retries)
+        last_exc: "Exception | None" = None
+        saw_stale = False
+        for click_attempt in range(1, retries + 1):
+            resolution = self.resolve_unique_text(
+                text, timeout=timeout, scroll=scroll, max_swipes=max_swipes
             )
-        matches[0].click()
+            resolution.click_attempts = click_attempt
+            resolution.stale_at_click = saw_stale
+            try:
+                resolution.element.click()
+                return resolution
+            except Exception as exc:  # noqa: BLE001
+                if not self._is_stale_exception(exc):
+                    raise
+                last_exc = exc
+                saw_stale = True
+                resolution.stale_at_click = True
+                if click_attempt < retries and self.unique_text_retry_interval:
+                    time.sleep(self.unique_text_retry_interval)
+
+        # Every re-resolve produced an element that went stale before the click
+        # landed: capture diagnostics and fail with the stale-at-click metric.
+        shot, src = self._capture_diagnostics(f"stale-at-click-text-{text}")
+        resolution = RowResolution(
+            element=None, attempts=retries, matched_rows=1, stale_at_click=True,
+            click_attempts=retries, screenshot_path=shot, page_source_path=src,
+            problem=f"element went stale at click after {retries} re-resolve(s): {last_exc}",
+        )
+        raise RowResolutionError(
+            f"Element with exact text {text!r} went stale at click after {retries} "
+            f"re-resolve(s): {last_exc}.",
+            resolution,
+        )
 
     def capture_diagnostics(self, label: str) -> "tuple[str | None, str | None]":
         """Public entry point for on-failure diagnostics (screenshot + page
