@@ -43,6 +43,31 @@ needs_owner()  {
     printf "  Send this report to your technical owner : %s\n" "${4:-reports/latest-run/}"
 }
 
+# Priority 7: even when an early gate (an invalid bundle, a machine-config
+# problem) stops the run before the full regression ("06"), STILL produce ONE
+# consolidated report. `consolidate` auto-discovers the components recorded so
+# far, marks every downstream component as not-run because of the gate, refreshes
+# reports/latest-run, and we open it. Echoes the consolidated exit code (the
+# consolidated PASS/FAIL/BLOCKED status) so the caller exits with it.
+consolidate_gate() {
+    # Safe, read-only identity evidence where possible -- never a product test.
+    python3 -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase pre >/dev/null 2>&1 || true
+    python3 -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase post >/dev/null 2>&1 || true
+    # Mirror 06's mandatory-component flags for whatever evidence exists, and
+    # allow-unknown build identity (an early gate cannot collect the full build
+    # identity). The consolidated status is driven by the recorded component(s):
+    # a BLOCKED/INVALID installation or machine-config yields a BLOCKED report.
+    local args=(--run-id "$CALEE_RUN_ID" --allow-unknown-build-identity)
+    [ -f "reports/runs/$CALEE_RUN_ID/machine-config/results.json" ] && args+=(--machine-config-mandatory)
+    [ -f "reports/runs/$CALEE_RUN_ID/installation/results.json" ] && args+=(--installation-mandatory)
+    python3 -m calee_regression consolidate "${args[@]}"
+    local status=$?
+    echo ""
+    echo "Opening the final report…"
+    bash "$DIR/07 Open Latest Report.command" </dev/null || true
+    return $status
+}
+
 say "Calee Release Regression"
 
 # ── 0. environment bootstrap (venv + dependencies) ──────────────────────────
@@ -78,8 +103,12 @@ if ! MACHINE_VARS="$(python3 -m calee_regression machine-config-snapshot --run-i
                 "reports/runs/$CALEE_RUN_ID/machine-config/results.json"
     cat machine_config_error.txt
     rm -f machine_config_error.txt
+    # Priority 7: the machine-config gate blocked, but still consolidate the
+    # BLOCKED machine-config evidence (downstream marked not-run) into ONE report.
+    consolidate_gate
+    CONSOLIDATED_STATUS=$?
     read -r -p "Press Enter to close..." _
-    exit 3
+    exit $CONSOLIDATED_STATUS
 fi
 eval "$MACHINE_VARS"
 rm -f machine_config_error.txt
@@ -114,13 +143,18 @@ INSTALL_STATUS=$?
 
 if [ $INSTALL_STATUS -eq 2 ]; then
     # A malformed/mislabelled bundle: nothing was installed, and running the
-    # regression against whatever is on the tablet would be misleading. Stop.
+    # regression against whatever is on the tablet would be misleading. Do NOT
+    # run product tests -- but STILL produce ONE consolidated report (Priority 7):
+    # the INVALID/BLOCKED installation evidence is already recorded, and
+    # consolidate marks every downstream component not-run because of this gate.
     needs_owner "The release bundle failed verification or its actual APK contents/signer did not match the manifest." \
                 "No — the bundle the technical owner supplied is malformed; nothing was installed or tested." \
                 "Ask your technical owner to rebuild/re-sign the release bundle and drop it back in the folder." \
                 "reports/runs/$CALEE_RUN_ID/installation/results.json"
+    consolidate_gate
+    CONSOLIDATED_STATUS=$?
     read -r -p "Press Enter to close..." _
-    exit 3
+    exit $CONSOLIDATED_STATUS
 fi
 if [ $INSTALL_STATUS -eq 0 ]; then
     state_pass "Release installed on the tablet and verified."
