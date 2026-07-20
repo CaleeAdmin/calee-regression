@@ -91,6 +91,12 @@ export CALEE_API_BASE="$MACHINE_BACKEND_URL"
 if [ "$MACHINE_ALLOW_CALEESHELL_TECHNICAL" = "true" ]; then
     export CALEE_CONFIRM_TECHNICAL=1
 fi
+# Priority 4: the configured mobile device ids control which iPhone/Android the
+# UI suite drives (scripts/test_caleemobile.sh -> run_ui_suite.py --device-id),
+# so a machine with more than one device targets the CONFIGURED one instead of
+# guessing. Empty values fall back to run_ui_suite.py's single-device resolution.
+[ -n "${MACHINE_IPHONE_DEVICE:-}" ] && export CALEE_IPHONE_DEVICE="$MACHINE_IPHONE_DEVICE"
+[ -n "${MACHINE_ANDROID_DEVICE:-}" ] && export CALEE_ANDROID_DEVICE="$MACHINE_ANDROID_DEVICE"
 state_ready "Machine configuration loaded (authoritative). Backend: ${MACHINE_BACKEND_URL}"
 
 # ── 3. install the release into the SAME run (Priority 1/5/6) ────────────────

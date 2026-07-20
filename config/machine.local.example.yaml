@@ -46,8 +46,15 @@ mobile_platforms:
   - android
   - ios
 # Optional explicit iPhone device id/name override (from `xcrun xctrace list
-# devices`); leave blank to auto-resolve the single connected iPhone.
+# devices`); leave blank to auto-resolve the single connected iPhone. When set,
+# it drives the CaleeMobile iOS UI suite (run_ui_suite.py --device-id) so the
+# CONFIGURED iPhone is targeted rather than whichever device happens to attach.
 iphone_device: ""
+# Optional explicit Android mobile device id override (from `adb devices`);
+# leave blank to auto-resolve the single connected Android. When set, it drives
+# the CaleeMobile Android UI suite the same way. This is the CaleeMobile phone,
+# distinct from the Calee TABLET serial above.
+android_device: ""
 
 # ── reports ──────────────────────────────────────────────────────────────
 # Where consolidated reports are written. The tester opens the latest from here.

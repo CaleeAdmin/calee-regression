@@ -42,6 +42,12 @@ COMPONENT_NAMES = (
     # secrets excluded, so the selected backend/devices/package-ids/profile are
     # captured in the run evidence. Written before any release verification.
     "machine-config",
+    # Effective RELEASE configuration (Priority 3): the machine config and the
+    # release candidate (release-platforms.yaml) composed into ONE authoritative
+    # configuration for THIS run -- enabled platforms/features, selected backend,
+    # expected identities, device ids, report root, and every conflict decision.
+    # An unresolved machine/release conflict is recorded here and BLOCKS.
+    "release-config",
     # Tablet release installation (Priority 5/6): bundle verification, actual
     # APK content + signer inspection, tablet pre-install inspection, the
     # install plan, its execution, and post-install package/HOME verification --

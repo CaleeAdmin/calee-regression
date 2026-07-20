@@ -257,6 +257,28 @@ else
                 echo "problem, not a product failure. See $UI_DIR/pub-get.log"
                 UI_STATUS=3
             else
+                # Priority 4: the CONFIGURED device id controls which device the
+                # UI suite drives. A per-platform machine device id
+                # (CALEE_IPHONE_DEVICE for iOS, CALEE_ANDROID_DEVICE for Android)
+                # becomes CALEE_UI_DEVICE_ID (which run_ui_suite.py reads and also
+                # records in the device-identifier metadata), and is passed
+                # explicitly as --device-id so the configured iPhone/Android is
+                # targeted instead of "whatever single device happens to be
+                # attached". An empty value falls back to run_ui_suite.py's own
+                # single-device auto-resolution.
+                UI_DEVICE_ID="${CALEE_UI_DEVICE_ID:-}"
+                if [ -z "$UI_DEVICE_ID" ]; then
+                    if [ "$PLATFORM" = "ios" ]; then
+                        UI_DEVICE_ID="${CALEE_IPHONE_DEVICE:-}"
+                    elif [ "$PLATFORM" = "android" ]; then
+                        UI_DEVICE_ID="${CALEE_ANDROID_DEVICE:-}"
+                    fi
+                fi
+                UI_DEVICE_ARGS=()
+                if [ -n "$UI_DEVICE_ID" ]; then
+                    export CALEE_UI_DEVICE_ID="$UI_DEVICE_ID"
+                    UI_DEVICE_ARGS=(--device-id "$UI_DEVICE_ID")
+                fi
                 # CALEE_MOBILE_BACKEND / CALEE_EXPECTED_BACKEND / CALEE_FIXTURE_STATUS
                 # are exported above and read by run_ui_suite.py from the environment.
                 # The mobile release features (Workstream 1) are passed explicitly
@@ -264,8 +286,11 @@ else
                 # --dart-define=CALEE_RELEASE_FEATURE_* and tags each step with the
                 # feature it exercised (kiosk/admin is a tablet feature, handled by
                 # the kiosk-admin command, not the mobile UI suite).
+                # ${arr[@]+"${arr[@]}"} keeps an empty array safe under `set -u`
+                # on the bash 3.2 that ships with macOS.
                 (cd "$SIBLING/ui" && python3 run_ui_suite.py \
                     --platform "$PLATFORM" \
+                    ${UI_DEVICE_ARGS[@]+"${UI_DEVICE_ARGS[@]}"} \
                     --report "$SCRIPT_DIR/$UI_REPORT" \
                     --log "$SCRIPT_DIR/$UI_DIR/flutter.log" \
                     --feature "meals=$CALEE_RELEASE_FEATURE_MEALS" \

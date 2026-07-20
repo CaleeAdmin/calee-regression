@@ -60,6 +60,7 @@ class MachineConfig:
     report_dir: str
     mobile_platforms: "list[str]" = field(default_factory=list)
     iphone_device: "str | None" = None
+    android_device: "str | None" = None
     allow_caleeshell_technical: bool = False
     config_path: "Path | None" = None
 
@@ -155,6 +156,7 @@ def load_machine_config(path) -> MachineConfig:
         report_dir=raw["report_dir"],
         mobile_platforms=list(raw.get("mobile_platforms", [])),
         iphone_device=raw.get("iphone_device") or None,
+        android_device=raw.get("android_device") or None,
         allow_caleeshell_technical=bool(raw.get("allow_caleeshell_technical", False)),
         config_path=path.resolve(),
     )

@@ -2521,6 +2521,7 @@ def machine_config_snapshot_cmd(config_path, legacy_config_path, run_id_opt):
     _emit("RELEASE_PROFILE", effective.release_profile)
     _emit("REPORT_DIR", effective.report_dir)
     _emit("IPHONE_DEVICE", effective.iphone_device or "")
+    _emit("ANDROID_DEVICE", effective.android_device or "")
     _emit("CALEE_PACKAGE_ID", effective.calee_package_id)
     _emit("CALEESHELL_PACKAGE_ID", effective.caleeshell_package_id)
     _emit("HOME_ACTIVITY", effective.home_activity)
@@ -2528,6 +2529,112 @@ def machine_config_snapshot_cmd(config_path, legacy_config_path, run_id_opt):
     _emit("PLATFORM_ANDROID", "true" if "android" in effective.mobile_platforms else "false")
     _emit("PLATFORM_IOS", "true" if "ios" in effective.mobile_platforms else "false")
     _emit("ALLOW_CALEESHELL_TECHNICAL", "true" if effective.allow_caleeshell_technical else "false")
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@main.command("release-config")
+@click.option("--config", "config_path", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
+@click.option("--release-platforms", "platforms_path", envvar="CALEE_RELEASE_PLATFORMS", default=None, type=click.Path(), help="Path to release-platforms.yaml (the release candidate manifest).")
+@click.option("--release-id", "release_id_opt", envvar="CALEE_RELEASE_ID", default=None, help="Release candidate id (from the bundle manifest).")
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True, help="Shared release run ID (run_context.py).")
+def release_config_cmd(config_path, platforms_path, release_id_opt, run_id_opt):
+    """Compose the ONE effective RELEASE configuration for this run (Priority 3).
+
+    Combines the MACHINE config (how/where a run executes) with the RELEASE
+    CANDIDATE manifest (config/release-platforms.yaml -- what the release is)
+    under one precedence rule: the release candidate is authoritative for scope
+    (platforms, features, profile, expected identities, backend), and the
+    machine must be consistent with and capable of it. Any disagreement or
+    missing capability is a CONFLICT that BLOCKS. Writes the composed config +
+    every conflict decision to reports/runs/<run-id>/release-config/results.json
+    and emits eval-able RELEASE_* assignments (enabled platforms, device ids,
+    selected backend, profile) so the composition actually drives execution.
+    """
+    import shlex as _shlex
+
+    import yaml as _yaml
+
+    from . import machine_config as machine_mod
+    from . import release_config as rc_mod
+    from . import release_platforms as rp_mod
+
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+    workspace.ensure_created()
+
+    def _record(payload: dict, exit_code: int) -> None:
+        payload = {"runId": run_id_opt, **payload}
+        path = workspace.component_report_path("release-config")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        manifest = _load_or_init_manifest(workspace)
+        manifest.record_component("release-config", report_path=str(path), exit_code=exit_code)
+        manifest.write(workspace.manifest_path)
+
+    machine_path = Path(config_path) if config_path else (REPO_ROOT / "config" / "machine.local.yaml")
+    try:
+        machine = machine_mod.load_machine_config(machine_path)
+    except machine_mod.MachineConfigError as exc:
+        _record({"status": STATUS_BLOCKED, "detail": [str(exc)]}, EXIT_BLOCKED)
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    try:
+        platforms = rp_mod.load_release_platforms(platforms_path)
+        features = rp_mod.load_release_features(platforms_path)
+        expected = rp_mod.load_expected_build_identity(platforms_path)
+    except rp_mod.ReleasePlatformsError as exc:
+        _record({"status": STATUS_BLOCKED, "detail": [f"release-platforms.yaml problem: {exc}"]}, EXIT_BLOCKED)
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    # Optional release-candidate extras (backend/environment pin + distributed
+    # build acceptance) read from the same release-platforms.yaml top level.
+    expected_backend = None
+    distributed_build_required = False
+    resolved_platforms_path = Path(platforms_path) if platforms_path else rp_mod.DEFAULT_CONFIG_PATH
+    if resolved_platforms_path.is_file():
+        try:
+            raw = _yaml.safe_load(resolved_platforms_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                expected_backend = (raw.get("backend") or raw.get("expected_backend") or None)
+                distributed_build_required = bool(raw.get("distributed_build_required", False))
+                release_id_opt = release_id_opt or raw.get("release_id")
+        except _yaml.YAMLError:
+            pass
+
+    effective = rc_mod.compose_effective_release_config(
+        machine, platforms, features, expected,
+        run_id=run_id_opt, release_id=release_id_opt,
+        expected_backend=expected_backend, distributed_build_required=distributed_build_required,
+    )
+    exit_code = EXIT_SUCCESS if effective.ok else EXIT_BLOCKED
+    _record(effective.to_dict(), exit_code)
+
+    def _emit(name, value):
+        click.echo(f"RELEASE_{name}={_shlex.quote(str('' if value is None else value))}")
+
+    _emit("EFFECTIVE_CONFIG", str(workspace.component_report_path("release-config")))
+    _emit("PROFILE", effective.profile)
+    _emit("SELECTED_BACKEND", effective.selected_backend or "")
+    _emit("PLATFORM_TABLET", "true" if "tablet" in effective.enabled_platforms else "false")
+    _emit("PLATFORM_ANDROID", "true" if "android" in effective.enabled_platforms else "false")
+    _emit("PLATFORM_IOS", "true" if "ios" in effective.enabled_platforms else "false")
+    _emit("ENABLED_FEATURES", ",".join(effective.enabled_features))
+    _emit("TABLET_SERIAL", effective.tablet_serial or "")
+    _emit("IPHONE_DEVICE", effective.iphone_device or "")
+    _emit("ANDROID_DEVICE", effective.android_device or "")
+    _emit("REPORT_ROOT", effective.report_root or "")
+
+    if not effective.ok:
+        click.echo(click.style("[BLOCKED] Machine/release configuration conflict:", fg="red"), err=True)
+        for c in effective.conflicts:
+            if c.blocking:
+                click.echo(f"  - {c.explanation}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+    click.echo(click.style(f"[OK] Effective release configuration composed for {run_id_opt}.", fg="green"), err=True)
     raise SystemExit(EXIT_SUCCESS)
 
 
@@ -2726,13 +2833,29 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
             click.echo(f"  - {err}", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
 
-    if serial is None and config_path:
+    # Priority 4: the effective (machine-authoritative) config controls the
+    # install plan -- the HOME activity and the Calee launch/START action come
+    # from config, not hardcoded defaults, so they actually reach the installer
+    # command arrays and the post-reboot verification.
+    home_component = None
+    calee_launch_action = None
+    if config_path:
         try:
-            serial = config_mod.load_config(config_path).udid
+            _cfg = config_mod.load_config(config_path)
+            if serial is None:
+                serial = _cfg.udid
+            if _cfg.shell_package and _cfg.shell_activity:
+                home_component = f"{_cfg.shell_package}/{_cfg.shell_activity}"
+            calee_launch_action = _cfg.start_action or None
         except config_mod.ConfigError:
-            serial = None
+            pass
 
-    plan = release_installer.build_install_plan(verification, serial=serial, allow_downgrade=allow_downgrade)
+    plan_kwargs = {"serial": serial, "allow_downgrade": allow_downgrade}
+    if home_component:
+        plan_kwargs["home_component"] = home_component
+    if calee_launch_action:
+        plan_kwargs["calee_launch_action"] = calee_launch_action
+    plan = release_installer.build_install_plan(verification, **plan_kwargs)
 
     if plan_only:
         payload = {"status": "plan-only", "detail": ["Plan constructed, not executed."],
@@ -2766,7 +2889,10 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     # Read-only tablet pre-install inspection (installed identities + HOME).
     tablet_inspection = release_installer.inspect_tablet(release_installer.real_adb_runner, serial=serial)
 
-    execution = release_installer.execute_install_plan(plan, verification, release_installer.real_adb_runner)
+    execute_kwargs = {}
+    if calee_launch_action:
+        execute_kwargs["calee_launch_action"] = calee_launch_action
+    execution = release_installer.execute_install_plan(plan, verification, release_installer.real_adb_runner, **execute_kwargs)
     status = "ok" if execution.status == release_installer.STATUS_OK else "blocked"
     detail = [] if status == "ok" else [execution.detail or "Installation did not complete."]
     if tablet_inspection.status != release_installer.STATUS_OK and status == "ok":
@@ -2780,6 +2906,9 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     # only one of them. A gap in the unchanged app BLOCKS the release.
     solution = None
     if status == "ok":
+        solution_kwargs = {}
+        if calee_launch_action:
+            solution_kwargs["calee_launch_action"] = calee_launch_action
         solution = release_installer.verify_tablet_solution(
             verification.expected_app("calee"),
             verification.expected_app("caleeShell"),
@@ -2787,6 +2916,7 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
             serial=serial,
             release_id=plan.release_id,
             installed_signer_reader=signer_reader,
+            **solution_kwargs,
         )
         if solution.status != release_installer.STATUS_OK:
             status = "blocked"
