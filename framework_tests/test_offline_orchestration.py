@@ -60,6 +60,12 @@ def test_iphone_device_id_reaches_run_ui_suite(tmp_path):
     env = dict(os.environ)
     env["PATH"] = f"{fakebin}:{env['PATH']}"
     env["CALEE_RUN_ID"] = run_id
+    # Priority 3: simulate report root already resolved+exported by an
+    # orchestrating "06" (the realistic case for this delegated script) --
+    # this test's `repo` is an isolated scratch copy, not the actual
+    # installed package location `python3 -m calee_regression report-root`
+    # would resolve to, so it must be supplied rather than re-derived.
+    env["CALEE_REPORT_ROOT"] = str(repo)
     env["CALEE_IPHONE_DEVICE"] = "00008110-CONFIGURED-IPHONE"
     env["CALEE_TEST_EMAIL"] = "reg@example.com"
     env["CALEE_TEST_PASSWORD"] = "pw"

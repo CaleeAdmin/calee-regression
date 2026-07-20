@@ -56,9 +56,22 @@ iphone_device: ""
 # distinct from the Calee TABLET serial above.
 android_device: ""
 
-# ── reports ──────────────────────────────────────────────────────────────
-# Where consolidated reports are written. The tester opens the latest from here.
-report_dir: "reports"
+# ── reports (Priority 3) ────────────────────────────────────────────────
+# The canonical report root controlling EVERY artifact this framework writes
+# for a run (component reports, the run manifest, the consolidated report,
+# the evidence ZIP, the latest-run pointer) -- not just where "07 Open Latest
+# Report" happens to look. A "reports/" subtree is created beneath whatever
+# you set here (matching the CALEE_REPORT_ROOT environment variable, which
+# takes precedence over this field when both are set).
+#
+# "." (the default below) means "this repo's own reports/ directory" --
+# unmodified, current behavior. Set an ABSOLUTE path (e.g. an external drive:
+# "/Volumes/Evidence/calee-reports") to move every run's evidence there
+# instead. A relative value is resolved against this repo's own root, never
+# against whatever directory a launcher happened to be started from. The
+# configured root must be creatable and writable -- an unsafe/unwritable
+# value BLOCKS the run rather than silently falling back to the default.
+report_dir: "."
 
 # ── CaleeShell technical test permission ─────────────────────────────────
 # Whether this machine is allowed to run the destructive-adjacent CaleeShell

@@ -239,7 +239,7 @@ def _machine_yaml(repo, bundle):
         "release_bundle_dir": str(bundle),
         "backend_url": "https://hub-dev.calee.com.au",
         "release_profile": "staging",
-        "report_dir": "reports",
+        "report_dir": ".",
         "mobile_platforms": ["android"],
     }))
 
@@ -271,7 +271,7 @@ if len(argv) >= 3 and argv[0] == "-m" and argv[1] == "calee_regression":
     if order:
         with open(order, "a") as f:
             f.write(cmd + "\\n")
-    if cmd in ("machine-config-snapshot", "install-tablet-release", "run-with-credentials"):
+    if cmd in ("machine-config-snapshot", "install-tablet-release", "run-with-credentials", "report-root"):
         os.execv(REAL, [REAL, "-m", "calee_regression"] + argv[2:])
     if cmd == "release-platforms":
         sys.stdout.write("export RELEASE_PLATFORM_TABLET=true\\n")

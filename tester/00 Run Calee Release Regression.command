@@ -40,7 +40,7 @@ needs_owner()  {
     printf "  What could not run : %s\n" "$1"
     printf "  Is this a product failure? : %s\n" "$2"
     printf "  What you can do now : %s\n" "$3"
-    printf "  Send this report to your technical owner : %s\n" "${4:-reports/latest-run/}"
+    printf "  Send this report to your technical owner : %s\n" "${4:-${CALEE_REPORT_ROOT:-.}/reports/latest-run/}"
 }
 
 # Priority 7: even when an early gate (an invalid bundle, a machine-config
@@ -58,8 +58,8 @@ consolidate_gate() {
     # identity). The consolidated status is driven by the recorded component(s):
     # a BLOCKED/INVALID installation or machine-config yields a BLOCKED report.
     local args=(--run-id "$CALEE_RUN_ID" --allow-unknown-build-identity)
-    [ -f "reports/runs/$CALEE_RUN_ID/machine-config/results.json" ] && args+=(--machine-config-mandatory)
-    [ -f "reports/runs/$CALEE_RUN_ID/installation/results.json" ] && args+=(--installation-mandatory)
+    [ -f "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/machine-config/results.json" ] && args+=(--machine-config-mandatory)
+    [ -f "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/installation/results.json" ] && args+=(--installation-mandatory)
     python3 -m calee_regression consolidate "${args[@]}"
     local status=$?
     echo ""
@@ -83,15 +83,38 @@ if [ $BOOTSTRAP_STATUS -ne 0 ]; then
     exit $BOOTSTRAP_STATUS
 fi
 
+# ── 0.5. report root (Priority 3) ────────────────────────────────────────────
+# Resolve the ONE canonical report root for this ENTIRE run -- the
+# CALEE_REPORT_ROOT environment variable if already set, else
+# config/machine.local.yaml's report_dir, else this repo's own reports/
+# directory -- BEFORE a single file is written, and export it so every
+# downstream process (every delegated calee_regression subcommand, "06",
+# scripts/test_caleemobile.sh, "07 Open Latest Report") agrees on exactly
+# where evidence lives. An unsafe/unwritable configured root BLOCKS here
+# rather than silently falling back. See calee_regression/report_root.py.
+if [ -z "${CALEE_REPORT_ROOT:-}" ]; then
+    if ! CALEE_REPORT_ROOT="$(python3 -m calee_regression report-root)"; then
+        needs_owner "The configured report root could not be resolved." \
+                    "No — this is a setup/configuration problem, not a product failure." \
+                    "Ask your technical owner to check config/machine.local.yaml's report_dir (or the CALEE_REPORT_ROOT environment variable)." \
+                    "reports/setup.log"
+        read -r -p "Press Enter to close..." _
+        exit 3
+    fi
+fi
+export CALEE_REPORT_ROOT
+
 # ── 1. ONE run ID, created BEFORE any release verification (Priority 6) ──────
 # Everything below -- the machine-config snapshot, bundle verification, APK
 # inspection, installation, and the full regression delegated to "06" -- writes
-# into reports/runs/$CALEE_RUN_ID/. There is no second run ID created later.
+# into $CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/. There is no second run
+# ID created later.
 CALEE_RUN_ID="release-$(date +%Y%m%d-%H%M%S)-$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
 export CALEE_RUN_ID
-mkdir -p "reports/runs/$CALEE_RUN_ID"
+mkdir -p "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID"
 echo "Run ID: $CALEE_RUN_ID"
-echo "Workspace: reports/runs/$CALEE_RUN_ID/"
+echo "Report root: $CALEE_REPORT_ROOT"
+echo "Workspace: $CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/"
 
 # ── 2. machine config = the single authoritative source (Priority 4) ─────────
 echo ""
@@ -100,7 +123,7 @@ if ! MACHINE_VARS="$(python3 -m calee_regression machine-config-snapshot --run-i
     needs_owner "The machine configuration is missing or invalid (or contains a secret it must not)." \
                 "No — this is a setup problem, not a product failure." \
                 "Ask your technical owner to fix config/machine.local.yaml (see config/machine.local.example.yaml)." \
-                "reports/runs/$CALEE_RUN_ID/machine-config/results.json"
+                "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/machine-config/results.json"
     cat machine_config_error.txt
     rm -f machine_config_error.txt
     # Priority 7: the machine-config gate blocked, but still consolidate the
@@ -150,7 +173,7 @@ if [ $INSTALL_STATUS -eq 2 ]; then
     needs_owner "The release bundle failed verification or its actual APK contents/signer did not match the manifest." \
                 "No — the bundle the technical owner supplied is malformed; nothing was installed or tested." \
                 "Ask your technical owner to rebuild/re-sign the release bundle and drop it back in the folder." \
-                "reports/runs/$CALEE_RUN_ID/installation/results.json"
+                "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/installation/results.json"
     consolidate_gate
     CONSOLIDATED_STATUS=$?
     read -r -p "Press Enter to close..." _
@@ -172,7 +195,7 @@ else
     needs_owner "The release could not be installed on the tablet (see the installation report)." \
                 "No — this is an installation/environment blocker (missing device, missing SDK tool, signer trust, or a version/HOME mismatch), not a proven product failure." \
                 "Check the tablet is connected, unlocked, and awake, then run this again. If it keeps happening, ask your technical owner to check the installation report." \
-                "reports/runs/$CALEE_RUN_ID/installation/results.json"
+                "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/installation/results.json"
     consolidate_gate
     CONSOLIDATED_STATUS=$?
     read -r -p "Press Enter to close..." _
@@ -203,13 +226,13 @@ case $REGRESSION_STATUS in
         needs_owner "One or more product checks failed." \
                     "YES — this is a genuine product failure." \
                     "Do not ship this release. Send the report." \
-                    "reports/latest-run/"
+                    "$CALEE_REPORT_ROOT/reports/latest-run/"
         ;;
     *)
         needs_owner "Some required checks could not run (a missing device, credential, fixture, or installation)." \
                     "No — these are environment/setup blockers, not proven product failures." \
                     "Make sure the tablet AND iPhone are connected and prepared, then run this again." \
-                    "reports/latest-run/"
+                    "$CALEE_REPORT_ROOT/reports/latest-run/"
         ;;
 esac
 
