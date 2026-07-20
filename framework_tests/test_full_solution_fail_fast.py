@@ -110,6 +110,13 @@ def _install_fakes(repo: Path, tmp_path: Path) -> Path:
         "            shift 3\n"
         '            if [ "$1" = "--" ]; then shift; fi\n'
         '            exec "$@" ;;\n'
+        # release-config (Priority 3/4) is delegated to the REAL CLI so the
+        # machine+release composition actually drives 06's platform scope.
+        "        release-config)\n"
+        '            exec "$REAL_PYTHON" "$@" ;;\n'
+        # build-identity/consolidate helpers 00's early-gate path may call.
+        "        build-identity)\n"
+        "            exit 0 ;;\n"
         "        *)\n"
         "            exit 0 ;;\n"
         "    esac\n"
@@ -324,6 +331,55 @@ def test_ready_prepare_honors_release_platform_scope(tmp_path):
 
     assert "caleemobile:android --ui-only" in steps
     assert "caleemobile:ios --ui-only" not in steps
+
+
+def _write_machine_and_release_scope(repo, *, mobile_platforms, release_ios):
+    import yaml
+    (repo / "config" / "machine.local.yaml").write_text(yaml.safe_dump({
+        "tablet_serial": "TAB123",
+        "expected_tablet_state": "logged_in_tablet",
+        "calee_package_id": "com.viso.calee",
+        "caleeshell_package_id": "com.viso.caleeshell",
+        "home_activity": "com.viso.caleeshell/.ui.LauncherActivity",
+        "calee_launch_action": "com.viso.calee.action.START",
+        "release_bundle_dir": str(repo / "bundle"),
+        "backend_url": "https://hub-staging.calee.com.au",
+        "release_profile": "staging",
+        "report_dir": "reports",
+        "mobile_platforms": mobile_platforms,
+        "android_device": "R5ANDROID",
+        "iphone_device": "",
+        "allow_caleeshell_technical": True,
+    }))
+    (repo / "config" / "release-platforms.yaml").write_text(yaml.safe_dump({
+        "release_platforms": {"tablet": True, "mobile_android": True, "mobile_ios": release_ios},
+        "release_features": {"kiosk_admin": False},
+    }))
+
+
+def test_machine_platform_scope_reaches_launcher_06(tmp_path):
+    """Priority 9 (#3): the MACHINE's platform scope, composed with the release
+    candidate into the effective release config, reaches 06 and gates the mobile
+    legs -- even overriding the release-platforms-only value the shim emits."""
+    repo = _copy_repo(tmp_path)
+    # Machine can run Android + tablet only; the release does not require iOS.
+    _write_machine_and_release_scope(repo, mobile_platforms=["android"], release_ios=False)
+    fakebin = _install_fakes(repo, tmp_path)
+    order_log = tmp_path / "order.log"
+    report = {"status": "pass", "detail": ["ready"]}
+    # The release-platforms shim says iOS=true; the effective release config
+    # (machine has no iPhone + release ios:false) narrows it to false, and THAT
+    # is what reaches 06.
+    _run(repo, fakebin, order_log, report, prepare_exit=0, ios="true")
+    steps = _order(order_log)
+
+    assert "release-config" in steps  # 06 composed the effective config
+    assert "caleemobile:android --ui-only" in steps
+    assert "caleemobile:ios --ui-only" not in steps, steps
+    # The effective release-config evidence was written for the run.
+    runs = list((repo / "reports" / "runs").glob("release-*"))
+    assert runs, "no run workspace created"
+    assert (runs[0] / "release-config" / "results.json").is_file()
 
 
 def test_ready_prepare_sync_uses_remaining_platform_when_android_excluded(tmp_path):

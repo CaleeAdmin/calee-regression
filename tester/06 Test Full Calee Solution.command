@@ -41,6 +41,33 @@ echo ""
 # convenient to run right now.
 eval "$(python -m calee_regression release-platforms)"
 
+# Priority 3/4: when a machine config exists, compose the ONE effective release
+# configuration (machine + release candidate) and let it drive this launcher --
+# so the MACHINE's platform scope + device ids reach 06, not just the release
+# candidate's. The composed RELEASE_PLATFORM_* (machine capability ∩ release
+# scope) overrides the release-platforms-only values above, the configured
+# iPhone/Android device ids are exported for the UI suite, and a machine/release
+# conflict BLOCKS (recorded in the run's release-config evidence). Absent a
+# machine config (CI/example), the release-platforms defaults above stand.
+if [ -f config/machine.local.yaml ]; then
+    if RELEASE_CFG_OUT="$(python -m calee_regression release-config --run-id "$CALEE_RUN_ID" 2>/dev/null)"; then
+        RELEASE_CFG_STATUS=0
+    else
+        RELEASE_CFG_STATUS=$?
+    fi
+    # Apply the composed platform scope + device ids regardless (the emitted
+    # values are the safe machine∩release intersection).
+    eval "$RELEASE_CFG_OUT" 2>/dev/null || true
+    [ -n "${RELEASE_IPHONE_DEVICE:-}" ] && export CALEE_IPHONE_DEVICE="$RELEASE_IPHONE_DEVICE"
+    [ -n "${RELEASE_ANDROID_DEVICE:-}" ] && export CALEE_ANDROID_DEVICE="$RELEASE_ANDROID_DEVICE"
+    if [ "$RELEASE_CFG_STATUS" -ne 0 ]; then
+        echo ""
+        echo "BLOCKED: the machine and release-candidate configurations conflict —"
+        echo "see reports/runs/$CALEE_RUN_ID/release-config/results.json. Continuing to"
+        echo "produce ONE consolidated BLOCKED report."
+    fi
+fi
+
 echo ""
 echo "--- Step 1: Prepare Test Environment (incl. Appium) ---"
 python -m calee_regression prepare --config "$CALEE_TEST_CONFIG" --suite tablet-full --run-id "$CALEE_RUN_ID"
