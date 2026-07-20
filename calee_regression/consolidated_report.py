@@ -528,6 +528,41 @@ def component_from_release_config_report(
     return ComponentResult(name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1, detail=detail, evidence=report_dict)
 
 
+SUBSCRIBED_FIXTURE_COMPONENT_NAME = "Subscribed-calendar fixture"
+
+
+def component_from_subscribed_fixture_report(
+    name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = False
+) -> ComponentResult:
+    """Build a ComponentResult from the subscribed-fixture component
+    (Priority 7): publication + bounded-polling observation evidence for the
+    today-relative ICS (published mode), or the fixed-date/offline-only mode
+    record (subscribed_publisher.SubscribedFixtureResult).
+
+    ``mandatory`` defaults to False -- optional while scenarios/subscribed_
+    calendar.yaml stays draft-unverified (Priority 7: "while the scenario
+    remains draft, the component may be optional"). The caller (cli.py's
+    consolidate) passes True once that scenario's promotion file records
+    releaseSuiteEligible: true -- the component then automatically becomes
+    mandatory, exactly like every other release-gating component.
+
+    A ``status: "ok"`` report is PASS; any other status (a real BLOCKED
+    publication/observation failure, or a missing/unreadable report) BLOCKS --
+    an unrecognized status is never silently trusted as a pass."""
+    if report_dict is None:
+        return ComponentResult(
+            name=name, status=STATUS_NOT_RUN, mandatory=mandatory,
+            detail=["No subscribed-fixture evidence was recorded for this run."],
+        )
+    status = report_dict.get("status")
+    detail = list(report_dict.get("detail", []))
+    if status == "ok":
+        return ComponentResult(name=name, status=STATUS_PASS, mandatory=mandatory, detail=detail, evidence=report_dict)
+    if status != "blocked":
+        detail = detail + [f"Unrecognized subscribed-fixture status {report_dict.get('status')!r}."]
+    return ComponentResult(name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1, detail=detail, evidence=report_dict)
+
+
 def component_from_machine_config_report(
     name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = True
 ) -> ComponentResult:
@@ -1381,6 +1416,8 @@ def build_release_report(
     mobile_android_ui: "dict[str, Any] | None" = None,
     mobile_ios_ui: "dict[str, Any] | None" = None,
     sync: "dict[str, Any] | None" = None,
+    subscribed_fixture: "dict[str, Any] | None" = None,
+    subscribed_fixture_mandatory: "bool | None" = None,
     kiosk_admin: "dict[str, Any] | None" = None,
     installation: "dict[str, Any] | None" = None,
     installation_mandatory: "bool | None" = None,
@@ -1529,6 +1566,21 @@ def build_release_report(
         components.insert(
             insert_at,
             component_from_sync_report(SYNC_COMPONENT_NAME, sync, mandatory=sync_mandatory),
+        )
+        insert_at += 1
+
+    # Subscribed-calendar fixture (Priority 7). Included exactly when the
+    # caller made an explicit mandatory/optional decision; cli.py's
+    # consolidate always does (optional while the scenario stays draft,
+    # automatically mandatory once promotion.load_promotion(...).
+    # release_suite_eligible is true). A mandatory-and-BLOCKED subscribed-
+    # fixture then gates the overall status like any other component.
+    if subscribed_fixture_mandatory is not None:
+        components.insert(
+            insert_at,
+            component_from_subscribed_fixture_report(
+                SUBSCRIBED_FIXTURE_COMPONENT_NAME, subscribed_fixture, mandatory=subscribed_fixture_mandatory,
+            ),
         )
         insert_at += 1
 

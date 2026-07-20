@@ -1908,6 +1908,14 @@ def _resolve_component(
          "report exists. A BLOCKED/missing release-config composition can never read as a release "
          "PASS, and no product test may run once it is BLOCKED.",
 )
+@click.option(
+    "--subscribed-fixture-mandatory/--subscribed-fixture-optional", "subscribed_fixture_mandatory", default=None,
+    help="Whether the subscribed-calendar fixture component is release-gating (Priority 7). When "
+         "omitted, this is derived automatically from scenarios/promotion/subscribed_calendar.yaml's "
+         "releaseSuiteEligible -- optional while that scenario stays draft-unverified, and "
+         "automatically mandatory once it is promoted. A component report is still shown/recorded "
+         "either way.",
+)
 # Independent release-feature gating (Workstream 3). Each defaults to the
 # release feature profile (config/release-platforms.yaml release_features.*),
 # or True if absent -- an omitted feature is mandatory. An optional feature is
@@ -1955,6 +1963,7 @@ def consolidate(
     sync_report, installation_report, machine_config_report, release_config_report, kiosk_report, manual_checks_path, environment_report,
     android_mandatory, ios_mandatory, sync_mandatory,
     selector_contract_mandatory, installation_mandatory, machine_config_mandatory, release_config_mandatory,
+    subscribed_fixture_mandatory,
     meals_mandatory, onboarding_mandatory, google_calendar_mandatory, kiosk_admin_mandatory,
     build_version, calee_build_version, expected_calee_build_version,
     caleemobile_build_version, expected_caleemobile_build_version, caleeshell_version,
@@ -2022,6 +2031,9 @@ def consolidate(
     # production) is deferred below, once the mobile scope, production profile
     # and any named waiver are resolved.
     selector_contract_report = resolve("selector-contract", None)
+    # Subscribed-calendar fixture (Priority 7). Auto-discovered the same way;
+    # its mandatory-ness (below) defaults to the scenario's promotion state.
+    subscribed_fixture_report = resolve("subscribed-fixture", None)
 
     manual_checks_raw = resolve("manual-checks", manual_checks_path)
     manual_checks_list = None
@@ -2088,6 +2100,23 @@ def consolidate(
         release_config_mandatory if release_config_mandatory is not None
         else (True if release_config_composition is not None else None)
     )
+    # Subscribed-calendar fixture gating (Priority 7): an explicit flag wins;
+    # else derived from the scenario's OWN promotion state -- optional while
+    # scenarios/promotion/subscribed_calendar.yaml stays draft (releaseSuite
+    # Eligible: false), automatically mandatory once it is promoted. A
+    # promotion file that fails to load is treated as still-draft (optional),
+    # never silently mandatory from a parsing accident.
+    from . import promotion as promotion_mod
+
+    if subscribed_fixture_mandatory is not None:
+        subscribed_fixture_gating = subscribed_fixture_mandatory
+    else:
+        try:
+            subscribed_fixture_gating = promotion_mod.load_promotion(
+                promotion_mod.PROMOTION_DIR / "subscribed_calendar.yaml"
+            ).release_suite_eligible
+        except (promotion_mod.PromotionError, OSError):
+            subscribed_fixture_gating = False
 
     # Independent release-feature gating (Workstream 3): explicit
     # --<feature>-mandatory/--<feature>-optional wins, else the release feature
@@ -2289,6 +2318,8 @@ def consolidate(
         mobile_android_ui=mobile_android,
         mobile_ios_ui=mobile_ios,
         sync=sync,
+        subscribed_fixture=subscribed_fixture_report,
+        subscribed_fixture_mandatory=subscribed_fixture_gating,
         kiosk_admin=kiosk,
         installation=installation,
         installation_mandatory=installation_gating,
@@ -2380,7 +2411,7 @@ def consolidate(
         ("sync", sync_report, sync),
         ("kiosk-admin", kiosk_report, kiosk),
         ("manual-checks", manual_checks_path, manual_checks_raw),
-        ("subscribed-fixture", None, resolve("subscribed-fixture", None)),
+        ("subscribed-fixture", None, subscribed_fixture_report),
     ):
         if loaded is None:
             continue
@@ -2663,28 +2694,53 @@ def machine_config_snapshot_cmd(config_path, legacy_config_path, run_id_opt):
     raise SystemExit(EXIT_SUCCESS)
 
 
+def _load_subscribed_fixture_config(config_path: "Path | None") -> dict:
+    import yaml as _yaml
+
+    path = config_path or (REPO_ROOT / "config" / "machine.local.yaml")
+    if not path.is_file():
+        return {}
+    try:
+        raw = _yaml.safe_load(path.read_text(encoding="utf-8"))
+    except _yaml.YAMLError:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    section = raw.get("subscribed_fixture")
+    return section if isinstance(section, dict) else {}
+
+
 @main.command("prepare-subscribed-fixture")
 @click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True, help="Shared release run ID (run_context.py).")
-@click.option("--target-date", "date_opt", default=None, help="Pin the subscribed target date (YYYY-MM-DD); defaults to today.")
+@click.option("--release-id", "release_id_opt", envvar="CALEE_RELEASE_ID", default=None, help="Release id recorded in this component's evidence.")
+@click.option("--config", "config_path", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml); reads its subscribed_fixture: section.")
+@click.option(
+    "--mode", "mode_opt", type=click.Choice(["published", "fixed-date", "offline-only"]), default=None,
+    help="Subscribed-fixture mode (Priority 6). Defaults to config/machine.local.yaml's subscribed_fixture.mode, else 'offline-only'. Never silently falls back between modes.",
+)
+@click.option("--target-date", "date_opt", default=None, help="Pin the subscribed target date (YYYY-MM-DD); defaults to today. Ignored in fixed-date mode (its own known date is used).")
 @click.option("--timezone", "tz_opt", default=None, help="Timezone label recorded in evidence (default Australia/Perth).")
-@click.option("--hub-base", "hub_base", envvar="CALEE_HUB_BASE", default=None, help="Hub base URL for the authenticated regression provisioning endpoint.")
-def prepare_subscribed_fixture_cmd(run_id_opt, date_opt, tz_opt, hub_base):
-    """Generate the today-relative subscribed ICS, provision it through the
-    AUTHENTICATED regression endpoint, and record evidence + scenario variables
-    (Priority 6).
+def prepare_subscribed_fixture_cmd(run_id_opt, release_id_opt, config_path, mode_opt, date_opt, tz_opt):
+    """Generate the today-relative subscribed ICS and run it through exactly
+    ONE explicit mode -- published / fixed-date / offline-only (Priority 5/6)
+    -- recording first-class subscribed-fixture evidence (Priority 7).
 
-    Resolves ONE target date + timezone for the run, generates the subscribed
-    ICS for that date, provisions it (replacing any stale regression feed) via
-    the authenticated, regression-only, production-disabled hub endpoint, writes
-    reports/runs/<run-id>/subscribed-fixture/results.json, and records the
-    generated event titles as scenario variables so the tablet scenario asserts
-    the exact events THIS run provisioned. With no hub backend/token (offline/
-    CI), provisioning is recorded as BLOCKED and never faked -- the subscribed
-    scenario stays draft-unverified.
+    published: publishes the ICS to config/machine.local.yaml's
+    subscribed_fixture.public_url via the configured adapter (webdav/
+    presigned-put/s3-cli/local) and polls until the run-specific event is
+    observable, using bounded polling (never an arbitrary sleep). fixed-date:
+    uses the existing static fixture at its own known date, never Today.
+    offline-only (the default -- always safe, no setup required): generates
+    and validates the ICS locally only, never claims provisioning.
+
+    Writes reports/runs/<run-id>/subscribed-fixture/results.json and
+    reg_sub_today_relative.ics, and records the generated event titles as
+    scenario variables so the tablet scenario asserts the exact events this
+    run produced. Never silently falls back from published to fixed-date.
     """
     import datetime as _dt
 
-    from . import subscribed_provision as sp
+    from . import subscribed_publisher as sp
 
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
@@ -2700,36 +2756,64 @@ def prepare_subscribed_fixture_cmd(run_id_opt, date_opt, tz_opt, hub_base):
             click.echo(f"Invalid --target-date {date_opt!r}; expected YYYY-MM-DD.", err=True)
             raise SystemExit(EXIT_INVALID_CONFIG)
 
-    # Build the authenticated provisioner only when a hub base URL and an
-    # operator token are both available. Absent either, provisioning is
-    # BLOCKED-recorded, never faked and never an unauthenticated reset.
-    provisioner = None
-    if hub_base:
-        token = credentials_mod.default_resolver().get(credentials_mod.API_TOKEN)
-        if token:
-            provisioner = sp.http_provisioner(hub_base, token=token)
+    section = _load_subscribed_fixture_config(Path(config_path) if config_path else None)
+    mode = mode_opt or section.get("mode") or sp.MODE_OFFLINE_ONLY
+    if mode not in sp.VALID_MODES:
+        click.echo(f"subscribed_fixture.mode {mode!r} is not one of {sorted(sp.VALID_MODES)}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
 
-    result = sp.provision_subscribed_fixture(
-        run_id=run_id_opt, target_date=target_date,
-        timezone=tz_opt or sp.DEFAULT_TIMEZONE, provisioner=provisioner,
+    kwargs = dict(
+        run_id=run_id_opt, release_id=release_id_opt, mode=mode,
+        target_date=target_date, timezone=tz_opt or section.get("timezone") or sp.DEFAULT_TIMEZONE,
     )
+    if mode == sp.MODE_PUBLISHED:
+        publisher, publisher_type, public_url = sp.build_publisher_from_config(section)
+        poll_check = None
+        if public_url:
+            # Re-fetches the run's OWN published URL until the (freshly
+            # published) content is retrievable -- the generic, product-API-
+            # free "existing API" this offline CLI layer can poll without a
+            # live tablet/device. The scenario's own tablet-side visibility
+            # check remains a separate, physical, out-of-scope concern here.
+            def poll_check(_url=public_url):
+                import urllib.request
+                with urllib.request.urlopen(_url, timeout=15) as resp:
+                    return resp.read()
+        kwargs.update(
+            publisher=publisher, publisher_type=publisher_type, public_url=public_url,
+            poll_check=poll_check,
+            poll_interval_seconds=float(section.get("poll_interval_seconds", 10)),
+            poll_timeout_seconds=float(section.get("timeout_seconds", 300)),
+        )
+    elif mode == sp.MODE_FIXED_DATE:
+        kwargs.update(fixed_date=section.get("fixed_date"), fixed_date_titles=section.get("fixed_date_titles"))
+
+    result = sp.prepare_subscribed_fixture(**kwargs)
 
     report_path = workspace.component_report_path("subscribed-fixture")
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps({"runId": run_id_opt, **result.to_dict()}, indent=2) + "\n", encoding="utf-8")
+    report_path.write_text(json.dumps({"runId": run_id_opt, "releaseRunId": run_id_opt, **result.to_dict()}, indent=2) + "\n", encoding="utf-8")
     # The generated ICS is provisioning INPUT (recorded next to, not inside, the
     # results json). It carries only regression event titles, never a secret.
     if result.ics:
         (report_path.parent / "reg_sub_today_relative.ics").write_text(result.ics, encoding="utf-8")
 
+    manifest = _load_or_init_manifest(workspace)
+    manifest.record_component(
+        "subscribed-fixture", report_path=str(report_path),
+        exit_code=(EXIT_SUCCESS if result.ok else EXIT_BLOCKED),
+    )
+    manifest.write(workspace.manifest_path)
+
     click.echo(f"Subscribed-fixture evidence: {report_path}")
-    click.echo(f"  status: {result.status}  date: {result.resolved_date}  events: "
-               f"{result.events.get('timed')} / {result.events.get('allDay')}")
+    click.echo(f"  mode: {result.mode}  status: {result.status}  date: {result.resolved_date}")
     for d in result.detail:
         click.echo(f"  - {d}")
-    # This preparation step itself succeeds when it has generated + recorded the
-    # fixture; the subscribed scenario (draft-unverified, mandatory:false) is what
-    # honours a BLOCKED provisioning, so this never blocks the whole run on its own.
+    # This preparation step itself always exits success; the subscribed
+    # scenario (draft-unverified, mandatory:false while draft -- see Priority
+    # 7) is what honours a BLOCKED publication/observation, so a BLOCKED
+    # subscribed-fixture result never blocks the whole run on its own UNLESS
+    # the scenario has been promoted (consolidate then requires status "ok").
     raise SystemExit(EXIT_SUCCESS)
 
 

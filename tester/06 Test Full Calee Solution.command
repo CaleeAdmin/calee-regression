@@ -142,14 +142,21 @@ python -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase pre >
 # bundle so the release has an auditable record of exactly why it stopped.
 if [ "$PREPARE_STATUS" -eq 0 ]; then
     echo ""
-    echo "--- Step 1.5: Provision the today-relative subscribed calendar fixture ---"
-    # Priority 6: resolve ONE date for the run, generate the today-relative
-    # subscribed ICS, provision it through the AUTHENTICATED regression endpoint
-    # (never an unauthenticated reset), record evidence under this run, and make
-    # the generated event titles available to the tablet scenario as
-    # ${REG_SUB_*} variables. Without a hub backend this records BLOCKED and is
-    # never faked; it never blocks the run on its own (the subscribed scenario
-    # is draft-unverified). CALEE_HUB_BASE selects the endpoint when present.
+    echo "--- Step 1.5: Prepare the today-relative subscribed calendar fixture ---"
+    # Priority 5/6/7: resolve ONE date for the run, generate the today-relative
+    # subscribed ICS, and run it through exactly ONE explicit mode -- never a
+    # silent fallback between them (config/machine.local.yaml's
+    # subscribed_fixture.mode; defaults to "offline-only", which never claims
+    # provisioning). "published" mode publishes the ICS to a stable external
+    # URL already subscribed by the regression account (WebDAV/presigned-PUT/
+    # S3-CLI/local adapter -- no calee-hub-core endpoint involved) and polls
+    # until the run-specific event is visible; "fixed-date" uses the existing
+    # static fixture at its own known date. Records first-class subscribed-
+    # fixture evidence under this run and makes the generated event titles
+    # available to the tablet scenario as ${REG_SUB_*} variables. Optional
+    # while the subscribed-calendar scenario stays draft-unverified --
+    # automatically mandatory once it is promoted (see consolidate's
+    # --subscribed-fixture-mandatory/--subscribed-fixture-optional).
     python -m calee_regression prepare-subscribed-fixture --run-id "$CALEE_RUN_ID"
 
     echo ""
