@@ -212,7 +212,7 @@ def _external_bundle(tmp_path):
     return bundle
 
 
-def _machine_yaml(repo, bundle):
+def _machine_yaml(repo, bundle, *, report_dir="."):
     # A release-platforms.yaml narrowed to exactly what this fake machine can
     # provide (android + tablet, no iOS device, no kiosk/technical
     # authorisation) -- without it, release-config's default "every platform
@@ -239,7 +239,7 @@ def _machine_yaml(repo, bundle):
         "release_bundle_dir": str(bundle),
         "backend_url": "https://hub-dev.calee.com.au",
         "release_profile": "staging",
-        "report_dir": ".",
+        "report_dir": report_dir,
         "mobile_platforms": ["android"],
     }))
 
@@ -254,12 +254,18 @@ def _fakebin(tmp_path, *, device_present=True, prepare_exit=0, consolidate_exit=
     real_python = sys.executable
 
     py_shim = f'''#!{real_python}
-import os, sys, json, pathlib
+import os, sys, json, pathlib, zipfile
 REAL = {real_python!r}
 argv = sys.argv[1:]
 order = os.environ.get("FAKE_ORDER_LOG")
 run_id = os.environ.get("CALEE_RUN_ID", "")
-root = pathlib.Path(os.environ.get("FAKE_REPO_ROOT", "."))
+# Priority 3: honour an already-resolved CALEE_REPORT_ROOT (as the real "00"
+# launcher exports after delegating "report-root" to the real interpreter
+# above) so this fake's OWN writes land in the same place as the real,
+# delegated components' evidence -- falling back to FAKE_REPO_ROOT only if
+# report-root was never resolved (matches this fixture's pre-Priority-3
+# behaviour exactly when no custom root is configured).
+root = pathlib.Path(os.environ.get("CALEE_REPORT_ROOT") or os.environ.get("FAKE_REPO_ROOT", "."))
 
 def wc(component, data):
     d = root / "reports" / "runs" / run_id / component
@@ -310,7 +316,41 @@ if len(argv) >= 3 and argv[0] == "-m" and argv[1] == "calee_regression":
         sys.exit(0)
     if cmd == "consolidate":
         (root / "reports" / "runs" / run_id / "consolidate-argv.txt").write_text(" ".join(argv[2:]))
-        sys.exit(int(os.environ.get("FAKE_CONSOLIDATE_EXIT", "0")))
+        exit_code = int(os.environ.get("FAKE_CONSOLIDATE_EXIT", "0"))
+        status_word = {{0: "PASS", 1: "FAIL"}}.get(exit_code, "BLOCKED")
+        # A minimal but real consolidated bundle (JSON/HTML/JUnit + ZIP) and
+        # latest-run pointer -- Priority 3 requires proving these land under
+        # the SAME resolved report root as every component report, which a
+        # bare argv-recording fake could not demonstrate. Real consolidation
+        # CORRECTNESS (exact JSON shape, gating rules, ...) is exercised
+        # elsewhere (Harness B in this file, test_cli_consolidate.py,
+        # test_selector_contract_gate.py); this only proves root placement.
+        consolidated_dir = root / "reports" / "runs" / run_id / "consolidated"
+        consolidated_dir.mkdir(parents=True, exist_ok=True)
+        (consolidated_dir / "consolidated-report.json").write_text(
+            json.dumps({{"runId": run_id, "overallStatus": status_word}})
+        )
+        (consolidated_dir / "consolidated-report.html").write_text(
+            f"<html><body>{{status_word}} ({{run_id}})</body></html>"
+        )
+        (consolidated_dir / "consolidated-report.junit.xml").write_text(
+            '<?xml version="1.0"?><testsuite name="calee-regression"></testsuite>'
+        )
+        zip_path = consolidated_dir / f"Calee-Regression-fake-{{run_id}}-{{status_word}}.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name in ("consolidated-report.json", "consolidated-report.html", "consolidated-report.junit.xml"):
+                zf.write(consolidated_dir / name, arcname=name)
+        latest_link = root / "reports" / "latest-run"
+        if latest_link.is_symlink() or latest_link.exists():
+            try:
+                latest_link.unlink()
+            except OSError:
+                pass
+        try:
+            latest_link.symlink_to(pathlib.Path("runs") / run_id, target_is_directory=True)
+        except OSError:
+            pass
+        sys.exit(exit_code)
     if cmd == "stop-appium":
         sys.exit(0)
     sys.exit(0)
@@ -504,3 +544,79 @@ def test_launcher_invalid_bundle_still_consolidates(tmp_path):
     install = json.loads((_only_run_dir(repo) / "installation" / "results.json").read_text())
     assert install["status"] == "invalid"
     assert proc.returncode == 3
+
+
+def test_custom_report_root_controls_every_artifact_through_the_real_launcher(tmp_path):
+    """Priority 3: a configured machine report_dir must control the ENTIRE
+    run, not just ReportBuilder/EffectiveReleaseConfig in isolation. Drives
+    the real "00" launcher end to end (through the fake orchestration) with
+    report_dir pointed at an external directory, and proves every component
+    report, the run manifest, the consolidated bundle (JSON/HTML/JUnit), the
+    evidence ZIP, and the latest-run pointer all land under it -- while the
+    repo's own default reports/ directory is never touched at all."""
+    repo = _copy_repo(tmp_path)
+    bundle = _external_bundle(tmp_path)
+    custom_root = tmp_path / "custom-calee-reports"
+    _machine_yaml(repo, bundle, report_dir=str(custom_root))
+    fakebin = _fakebin(tmp_path)
+
+    proc = _run_launcher(repo, fakebin, stdin="")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    # The repo's own default reports/ directory must never be used for
+    # anything run-scoped -- not even an empty "runs/" placeholder.
+    default_runs_dir = repo / "reports" / "runs"
+    assert not default_runs_dir.exists(), (
+        f"the repo's default reports/runs was used despite a configured custom "
+        f"report root: {list(default_runs_dir.rglob('*'))}"
+    )
+
+    # Exactly one run workspace, under the CUSTOM root.
+    custom_runs = list((custom_root / "reports" / "runs").glob("release-*"))
+    assert len(custom_runs) == 1, f"expected exactly one run dir under the custom root, got {custom_runs}"
+    run_dir = custom_runs[0]
+
+    # Every component this run produced is under the custom root. (This
+    # harness's fake python3 shim doesn't delegate "release-config" to the
+    # real interpreter -- see _fakebin() -- so it's not a component here;
+    # release-config's own report-root placement is proven directly in
+    # test_full_solution_fail_fast.py, which does delegate it. There's no
+    # fake CaleeMobile-Regression sibling in this harness either, so
+    # scripts/test_caleemobile.sh BLOCKS before mobile-api/mobile-android
+    # ever get a results.json -- unrelated to report-root placement, which
+    # is what this test is about.)
+    for component in (
+        "machine-config", "installation", "environment",
+        "tablet", "sync", "kiosk-admin", "manual-checks", "selector-contract",
+    ):
+        report = run_dir / component / "results.json"
+        assert report.is_file(), f"{component} results.json missing under the custom root: {report}"
+
+    # The run manifest is under the custom root.
+    assert (run_dir / "run-manifest.json").is_file()
+
+    # The consolidated report (JSON/HTML/JUnit) and evidence ZIP are under
+    # the custom root.
+    consolidated_dir = run_dir / "consolidated"
+    assert (consolidated_dir / "consolidated-report.json").is_file()
+    assert (consolidated_dir / "consolidated-report.html").is_file()
+    assert (consolidated_dir / "consolidated-report.junit.xml").is_file()
+    zips = list(consolidated_dir.glob("*.zip"))
+    assert len(zips) == 1, f"expected exactly one evidence ZIP under the custom root, got {zips}"
+
+    # latest-run lives under the custom root and points into this same run.
+    latest_link = custom_root / "reports" / "latest-run"
+    assert latest_link.is_symlink(), "latest-run must be a symlink under the custom root"
+    assert latest_link.resolve() == run_dir.resolve()
+    assert (latest_link / "consolidated" / "consolidated-report.html").is_file()
+
+    # "07 Open Latest Report" resolves and opens the SAME report -- it must
+    # never silently fall back to the repo's own reports/ when a custom root
+    # is configured.
+    open_report = subprocess.run(
+        ["bash", str(repo / "tester" / "07 Open Latest Report.command")],
+        cwd=str(repo),
+        env={**os.environ, "PATH": f"{fakebin}:{os.environ['PATH']}", "CALEE_REPORT_ROOT": str(custom_root)},
+        input="", capture_output=True, text=True, timeout=30,
+    )
+    assert str(custom_root) in open_report.stdout, open_report.stdout + open_report.stderr
