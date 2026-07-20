@@ -3,6 +3,12 @@ name: framework-tests
 on:
   push:
   pull_request:
+  # Priority 8: run the SAME required gates on the merge commit GitHub creates
+  # in a merge queue, so what actually lands is tested -- not just each branch.
+  merge_group:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -88,3 +94,63 @@ jobs:
             source scripts/ensure_environment.sh
             python -c "import click, yaml, appium, selenium, PIL, numpy; print(\"all runtime dependencies import cleanly\")"
           '
+
+      # Priority 8: embed the EXACT commit SHA under test into framework-test
+      # evidence and retain it as an artifact. On a push to main (or the merge
+      # commit in a merge queue) GITHUB_SHA is exactly the content that will
+      # ship, so a green run is provably about that commit -- not a stale one.
+      # Runs on every event (always) so evidence is retained even on failure.
+      - name: Record framework-test evidence (exact commit SHA)
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os
+          event = os.environ.get("GITHUB_EVENT_NAME", "")
+          ref = os.environ.get("GITHUB_REF", "")
+          summary = {
+              "workflow": "framework-tests",
+              "event": event,
+              "ref": ref,
+              "commitSha": os.environ.get("GITHUB_SHA", ""),
+              "runId": os.environ.get("GITHUB_RUN_ID", ""),
+              "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+              "isMainPush": event == "push" and ref == "refs/heads/main",
+              "isMergeGroup": event == "merge_group",
+          }
+          with open("framework-test-summary.json", "w") as f:
+              json.dump(summary, f, indent=2)
+          print(json.dumps(summary, indent=2))
+          step = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step:
+              with open(step, "a") as f:
+                  f.write("### framework-tests evidence\n\n")
+                  f.write(f"- commit `{summary['commitSha']}`\n")
+                  f.write(f"- event `{summary['event']}`\n")
+                  f.write(f"- ref `{summary['ref']}`\n")
+          PY
+
+      - name: Upload framework-test summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: framework-test-summary-${{ github.sha }}
+          path: framework-test-summary.json
+          retention-days: 90
+          if-no-files-found: error
+
+      # Priority 8: merge-commit smoke check. When GitHub creates a merge commit
+      # (merge_group) or a commit lands on main, verify the retained evidence
+      # embeds the exact commit under test -- so a green check can never be
+      # mistaken for evidence about a different commit.
+      - name: Merge-commit / main smoke check (evidence embeds the exact SHA)
+        if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          data = json.load(open("framework-test-summary.json"))
+          expected = os.environ.get("GITHUB_SHA", "")
+          if not expected or data.get("commitSha") != expected:
+              print(f"FAIL: evidence commitSha {data.get('commitSha')!r} != commit under test {expected!r}.")
+              sys.exit(1)
+          print(f"Merge-commit/main smoke check OK: framework-test evidence embeds {data['commitSha']}.")
+          PY

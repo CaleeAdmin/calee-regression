@@ -239,7 +239,7 @@ if len(argv) >= 3 and argv[0] == "-m" and argv[1] == "calee_regression":
     if order:
         with open(order, "a") as f:
             f.write(cmd + "\\n")
-    if cmd in ("machine-config-snapshot", "install-tablet-release"):
+    if cmd in ("machine-config-snapshot", "install-tablet-release", "run-with-credentials"):
         os.execv(REAL, [REAL, "-m", "calee_regression"] + argv[2:])
     if cmd == "release-platforms":
         sys.stdout.write("export RELEASE_PLATFORM_TABLET=true\\n")
@@ -427,3 +427,32 @@ def test_launcher_missing_credentials_becomes_blocked(tmp_path):
     run_dir = _only_run_dir(repo)
     env = json.loads((run_dir / "environment" / "results.json").read_text())
     assert env["status"] == "blocked"
+
+
+def test_launcher_invalid_bundle_still_consolidates(tmp_path):
+    """Priority 7: an invalid bundle stops before the product tests, but the
+    launcher STILL consolidates -- it never exits without producing one report."""
+    repo = _copy_repo(tmp_path)
+    bundle = _external_bundle(tmp_path)
+    # Corrupt the manifest checksum so verify_release_bundle fails -> the real
+    # install-tablet-release returns INVALID (exit 2).
+    manifest = json.loads((bundle / "release-manifest.json").read_text())
+    manifest["calee"]["sha256"] = "0" * 64
+    (bundle / "release-manifest.json").write_text(json.dumps(manifest))
+    _machine_yaml(repo, bundle)
+    fakebin = _fakebin(tmp_path)
+
+    # The fake consolidate reports BLOCKED (exit 3); the launcher must exit with it.
+    proc = _run_launcher(repo, fakebin, stdin="", extra_env={"FAKE_CONSOLIDATE_EXIT": "3"})
+    order = (repo / "order.log").read_text().splitlines()
+
+    # install ran (real) and the launcher STILL consolidated afterwards...
+    assert "install-tablet-release" in order
+    assert "consolidate" in order
+    assert order.index("install-tablet-release") < order.index("consolidate")
+    # ...but NO product test ran after the invalid bundle.
+    assert "suite" not in order and "sync-smoke" not in order and "kiosk-admin" not in order
+    # The installation evidence is recorded INVALID, and the run exits BLOCKED.
+    install = json.loads((_only_run_dir(repo) / "installation" / "results.json").read_text())
+    assert install["status"] == "invalid"
+    assert proc.returncode == 3

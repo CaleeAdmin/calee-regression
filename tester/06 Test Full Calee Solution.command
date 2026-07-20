@@ -41,6 +41,33 @@ echo ""
 # convenient to run right now.
 eval "$(python -m calee_regression release-platforms)"
 
+# Priority 3/4: when a machine config exists, compose the ONE effective release
+# configuration (machine + release candidate) and let it drive this launcher --
+# so the MACHINE's platform scope + device ids reach 06, not just the release
+# candidate's. The composed RELEASE_PLATFORM_* (machine capability ∩ release
+# scope) overrides the release-platforms-only values above, the configured
+# iPhone/Android device ids are exported for the UI suite, and a machine/release
+# conflict BLOCKS (recorded in the run's release-config evidence). Absent a
+# machine config (CI/example), the release-platforms defaults above stand.
+if [ -f config/machine.local.yaml ]; then
+    if RELEASE_CFG_OUT="$(python -m calee_regression release-config --run-id "$CALEE_RUN_ID" 2>/dev/null)"; then
+        RELEASE_CFG_STATUS=0
+    else
+        RELEASE_CFG_STATUS=$?
+    fi
+    # Apply the composed platform scope + device ids regardless (the emitted
+    # values are the safe machine∩release intersection).
+    eval "$RELEASE_CFG_OUT" 2>/dev/null || true
+    [ -n "${RELEASE_IPHONE_DEVICE:-}" ] && export CALEE_IPHONE_DEVICE="$RELEASE_IPHONE_DEVICE"
+    [ -n "${RELEASE_ANDROID_DEVICE:-}" ] && export CALEE_ANDROID_DEVICE="$RELEASE_ANDROID_DEVICE"
+    if [ "$RELEASE_CFG_STATUS" -ne 0 ]; then
+        echo ""
+        echo "BLOCKED: the machine and release-candidate configurations conflict —"
+        echo "see reports/runs/$CALEE_RUN_ID/release-config/results.json. Continuing to"
+        echo "produce ONE consolidated BLOCKED report."
+    fi
+fi
+
 echo ""
 echo "--- Step 1: Prepare Test Environment (incl. Appium) ---"
 python -m calee_regression prepare --config "$CALEE_TEST_CONFIG" --suite tablet-full --run-id "$CALEE_RUN_ID"
@@ -75,6 +102,17 @@ python -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase pre >
 # safe build identity above/below, and still produce ONE consolidated BLOCKED
 # bundle so the release has an auditable record of exactly why it stopped.
 if [ "$PREPARE_STATUS" -eq 0 ]; then
+    echo ""
+    echo "--- Step 1.5: Provision the today-relative subscribed calendar fixture ---"
+    # Priority 6: resolve ONE date for the run, generate the today-relative
+    # subscribed ICS, provision it through the AUTHENTICATED regression endpoint
+    # (never an unauthenticated reset), record evidence under this run, and make
+    # the generated event titles available to the tablet scenario as
+    # ${REG_SUB_*} variables. Without a hub backend this records BLOCKED and is
+    # never faked; it never blocks the run on its own (the subscribed scenario
+    # is draft-unverified). CALEE_HUB_BASE selects the endpoint when present.
+    python -m calee_regression prepare-subscribed-fixture --run-id "$CALEE_RUN_ID"
+
     echo ""
     echo "--- Step 2: Calee Tablet ---"
     python -m calee_regression suite --config "$CALEE_TEST_CONFIG" --suite full-tester --run-id "$CALEE_RUN_ID"
@@ -113,12 +151,18 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     # reports/runs/$CALEE_RUN_ID/mobile-api/results.json. An initial API result
     # therefore stands for the whole release; see scripts/test_caleemobile.sh and
     # Phase 3.
-    bash scripts/test_caleemobile.sh api-only
+    # Priority 5: the Bash mobile orchestration (and run_regression.py /
+    # run_ui_suite.py underneath it) receives CALEE_TEST_EMAIL / CALEE_TEST_
+    # PASSWORD through the single secure credential boundary -- resolved once
+    # from the environment OR the macOS Keychain and placed only in the child
+    # environment, never on a command line. A Keychain-only technical owner does
+    # not have to export the credentials for the mobile suites to run.
+    python3 -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh api-only
 
     if [ "$RELEASE_PLATFORM_ANDROID" = "true" ]; then
         echo ""
         echo "--- Step 4: CaleeMobile Android UI ---"
-        bash scripts/test_caleemobile.sh android --ui-only
+        python3 -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh android --ui-only
     else
         echo ""
         echo "--- Step 4: CaleeMobile Android UI — SKIPPED (not part of this release; see config/release-platforms.yaml) ---"
@@ -127,7 +171,7 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     if [ "$RELEASE_PLATFORM_IOS" = "true" ]; then
         echo ""
         echo "--- Step 5: CaleeMobile iPhone UI ---"
-        bash scripts/test_caleemobile.sh ios --ui-only
+        python3 -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh ios --ui-only
     else
         echo ""
         echo "--- Step 5: CaleeMobile iPhone UI — SKIPPED (not part of this release; see config/release-platforms.yaml) ---"

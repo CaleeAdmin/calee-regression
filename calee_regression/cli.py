@@ -590,7 +590,8 @@ def run(config_path, scenario_arg, run_id_opt):
     scenario_path = _resolve_scenario_path(scenario_arg)
     out_dir, run_id = _tablet_out_dir(run_id_opt)
     rb = reporting.ReportBuilder(cfg, run_name=scenario_path.stem, out_dir=out_dir)
-    result = ScenarioRunner(cfg, report_builder=rb).run_scenarios([scenario_path], suite_name=scenario_path.stem)
+    variables = _load_run_scenario_variables(run_id)
+    result = ScenarioRunner(cfg, report_builder=rb, variables=variables).run_scenarios([scenario_path], suite_name=scenario_path.stem)
     if run_id:
         result.run_id = run_id
     report_dir = rb.write(result)
@@ -610,6 +611,25 @@ def _tablet_out_dir(run_id_opt: "str | None") -> "tuple[Path | None, str | None]
     workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
     workspace.ensure_created()
     return workspace.component_dir("tablet"), run_id
+
+
+def _load_run_scenario_variables(run_id: "str | None") -> "dict | None":
+    """Load run-scoped scenario variables (Priority 6): the today-relative
+    subscribed-event titles that prepare-subscribed-fixture recorded, so a
+    scenario's ${VAR} placeholders resolve to THIS run's provisioned events.
+    None when there is no run or no subscribed-fixture evidence."""
+    if not run_id or not run_context.is_valid_run_id(run_id):
+        return None
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    evidence = workspace.component_report_path("subscribed-fixture")
+    if not evidence.is_file():
+        return None
+    try:
+        data = json.loads(evidence.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    variables = data.get("variables")
+    return variables if isinstance(variables, dict) and variables else None
 
 
 def _record_tablet_component(run_id: "str | None", report_dir: Path, result) -> None:
@@ -655,7 +675,8 @@ def suite(config_path, suite_name, confirm_technical, run_id_opt):
 
     out_dir, run_id = _tablet_out_dir(run_id_opt)
     rb = reporting.ReportBuilder(cfg, run_name=suite_name, out_dir=out_dir)
-    result = ScenarioRunner(cfg, report_builder=rb).run_scenarios(scenario_paths, suite_name=suite_name)
+    variables = _load_run_scenario_variables(run_id)
+    result = ScenarioRunner(cfg, report_builder=rb, variables=variables).run_scenarios(scenario_paths, suite_name=suite_name)
     if run_id:
         result.run_id = run_id
     report_dir = rb.write(result)
@@ -2521,6 +2542,7 @@ def machine_config_snapshot_cmd(config_path, legacy_config_path, run_id_opt):
     _emit("RELEASE_PROFILE", effective.release_profile)
     _emit("REPORT_DIR", effective.report_dir)
     _emit("IPHONE_DEVICE", effective.iphone_device or "")
+    _emit("ANDROID_DEVICE", effective.android_device or "")
     _emit("CALEE_PACKAGE_ID", effective.calee_package_id)
     _emit("CALEESHELL_PACKAGE_ID", effective.caleeshell_package_id)
     _emit("HOME_ACTIVITY", effective.home_activity)
@@ -2528,6 +2550,236 @@ def machine_config_snapshot_cmd(config_path, legacy_config_path, run_id_opt):
     _emit("PLATFORM_ANDROID", "true" if "android" in effective.mobile_platforms else "false")
     _emit("PLATFORM_IOS", "true" if "ios" in effective.mobile_platforms else "false")
     _emit("ALLOW_CALEESHELL_TECHNICAL", "true" if effective.allow_caleeshell_technical else "false")
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@main.command("prepare-subscribed-fixture")
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True, help="Shared release run ID (run_context.py).")
+@click.option("--target-date", "date_opt", default=None, help="Pin the subscribed target date (YYYY-MM-DD); defaults to today.")
+@click.option("--timezone", "tz_opt", default=None, help="Timezone label recorded in evidence (default Australia/Perth).")
+@click.option("--hub-base", "hub_base", envvar="CALEE_HUB_BASE", default=None, help="Hub base URL for the authenticated regression provisioning endpoint.")
+def prepare_subscribed_fixture_cmd(run_id_opt, date_opt, tz_opt, hub_base):
+    """Generate the today-relative subscribed ICS, provision it through the
+    AUTHENTICATED regression endpoint, and record evidence + scenario variables
+    (Priority 6).
+
+    Resolves ONE target date + timezone for the run, generates the subscribed
+    ICS for that date, provisions it (replacing any stale regression feed) via
+    the authenticated, regression-only, production-disabled hub endpoint, writes
+    reports/runs/<run-id>/subscribed-fixture/results.json, and records the
+    generated event titles as scenario variables so the tablet scenario asserts
+    the exact events THIS run provisioned. With no hub backend/token (offline/
+    CI), provisioning is recorded as BLOCKED and never faked -- the subscribed
+    scenario stays draft-unverified.
+    """
+    import datetime as _dt
+
+    from . import subscribed_provision as sp
+
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+    workspace.ensure_created()
+
+    target_date = None
+    if date_opt:
+        try:
+            target_date = _dt.date.fromisoformat(date_opt)
+        except ValueError:
+            click.echo(f"Invalid --target-date {date_opt!r}; expected YYYY-MM-DD.", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+
+    # Build the authenticated provisioner only when a hub base URL and an
+    # operator token are both available. Absent either, provisioning is
+    # BLOCKED-recorded, never faked and never an unauthenticated reset.
+    provisioner = None
+    if hub_base:
+        token = credentials_mod.default_resolver().get(credentials_mod.API_TOKEN)
+        if token:
+            provisioner = sp.http_provisioner(hub_base, token=token)
+
+    result = sp.provision_subscribed_fixture(
+        run_id=run_id_opt, target_date=target_date,
+        timezone=tz_opt or sp.DEFAULT_TIMEZONE, provisioner=provisioner,
+    )
+
+    report_path = workspace.component_report_path("subscribed-fixture")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps({"runId": run_id_opt, **result.to_dict()}, indent=2) + "\n", encoding="utf-8")
+    # The generated ICS is provisioning INPUT (recorded next to, not inside, the
+    # results json). It carries only regression event titles, never a secret.
+    if result.ics:
+        (report_path.parent / "reg_sub_today_relative.ics").write_text(result.ics, encoding="utf-8")
+
+    click.echo(f"Subscribed-fixture evidence: {report_path}")
+    click.echo(f"  status: {result.status}  date: {result.resolved_date}  events: "
+               f"{result.events.get('timed')} / {result.events.get('allDay')}")
+    for d in result.detail:
+        click.echo(f"  - {d}")
+    # This preparation step itself succeeds when it has generated + recorded the
+    # fixture; the subscribed scenario (draft-unverified, mandatory:false) is what
+    # honours a BLOCKED provisioning, so this never blocks the whole run on its own.
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@main.command("run-with-credentials", context_settings={"ignore_unknown_options": True})
+@click.argument("command", nargs=-1, type=click.UNPROCESSED)
+def run_with_credentials_cmd(command):
+    """Resolve regression credentials ONCE and exec a delegated command with the
+    credentials present ONLY in that command's child environment (Priority 5).
+
+        python -m calee_regression run-with-credentials -- <command...>
+
+    The credentials are resolved through the standard chain (injected -> env ->
+    macOS Keychain), so a technical owner who stores them in the Keychain never
+    has to export CALEE_TEST_EMAIL / CALEE_TEST_PASSWORD -- this single secure
+    boundary is how the Bash mobile orchestration (and everything it spawns:
+    Prepare, the CaleeMobile Client API, the mobile UI, the sync receivers)
+    obtains them. The credentials NEVER appear in argv, in any report, in this
+    process's logs, or in a persistent plaintext file; only the specific
+    CALEE_TEST_EMAIL / CALEE_TEST_PASSWORD (and, when present, CALEE_API_TOKEN)
+    are added to the child environment, which is otherwise inherited unchanged.
+    """
+    argv = list(command)
+    while argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        click.echo("run-with-credentials needs a command: run-with-credentials -- <command...>", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    resolver = credentials_mod.default_resolver()
+    try:
+        resolved = resolver.resolve_all([
+            credentials_mod.REGRESSION_USERNAME,
+            credentials_mod.REGRESSION_PASSWORD,
+            credentials_mod.API_TOKEN,
+        ])
+    except credentials_mod.CredentialError as exc:
+        # CredentialError names the env var / keychain item, never a value.
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    mapping = {
+        credentials_mod.REGRESSION_USERNAME.name: credentials_mod.REGRESSION_USERNAME.env_var,
+        credentials_mod.REGRESSION_PASSWORD.name: credentials_mod.REGRESSION_PASSWORD.env_var,
+        credentials_mod.API_TOKEN.name: credentials_mod.API_TOKEN.env_var,
+    }
+    child_env = credentials_mod.build_env(os.environ, resolved, mapping)
+
+    # Replace THIS process with the delegated command: the credentials then live
+    # only in the delegated process tree's environment, never touching a report
+    # or a persistent file. A failed exec (command not found) BLOCKS.
+    try:
+        os.execvpe(argv[0], argv, child_env)
+    except OSError as exc:
+        click.echo(f"run-with-credentials could not exec {argv[0]!r}: {exc}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+
+@main.command("release-config")
+@click.option("--config", "config_path", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
+@click.option("--release-platforms", "platforms_path", envvar="CALEE_RELEASE_PLATFORMS", default=None, type=click.Path(), help="Path to release-platforms.yaml (the release candidate manifest).")
+@click.option("--release-id", "release_id_opt", envvar="CALEE_RELEASE_ID", default=None, help="Release candidate id (from the bundle manifest).")
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True, help="Shared release run ID (run_context.py).")
+def release_config_cmd(config_path, platforms_path, release_id_opt, run_id_opt):
+    """Compose the ONE effective RELEASE configuration for this run (Priority 3).
+
+    Combines the MACHINE config (how/where a run executes) with the RELEASE
+    CANDIDATE manifest (config/release-platforms.yaml -- what the release is)
+    under one precedence rule: the release candidate is authoritative for scope
+    (platforms, features, profile, expected identities, backend), and the
+    machine must be consistent with and capable of it. Any disagreement or
+    missing capability is a CONFLICT that BLOCKS. Writes the composed config +
+    every conflict decision to reports/runs/<run-id>/release-config/results.json
+    and emits eval-able RELEASE_* assignments (enabled platforms, device ids,
+    selected backend, profile) so the composition actually drives execution.
+    """
+    import shlex as _shlex
+
+    import yaml as _yaml
+
+    from . import machine_config as machine_mod
+    from . import release_config as rc_mod
+    from . import release_platforms as rp_mod
+
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+    workspace.ensure_created()
+
+    def _record(payload: dict, exit_code: int) -> None:
+        payload = {"runId": run_id_opt, **payload}
+        path = workspace.component_report_path("release-config")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        manifest = _load_or_init_manifest(workspace)
+        manifest.record_component("release-config", report_path=str(path), exit_code=exit_code)
+        manifest.write(workspace.manifest_path)
+
+    machine_path = Path(config_path) if config_path else (REPO_ROOT / "config" / "machine.local.yaml")
+    try:
+        machine = machine_mod.load_machine_config(machine_path)
+    except machine_mod.MachineConfigError as exc:
+        _record({"status": STATUS_BLOCKED, "detail": [str(exc)]}, EXIT_BLOCKED)
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    try:
+        platforms = rp_mod.load_release_platforms(platforms_path)
+        features = rp_mod.load_release_features(platforms_path)
+        expected = rp_mod.load_expected_build_identity(platforms_path)
+    except rp_mod.ReleasePlatformsError as exc:
+        _record({"status": STATUS_BLOCKED, "detail": [f"release-platforms.yaml problem: {exc}"]}, EXIT_BLOCKED)
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    # Optional release-candidate extras (backend/environment pin + distributed
+    # build acceptance) read from the same release-platforms.yaml top level.
+    expected_backend = None
+    distributed_build_required = False
+    resolved_platforms_path = Path(platforms_path) if platforms_path else rp_mod.DEFAULT_CONFIG_PATH
+    if resolved_platforms_path.is_file():
+        try:
+            raw = _yaml.safe_load(resolved_platforms_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                expected_backend = (raw.get("backend") or raw.get("expected_backend") or None)
+                distributed_build_required = bool(raw.get("distributed_build_required", False))
+                release_id_opt = release_id_opt or raw.get("release_id")
+        except _yaml.YAMLError:
+            pass
+
+    effective = rc_mod.compose_effective_release_config(
+        machine, platforms, features, expected,
+        run_id=run_id_opt, release_id=release_id_opt,
+        expected_backend=expected_backend, distributed_build_required=distributed_build_required,
+    )
+    exit_code = EXIT_SUCCESS if effective.ok else EXIT_BLOCKED
+    _record(effective.to_dict(), exit_code)
+
+    def _emit(name, value):
+        click.echo(f"RELEASE_{name}={_shlex.quote(str('' if value is None else value))}")
+
+    _emit("EFFECTIVE_CONFIG", str(workspace.component_report_path("release-config")))
+    _emit("PROFILE", effective.profile)
+    _emit("SELECTED_BACKEND", effective.selected_backend or "")
+    _emit("PLATFORM_TABLET", "true" if "tablet" in effective.enabled_platforms else "false")
+    _emit("PLATFORM_ANDROID", "true" if "android" in effective.enabled_platforms else "false")
+    _emit("PLATFORM_IOS", "true" if "ios" in effective.enabled_platforms else "false")
+    _emit("ENABLED_FEATURES", ",".join(effective.enabled_features))
+    _emit("TABLET_SERIAL", effective.tablet_serial or "")
+    _emit("IPHONE_DEVICE", effective.iphone_device or "")
+    _emit("ANDROID_DEVICE", effective.android_device or "")
+    _emit("REPORT_ROOT", effective.report_root or "")
+
+    if not effective.ok:
+        click.echo(click.style("[BLOCKED] Machine/release configuration conflict:", fg="red"), err=True)
+        for c in effective.conflicts:
+            if c.blocking:
+                click.echo(f"  - {c.explanation}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+    click.echo(click.style(f"[OK] Effective release configuration composed for {run_id_opt}.", fg="green"), err=True)
     raise SystemExit(EXIT_SUCCESS)
 
 
@@ -2682,13 +2934,18 @@ def _record_installation_component(
 @click.option("--plan-only", is_flag=True, default=False, help="Print/write the ordered install plan without executing it.")
 @click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON result.")
 @click.option(
+    "--retain-diagnostics", is_flag=True, default=False,
+    help="Keep the temporary pulled-APK workspace used to read the installed signer, for diagnosis. "
+         "By default it is deleted after inspection.",
+)
+@click.option(
     "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None,
     help="Shared release run ID (run_context.py). When given, the full installation evidence "
          "(bundle verification + APK content/signer inspection + tablet inspection + plan + "
          "execution) is written into reports/runs/<run-id>/installation/results.json as this run's "
          "mandatory installation component.",
 )
-def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade, plan_only, report_path, run_id_opt):
+def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade, plan_only, report_path, retain_diagnostics, run_id_opt):
     """Verify a release bundle, INSPECT each APK's actual contents + signer, and
     then install it in the correct, data-preserving order (Calee first,
     CaleeShell second, reassert HOME, reboot, verify identities/HOME/launch).
@@ -2721,13 +2978,29 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
             click.echo(f"  - {err}", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
 
-    if serial is None and config_path:
+    # Priority 4: the effective (machine-authoritative) config controls the
+    # install plan -- the HOME activity and the Calee launch/START action come
+    # from config, not hardcoded defaults, so they actually reach the installer
+    # command arrays and the post-reboot verification.
+    home_component = None
+    calee_launch_action = None
+    if config_path:
         try:
-            serial = config_mod.load_config(config_path).udid
+            _cfg = config_mod.load_config(config_path)
+            if serial is None:
+                serial = _cfg.udid
+            if _cfg.shell_package and _cfg.shell_activity:
+                home_component = f"{_cfg.shell_package}/{_cfg.shell_activity}"
+            calee_launch_action = _cfg.start_action or None
         except config_mod.ConfigError:
-            serial = None
+            pass
 
-    plan = release_installer.build_install_plan(verification, serial=serial, allow_downgrade=allow_downgrade)
+    plan_kwargs = {"serial": serial, "allow_downgrade": allow_downgrade}
+    if home_component:
+        plan_kwargs["home_component"] = home_component
+    if calee_launch_action:
+        plan_kwargs["calee_launch_action"] = calee_launch_action
+    plan = release_installer.build_install_plan(verification, **plan_kwargs)
 
     if plan_only:
         payload = {"status": "plan-only", "detail": ["Plan constructed, not executed."],
@@ -2739,7 +3012,11 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
         raise SystemExit(EXIT_SUCCESS)
 
     # Priority 5: inspect ACTUAL APK contents + signer before any install.
-    signer_reader = apk_inspect.device_installed_signer_reader(serial=serial)
+    # A signer that cannot be authoritatively read (SIGNER_UNKNOWN) BLOCKS here,
+    # before execute_install_plan is ever reached -- no install command runs.
+    signer_reader = apk_inspect.device_installed_signer_reader(
+        serial=serial, retain_diagnostics=retain_diagnostics
+    )
     inspection = apk_inspect.preinstall_inspect_bundle(verification, installed_signer_reader=signer_reader)
     if inspection.status != apk_inspect.STATUS_OK:
         exit_code = EXIT_INVALID_CONFIG if inspection.status == apk_inspect.STATUS_INVALID else EXIT_BLOCKED
@@ -2757,13 +3034,39 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     # Read-only tablet pre-install inspection (installed identities + HOME).
     tablet_inspection = release_installer.inspect_tablet(release_installer.real_adb_runner, serial=serial)
 
-    execution = release_installer.execute_install_plan(plan, verification, release_installer.real_adb_runner)
+    execute_kwargs = {}
+    if calee_launch_action:
+        execute_kwargs["calee_launch_action"] = calee_launch_action
+    execution = release_installer.execute_install_plan(plan, verification, release_installer.real_adb_runner, **execute_kwargs)
     status = "ok" if execution.status == release_installer.STATUS_OK else "blocked"
     detail = [] if status == "ok" else [execution.detail or "Installation did not complete."]
     if tablet_inspection.status != release_installer.STATUS_OK and status == "ok":
         # The install steps succeeded but the pre-install device read did not --
         # record it, but the execution's own verify steps are authoritative.
         detail.append(f"Tablet pre-install inspection: {tablet_inspection.detail}")
+
+    # Priority 2: after a successful install+reboot, verify the COMPLETE tablet
+    # solution -- BOTH Calee and CaleeShell (present/version/signer, plus Calee's
+    # START action and CaleeShell as HOME) -- even when this release replaced
+    # only one of them. A gap in the unchanged app BLOCKS the release.
+    solution = None
+    if status == "ok":
+        solution_kwargs = {}
+        if calee_launch_action:
+            solution_kwargs["calee_launch_action"] = calee_launch_action
+        solution = release_installer.verify_tablet_solution(
+            verification.expected_app("calee"),
+            verification.expected_app("caleeShell"),
+            release_installer.real_adb_runner,
+            serial=serial,
+            release_id=plan.release_id,
+            installed_signer_reader=signer_reader,
+            **solution_kwargs,
+        )
+        if solution.status != release_installer.STATUS_OK:
+            status = "blocked"
+            detail.append(f"Complete-solution verification: {solution.detail}")
+
     payload = {
         "status": status,
         "detail": detail,
@@ -2772,15 +3075,16 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
         "tabletInspection": tablet_inspection.to_dict(),
         "plan": plan.to_dict(),
         "execution": execution.to_dict(),
+        "solutionVerification": solution.to_dict() if solution is not None else None,
         "releaseId": plan.release_id,
     }
     _write_installer_report(Path(report_path) if report_path else None, payload)
     exit_code = EXIT_SUCCESS if status == "ok" else EXIT_BLOCKED
     _record_installation_component(run_id_opt, payload, exit_code)
     if status == "ok":
-        click.echo(click.style(f"[OK] Installed release {plan.release_id}.", fg="green"))
+        click.echo(click.style(f"[OK] Installed and verified the complete solution for release {plan.release_id}.", fg="green"))
         raise SystemExit(EXIT_SUCCESS)
-    click.echo(click.style(f"[BLOCKED] {execution.detail}", fg="yellow"), err=True)
+    click.echo(click.style(f"[BLOCKED] {'; '.join(detail) or execution.detail}", fg="yellow"), err=True)
     raise SystemExit(EXIT_BLOCKED)
 
 

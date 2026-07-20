@@ -84,6 +84,7 @@ class EffectiveConfig:
     release_profile: "str | None" = None
     mobile_platforms: "list[str]" = field(default_factory=list)
     iphone_device: "str | None" = None
+    android_device: "str | None" = None
     calee_package_id: "str | None" = None
     caleeshell_package_id: "str | None" = None
     home_activity: "str | None" = None
@@ -162,6 +163,7 @@ def reconcile(machine: MachineConfig, legacy_raw: "dict | None") -> EffectiveCon
         release_profile=machine.release_profile,
         mobile_platforms=list(machine.mobile_platforms),
         iphone_device=machine.iphone_device,
+        android_device=machine.android_device,
         calee_package_id=machine.calee_package_id,
         caleeshell_package_id=machine.caleeshell_package_id,
         home_activity=machine.home_activity,
@@ -196,6 +198,7 @@ def snapshot(effective: EffectiveConfig, *, machine_config_path: "str | None" = 
             "expectedTabletState": effective.tester_config.get("expected_state"),
             "mobilePlatforms": list(effective.mobile_platforms),
             "iphoneDevice": effective.iphone_device,
+            "androidDevice": effective.android_device,
             "caleePackageId": effective.calee_package_id,
             "caleeShellPackageId": effective.caleeshell_package_id,
             "homeActivity": effective.home_activity,

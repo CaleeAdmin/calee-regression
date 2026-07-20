@@ -27,6 +27,31 @@ customer calendar or an unauthenticated production reset endpoint. The private
 subscription URL is **not** recorded here or in any report — only the fixture
 calendar id is.
 
+**Client workflow (Priority 6).** `prepare-subscribed-fixture` (run by the
+`06` launcher, and standalone) resolves ONE date + timezone for the run,
+generates the today-relative ICS (`subscribed_fixture.generate_today_relative_ics`),
+records `reports/runs/<run-id>/subscribed-fixture/results.json` and the generated
+event titles as scenario variables (`REG_SUB_TIMED_TITLE` / `REG_SUB_ALLDAY_TITLE`
+/ `REG_SUB_DATE`) — which the tablet scenario substitutes into its `${…}`
+placeholders so it asserts the exact events THIS run provisioned on both Today
+and Calendar — and provisions the ICS through the authenticated provisioner seam
+(`subscribed_provision.http_provisioner`). With no hub backend (offline/CI, and
+until the backend endpoint below ships) provisioning records BLOCKED and is
+**never faked** — the subscribed scenario stays draft-unverified.
+
+**REQUIRED backend contract (a separate calee-hub-core change, not yet
+implemented).** The client calls `POST /v1/admin/regression/subscribed-source`.
+The backend endpoint MUST be: admin-authenticated (never a customer bearer
+token); scoped to the dedicated regression account / `regression:regsub` only
+(it must refuse any other account or calendar, so no customer calendar is ever
+touched); production-disabled by default (invisible/404 unless a non-production
+`APP_ENV`); audited; and a deterministic replace of any stale feed. It must NOT
+be an unauthenticated reset. Note for the implementer: the regression source
+must not be picked up by the normal `sources_due_for_refresh` sync worker (its
+feed is supplied directly, not network-fetched) — e.g. mark it orphaned/disabled
+or set a far-future `refresh_after` so the worker never tries (and fails) to
+fetch it.
+
 Exercise **both** ingestion paths:
 
 1. **subscription cache expansion** (the normal path — hub expands the feed into

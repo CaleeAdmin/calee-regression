@@ -91,7 +91,20 @@ class ReleaseInstallerError(Exception):
 
 @dataclass
 class AppRelease:
-    """One app's declared identity inside a release manifest."""
+    """One app's identity inside a release manifest.
+
+    Two orthogonal facts are recorded, and MUST NOT be conflated (Priority 2):
+
+      * ``install_artifact`` -- whether THIS release ships an APK to install for
+        this app. A release may replace Calee only, CaleeShell only, or both.
+      * ``has_expected`` + the identity fields -- the EXPECTED INSTALLED identity
+        that must be present on the tablet after the release, *whether or not*
+        this release installed the app. An unchanged app is not "ignored": it
+        still carries an expected identity that the post-reboot complete-solution
+        check verifies.
+
+    ``included`` is kept as a backward-compatible alias of ``install_artifact``
+    (older manifests and callers use ``included``)."""
 
     key: str  # "calee" | "caleeShell"
     included: bool
@@ -101,6 +114,18 @@ class AppRelease:
     git_sha: "str | None" = None
     apk: "str | None" = None
     sha256: "str | None" = None
+    # The trusted signing-certificate SHA-256 the installed app must carry. Part
+    # of the expected installed identity; used by the post-reboot signer-trust
+    # check. Optional (an older manifest may omit it -> signer trust recorded as
+    # not compared).
+    signer_sha256: "str | None" = None
+    # Whether this app ships an APK to install in this release (installArtifact).
+    install_artifact: bool = True
+    # Whether an EXPECTED INSTALLED identity is declared for this app (so the
+    # complete-solution check verifies it). True for any installed app and for
+    # an unchanged app that declares expectedInstalled; False only for a legacy
+    # ``included: false`` section that declares no identity at all.
+    has_expected: bool = True
     # The ABSOLUTE path of this app's APK inside the verified bundle root,
     # resolved once during verify_release_bundle and proven to stay inside that
     # root. Install commands use THIS, never the manifest-declared ``apk``
@@ -113,10 +138,13 @@ class AppRelease:
         return {
             "key": self.key,
             "included": self.included,
+            "installArtifact": self.install_artifact,
+            "hasExpected": self.has_expected,
             "packageId": self.package_id,
             "versionName": self.version_name,
             "versionCode": self.version_code,
             "gitSha": self.git_sha,
+            "signerSha256": self.signer_sha256,
             "apk": self.apk,
             "apkPath": self.apk_path,
             "sha256": self.sha256,
@@ -130,7 +158,14 @@ class ReleaseManifest:
     caleeshell: "AppRelease | None" = None
 
     def included_apps(self) -> "list[AppRelease]":
-        return [a for a in (self.calee, self.caleeshell) if a is not None and a.included]
+        """Apps whose APK this release installs (installArtifact/included)."""
+        return [a for a in (self.calee, self.caleeshell) if a is not None and a.install_artifact]
+
+    def expected_apps(self) -> "list[AppRelease]":
+        """Apps that carry an EXPECTED INSTALLED identity -- installed this
+        release OR unchanged-but-declared. These are what the complete-solution
+        check verifies after reboot. An unchanged app is never dropped here."""
+        return [a for a in (self.calee, self.caleeshell) if a is not None and a.has_expected]
 
     def to_dict(self) -> dict:
         return {
@@ -145,60 +180,121 @@ _EXPECTED_PACKAGE = {"calee": CALEE_PACKAGE_ID, "caleeShell": CALEESHELL_PACKAGE
 
 def _parse_app(key: str, raw: Any, errors: "list[str]") -> "AppRelease | None":
     """Parse and validate one app section. ``key`` is the manifest key
-    (``calee``/``caleeShell``). Returns an AppRelease (possibly with
-    ``included=False``) or None if the section is missing entirely.
+    (``calee``/``caleeShell``). Returns an AppRelease or None if the section is
+    missing entirely.
 
-    An *absent* section is legal (that app is simply not part of this
-    release) -- the "at least one app must be included" rule is enforced by
-    ``parse_manifest`` after both sections are parsed, so a Calee-only, a
-    CaleeShell-only, and a both-apps bundle are all expressible, while a
-    bundle that would install nothing is rejected."""
+    Two manifest shapes are accepted (Priority 2):
+
+      * Legacy flat: ``{"included": true, "packageId": ..., "versionName": ...,
+        "versionCode": ..., "gitSha": ..., "apk": ..., "sha256": ...}``. A legacy
+        ``{"included": false}`` section (no identity) means that app is simply
+        absent from this release -- back-compatible.
+      * Complete-solution: ``{"installArtifact": true|false, "apk"?: ...,
+        "sha256"?: ..., "expectedInstalled": {"packageId", "versionName",
+        "versionCode", "gitSha", "signerSha256"}}``. Here ``installArtifact``
+        controls whether an APK is installed, while ``expectedInstalled`` is the
+        identity the tablet must carry afterwards -- REQUIRED even when
+        ``installArtifact`` is false (an unchanged app still has an expected
+        identity that the post-reboot check verifies).
+
+    The "at least one app must be installed" rule is enforced by
+    ``parse_manifest`` after both sections are parsed."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
         errors.append(f"manifest.{key} must be an object.")
         return None
 
-    included = bool(raw.get("included", True))
+    # installArtifact supersedes the legacy 'included'; default install.
+    if "installArtifact" in raw:
+        install_artifact = bool(raw.get("installArtifact"))
+    else:
+        install_artifact = bool(raw.get("included", True))
+
+    # Expected installed identity: an explicit expectedInstalled block wins;
+    # otherwise the flat fields carry it (legacy). ``signerSha256`` may live in
+    # either the expectedInstalled block or (legacy) at the top of the section.
+    exp = raw.get("expectedInstalled")
+    if isinstance(exp, dict):
+        package_id = exp.get("packageId")
+        version_name = exp.get("versionName")
+        version_code = exp.get("versionCode")
+        git_sha = exp.get("gitSha")
+        signer_sha256 = exp.get("signerSha256")
+        has_expected = True
+    else:
+        if exp is not None:
+            errors.append(f"manifest.{key}.expectedInstalled must be an object.")
+        package_id = raw.get("packageId")
+        version_name = raw.get("versionName")
+        version_code = raw.get("versionCode")
+        git_sha = raw.get("gitSha")
+        signer_sha256 = raw.get("signerSha256")
+        # Legacy: an installed app declares identity inline; an app that neither
+        # installs nor declares any identity is truly absent (back-compat).
+        has_expected = install_artifact or any(
+            v is not None for v in (package_id, version_name, version_code, git_sha)
+        )
+
     app = AppRelease(
         key=key,
-        included=included,
-        package_id=raw.get("packageId"),
-        version_name=raw.get("versionName"),
-        version_code=raw.get("versionCode"),
-        git_sha=raw.get("gitSha"),
+        included=install_artifact,
+        install_artifact=install_artifact,
+        package_id=package_id,
+        version_name=version_name,
+        version_code=version_code,
+        git_sha=git_sha,
+        signer_sha256=signer_sha256,
         apk=raw.get("apk"),
         sha256=raw.get("sha256"),
+        has_expected=has_expected,
     )
-    if not included:
-        # A not-included app carries no install-relevant fields; nothing else
-        # to validate (its identity is recorded as omitted).
+
+    if not has_expected:
+        # A not-installed, not-declared app carries no fields; nothing to
+        # validate (its identity is recorded as omitted).
         return app
 
+    # Validate the EXPECTED INSTALLED identity (whether or not we install it --
+    # an unchanged app must still declare a well-formed identity to verify).
     expected_pkg = _EXPECTED_PACKAGE[key]
     if app.package_id != expected_pkg:
         errors.append(
-            f"manifest.{key}.packageId must be {expected_pkg!r} (got {app.package_id!r})."
+            f"manifest.{key} expected packageId must be {expected_pkg!r} (got {app.package_id!r})."
         )
     if not is_wellformed_version(app.version_name):
         errors.append(
-            f"manifest.{key}.versionName {app.version_name!r} is not a recognisable version "
+            f"manifest.{key} expected versionName {app.version_name!r} is not a recognisable version "
             f"(e.g. 'founder-v0.3.25')."
         )
     if not isinstance(app.version_code, int) or isinstance(app.version_code, bool) or app.version_code <= 0:
-        errors.append(f"manifest.{key}.versionCode must be a positive integer (got {app.version_code!r}).")
+        errors.append(f"manifest.{key} expected versionCode must be a positive integer (got {app.version_code!r}).")
     if not is_full_git_sha(app.git_sha):
         errors.append(
-            f"manifest.{key}.gitSha must be a full 40-character Git SHA (got {app.git_sha!r}); an "
+            f"manifest.{key} expected gitSha must be a full 40-character Git SHA (got {app.git_sha!r}); an "
             f"abbreviated SHA is ambiguous and is rejected."
         )
-    if not isinstance(app.apk, str) or not _APK_NAME_RE.match(app.apk or ""):
+    if signer_sha256 is not None and not _SHA256_RE.match(str(signer_sha256)):
         errors.append(
-            f"manifest.{key}.apk must be a plain '*.apk' filename inside the bundle root "
-            f"(got {app.apk!r}); paths/traversal are rejected."
+            f"manifest.{key} expected signerSha256 {signer_sha256!r} must be a 64-character hex SHA-256."
         )
-    if not isinstance(app.sha256, str) or not _SHA256_RE.match(app.sha256 or ""):
-        errors.append(f"manifest.{key}.sha256 must be a 64-character hex SHA-256 (got {app.sha256!r}).")
+
+    # Install-artifact-only fields: an app we actually install must ship a valid
+    # APK + checksum. An unchanged (installArtifact:false) app must NOT.
+    if install_artifact:
+        if not isinstance(app.apk, str) or not _APK_NAME_RE.match(app.apk or ""):
+            errors.append(
+                f"manifest.{key}.apk must be a plain '*.apk' filename inside the bundle root "
+                f"(got {app.apk!r}); paths/traversal are rejected."
+            )
+        if not isinstance(app.sha256, str) or not _SHA256_RE.match(app.sha256 or ""):
+            errors.append(f"manifest.{key}.sha256 must be a 64-character hex SHA-256 (got {app.sha256!r}).")
+    else:
+        if app.apk is not None or app.sha256 is not None:
+            errors.append(
+                f"manifest.{key} is not installed this release (installArtifact:false) but declares an "
+                f"apk/sha256 -- an unchanged app must not carry an install artifact."
+            )
     return app
 
 
@@ -219,8 +315,8 @@ def parse_manifest(raw: Any) -> "tuple[ReleaseManifest, list[str]]":
     manifest = ReleaseManifest(release_id=release_id, calee=calee, caleeshell=caleeshell)
     if not manifest.included_apps():
         errors.append(
-            "A release bundle must include at least one app (calee and/or caleeShell) with "
-            "included: true -- a bundle that would install nothing is rejected."
+            "A release bundle must install at least one app (calee and/or caleeShell) with "
+            "installArtifact/included: true -- a bundle that would install nothing is rejected."
         )
 
     return manifest, errors
@@ -253,6 +349,19 @@ class BundleVerification:
             if a.key == key:
                 return a
         return None
+
+    def expected_app(self, key: str) -> "AppRelease | None":
+        """The EXPECTED INSTALLED identity for an app (Calee/CaleeShell),
+        whether or not this release installed it. Backs the complete-solution
+        check, which verifies both apps after every update."""
+        if self.manifest:
+            for a in self.manifest.expected_apps():
+                if a.key == key:
+                    return a
+        return None
+
+    def expected_apps(self) -> "list[AppRelease]":
+        return self.manifest.expected_apps() if self.manifest else []
 
     def to_dict(self) -> dict:
         return {
@@ -959,6 +1068,174 @@ def inspect_tablet(runner: AdbRunner, *, serial: "str | None" = None) -> TabletI
     home = runner(_adb_base(serial) + ["shell", "cmd", "package", "resolve-activity", "-c", "android.intent.category.HOME"])
     inspection.home_package = parse_resolved_package(home.stdout)
     return inspection
+
+
+# ── complete tablet-solution verification (Priority 2) ─────────────────────
+#
+# After ANY release -- Calee-only, CaleeShell-only, or both -- the WHOLE
+# installed solution must be verified after reboot, not just the app(s) this
+# release replaced. An unchanged app is not "ignored": it still has an expected
+# installed identity that must hold. For each of Calee and CaleeShell we verify:
+#   * the package is installed,
+#   * the installed versionName/versionCode match the expected identity,
+#   * the installed signer matches the expected trusted signer,
+# plus role checks: Calee's custom START action resolves to Calee, and
+# CaleeShell is the HOME launcher. Any failed check on EITHER app BLOCKS.
+
+CHECK_OK = STATUS_OK
+CHECK_BLOCKED = STATUS_BLOCKED
+CHECK_NOT_COMPARED = "not_compared"
+
+
+@dataclass
+class SolutionCheck:
+    app: str      # "calee" | "caleeShell"
+    check: str    # "present" | "version" | "signer" | "launch-action" | "home"
+    status: str   # CHECK_OK | CHECK_BLOCKED | CHECK_NOT_COMPARED
+    detail: str = ""
+
+    def to_dict(self) -> dict:
+        return {"app": self.app, "check": self.check, "status": self.status, "detail": self.detail}
+
+
+@dataclass
+class SolutionVerification:
+    status: str  # STATUS_OK | STATUS_BLOCKED
+    release_id: "str | None" = None
+    serial: "str | None" = None
+    checks: "list[SolutionCheck]" = field(default_factory=list)
+    installed: "list[InstalledIdentity]" = field(default_factory=list)
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == STATUS_OK
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "releaseId": self.release_id,
+            "serial": self.serial,
+            "checks": [c.to_dict() for c in self.checks],
+            "installed": [i.to_dict() for i in self.installed],
+            "detail": self.detail,
+        }
+
+
+def _check_installed_signer(app: AppRelease, reader) -> SolutionCheck:
+    """Compare the app's currently-installed signer against its expected trusted
+    signer. No expected digest / no reader -> not_compared (recorded, never a
+    silent pass). An unreadable installed signer or a mismatch -> BLOCKED."""
+    if not app.signer_sha256:
+        return SolutionCheck(app.key, "signer", CHECK_NOT_COMPARED,
+                             "No expected signerSha256 declared -- installed-signer trust not verified.")
+    if reader is None:
+        return SolutionCheck(app.key, "signer", CHECK_NOT_COMPARED,
+                             "No installed-signer reader supplied -- installed-signer trust not verified.")
+    read = reader(app.package_id)
+    digest = getattr(read, "digest", None)
+    detail = getattr(read, "detail", "") or ""
+    if digest and digest.lower() == app.signer_sha256.lower():
+        return SolutionCheck(app.key, "signer", CHECK_OK,
+                             "Installed signer matches the expected trusted signer.")
+    if not digest:
+        return SolutionCheck(app.key, "signer", CHECK_BLOCKED,
+                             f"Could not read the installed {app.key} signer to verify trust -- BLOCKED. {detail}".strip())
+    return SolutionCheck(app.key, "signer", CHECK_BLOCKED,
+                         f"Installed {app.key} signer {digest} != expected trusted signer "
+                         f"{app.signer_sha256} -- BLOCKED. The installer never wipes data to work around it.")
+
+
+def verify_tablet_solution(
+    calee: "AppRelease | None",
+    caleeshell: "AppRelease | None",
+    runner: AdbRunner,
+    *,
+    serial: "str | None" = None,
+    release_id: "str | None" = None,
+    installed_signer_reader=None,
+    calee_launch_action: str = "com.viso.calee.action.START",
+) -> SolutionVerification:
+    """Verify the COMPLETE installed Calee tablet solution after a release.
+
+    ``calee`` and ``caleeshell`` are the EXPECTED INSTALLED identities of both
+    apps (from ``verification.expected_app(...)``) -- present whether or not this
+    release installed each one. BOTH are always checked. Uses only read-only adb
+    commands and an optional injected signer reader, so it is fully offline-
+    testable. With no device, returns ``blocked`` honestly.
+
+    A missing expected identity for either app is itself a BLOCK: a release must
+    declare what the tablet should carry for both Calee and CaleeShell."""
+    result = SolutionVerification(status=STATUS_OK, release_id=release_id, serial=serial)
+
+    if calee is None or not calee.has_expected:
+        result.checks.append(SolutionCheck("calee", "expected-identity", CHECK_BLOCKED,
+                                            "No expected Calee identity declared -- cannot verify the solution."))
+    if caleeshell is None or not caleeshell.has_expected:
+        result.checks.append(SolutionCheck("caleeShell", "expected-identity", CHECK_BLOCKED,
+                                            "No expected CaleeShell identity declared -- cannot verify the solution."))
+
+    # Device presence gate: without a device nothing can be verified.
+    state = runner(_adb_base(serial) + ["get-state"])
+    combined = f"{state.stdout}\n{state.stderr}".lower()
+    if state.returncode == 127 or "adb executable not found" in combined:
+        result.status = STATUS_BLOCKED
+        result.detail = _BLOCKING_DETAIL[OUTCOME_ADB_UNAVAILABLE]
+        return result
+    if state.returncode != 0 or "device" not in combined:
+        result.status = STATUS_BLOCKED
+        result.detail = _BLOCKING_DETAIL[OUTCOME_DEVICE_UNAVAILABLE]
+        return result
+
+    def _verify_app(app: "AppRelease | None", pkg: str):
+        if app is None or not app.has_expected:
+            return  # already recorded as a blocking missing-identity check above
+        out = runner(_adb_base(serial) + ["shell", "dumpsys", "package", pkg])
+        ident = parse_installed_identity(pkg, out.stdout)
+        result.installed.append(ident)
+        if not ident.present:
+            result.checks.append(SolutionCheck(app.key, "present", CHECK_BLOCKED,
+                                                f"{pkg} is NOT installed on the tablet -- the complete solution is "
+                                                f"broken even though this release may not have touched it."))
+        else:
+            result.checks.append(SolutionCheck(app.key, "present", CHECK_OK, f"{pkg} is installed."))
+            vm = classify_version_match(app, ident)
+            if vm == OUTCOME_OK:
+                result.checks.append(SolutionCheck(app.key, "version", CHECK_OK,
+                                                    f"Installed {app.version_name}/{app.version_code} matches expected."))
+            else:
+                result.checks.append(SolutionCheck(app.key, "version", CHECK_BLOCKED,
+                                                    f"Installed {ident.version_name}/{ident.version_code} != expected "
+                                                    f"{app.version_name}/{app.version_code} -- BLOCKED."))
+        result.checks.append(_check_installed_signer(app, installed_signer_reader))
+
+    _verify_app(calee, CALEE_PACKAGE_ID)
+    _verify_app(caleeshell, CALEESHELL_PACKAGE_ID)
+
+    # Role checks. Calee's custom START action must resolve to Calee.
+    if calee is not None and calee.has_expected:
+        launch = runner(_adb_base(serial) + ["shell", "cmd", "package", "resolve-activity", "-a", calee_launch_action, CALEE_PACKAGE_ID])
+        if parse_resolved_package(launch.stdout) == CALEE_PACKAGE_ID:
+            result.checks.append(SolutionCheck("calee", "launch-action", CHECK_OK,
+                                               f"Calee START action {calee_launch_action} resolves to Calee."))
+        else:
+            result.checks.append(SolutionCheck("calee", "launch-action", CHECK_BLOCKED,
+                                               f"Calee START action {calee_launch_action} does NOT resolve to "
+                                               f"{CALEE_PACKAGE_ID} -- BLOCKED."))
+    # CaleeShell must be the HOME launcher.
+    if caleeshell is not None and caleeshell.has_expected:
+        home = runner(_adb_base(serial) + ["shell", "cmd", "package", "resolve-activity", "-c", "android.intent.category.HOME", CALEESHELL_PACKAGE_ID])
+        if parse_resolved_package(home.stdout) == CALEESHELL_PACKAGE_ID:
+            result.checks.append(SolutionCheck("caleeShell", "home", CHECK_OK, "CaleeShell is the HOME launcher."))
+        else:
+            result.checks.append(SolutionCheck("caleeShell", "home", CHECK_BLOCKED,
+                                               "CaleeShell is NOT the HOME launcher -- BLOCKED."))
+
+    blocking = [c for c in result.checks if c.status == CHECK_BLOCKED]
+    if blocking:
+        result.status = STATUS_BLOCKED
+        result.detail = "; ".join(f"{c.app}/{c.check}: {c.detail}" for c in blocking)
+    return result
 
 
 def decide_downgrade(current_version_code: "int | str | None", target_version_code: "int | str | None", *, allow_downgrade: bool) -> str:

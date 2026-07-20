@@ -23,28 +23,52 @@ data to install, never code to run).
 
 ## Manifest contract (`release-manifest.json`)
 
+Two orthogonal facts are recorded per app and must never be conflated:
+
+* **`installArtifact`** — does this release ship an APK to install for this app?
+* **`expectedInstalled`** — the identity the tablet must carry *after* the
+  release, **whether or not** this release installed the app. An unchanged app
+  is not "ignored": it still declares an expected identity that the post-reboot
+  complete-solution check verifies.
+
+Complete-solution shape (recommended):
+
 ```json
 {
-  "releaseId": "2026.07.20-rc1",
+  "releaseId": "2026.07.20-rc2",
   "calee": {
-    "included": true,
-    "packageId": "com.viso.calee",
-    "versionName": "founder-v0.3.25",
-    "versionCode": 325,
-    "gitSha": "<full 40-char SHA>",
+    "installArtifact": true,
     "apk": "calee.apk",
-    "sha256": "<64-char hex>"
+    "sha256": "<64-char hex>",
+    "expectedInstalled": {
+      "packageId": "com.viso.calee",
+      "versionName": "founder-v0.3.26",
+      "versionCode": 326,
+      "gitSha": "<full 40-char SHA>",
+      "signerSha256": "<64-char hex>"
+    }
   },
-  "caleeShell": { "...": "same shape; or { \"included\": false }, or omitted" }
+  "caleeShell": {
+    "installArtifact": false,
+    "expectedInstalled": { "...": "same shape; NO apk/sha256 for an unchanged app" }
+  }
 }
 ```
 
-At least one app must be `included: true`. Each included app is validated:
-canonical `packageId` (`com.viso.calee` / `com.viso.caleeshell`), a
-well-formed `versionName`, a positive integer `versionCode`, a **full**
-40-character `gitSha` (an abbreviated SHA is ambiguous and rejected), an `apk`
-that is a plain in-bundle filename (path separators / `..` / absolute paths
-rejected), and a 64-hex `sha256`.
+Legacy flat shape stays supported: `{ "included": true, "packageId": ...,
+"versionName": ..., "versionCode": ..., "gitSha": ..., "apk": ..., "sha256": ...
+}`, with `{ "included": false }` (or omitted) meaning that app is absent from
+the release. `installArtifact` supersedes `included` when both appear.
+
+At least one app must ship an artifact (`installArtifact`/`included: true`). The
+**expected installed identity** of every declared app is validated regardless of
+`installArtifact`: canonical `packageId` (`com.viso.calee` /
+`com.viso.caleeshell`), a well-formed `versionName`, a positive integer
+`versionCode`, a **full** 40-character `gitSha` (an abbreviated SHA is ambiguous
+and rejected), and — if present — a 64-hex `signerSha256`. Only an app that is
+actually installed (`installArtifact: true`) additionally requires an `apk`
+(plain in-bundle filename; path separators / `..` / absolute paths rejected) and
+a 64-hex `sha256`; an unchanged app must **not** carry an install artifact.
 
 ## What `verify-release-bundle` checks
 
@@ -72,6 +96,20 @@ mismatch** after install, a **HOME mismatch**, an **unavailable adb**, or an
 **unavailable device** are each `BLOCKED` — and the installer **never**
 responds to any of them with a destructive uninstall/clear. Execution halts on
 the first blocking outcome; nothing downstream is faked.
+
+## Complete-solution verification (after every release)
+
+After a successful install + reboot, `install-tablet-release` runs
+`verify_tablet_solution`, which checks the **whole** installed solution — both
+Calee **and** CaleeShell — regardless of which app(s) this release replaced. For
+each app it verifies the package is present, the installed `versionName`/
+`versionCode` match the **expected** identity, and (when a `signerSha256` is
+declared) the installed signer matches the expected trusted signer; plus Calee's
+custom `START` action resolves to Calee and CaleeShell is the `HOME` launcher. A
+missing/mismatched/unreadable expectation on **either** app — including an
+*unchanged* app — `BLOCKS`. An unreadable installed signer is treated as
+`BLOCKED` (unknown, never assumed trusted), consistent with the pre-install
+signer gate.
 
 ## No device this session
 

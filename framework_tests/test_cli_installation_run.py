@@ -163,3 +163,36 @@ def test_consolidate_blocks_when_installation_blocked(tmp_path):
     # BLOCKED overall (installation is a mandatory component in blocked state).
     assert "Overall: BLOCKED" in result.output
     assert "Calee tablet release installation" in result.output
+
+
+def test_early_gate_invalid_bundle_consolidates_with_downstream_not_run(tmp_path):
+    """Priority 7: an early gate (invalid bundle) still consolidates -- the
+    INVALID installation is recorded, every downstream component is marked
+    NOT_RUN because of the gate, reports/latest-run is updated, and the run
+    reports BLOCKED. This is what the 00 launcher's consolidate_gate produces."""
+    run_id = "release-20260720-000000-p7gate"
+    workspace = run_context.RunWorkspace(tmp_path, run_id)
+    workspace.ensure_created()
+    run_context.RunManifest(run_id=run_id, started_at="2026-07-20 00:00:00").write(workspace.manifest_path)
+    workspace.component_report_path("machine-config").write_text(
+        json.dumps({"runId": run_id, "status": "ok", "detail": [], "selected": {}}) + "\n"
+    )
+    workspace.component_report_path("installation").write_text(
+        json.dumps({"runId": run_id, "status": "invalid", "detail": ["Bundle failed verification."]}) + "\n"
+    )
+    result = CliRunner().invoke(
+        cli.main,
+        ["consolidate", "--run-id", run_id, "--allow-unknown-build-identity",
+         "--machine-config-mandatory", "--installation-mandatory"],
+    )
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    assert "Overall: BLOCKED" in result.output
+    # Downstream components are consolidated as NOT_RUN (never silently omitted).
+    report = json.loads((workspace.consolidated_dir / "consolidated-report.json").read_text())
+    statuses = {c["name"]: c["status"] for c in report["components"]}
+    not_run = [name for name, st in statuses.items() if st == "not_run"]
+    assert any("tablet" in n.lower() for n in not_run)
+    assert any("selector" in n.lower() for n in not_run)
+    # reports/latest-run now points at this run.
+    latest = tmp_path / "reports" / "latest-run"
+    assert latest.is_symlink() or latest.exists()
