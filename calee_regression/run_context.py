@@ -70,6 +70,13 @@ COMPONENT_NAMES = (
     # physical kiosk suite (or an explicit BLOCKED marker) is consolidated
     # independently, exactly like sync.
     "kiosk-admin",
+    # Subscribed-calendar fixture evidence (Priority 7): publication + bounded-
+    # polling observation for the today-relative ICS (or the fixed-date/
+    # offline-only mode record) -- its own run-scoped component so wrong-run/
+    # stale evidence is rejected exactly like every other component. Optional
+    # while scenarios/subscribed_calendar.yaml stays draft-unverified;
+    # automatically mandatory once that scenario is promoted.
+    "subscribed-fixture",
 )
 
 

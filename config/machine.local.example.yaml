@@ -78,3 +78,44 @@ report_dir: "."
 # kiosk/admin technical checks (only ever true on a DISPOSABLE tablet, never a
 # customer device). Default false: a tester machine never opts in by accident.
 allow_caleeshell_technical: false
+
+# ── subscribed-calendar fixture (Priority 5/6/7) ─────────────────────────
+# How the today-relative subscribed-calendar ICS is made available to the
+# regression account's subscription. Three explicit modes -- `prepare-
+# subscribed-fixture` never silently falls back between them:
+#
+#   published    -- publish the run-relative ICS to `public_url` (already
+#                    subscribed by the regression account) and poll until the
+#                    run-specific event is visible. Needs one of the
+#                    publisher adapters below AND its credential (resolved
+#                    via calee_regression/credentials.py -- NEVER put a
+#                    credential in this file).
+#   fixed-date   -- use the existing static subscribed fixture at its own
+#                    known date; never asserts against Today.
+#   offline-only -- generate + validate the ICS locally only; never claims
+#                    provisioning (the default -- always safe, no setup
+#                    required).
+#
+# subscribed_fixture:
+#   mode: "offline-only"   # "published" | "fixed-date" | "offline-only"
+#   public_url: "https://fixtures.example.com/calee/regression-calendar.ics"
+#   publisher: "webdav"    # "webdav" | "presigned-put" | "s3-cli" | "local"
+#   poll_interval_seconds: 10
+#   timeout_seconds: 300
+#   # s3-cli only:
+#   # s3_key: "calee/regression-calendar.ics"
+#   # s3_cli_path: "aws"
+#   # local only (offline-only mode, for validating the publisher plumbing
+#   # itself without any external endpoint):
+#   # local_path: "/tmp/reg-sub-calendar.ics"
+#   #
+#   # fixed-date only:
+#   # fixed_date: "2026-08-05"
+#
+# Credentials the chosen publisher needs (webdav: username+password;
+# presigned-put: the presigned PUT URL itself; s3-cli: the bucket name, plus
+# whatever AWS_* the installed `aws` CLI already reads from its own
+# environment/profile) are resolved from the environment or the macOS
+# Keychain (service "calee-regression"), exactly like the regression
+# account's own credentials -- never written here, never in argv, never in a
+# report.

@@ -33,7 +33,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .machine_config import MachineConfig
-from .release_installer import CALEE_PACKAGE_ID, CALEESHELL_PACKAGE_ID
+from .release_installer import (
+    CALEE_PACKAGE_ID,
+    CALEESHELL_PACKAGE_ID,
+    RELEASE_MANIFEST_SCHEMA_V1,
+    ReleaseManifest,
+)
 from .release_platforms import ExpectedBuildIdentity, ReleaseFeatures, ReleasePlatforms
 
 STATUS_OK = "ok"
@@ -49,22 +54,83 @@ RES_CONFLICT = "conflict"              # disagreement / machine cannot satisfy -
 
 @dataclass
 class ConfigConflict:
+    """One row of the run's configuration/identity comparison matrix
+    (Priority 3). ``axis``/``machine_value``/``release_value``/``resolution``/
+    ``explanation`` are the original field names (kept so existing callers --
+    ``compose_effective_release_config``'s own machine-vs-release axes below,
+    and their tests -- are unaffected). ``source_a``/``source_b`` default to
+    "machine"/"release-candidate" for those original axes, but a row can name
+    any two sources being compared (e.g. "release-bundle-manifest" vs
+    "release-platforms.yaml" for the schema-v1 identity cross-check)."""
+
     axis: str
     machine_value: object = None
     release_value: object = None
     resolution: str = RES_AGREE
     blocking: bool = False
     explanation: str = ""
+    source_a: str = "machine"
+    source_b: str = "release-candidate"
 
     def to_dict(self) -> dict:
         return {
+            # Priority 3's canonical comparison-matrix field names.
+            "field": self.axis,
+            "sourceA": self.source_a,
+            "valueA": self.machine_value,
+            "sourceB": self.source_b,
+            "valueB": self.release_value,
+            "result": self.resolution,
+            "blocking": self.blocking,
+            "detail": self.explanation,
+            # Original field names, preserved for existing callers/tests.
             "axis": self.axis,
             "machineValue": self.machine_value,
             "releaseValue": self.release_value,
             "resolution": self.resolution,
-            "blocking": self.blocking,
             "explanation": self.explanation,
         }
+
+
+def _compare_row(
+    field_name: str, source_a: str, value_a, source_b: str, value_b, *, blocking_on_conflict: bool = True
+) -> ConfigConflict:
+    """One Priority-3 comparison-matrix row between two named, independent
+    sources. Both sources silent -> agree (nothing to compare). Only one
+    stated -> that source's value stands, non-blocking. Both stated and equal
+    -> agree. Both stated and different -> CONFLICT, blocking by default (a
+    technical owner must reconcile the disagreement, never have one side
+    silently win)."""
+    if value_a is None and value_b is None:
+        return ConfigConflict(
+            axis=field_name, machine_value=None, release_value=None, resolution=RES_AGREE, blocking=False,
+            explanation=f"{field_name}: not specified by {source_a} or {source_b}.",
+            source_a=source_a, source_b=source_b,
+        )
+    if value_a is None:
+        return ConfigConflict(
+            axis=field_name, machine_value=None, release_value=value_b, resolution=RES_RELEASE_ONLY, blocking=False,
+            explanation=f"{field_name}: only {source_b} specifies {value_b!r}.",
+            source_a=source_a, source_b=source_b,
+        )
+    if value_b is None:
+        return ConfigConflict(
+            axis=field_name, machine_value=value_a, release_value=None, resolution=RES_MACHINE_ONLY, blocking=False,
+            explanation=f"{field_name}: only {source_a} specifies {value_a!r}.",
+            source_a=source_a, source_b=source_b,
+        )
+    if value_a == value_b:
+        return ConfigConflict(
+            axis=field_name, machine_value=value_a, release_value=value_b, resolution=RES_AGREE, blocking=False,
+            explanation=f"{field_name}: {source_a} and {source_b} agree ({value_a!r}).",
+            source_a=source_a, source_b=source_b,
+        )
+    return ConfigConflict(
+        axis=field_name, machine_value=value_a, release_value=value_b, resolution=RES_CONFLICT,
+        blocking=blocking_on_conflict,
+        explanation=f"{field_name}: {source_a}={value_a!r} disagrees with {source_b}={value_b!r}.",
+        source_a=source_a, source_b=source_b,
+    )
 
 
 @dataclass
@@ -75,6 +141,10 @@ class EffectiveReleaseConfig:
     run_id: "str | None" = None
     release_id: "str | None" = None
     status: str = STATUS_OK
+    # Priority 2: which release-bundle-manifest schema version drove this
+    # composition. 1 when no bundle manifest was available (release-platforms.
+    # yaml alone still drives composition, as before schema v2 existed).
+    schema_version: int = 1
 
     # Machine selections (HOW/WHERE).
     tablet_serial: "str | None" = None
@@ -112,6 +182,7 @@ class EffectiveReleaseConfig:
             "status": self.status,
             "runId": self.run_id,
             "releaseId": self.release_id,
+            "schemaVersion": self.schema_version,
             "detail": list(self.detail),
             "machineSelections": {
                 "tabletSerial": self.tablet_serial,
@@ -153,6 +224,93 @@ def _machine_can(platform: str, machine: MachineConfig) -> bool:
     return False
 
 
+def _identity_matrix_rows(
+    *,
+    bundle_manifest: "ReleaseManifest | None",
+    expected: ExpectedBuildIdentity,
+    is_v2: bool,
+    passed_release_id: "str | None",
+) -> "list[ConfigConflict]":
+    """Priority 3's pre-install identity comparison-matrix rows for the
+    fields ``compose_effective_release_config``'s other axes below don't
+    already cover: release ID and the full Calee/CaleeShell/CaleeMobile
+    expected-identity fields. Empty when no bundle manifest was verified for
+    this run (nothing to compare)."""
+    if bundle_manifest is None:
+        return []
+    rows: "list[ConfigConflict]" = []
+    bundle_src = "release-bundle-manifest"
+    platforms_src = "release-platforms.yaml"
+
+    rows.append(_compare_row(
+        "releaseId", bundle_src, bundle_manifest.release_id, "cli/env override", passed_release_id,
+    ))
+
+    calee_app = bundle_manifest.calee
+    shell_app = bundle_manifest.caleeshell
+
+    if is_v2:
+        # Schema v2: the bundle manifest is self-contained/authoritative --
+        # parse_manifest already rejected an incomplete/malformed manifest, so
+        # every row here is the auditable record of that completeness check
+        # (Priority 3: "validate completeness and internal consistency"),
+        # never a second, independent cross-check against another source.
+        rows.append(_compare_row("profile", bundle_src, bundle_manifest.profile, bundle_src, bundle_manifest.profile))
+        rows.append(_compare_row("backend", bundle_src, bundle_manifest.backend, bundle_src, bundle_manifest.backend))
+        if bundle_manifest.platforms is not None:
+            for label, value in (
+                ("tablet", bundle_manifest.platforms.tablet),
+                ("mobileAndroid", bundle_manifest.platforms.mobile_android),
+                ("mobileIos", bundle_manifest.platforms.mobile_ios),
+            ):
+                rows.append(_compare_row(f"platforms.{label}", bundle_src, value, bundle_src, value))
+        if bundle_manifest.features is not None:
+            for label, value in (
+                ("synchronization", bundle_manifest.features.synchronization),
+                ("meals", bundle_manifest.features.meals),
+                ("onboarding", bundle_manifest.features.onboarding),
+                ("googleCalendar", bundle_manifest.features.google_calendar),
+                ("kioskAdmin", bundle_manifest.features.kiosk_admin),
+                ("notifications", bundle_manifest.features.notifications),
+            ):
+                rows.append(_compare_row(f"features.{label}", bundle_src, value, bundle_src, value))
+        for app, prefix in ((calee_app, "calee"), (shell_app, "caleeShell")):
+            if app is None:
+                continue
+            for label, value in (
+                ("packageId", app.package_id), ("versionName", app.version_name),
+                ("versionCode", app.version_code), ("gitSha", app.git_sha),
+                ("signerSha256", app.signer_sha256),
+            ):
+                rows.append(_compare_row(f"{prefix}.{label}", bundle_src, value, bundle_src, value))
+        cm = bundle_manifest.calee_mobile
+        if cm is not None:
+            for label, value in (
+                ("version", cm.version), ("gitSha", cm.git_sha),
+                ("selectorEvidenceRequired", cm.selector_evidence_required),
+                ("distributedBuildAcceptanceRequired", cm.distributed_build_acceptance_required),
+            ):
+                rows.append(_compare_row(f"caleeMobile.{label}", bundle_src, value, bundle_src, value))
+    else:
+        # Schema v1: cross-check every value BOTH the bundle manifest and
+        # release-platforms.yaml happen to declare -- disagreement BLOCKS,
+        # two sources of truth must never silently diverge. A v1 manifest has
+        # no CaleeMobile/profile/backend/platform/feature fields at all, so
+        # there is nothing to compare for those here (see the deprecation
+        # warning recorded by the caller instead).
+        if calee_app is not None:
+            rows.append(_compare_row("calee.versionName", bundle_src, calee_app.version_name, platforms_src, expected.calee_build_version))
+            rows.append(_compare_row("calee.gitSha", bundle_src, calee_app.git_sha, platforms_src, expected.calee_git_sha))
+            expected_version_code = (
+                str(expected.calee_version_code).strip() if expected.calee_version_code not in (None, "") else None
+            )
+            bundle_version_code = str(calee_app.version_code) if calee_app.version_code is not None else None
+            rows.append(_compare_row("calee.versionCode", bundle_src, bundle_version_code, platforms_src, expected_version_code))
+        if shell_app is not None:
+            rows.append(_compare_row("caleeShell.versionName", bundle_src, shell_app.version_name, platforms_src, expected.caleeshell_version))
+    return rows
+
+
 def compose_effective_release_config(
     machine: MachineConfig,
     platforms: ReleasePlatforms,
@@ -163,13 +321,56 @@ def compose_effective_release_config(
     release_id: "str | None" = None,
     expected_backend: "str | None" = None,
     distributed_build_required: bool = False,
+    bundle_manifest: "ReleaseManifest | None" = None,
 ) -> EffectiveReleaseConfig:
     """Compose the effective release configuration and detect conflicts under
     the one precedence rule (see module docstring). Never raises; an unresolved
-    conflict is recorded and makes the whole composition ``blocked``."""
+    conflict is recorded and makes the whole composition ``blocked``.
+
+    Priority 2 -- ``bundle_manifest`` (the already-verified release bundle
+    manifest; see release_installer.verify_release_bundle):
+
+      * schema version 2 -- AUTHORITATIVE for release scope (platforms/
+        features/profile/backend) and expected identity (Calee/CaleeShell/
+        CaleeMobile). ``platforms``/``features``/``expected_backend`` (which
+        would otherwise come from release-platforms.yaml) are NOT consulted;
+        release-platforms.yaml is not required. Every manifest-declared value
+        is recorded as a self-consistency row in the comparison matrix
+        (Priority 3).
+      * schema version 1, or no bundle manifest -- release-platforms.yaml
+        drives composition exactly as before. When a v1 bundle manifest WAS
+        supplied, a deprecation warning is recorded, and every identity value
+        it happens to declare is cross-checked against release-platforms.
+        yaml's expected_build_identity -- disagreement BLOCKS (Priority 2:
+        "cross-check every overlapping value; block on disagreement").
+    """
+    is_v2 = bundle_manifest is not None and bundle_manifest.is_schema_v2
+    passed_release_id = release_id
+    release_source_label = "release-platforms.yaml"
+    if is_v2:
+        # The bundle manifest is authoritative for scope in schema v2 -- swap
+        # in its platform/feature scope for the rest of this function (their
+        # attribute names deliberately mirror ReleasePlatforms/ReleaseFeatures
+        # so every existing conflict-detection axis below is reused as-is).
+        platforms = bundle_manifest.platforms or ReleasePlatforms(tablet=False, mobile_android=False, mobile_ios=False)
+        features = bundle_manifest.features or ReleaseFeatures(
+            synchronization=False, meals=False, onboarding=False, google_calendar=False, kiosk_admin=False,
+        )
+        expected_backend = bundle_manifest.backend
+        release_id = bundle_manifest.release_id
+        release_source_label = "release-bundle-manifest"
+    elif bundle_manifest is not None and release_id is None:
+        # Schema v1 (or unversioned) with no independent --release-id/
+        # CALEE_RELEASE_ID/release-platforms.yaml override: adopt the bundle
+        # manifest's own releaseId rather than leaving the composed config's
+        # release_id null -- there is nothing to disagree with yet, so this is
+        # not a conflict (see _identity_matrix_rows' releaseId row below).
+        release_id = bundle_manifest.release_id
+
     cfg = EffectiveReleaseConfig(
         run_id=run_id,
         release_id=release_id,
+        schema_version=bundle_manifest.schema_version if bundle_manifest is not None else RELEASE_MANIFEST_SCHEMA_V1,
         tablet_serial=machine.tablet_serial,
         iphone_device=machine.iphone_device,
         android_device=machine.android_device,
@@ -180,8 +381,17 @@ def compose_effective_release_config(
         calee_launch_action=machine.calee_launch_action,
         allow_caleeshell_technical=bool(machine.allow_caleeshell_technical),
         machine_backend_url=machine.backend_url,
-        distributed_build_required=bool(distributed_build_required),
+        distributed_build_required=bool(
+            bundle_manifest.calee_mobile.distributed_build_acceptance_required
+            if (is_v2 and bundle_manifest.calee_mobile is not None) else distributed_build_required
+        ),
     )
+    if bundle_manifest is not None and not is_v2:
+        cfg.detail.append(
+            "DEPRECATED: the release bundle manifest uses schema version 1 (or declares none). "
+            "Migrate to schemaVersion 2 so the bundle manifest is self-contained and authoritative "
+            "for release scope and expected identity -- see docs/RELEASE_INSTALLER.md."
+        )
 
     # ── platform scope: release requires; machine must be capable ──────────
     required = [p for p, on in (("tablet", platforms.tablet),
@@ -195,13 +405,13 @@ def compose_effective_release_config(
             enabled.append(platform)
             cfg.conflicts.append(ConfigConflict(
                 axis=f"platform:{platform}", machine_value="capable", release_value="required",
-                resolution=RES_AGREE, blocking=False,
+                resolution=RES_AGREE, blocking=False, source_b=release_source_label,
                 explanation=f"{platform}: required by the release candidate and the machine is configured for it.",
             ))
         elif release_requires and not machine_capable:
             cfg.conflicts.append(ConfigConflict(
                 axis=f"platform:{platform}", machine_value="not-configured", release_value="required",
-                resolution=RES_CONFLICT, blocking=True,
+                resolution=RES_CONFLICT, blocking=True, source_b=release_source_label,
                 explanation=(
                     f"{platform}: the release candidate REQUIRES it, but this machine is not configured "
                     f"to run it (no device / platform not enabled). Align the machine or the release scope."
@@ -210,7 +420,7 @@ def compose_effective_release_config(
         elif (not release_requires) and machine_capable:
             cfg.conflicts.append(ConfigConflict(
                 axis=f"platform:{platform}", machine_value="capable", release_value="not-required",
-                resolution=RES_NARROWED, blocking=False,
+                resolution=RES_NARROWED, blocking=False, source_b=release_source_label,
                 explanation=f"{platform}: the machine can run it, but the release does not require it -- narrowed out.",
             ))
     cfg.enabled_platforms = enabled
@@ -221,11 +431,13 @@ def compose_effective_release_config(
         "onboarding": features.onboarding, "google_calendar": features.google_calendar,
         "kiosk_admin": features.kiosk_admin,
     }
+    if is_v2:
+        feature_flags["notifications"] = features.notifications
     cfg.enabled_features = [name for name, on in feature_flags.items() if on]
     if features.kiosk_admin and not machine.allow_caleeshell_technical:
         cfg.conflicts.append(ConfigConflict(
             axis="feature:kiosk_admin", machine_value="not-authorised", release_value="required",
-            resolution=RES_CONFLICT, blocking=True,
+            resolution=RES_CONFLICT, blocking=True, source_b=release_source_label,
             explanation=(
                 "kiosk_admin: the release requires the kiosk/admin feature, but this machine is not "
                 "authorised for kiosk technical tests (allow_caleeshell_technical: false)."
@@ -233,13 +445,13 @@ def compose_effective_release_config(
         ))
 
     # ── profile: release candidate authoritative; machine must agree ───────
-    release_profile = "production" if expected.production else "staging"
+    release_profile = bundle_manifest.profile if is_v2 else ("production" if expected.production else "staging")
     cfg.profile = release_profile
     machine_profile = (machine.release_profile or "").strip().lower()
     if machine_profile and machine_profile != release_profile:
         cfg.conflicts.append(ConfigConflict(
             axis="profile", machine_value=machine_profile, release_value=release_profile,
-            resolution=RES_CONFLICT, blocking=True,
+            resolution=RES_CONFLICT, blocking=True, source_b=release_source_label,
             explanation=(
                 f"profile: the machine is configured for {machine_profile!r} but the release candidate is "
                 f"{release_profile!r}. A release must not run against a machine set up for a different profile."
@@ -248,7 +460,7 @@ def compose_effective_release_config(
     else:
         cfg.conflicts.append(ConfigConflict(
             axis="profile", machine_value=machine_profile or None, release_value=release_profile,
-            resolution=RES_AGREE if machine_profile else RES_RELEASE_ONLY, blocking=False,
+            resolution=RES_AGREE if machine_profile else RES_RELEASE_ONLY, blocking=False, source_b=release_source_label,
             explanation=f"profile: {release_profile} (release candidate authoritative).",
         ))
 
@@ -258,7 +470,7 @@ def compose_effective_release_config(
         if machine.backend_url and machine.backend_url != expected_backend:
             cfg.conflicts.append(ConfigConflict(
                 axis="backend", machine_value=machine.backend_url, release_value=expected_backend,
-                resolution=RES_CONFLICT, blocking=True,
+                resolution=RES_CONFLICT, blocking=True, source_b=release_source_label,
                 explanation=(
                     f"backend: the machine points at {machine.backend_url!r} but the release candidate "
                     f"expects {expected_backend!r}. The tested backend must match the release's environment."
@@ -279,24 +491,51 @@ def compose_effective_release_config(
         if machine_pkg and machine_pkg != canonical:
             cfg.conflicts.append(ConfigConflict(
                 axis=f"packageId:{label}", machine_value=machine_pkg, release_value=canonical,
-                resolution=RES_CONFLICT, blocking=True,
+                resolution=RES_CONFLICT, blocking=True, source_b="installer canonical package id",
                 explanation=(
                     f"{label} package id: the machine declares {machine_pkg!r} but the installer's canonical "
                     f"package is {canonical!r}. The tablet solution only installs the canonical packages."
                 ),
             ))
 
-    # ── expected application identities (release candidate owns these) ─────
-    cfg.expected_identities = {
-        "calee": {
-            "buildVersion": expected.calee_build_version, "gitSha": expected.calee_git_sha,
-            "applicationId": expected.calee_application_id, "versionCode": expected.calee_version_code,
-        },
-        "caleeShell": {"version": expected.caleeshell_version},
-        "caleeMobile": {
-            "buildVersion": expected.caleemobile_build_version, "gitSha": expected.caleemobile_git_sha,
-        },
-    }
+    # ── expected application identities ─────────────────────────────────────
+    if is_v2:
+        calee_app, shell_app, cm = bundle_manifest.calee, bundle_manifest.caleeshell, bundle_manifest.calee_mobile
+        cfg.expected_identities = {
+            "calee": {
+                "buildVersion": calee_app.version_name if calee_app else None,
+                "gitSha": calee_app.git_sha if calee_app else None,
+                "applicationId": calee_app.package_id if calee_app else None,
+                "versionCode": calee_app.version_code if calee_app else None,
+                "signerSha256": calee_app.signer_sha256 if calee_app else None,
+            },
+            "caleeShell": {
+                "version": shell_app.version_name if shell_app else None,
+                "signerSha256": shell_app.signer_sha256 if shell_app else None,
+            },
+            "caleeMobile": {
+                "buildVersion": cm.version if cm else None,
+                "gitSha": cm.git_sha if cm else None,
+                "selectorEvidenceRequired": cm.selector_evidence_required if cm else True,
+                "distributedBuildAcceptanceRequired": cm.distributed_build_acceptance_required if cm else True,
+            },
+        }
+    else:
+        cfg.expected_identities = {
+            "calee": {
+                "buildVersion": expected.calee_build_version, "gitSha": expected.calee_git_sha,
+                "applicationId": expected.calee_application_id, "versionCode": expected.calee_version_code,
+            },
+            "caleeShell": {"version": expected.caleeshell_version},
+            "caleeMobile": {
+                "buildVersion": expected.caleemobile_build_version, "gitSha": expected.caleemobile_git_sha,
+            },
+        }
+
+    # ── Priority 3: the full pre-install identity comparison matrix ────────
+    cfg.conflicts.extend(_identity_matrix_rows(
+        bundle_manifest=bundle_manifest, expected=expected, is_v2=is_v2, passed_release_id=passed_release_id,
+    ))
 
     blocking = [c for c in cfg.conflicts if c.blocking]
     if blocking:

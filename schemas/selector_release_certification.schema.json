@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://calee.internal/schemas/selector_release_certification.schema.json",
+  "title": "CaleeMobile selector-contract release-certification evidence",
+  "description": "Priority 8: the fields a selector-contract result must carry for it to be usable as RELEASE-CERTIFICATION evidence (as opposed to ordinary PR selector checking, which stays unaffected). This exact file is intentionally duplicated byte-for-byte in both CaleeAdmin/calee-regression (schemas/selector_release_certification.schema.json) and CaleeAdmin/CaleeMobile-Regression (schemas/selector_release_certification.schema.json). A contract test in each repository loads its own local copy, validates a representative payload against it, and asserts the file's own content digest equals a value hardcoded in that repository's test -- if either copy is edited without updating the other (and its test's hardcoded digest), that repository's own contract test fails, catching drift without either repository needing live access to the other at test time.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "component",
+    "testedSha",
+    "pubspecVersion",
+    "contract",
+    "releaseId",
+    "correlationId"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "component": {
+      "type": "string",
+      "const": "caleemobile-selector-contract"
+    },
+    "testedSha": {
+      "type": ["string", "null"],
+      "description": "Actual SHA tested -- the full 40-character CaleeMobile commit this evidence was generated against.",
+      "pattern": "^[0-9a-fA-F]{40}$"
+    },
+    "pubspecVersion": {
+      "type": ["string", "null"],
+      "description": "Actual version tested -- the CaleeMobile pubspec version+build (e.g. 0.0.24+24)."
+    },
+    "contract": {
+      "type": "string",
+      "enum": ["PASS", "FAIL"],
+      "description": "Result: whether every required selector was found in the tested CaleeMobile source."
+    },
+    "releaseId": {
+      "type": ["string", "null"],
+      "description": "The product release this evidence is bound to. A release-certification request with this missing FAILS certification (never a grey skip). calee-regression rejects evidence for another release ID even when testedSha/pubspecVersion match."
+    },
+    "correlationId": {
+      "type": ["string", "null"],
+      "description": "Cross-repo dispatch correlation id tying this evidence to the release-certification request that asked for it."
+    },
+    "expectedSha": {
+      "type": ["string", "null"],
+      "description": "Expected SHA -- the CaleeMobile SHA the release-certification request expected. A mismatch against testedSha FAILS certification."
+    },
+    "expectedVersion": {
+      "type": ["string", "null"],
+      "description": "Expected version -- the CaleeMobile version the release-certification request expected. A mismatch against pubspecVersion FAILS certification."
+    },
+    "releaseRunId": {
+      "type": ["string", "null"],
+      "description": "The calee-regression run this evidence was adopted into, when applicable -- distinct from releaseId/correlationId, which identify the PRODUCT release, not the test run."
+    },
+    "workflowRunId": {
+      "type": ["string", "null"],
+      "description": "The CI workflow run that produced this evidence."
+    }
+  }
+}

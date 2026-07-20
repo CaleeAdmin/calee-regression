@@ -1329,12 +1329,19 @@ def verify_selector_evidence_cmd(evidence_path, expected_sha, expected_version, 
     "--mandatory/--optional", "mandatory", default=True,
     help="Whether this selector contract is release-gating (default: mandatory).",
 )
+@click.option(
+    "--expected-release-id", "expected_release_id", envvar="CALEE_RELEASE_ID", default=None,
+    help="Priority 8: when set, this is a RELEASE-CERTIFICATION request, not ordinary PR selector "
+         "checking -- the adopted evidence must carry a matching releaseId (missing release identity, "
+         "or a mismatched one, fails certification even if SHA/version match). Defaults to the "
+         "release-config composition's releaseId when this run already composed one.",
+)
 def selector_contract_cmd(
     run_id_opt, source_path, expected_sha, expected_version, expected_ref,
     caleemobile_source_opt, regression_source_opt, flutter_version_opt,
     production_opt, source_artifact_id, source_artifact_digest,
     github_run_id, github_artifact_id, github_artifact_zip, dirty_waiver_opt,
-    adopted_by, mandatory,
+    adopted_by, mandatory, expected_release_id,
 ):
     """Release gate: obtain/generate CaleeMobile selector evidence for the EXACT
     release build, validate it, and record it under this run BEFORE any mobile
@@ -1364,6 +1371,20 @@ def selector_contract_cmd(
     component_dir.mkdir(parents=True, exist_ok=True)
     report_path = workspace.component_report_path("selector-contract")
 
+    # Priority 8: an explicit --expected-release-id wins; else, when this run
+    # already composed its release-config (launcher "00" always does before
+    # this gate runs), adopt ITS releaseId -- the same release the whole run
+    # is for. No release-config composed for this run at all (a bare/dev
+    # invocation) leaves this None, so ordinary PR selector checking is
+    # completely unaffected (requirement 1).
+    if expected_release_id is None:
+        release_config_path = workspace.component_report_path("release-config")
+        if release_config_path.is_file():
+            try:
+                expected_release_id = json.loads(release_config_path.read_text(encoding="utf-8")).get("releaseId")
+            except (OSError, json.JSONDecodeError):
+                expected_release_id = None
+
     # Production release profile (Problem A): production accepts ONLY a
     # CI-produced selector artifact; local generation is refused. An explicit
     # --production/--development wins over config/release-platforms.yaml.
@@ -1386,6 +1407,7 @@ def selector_contract_cmd(
             "production": eff_production,
             "expectedSha": expected_sha,
             "expectedVersion": expected_version,
+            "expectedReleaseId": expected_release_id,
             "source": source_label,
             "detail": list(detail),
             "problems": list(problems),
@@ -1650,6 +1672,7 @@ def selector_contract_cmd(
         expected_version=expected_version,
         expected_ref=expected_ref,
         expected_flutter_version=required_flutter,
+        expected_release_id=expected_release_id,
     )
     if verdict.ok:
         detail = [
@@ -1908,6 +1931,14 @@ def _resolve_component(
          "report exists. A BLOCKED/missing release-config composition can never read as a release "
          "PASS, and no product test may run once it is BLOCKED.",
 )
+@click.option(
+    "--subscribed-fixture-mandatory/--subscribed-fixture-optional", "subscribed_fixture_mandatory", default=None,
+    help="Whether the subscribed-calendar fixture component is release-gating (Priority 7). When "
+         "omitted, this is derived automatically from scenarios/promotion/subscribed_calendar.yaml's "
+         "releaseSuiteEligible -- optional while that scenario stays draft-unverified, and "
+         "automatically mandatory once it is promoted. A component report is still shown/recorded "
+         "either way.",
+)
 # Independent release-feature gating (Workstream 3). Each defaults to the
 # release feature profile (config/release-platforms.yaml release_features.*),
 # or True if absent -- an omitted feature is mandatory. An optional feature is
@@ -1955,6 +1986,7 @@ def consolidate(
     sync_report, installation_report, machine_config_report, release_config_report, kiosk_report, manual_checks_path, environment_report,
     android_mandatory, ios_mandatory, sync_mandatory,
     selector_contract_mandatory, installation_mandatory, machine_config_mandatory, release_config_mandatory,
+    subscribed_fixture_mandatory,
     meals_mandatory, onboarding_mandatory, google_calendar_mandatory, kiosk_admin_mandatory,
     build_version, calee_build_version, expected_calee_build_version,
     caleemobile_build_version, expected_caleemobile_build_version, caleeshell_version,
@@ -2022,6 +2054,9 @@ def consolidate(
     # production) is deferred below, once the mobile scope, production profile
     # and any named waiver are resolved.
     selector_contract_report = resolve("selector-contract", None)
+    # Subscribed-calendar fixture (Priority 7). Auto-discovered the same way;
+    # its mandatory-ness (below) defaults to the scenario's promotion state.
+    subscribed_fixture_report = resolve("subscribed-fixture", None)
 
     manual_checks_raw = resolve("manual-checks", manual_checks_path)
     manual_checks_list = None
@@ -2088,6 +2123,23 @@ def consolidate(
         release_config_mandatory if release_config_mandatory is not None
         else (True if release_config_composition is not None else None)
     )
+    # Subscribed-calendar fixture gating (Priority 7): an explicit flag wins;
+    # else derived from the scenario's OWN promotion state -- optional while
+    # scenarios/promotion/subscribed_calendar.yaml stays draft (releaseSuite
+    # Eligible: false), automatically mandatory once it is promoted. A
+    # promotion file that fails to load is treated as still-draft (optional),
+    # never silently mandatory from a parsing accident.
+    from . import promotion as promotion_mod
+
+    if subscribed_fixture_mandatory is not None:
+        subscribed_fixture_gating = subscribed_fixture_mandatory
+    else:
+        try:
+            subscribed_fixture_gating = promotion_mod.load_promotion(
+                promotion_mod.PROMOTION_DIR / "subscribed_calendar.yaml"
+            ).release_suite_eligible
+        except (promotion_mod.PromotionError, OSError):
+            subscribed_fixture_gating = False
 
     # Independent release-feature gating (Workstream 3): explicit
     # --<feature>-mandatory/--<feature>-optional wins, else the release feature
@@ -2282,6 +2334,15 @@ def consolidate(
     if release_intent is not None:
         extra_components.append(release_intent)
 
+    # Priority 8: the release ID this run's selector-contract evidence must be
+    # bound to -- this run's OWN composed release-config releaseId when one
+    # was recorded (the same release the whole run is for). No release-config
+    # for this run (ad-hoc/dev consolidation) leaves this None, so ordinary
+    # selector-contract validation is unaffected.
+    expected_release_id_for_selector = (
+        release_config_composition.get("releaseId") if release_config_composition is not None else None
+    )
+
     report = build_release_report(
         environment=env_report,
         tablet=tablet,
@@ -2289,6 +2350,8 @@ def consolidate(
         mobile_android_ui=mobile_android,
         mobile_ios_ui=mobile_ios,
         sync=sync,
+        subscribed_fixture=subscribed_fixture_report,
+        subscribed_fixture_mandatory=subscribed_fixture_gating,
         kiosk_admin=kiosk,
         installation=installation,
         installation_mandatory=installation_gating,
@@ -2308,6 +2371,7 @@ def consolidate(
             str(workspace.component_dir("selector-contract"))
             if selector_contract_report is not None else None
         ),
+        expected_release_id=expected_release_id_for_selector,
         calee_build_version=calee_build_version,
         expected_calee_build_version=eff_expected_calee_build,
         caleemobile_build_version=caleemobile_build_version,
@@ -2359,14 +2423,56 @@ def consolidate(
     # captured by the tablet/mobile UI runs travel into the release ZIP too.
     for ui_report in (tablet, mobile_android, mobile_ios):
         evidence_paths.extend(collect_step_diagnostic_paths(ui_report))
-    # Priority 4/6: the machine-config snapshot and the full installation
-    # evidence (bundle verification + APK inspection + install execution) travel
-    # into the release ZIP, so the qualification bundle contains all installer
-    # and configuration evidence, not just reports/*.json.
-    for component_name in ("machine-config", "installation"):
-        component_report = workspace.component_report_path(component_name)
-        if component_report.is_file():
-            evidence_paths.append(component_report)
+    # Priority 9: every component's own results.json travels into the release
+    # ZIP (not just machine-config/installation) -- the qualification bundle
+    # must contain the complete evidence set, not a hand-picked subset. Uses
+    # the SAME path each component was actually resolved from above (an
+    # explicit --foo-report override, not just the default in-workspace path)
+    # so the bundle always contains the exact file that backed the decision --
+    # `loaded is None` means that component was never executed or was
+    # rejected by _resolve_component, and there is nothing to package for it
+    # (already correctly reflected as NOT_RUN/BLOCKED in the status above).
+    for component_name, explicit_override, loaded in (
+        ("machine-config", machine_config_report, machine_config_snapshot),
+        ("release-config", release_config_report, release_config_composition),
+        ("installation", installation_report, installation),
+        ("environment", environment_report, env_report),
+        ("tablet", tablet_report, tablet),
+        ("mobile-api", mobile_api_report, mobile_api),
+        ("mobile-android", mobile_android_report, mobile_android),
+        ("mobile-ios", mobile_ios_report, mobile_ios),
+        ("sync", sync_report, sync),
+        ("kiosk-admin", kiosk_report, kiosk),
+        ("manual-checks", manual_checks_path, manual_checks_raw),
+        ("subscribed-fixture", None, subscribed_fixture_report),
+    ):
+        if loaded is None:
+            continue
+        evidence_paths.append(Path(explicit_override) if explicit_override else workspace.component_report_path(component_name))
+    # The today-relative subscribed-fixture ICS sidecar (Priority 7) -- not a
+    # results.json, so it isn't covered by the loop above.
+    subscribed_ics = workspace.component_dir("subscribed-fixture") / "reg_sub_today_relative.ics"
+    if subscribed_ics.is_file():
+        evidence_paths.append(subscribed_ics)
+    # Priority 4/Phase 3-4: the pre/post build-identity snapshots (not under
+    # component_report_path -- see cli.py's build-identity command).
+    for phase in ("pre", "post"):
+        identity_snapshot = workspace.root / "identity" / f"{phase}.json"
+        if identity_snapshot.is_file():
+            evidence_paths.append(identity_snapshot)
+
+    # Priority 9: a file this consolidation resolved and intended to package
+    # (above) but that has since vanished from disk is a hard evidence-
+    # integrity problem -- never silently ship a bundle missing a file it
+    # claims to include. Block rather than produce an incomplete ZIP.
+    vanished_evidence = [p for p in evidence_paths if not p.is_file()]
+    if vanished_evidence:
+        report.overall_status = STATUS_BLOCKED
+        report.summary["suggestedNextAction"] = (
+            "Evidence file(s) resolved for this run vanished before the release ZIP could be written: "
+            + ", ".join(str(p) for p in vanished_evidence) + " -- rerun this run's consolidation."
+        )
+
     bundle_path = write_release_bundle(
         report, out, build_label=build_version, evidence_paths=evidence_paths or None
     )
@@ -2621,28 +2727,53 @@ def machine_config_snapshot_cmd(config_path, legacy_config_path, run_id_opt):
     raise SystemExit(EXIT_SUCCESS)
 
 
+def _load_subscribed_fixture_config(config_path: "Path | None") -> dict:
+    import yaml as _yaml
+
+    path = config_path or (REPO_ROOT / "config" / "machine.local.yaml")
+    if not path.is_file():
+        return {}
+    try:
+        raw = _yaml.safe_load(path.read_text(encoding="utf-8"))
+    except _yaml.YAMLError:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    section = raw.get("subscribed_fixture")
+    return section if isinstance(section, dict) else {}
+
+
 @main.command("prepare-subscribed-fixture")
 @click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True, help="Shared release run ID (run_context.py).")
-@click.option("--target-date", "date_opt", default=None, help="Pin the subscribed target date (YYYY-MM-DD); defaults to today.")
+@click.option("--release-id", "release_id_opt", envvar="CALEE_RELEASE_ID", default=None, help="Release id recorded in this component's evidence.")
+@click.option("--config", "config_path", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml); reads its subscribed_fixture: section.")
+@click.option(
+    "--mode", "mode_opt", type=click.Choice(["published", "fixed-date", "offline-only"]), default=None,
+    help="Subscribed-fixture mode (Priority 6). Defaults to config/machine.local.yaml's subscribed_fixture.mode, else 'offline-only'. Never silently falls back between modes.",
+)
+@click.option("--target-date", "date_opt", default=None, help="Pin the subscribed target date (YYYY-MM-DD); defaults to today. Ignored in fixed-date mode (its own known date is used).")
 @click.option("--timezone", "tz_opt", default=None, help="Timezone label recorded in evidence (default Australia/Perth).")
-@click.option("--hub-base", "hub_base", envvar="CALEE_HUB_BASE", default=None, help="Hub base URL for the authenticated regression provisioning endpoint.")
-def prepare_subscribed_fixture_cmd(run_id_opt, date_opt, tz_opt, hub_base):
-    """Generate the today-relative subscribed ICS, provision it through the
-    AUTHENTICATED regression endpoint, and record evidence + scenario variables
-    (Priority 6).
+def prepare_subscribed_fixture_cmd(run_id_opt, release_id_opt, config_path, mode_opt, date_opt, tz_opt):
+    """Generate the today-relative subscribed ICS and run it through exactly
+    ONE explicit mode -- published / fixed-date / offline-only (Priority 5/6)
+    -- recording first-class subscribed-fixture evidence (Priority 7).
 
-    Resolves ONE target date + timezone for the run, generates the subscribed
-    ICS for that date, provisions it (replacing any stale regression feed) via
-    the authenticated, regression-only, production-disabled hub endpoint, writes
-    reports/runs/<run-id>/subscribed-fixture/results.json, and records the
-    generated event titles as scenario variables so the tablet scenario asserts
-    the exact events THIS run provisioned. With no hub backend/token (offline/
-    CI), provisioning is recorded as BLOCKED and never faked -- the subscribed
-    scenario stays draft-unverified.
+    published: publishes the ICS to config/machine.local.yaml's
+    subscribed_fixture.public_url via the configured adapter (webdav/
+    presigned-put/s3-cli/local) and polls until the run-specific event is
+    observable, using bounded polling (never an arbitrary sleep). fixed-date:
+    uses the existing static fixture at its own known date, never Today.
+    offline-only (the default -- always safe, no setup required): generates
+    and validates the ICS locally only, never claims provisioning.
+
+    Writes reports/runs/<run-id>/subscribed-fixture/results.json and
+    reg_sub_today_relative.ics, and records the generated event titles as
+    scenario variables so the tablet scenario asserts the exact events this
+    run produced. Never silently falls back from published to fixed-date.
     """
     import datetime as _dt
 
-    from . import subscribed_provision as sp
+    from . import subscribed_publisher as sp
 
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
@@ -2658,36 +2789,64 @@ def prepare_subscribed_fixture_cmd(run_id_opt, date_opt, tz_opt, hub_base):
             click.echo(f"Invalid --target-date {date_opt!r}; expected YYYY-MM-DD.", err=True)
             raise SystemExit(EXIT_INVALID_CONFIG)
 
-    # Build the authenticated provisioner only when a hub base URL and an
-    # operator token are both available. Absent either, provisioning is
-    # BLOCKED-recorded, never faked and never an unauthenticated reset.
-    provisioner = None
-    if hub_base:
-        token = credentials_mod.default_resolver().get(credentials_mod.API_TOKEN)
-        if token:
-            provisioner = sp.http_provisioner(hub_base, token=token)
+    section = _load_subscribed_fixture_config(Path(config_path) if config_path else None)
+    mode = mode_opt or section.get("mode") or sp.MODE_OFFLINE_ONLY
+    if mode not in sp.VALID_MODES:
+        click.echo(f"subscribed_fixture.mode {mode!r} is not one of {sorted(sp.VALID_MODES)}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
 
-    result = sp.provision_subscribed_fixture(
-        run_id=run_id_opt, target_date=target_date,
-        timezone=tz_opt or sp.DEFAULT_TIMEZONE, provisioner=provisioner,
+    kwargs = dict(
+        run_id=run_id_opt, release_id=release_id_opt, mode=mode,
+        target_date=target_date, timezone=tz_opt or section.get("timezone") or sp.DEFAULT_TIMEZONE,
     )
+    if mode == sp.MODE_PUBLISHED:
+        publisher, publisher_type, public_url = sp.build_publisher_from_config(section)
+        poll_check = None
+        if public_url:
+            # Re-fetches the run's OWN published URL until the (freshly
+            # published) content is retrievable -- the generic, product-API-
+            # free "existing API" this offline CLI layer can poll without a
+            # live tablet/device. The scenario's own tablet-side visibility
+            # check remains a separate, physical, out-of-scope concern here.
+            def poll_check(_url=public_url):
+                import urllib.request
+                with urllib.request.urlopen(_url, timeout=15) as resp:
+                    return resp.read()
+        kwargs.update(
+            publisher=publisher, publisher_type=publisher_type, public_url=public_url,
+            poll_check=poll_check,
+            poll_interval_seconds=float(section.get("poll_interval_seconds", 10)),
+            poll_timeout_seconds=float(section.get("timeout_seconds", 300)),
+        )
+    elif mode == sp.MODE_FIXED_DATE:
+        kwargs.update(fixed_date=section.get("fixed_date"), fixed_date_titles=section.get("fixed_date_titles"))
+
+    result = sp.prepare_subscribed_fixture(**kwargs)
 
     report_path = workspace.component_report_path("subscribed-fixture")
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps({"runId": run_id_opt, **result.to_dict()}, indent=2) + "\n", encoding="utf-8")
+    report_path.write_text(json.dumps({"runId": run_id_opt, "releaseRunId": run_id_opt, **result.to_dict()}, indent=2) + "\n", encoding="utf-8")
     # The generated ICS is provisioning INPUT (recorded next to, not inside, the
     # results json). It carries only regression event titles, never a secret.
     if result.ics:
         (report_path.parent / "reg_sub_today_relative.ics").write_text(result.ics, encoding="utf-8")
 
+    manifest = _load_or_init_manifest(workspace)
+    manifest.record_component(
+        "subscribed-fixture", report_path=str(report_path),
+        exit_code=(EXIT_SUCCESS if result.ok else EXIT_BLOCKED),
+    )
+    manifest.write(workspace.manifest_path)
+
     click.echo(f"Subscribed-fixture evidence: {report_path}")
-    click.echo(f"  status: {result.status}  date: {result.resolved_date}  events: "
-               f"{result.events.get('timed')} / {result.events.get('allDay')}")
+    click.echo(f"  mode: {result.mode}  status: {result.status}  date: {result.resolved_date}")
     for d in result.detail:
         click.echo(f"  - {d}")
-    # This preparation step itself succeeds when it has generated + recorded the
-    # fixture; the subscribed scenario (draft-unverified, mandatory:false) is what
-    # honours a BLOCKED provisioning, so this never blocks the whole run on its own.
+    # This preparation step itself always exits success; the subscribed
+    # scenario (draft-unverified, mandatory:false while draft -- see Priority
+    # 7) is what honours a BLOCKED publication/observation, so a BLOCKED
+    # subscribed-fixture result never blocks the whole run on its own UNLESS
+    # the scenario has been promoted (consolidate then requires status "ok").
     raise SystemExit(EXIT_SUCCESS)
 
 
@@ -2745,37 +2904,123 @@ def run_with_credentials_cmd(command):
         raise SystemExit(EXIT_BLOCKED)
 
 
-@main.command("release-config")
-@click.option("--config", "config_path", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
-@click.option("--release-platforms", "platforms_path", envvar="CALEE_RELEASE_PLATFORMS", default=None, type=click.Path(), help="Path to release-platforms.yaml (the release candidate manifest).")
-@click.option("--release-id", "release_id_opt", envvar="CALEE_RELEASE_ID", default=None, help="Release candidate id (from the bundle manifest).")
-@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True, help="Shared release run ID (run_context.py).")
-def release_config_cmd(config_path, platforms_path, release_id_opt, run_id_opt):
-    """Compose the ONE effective RELEASE configuration for this run (Priority 3).
-
-    Combines the MACHINE config (how/where a run executes) with the RELEASE
-    CANDIDATE manifest (config/release-platforms.yaml -- what the release is)
-    under one precedence rule: the release candidate is authoritative for scope
-    (platforms, features, profile, expected identities, backend), and the
-    machine must be consistent with and capable of it. Any disagreement or
-    missing capability is a CONFLICT that BLOCKS. Writes the composed config +
-    every conflict decision to reports/runs/<run-id>/release-config/results.json
-    and emits eval-able RELEASE_* assignments (enabled platforms, device ids,
-    selected backend, profile) so the composition actually drives execution.
-    """
+def _emit_release_config_vars(workspace: run_context.RunWorkspace, effective_dict: dict) -> None:
+    """Emits the eval-able RELEASE_* shell assignments launchers "00"/"06"
+    source, from an ``EffectiveReleaseConfig.to_dict()`` payload (freshly
+    composed OR loaded back from this run's own already-written evidence --
+    see release_config_cmd's reuse-not-recompute path)."""
     import shlex as _shlex
 
-    import yaml as _yaml
+    def _emit(name, value):
+        click.echo(f"RELEASE_{name}={_shlex.quote(str('' if value is None else value))}")
 
-    from . import machine_config as machine_mod
-    from . import release_config as rc_mod
-    from . import release_platforms as rp_mod
+    release_selections = effective_dict.get("releaseSelections") or {}
+    machine_selections = effective_dict.get("machineSelections") or {}
+    device_ids = effective_dict.get("deviceIds") or {}
+    enabled_platforms = release_selections.get("enabledPlatforms") or []
 
+    _emit("EFFECTIVE_CONFIG", str(workspace.component_report_path("release-config")))
+    _emit("PROFILE", release_selections.get("profile"))
+    _emit("SELECTED_BACKEND", release_selections.get("selectedBackend") or "")
+    _emit("PLATFORM_TABLET", "true" if "tablet" in enabled_platforms else "false")
+    _emit("PLATFORM_ANDROID", "true" if "android" in enabled_platforms else "false")
+    _emit("PLATFORM_IOS", "true" if "ios" in enabled_platforms else "false")
+    _emit("ENABLED_FEATURES", ",".join(release_selections.get("enabledFeatures") or []))
+    _emit("TABLET_SERIAL", device_ids.get("tablet") or "")
+    _emit("IPHONE_DEVICE", device_ids.get("ios") or "")
+    _emit("ANDROID_DEVICE", device_ids.get("android") or "")
+    _emit("REPORT_ROOT", machine_selections.get("reportRoot") or "")
+
+
+_RELEASE_CONFIG_REQUIRED_KEYS = {"status", "machineSelections", "releaseSelections", "deviceIds", "conflicts"}
+
+
+@main.command("release-config")
+@click.option("--config", "config_path", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
+@click.option("--release-platforms", "platforms_path", envvar="CALEE_RELEASE_PLATFORMS", default=None, type=click.Path(), help="Path to release-platforms.yaml (schema-v1 release candidate manifest).")
+@click.option("--release-id", "release_id_opt", envvar="CALEE_RELEASE_ID", default=None, help="Release candidate id override; a schema-v2 bundle manifest's releaseId is authoritative and a mismatch BLOCKS.")
+@click.option("--bundle", "bundle_path", default=None, type=click.Path(), help="Path to the release bundle directory. When given, it is verified and folded into this composition (Priority 1/2). Omit for a bundle-less diagnostic/dev run.")
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True, help="Shared release run ID (run_context.py).")
+def release_config_cmd(config_path, platforms_path, release_id_opt, bundle_path, run_id_opt):
+    """Compose the ONE effective RELEASE configuration for this run (Priority 3),
+    or -- when this run already recorded one -- CONSUME that same evidence
+    instead of recomputing a second, possibly-different composition (Priority 1).
+
+    Combines the MACHINE config (how/where a run executes) with the RELEASE
+    CANDIDATE -- the verified release bundle manifest when schema version 2
+    (authoritative for scope: platforms, features, profile, backend, expected
+    identity; config/release-platforms.yaml is then not consulted), else
+    config/release-platforms.yaml (schema version 1) -- under one precedence
+    rule: the release candidate is authoritative for scope, and the machine
+    must be consistent with and capable of it. Any disagreement or missing
+    capability is a CONFLICT that BLOCKS. Writes the composed config, the full
+    pre-install identity comparison matrix, and every conflict decision to
+    reports/runs/<run-id>/release-config/results.json, and emits eval-able
+    RELEASE_* assignments (enabled platforms, device ids, selected backend,
+    profile) so the composition actually drives execution.
+
+    Idempotent per run: called a second time for the SAME run ID (e.g. by "06"
+    after "00" already composed it), this reuses and re-validates the
+    already-written evidence instead of recomposing -- rejecting it if it is
+    missing, malformed, stale, or was written for a different run.
+    """
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
     workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
     workspace.ensure_created()
+
+    existing_path = workspace.component_report_path("release-config")
+    if existing_path.is_file():
+        # Priority 1: launcher 06 must CONSUME the same-run release-config
+        # evidence launcher 00 already composed, never recompute a second,
+        # possibly-different one. Reject missing/malformed/stale/wrong-run
+        # evidence rather than silently trusting or silently recomposing it.
+        try:
+            existing_report = json.loads(existing_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            click.echo(f"This run's release-config evidence at {existing_path} is unreadable: {exc}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        run_manifest = _load_or_init_manifest(workspace)
+        run_started_at_epoch = None
+        if run_manifest.started_at:
+            try:
+                run_started_at_epoch = time.mktime(time.strptime(run_manifest.started_at, "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                run_started_at_epoch = None
+        try:
+            run_context.validate_component_report(
+                existing_report, report_path=existing_path, run_id=run_id_opt, workspace=workspace,
+                component="release-config", run_started_at_epoch=run_started_at_epoch,
+            )
+        except run_context.RunIdError as exc:
+            click.echo(f"This run's release-config evidence was rejected: {exc}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        if not _RELEASE_CONFIG_REQUIRED_KEYS.issubset(existing_report):
+            click.echo(
+                f"This run's release-config evidence at {existing_path} is malformed "
+                f"(missing one of {sorted(_RELEASE_CONFIG_REQUIRED_KEYS)}).", err=True,
+            )
+            raise SystemExit(EXIT_BLOCKED)
+        _emit_release_config_vars(workspace, existing_report)
+        if existing_report.get("status") != "ok":  # matches release_config.STATUS_OK
+            click.echo(click.style(
+                "[BLOCKED] Reusing this run's already-composed (and already-BLOCKED) release configuration "
+                "-- see the detail above/in the report.", fg="red",
+            ), err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        click.echo(click.style(
+            f"[OK] Reusing this run's already-composed effective release configuration for {run_id_opt}.",
+            fg="green",
+        ), err=True)
+        raise SystemExit(EXIT_SUCCESS)
+
+    import yaml as _yaml
+
+    from . import machine_config as machine_mod
+    from . import release_config as rc_mod
+    from . import release_installer as ri_mod
+    from . import release_platforms as rp_mod
 
     def _record(payload: dict, exit_code: int) -> None:
         payload = {"runId": run_id_opt, **payload}
@@ -2794,6 +3039,29 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, run_id_opt):
         click.echo(str(exc), err=True)
         raise SystemExit(EXIT_BLOCKED)
 
+    # Priority 1: verify and parse the release bundle -- WITHOUT touching any
+    # device -- before composing. Its manifest feeds the composition below
+    # (schema v2: authoritative for scope; schema v1: cross-checked against
+    # release-platforms.yaml). Only when EXPLICITLY given --bundle (the
+    # launcher always passes the machine's release_bundle_dir) -- a bare
+    # dev/diagnostic `release-config` invocation with no --bundle composes
+    # exactly as before Priority 2 existed, even if a machine config happens
+    # to declare a release_bundle_dir for unrelated (installation) purposes.
+    bundle_manifest = None
+    if bundle_path:
+        verification = ri_mod.verify_release_bundle(bundle_path)
+        if not verification.ok:
+            _record({
+                "status": STATUS_BLOCKED,
+                "detail": ["Release bundle failed verification:"] + list(verification.errors),
+                "bundleVerification": verification.to_dict(),
+            }, EXIT_BLOCKED)
+            click.echo(click.style("[BLOCKED] Release bundle failed verification:", fg="red"), err=True)
+            for err in verification.errors:
+                click.echo(f"  - {err}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        bundle_manifest = verification.manifest
+
     try:
         platforms = rp_mod.load_release_platforms(platforms_path)
         features = rp_mod.load_release_features(platforms_path)
@@ -2805,6 +3073,8 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, run_id_opt):
 
     # Optional release-candidate extras (backend/environment pin + distributed
     # build acceptance) read from the same release-platforms.yaml top level.
+    # Schema v2 does not consult release-platforms.yaml at all -- the bundle
+    # manifest is authoritative -- so these are only meaningful for schema v1.
     expected_backend = None
     distributed_build_required = False
     resolved_platforms_path = Path(platforms_path) if platforms_path else rp_mod.DEFAULT_CONFIG_PATH
@@ -2822,24 +3092,11 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, run_id_opt):
         machine, platforms, features, expected,
         run_id=run_id_opt, release_id=release_id_opt,
         expected_backend=expected_backend, distributed_build_required=distributed_build_required,
+        bundle_manifest=bundle_manifest,
     )
     exit_code = EXIT_SUCCESS if effective.ok else EXIT_BLOCKED
     _record(effective.to_dict(), exit_code)
-
-    def _emit(name, value):
-        click.echo(f"RELEASE_{name}={_shlex.quote(str('' if value is None else value))}")
-
-    _emit("EFFECTIVE_CONFIG", str(workspace.component_report_path("release-config")))
-    _emit("PROFILE", effective.profile)
-    _emit("SELECTED_BACKEND", effective.selected_backend or "")
-    _emit("PLATFORM_TABLET", "true" if "tablet" in effective.enabled_platforms else "false")
-    _emit("PLATFORM_ANDROID", "true" if "android" in effective.enabled_platforms else "false")
-    _emit("PLATFORM_IOS", "true" if "ios" in effective.enabled_platforms else "false")
-    _emit("ENABLED_FEATURES", ",".join(effective.enabled_features))
-    _emit("TABLET_SERIAL", effective.tablet_serial or "")
-    _emit("IPHONE_DEVICE", effective.iphone_device or "")
-    _emit("ANDROID_DEVICE", effective.android_device or "")
-    _emit("REPORT_ROOT", effective.report_root or "")
+    _emit_release_config_vars(workspace, effective.to_dict())
 
     if not effective.ok:
         click.echo(click.style("[BLOCKED] Machine/release configuration conflict:", fg="red"), err=True)
@@ -3185,6 +3442,135 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
         raise SystemExit(EXIT_SUCCESS)
     click.echo(click.style(f"[BLOCKED] {'; '.join(detail) or execution.detail}", fg="yellow"), err=True)
     raise SystemExit(EXIT_BLOCKED)
+
+
+def _load_expected_identity_json(path: "str | None", flag_name: str) -> "dict | None":
+    if not path:
+        return None
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        click.echo(f"{flag_name} {path!r} could not be read as JSON: {exc}", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    if not isinstance(raw, dict):
+        click.echo(f"{flag_name} {path!r} must contain a JSON object.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    return raw
+
+
+@main.command("assemble-release-bundle")
+@click.option("--release-id", required=True, help="Release candidate id, e.g. 2026.07.20-rc3. Ambiguous references (e.g. 'latest') are rejected downstream by the identity checks below.")
+@click.option("--profile", type=click.Choice(["staging", "production"]), required=True)
+@click.option("--backend", required=True, help="Backend base URL this release targets.")
+@click.option("--calee-apk", type=click.Path(exists=True), default=None, help="Path to an already-signed calee.apk. Omit when Calee is unchanged this release (then --calee-expected is required).")
+@click.option("--calee-git-sha", default=None, help="Full 40-character Git SHA the Calee APK was built from. Required with --calee-apk.")
+@click.option("--calee-expected", type=click.Path(exists=True), default=None, help="JSON file with Calee's expected installed identity (packageId/versionName/versionCode/gitSha/signerSha256), required when --calee-apk is omitted.")
+@click.option("--caleeshell-apk", type=click.Path(exists=True), default=None, help="Path to an already-signed caleeshell.apk. Omit when CaleeShell is unchanged this release (then --caleeshell-expected is required).")
+@click.option("--caleeshell-git-sha", default=None, help="Full 40-character Git SHA the CaleeShell APK was built from. Required with --caleeshell-apk.")
+@click.option("--caleeshell-expected", type=click.Path(exists=True), default=None, help="JSON file with CaleeShell's expected installed identity, required when --caleeshell-apk is omitted.")
+@click.option("--caleemobile-sha", required=True, help="Full 40-character CaleeMobile Git SHA this release expects.")
+@click.option("--caleemobile-version", required=True, help="CaleeMobile pubspec version+build, e.g. 0.0.24+24.")
+@click.option("--selector-evidence-required/--no-selector-evidence-required", default=True, help="Whether release certification requires CaleeMobile selector evidence (Priority 8).")
+@click.option("--distributed-build-acceptance-required/--no-distributed-build-acceptance-required", default=True)
+@click.option("--tablet/--no-tablet", "platform_tablet", default=True)
+@click.option("--mobile-android/--no-mobile-android", "platform_android", default=True)
+@click.option("--mobile-ios/--no-mobile-ios", "platform_ios", default=True)
+@click.option("--sync/--no-sync", "feature_sync", default=True)
+@click.option("--meals/--no-meals", "feature_meals", default=True)
+@click.option("--onboarding/--no-onboarding", "feature_onboarding", default=True)
+@click.option("--google-calendar/--no-google-calendar", "feature_google_calendar", default=True)
+@click.option("--kiosk-admin/--no-kiosk-admin", "feature_kiosk_admin", default=True)
+@click.option("--notifications/--no-notifications", "feature_notifications", default=True)
+@click.option("--source-repo", default=None, help="Optional provenance: the source repository (e.g. CaleeAdmin/Calee). Metadata only -- never used to fetch anything.")
+@click.option("--source-workflow-run-id", default=None, help="Optional provenance: the CI workflow run id these APKs came from.")
+@click.option("--source-artifact-name", default=None, help="Optional provenance: the CI artifact name these APKs came from.")
+@click.option("--source-commit", default=None, help="Optional provenance: the source commit these APKs were built from.")
+@click.option("--source-artifact-digest", default=None, help="Optional provenance: the CI artifact's own digest.")
+@click.option("--out", "out_dir", required=True, type=click.Path(), help="Output directory for the assembled bundle (e.g. ~/Calee-Releases/current).")
+@click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON assembly result.")
+def assemble_release_bundle_cmd(
+    release_id, profile, backend, calee_apk, calee_git_sha, calee_expected,
+    caleeshell_apk, caleeshell_git_sha, caleeshell_expected, caleemobile_sha, caleemobile_version,
+    selector_evidence_required, distributed_build_acceptance_required,
+    platform_tablet, platform_android, platform_ios,
+    feature_sync, feature_meals, feature_onboarding, feature_google_calendar, feature_kiosk_admin, feature_notifications,
+    source_repo, source_workflow_run_id, source_artifact_name, source_commit, source_artifact_digest,
+    out_dir, report_path,
+):
+    """Deterministically assemble a schema-version-2 release bundle from
+    already-signed, locally-available APKs (Priority 4): inspects each APK's
+    ACTUAL package id/version/signer (never signs anything), generates SHA-256
+    checksums, and writes a release-manifest.json that verify-release-bundle/
+    install-tablet-release/release-config can consume directly.
+
+    Supports a Calee-only, CaleeShell-only, or both-app release. An app this
+    release does not ship an APK for still needs an EXPLICIT expected
+    installed identity (--calee-expected/--caleeshell-expected) -- an
+    unchanged application is never silently dropped from the manifest.
+
+    Never downloads anything: every APK is an already-local path, and the
+    optional --source-* provenance flags are recorded verbatim as metadata,
+    never used to fetch an artifact. No GitHub (or any other) credential is
+    ever a parameter here, so none can leak into arguments, this command's
+    report, or the generated manifest.
+    """
+    from . import release_bundle_assembly as rba_mod
+
+    if calee_apk and not calee_git_sha:
+        click.echo("--calee-git-sha is required when --calee-apk is given.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    if caleeshell_apk and not caleeshell_git_sha:
+        click.echo("--caleeshell-git-sha is required when --caleeshell-apk is given.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    calee_expected_raw = _load_expected_identity_json(calee_expected, "--calee-expected")
+    caleeshell_expected_raw = _load_expected_identity_json(caleeshell_expected, "--caleeshell-expected")
+
+    provenance = {}
+    if source_repo:
+        provenance["repository"] = source_repo
+    if source_workflow_run_id:
+        provenance["workflowRunId"] = source_workflow_run_id
+    if source_artifact_name:
+        provenance["artifactName"] = source_artifact_name
+    if source_commit:
+        provenance["sourceCommit"] = source_commit
+    if source_artifact_digest:
+        provenance["artifactDigest"] = source_artifact_digest
+
+    assembly = rba_mod.assemble_release_bundle(
+        release_id=release_id, profile=profile, backend=backend,
+        calee_apk=calee_apk, calee_git_sha=calee_git_sha, calee_expected=calee_expected_raw,
+        caleeshell_apk=caleeshell_apk, caleeshell_git_sha=caleeshell_git_sha, caleeshell_expected=caleeshell_expected_raw,
+        caleemobile_sha=caleemobile_sha, caleemobile_version=caleemobile_version,
+        selector_evidence_required=selector_evidence_required,
+        distributed_build_acceptance_required=distributed_build_acceptance_required,
+        platforms={"tablet": platform_tablet, "mobileAndroid": platform_android, "mobileIos": platform_ios},
+        features={
+            "synchronization": feature_sync, "meals": feature_meals, "onboarding": feature_onboarding,
+            "googleCalendar": feature_google_calendar, "kioskAdmin": feature_kiosk_admin,
+            "notifications": feature_notifications,
+        },
+        provenance=provenance or None,
+    )
+
+    if not assembly.ok:
+        _write_installer_report(Path(report_path) if report_path else None, assembly.to_dict())
+        click.echo(click.style(f"[INVALID] Release bundle assembly has {len(assembly.errors)} problem(s):", fg="red"), err=True)
+        for err in assembly.errors:
+            click.echo(f"  - {err}", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    written = rba_mod.write_release_bundle(assembly, out_dir)
+    _write_installer_report(Path(report_path) if report_path else None, assembly.to_dict())
+    click.echo(click.style(f"[OK] Assembled release bundle {release_id} at {written}.", fg="green"))
+    for key in ("calee", "caleeShell"):
+        section = assembly.manifest["tabletSolution"][key]
+        if section["installArtifact"]:
+            click.echo(f"     {key}: installing {section['apk']} -> {section['expectedInstalled']['versionName']} (code {section['expectedInstalled']['versionCode']})")
+        else:
+            click.echo(f"     {key}: unchanged, expected {section['expectedInstalled']['versionName']} (code {section['expectedInstalled']['versionCode']})")
+    raise SystemExit(EXIT_SUCCESS)
 
 
 if __name__ == "__main__":

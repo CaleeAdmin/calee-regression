@@ -59,14 +59,24 @@ echo ""
 # convenient to run right now.
 eval "$(python -m calee_regression release-platforms)"
 
-# Priority 3/4: when a machine config exists, compose the ONE effective release
-# configuration (machine + release candidate) and let it drive this launcher --
-# so the MACHINE's platform scope + device ids reach 06, not just the release
-# candidate's. The composed RELEASE_PLATFORM_* (machine capability ∩ release
-# scope) overrides the release-platforms-only values above, the configured
-# iPhone/Android device ids are exported for the UI suite, and a machine/release
-# conflict BLOCKS (recorded in the run's release-config evidence). Absent a
-# machine config (CI/example), the release-platforms defaults above stand.
+# Priority 3/4: when a machine config exists, the ONE effective release
+# configuration (machine + release candidate/bundle manifest) drives this
+# launcher -- so the MACHINE's platform scope + device ids reach 06, not just
+# the release candidate's. The composed RELEASE_PLATFORM_* (machine capability
+# ∩ release scope) overrides the release-platforms-only values above, the
+# configured iPhone/Android device ids are exported for the UI suite, and a
+# machine/release conflict BLOCKS (recorded in the run's release-config
+# evidence). Absent a machine config (CI/example), the release-platforms
+# defaults above stand.
+#
+# Priority 1: when launcher "00" already composed this run's release-config
+# (before installing the release), this command CONSUMES that same-run
+# evidence and does NOT recompute a second, possibly-different composition --
+# see calee_regression/cli.py's release_config_cmd, which detects the
+# already-written reports/runs/$CALEE_RUN_ID/release-config/results.json and
+# re-validates + re-emits it instead of composing again. Run standalone (no
+# "00" delegation), no such evidence exists yet, so this composes it fresh,
+# exactly as before Priority 1.
 if [ -f config/machine.local.yaml ]; then
     if RELEASE_CFG_OUT="$(python -m calee_regression release-config --run-id "$CALEE_RUN_ID" 2>/dev/null)"; then
         RELEASE_CFG_STATUS=0
@@ -132,14 +142,21 @@ python -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase pre >
 # bundle so the release has an auditable record of exactly why it stopped.
 if [ "$PREPARE_STATUS" -eq 0 ]; then
     echo ""
-    echo "--- Step 1.5: Provision the today-relative subscribed calendar fixture ---"
-    # Priority 6: resolve ONE date for the run, generate the today-relative
-    # subscribed ICS, provision it through the AUTHENTICATED regression endpoint
-    # (never an unauthenticated reset), record evidence under this run, and make
-    # the generated event titles available to the tablet scenario as
-    # ${REG_SUB_*} variables. Without a hub backend this records BLOCKED and is
-    # never faked; it never blocks the run on its own (the subscribed scenario
-    # is draft-unverified). CALEE_HUB_BASE selects the endpoint when present.
+    echo "--- Step 1.5: Prepare the today-relative subscribed calendar fixture ---"
+    # Priority 5/6/7: resolve ONE date for the run, generate the today-relative
+    # subscribed ICS, and run it through exactly ONE explicit mode -- never a
+    # silent fallback between them (config/machine.local.yaml's
+    # subscribed_fixture.mode; defaults to "offline-only", which never claims
+    # provisioning). "published" mode publishes the ICS to a stable external
+    # URL already subscribed by the regression account (WebDAV/presigned-PUT/
+    # S3-CLI/local adapter -- no calee-hub-core endpoint involved) and polls
+    # until the run-specific event is visible; "fixed-date" uses the existing
+    # static fixture at its own known date. Records first-class subscribed-
+    # fixture evidence under this run and makes the generated event titles
+    # available to the tablet scenario as ${REG_SUB_*} variables. Optional
+    # while the subscribed-calendar scenario stays draft-unverified --
+    # automatically mandatory once it is promoted (see consolidate's
+    # --subscribed-fixture-mandatory/--subscribed-fixture-optional).
     python -m calee_regression prepare-subscribed-fixture --run-id "$CALEE_RUN_ID"
 
     echo ""

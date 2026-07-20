@@ -131,6 +131,7 @@ don't call directly; `tester/technical/*.command` requires a real physical table
 - [docs/TEST_DATA_RESET_CONTRACT.md](docs/TEST_DATA_RESET_CONTRACT.md) — device state contract + the deterministic REG-* fixture
 - [docs/CALENDAR_BIG_CHANGE_COVERAGE.md](docs/CALENDAR_BIG_CHANGE_COVERAGE.md) — how to use the calendar suite around big calendar changes
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — symptom → cause → fix, including exit codes and BLOCKED scenarios
+- [docs/CI_VALIDATION_TIERS.md](docs/CI_VALIDATION_TIERS.md) — PR validation vs. main-commit validation vs. release-candidate certification, and where each is enforced
 - [docs/sample-report/](docs/sample-report/) — a synthetic example consolidated report (HTML/JSON/JUnit + release bundle)
 
 ## Framework tests

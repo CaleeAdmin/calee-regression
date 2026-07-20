@@ -11,15 +11,24 @@
 #   1. creates ONE release run ID up front (before any verification),
 #   2. loads the technical owner's machine config as the single authoritative
 #      source and records a secrets-excluded snapshot into the run,
-#   3. installs the release bundle on the connected tablet (verifying the actual
+#   3. verifies the release bundle (manifest schema, checksums, Git SHAs) --
+#      WITHOUT touching any device,
+#   4. composes the ONE effective release configuration (folding the verified
+#      bundle manifest into it -- schema v2 is authoritative for scope; schema
+#      v1 is cross-checked against config/release-platforms.yaml) -- also
+#      WITHOUT touching any device. NO `adb install`, reboot, HOME mutation or
+#      product test may occur before this gate succeeds.
+#   5. installs the release bundle on the connected tablet (verifying the actual
 #      APK contents + signer first), recording all installer evidence INTO the
 #      same run,
-#   4. runs the full Calee regression under the SAME run (delegates to "06 Test
-#      Full Calee Solution", inheriting the run ID and the reconciled config),
-#   5. opens the final consolidated report.
+#   6. runs the full Calee regression under the SAME run (delegates to "06 Test
+#      Full Calee Solution", inheriting the run ID and CONSUMING -- never
+#      recomposing -- this run's release-config evidence),
+#   7. opens the final consolidated report.
 #
 # You never edit YAML/JSON/env. Every outcome is shown in plain language:
-#   Ready / Installing / Testing / Passed / Failed / Blocked / Needs technical owner
+#   Ready / Verifying / Configuring / Installing / Testing / Passed / Failed /
+#   Blocked / Needs technical owner
 #
 # When a device is missing, this reports "Needs technical owner" and stops --
 # it never pretends a device was present. All evidence for the technical owner
@@ -59,6 +68,7 @@ consolidate_gate() {
     # a BLOCKED/INVALID installation or machine-config yields a BLOCKED report.
     local args=(--run-id "$CALEE_RUN_ID" --allow-unknown-build-identity)
     [ -f "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/machine-config/results.json" ] && args+=(--machine-config-mandatory)
+    [ -f "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/release-config/results.json" ] && args+=(--release-config-mandatory)
     [ -f "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/installation/results.json" ] && args+=(--installation-mandatory)
     python3 -m calee_regression consolidate "${args[@]}"
     local status=$?
@@ -151,9 +161,75 @@ fi
 [ -n "${MACHINE_ANDROID_DEVICE:-}" ] && export CALEE_ANDROID_DEVICE="$MACHINE_ANDROID_DEVICE"
 state_ready "Machine configuration loaded (authoritative). Backend: ${MACHINE_BACKEND_URL}"
 
-# ── 3. install the release into the SAME run (Priority 1/5/6) ────────────────
-# verify-bundle (absolute APK paths) -> inspect actual APK contents + signer ->
-# read-only tablet inspection -> ordered data-preserving install. Every piece of
+# ── 3. verify the release bundle — NO device touch (Priority 1) ──────────────
+# Manifest schema (v1 or v2), full Git SHAs, package ids, version formats, APK
+# existence, SHA-256 checksums, no unexpected/traversal files -- entirely
+# offline. This runs BEFORE release configuration is composed and BEFORE any
+# `adb` command, so a malformed bundle is caught with a clear, separate
+# diagnosis instead of surfacing later as an installer or config failure.
+state_doing "Verifying the release bundle (no device touched yet)…" "VERIFYING"
+mkdir -p "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/release-config"
+python3 -m calee_regression verify-release-bundle \
+    --bundle "$MACHINE_RELEASE_BUNDLE_DIR" \
+    --report "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/release-config/bundle-verification.json"
+BUNDLE_VERIFY_STATUS=$?
+
+if [ $BUNDLE_VERIFY_STATUS -ne 0 ]; then
+    # Nothing was installed and no release configuration was composed -- STILL
+    # produce ONE consolidated BLOCKED report (Priority 7).
+    needs_owner "The release bundle failed verification (manifest schema, checksums, or Git SHAs)." \
+                "No — the bundle the technical owner supplied is malformed; nothing was installed or tested." \
+                "Ask your technical owner to rebuild/re-sign the release bundle and drop it back in the folder." \
+                "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/release-config/bundle-verification.json"
+    consolidate_gate
+    CONSOLIDATED_STATUS=$?
+    read -r -p "Press Enter to close..." _
+    exit $CONSOLIDATED_STATUS
+fi
+state_pass "Release bundle verified."
+
+# ── 4. compose the effective release configuration — NO device touch ────────
+# Folds the (already-verified) release bundle manifest into the ONE effective
+# release configuration for this run: schema v2 makes the bundle itself
+# authoritative for platform/feature scope, profile, backend and expected
+# identity; schema v1 cross-checks the bundle against config/release-
+# platforms.yaml and BLOCKS on disagreement. Writes the full pre-install
+# identity comparison matrix to reports/runs/$CALEE_RUN_ID/release-config/
+# results.json. Launcher "06" below CONSUMES this same evidence -- it never
+# recomposes a second, possibly-different configuration for this run.
+state_doing "Composing the effective release configuration…" "CONFIGURING"
+if RELEASE_CFG_OUT="$(python3 -m calee_regression release-config --bundle "$MACHINE_RELEASE_BUNDLE_DIR" --run-id "$CALEE_RUN_ID" 2>release_config_error.txt)"; then
+    RELEASE_CFG_STATUS=0
+else
+    RELEASE_CFG_STATUS=$?
+fi
+eval "$RELEASE_CFG_OUT" 2>/dev/null || true
+
+if [ $RELEASE_CFG_STATUS -ne 0 ]; then
+    # Priority 1, requirement 6: release configuration blocked -- execute NO
+    # `adb install`, NO reboot, NO HOME mutation, NO product tests. Installation
+    # is simply never attempted (never recorded), so consolidate's auto-
+    # discovery correctly shows it as not-run because this gate blocked. STILL
+    # produce ONE consolidated BLOCKED report (Priority 7), update
+    # reports/latest-run, and open the final report.
+    cat release_config_error.txt
+    rm -f release_config_error.txt
+    needs_owner "The machine and release configurations conflict (or the schema-1 bundle disagrees with config/release-platforms.yaml)." \
+                "No — this is a setup/configuration problem, not a proven product failure." \
+                "Ask your technical owner to check config/machine.local.yaml and config/release-platforms.yaml against the release bundle -- see the release-config report." \
+                "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/release-config/results.json"
+    consolidate_gate
+    CONSOLIDATED_STATUS=$?
+    read -r -p "Press Enter to close..." _
+    exit $CONSOLIDATED_STATUS
+fi
+rm -f release_config_error.txt
+state_pass "Effective release configuration composed."
+
+# ── 5. install the release into the SAME run (Priority 1/5/6) ────────────────
+# Only reached once BOTH the bundle verification AND release configuration
+# gates above have passed. inspect actual APK contents + signer -> read-only
+# tablet inspection -> ordered data-preserving install. Every piece of
 # installer evidence is written to reports/runs/$CALEE_RUN_ID/installation/.
 state_doing "Installing the release on the tablet (your data is preserved)…" "INSTALLING"
 SERIAL_ARG=()
@@ -202,12 +278,13 @@ else
     exit $CONSOLIDATED_STATUS
 fi
 
-# ── 4. run the full regression under the SAME run (delegate to 06) ───────────
+# ── 6. run the full regression under the SAME run (delegate to 06) ───────────
 state_doing "Running the full Calee regression. This takes a while — leave it running…" "TESTING"
 # "06 Test Full Calee Solution" owns Prepare -> tablet -> mobile -> sync ->
-# kiosk -> manual -> consolidate, INHERITS $CALEE_RUN_ID (so the installation +
-# machine-config evidence recorded above are consolidated in the SAME run), and
-# produces one consolidated PASS/FAIL/BLOCKED report.
+# kiosk -> manual -> consolidate, INHERITS $CALEE_RUN_ID (so the release-config,
+# installation and machine-config evidence recorded above are consolidated in
+# the SAME run), CONSUMES (never recomposes) this run's release-config
+# evidence, and produces one consolidated PASS/FAIL/BLOCKED report.
 #
 # Priority 2: NO `</dev/null` here. The delegated launcher contains mandatory
 # interactive manual checks; the tester's terminal input must reach them. An
@@ -216,7 +293,7 @@ state_doing "Running the full Calee regression. This takes a while — leave it 
 bash "$DIR/06 Test Full Calee Solution.command"
 REGRESSION_STATUS=$?
 
-# ── 5. plain-language final state ───────────────────────────────────────────
+# ── 7. plain-language final state ───────────────────────────────────────────
 case $REGRESSION_STATUS in
     0)
         state_pass "The Calee release passed regression. It is good to ship."
@@ -236,7 +313,7 @@ case $REGRESSION_STATUS in
         ;;
 esac
 
-# ── 6. open the report ──────────────────────────────────────────────────────
+# ── 8. open the report ──────────────────────────────────────────────────────
 echo ""
 echo "Opening the final report…"
 bash "$DIR/07 Open Latest Report.command" </dev/null || true
