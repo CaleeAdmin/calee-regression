@@ -1793,8 +1793,15 @@ def write_release_bundle(
         seen_arcs: "set[str]" = set()
         for evidence_path in evidence_paths or []:
             if evidence_path.is_file():
-                arc = f"evidence/{evidence_path.name}"
-                # Dedup identical basenames (e.g. a screenshot referenced twice)
+                # Priority 9: preserve the containing directory in the arcname
+                # (evidence/<component>/<filename>, matching the
+                # reports/runs/<run-id>/<component>/<filename> convention
+                # every producer already follows) -- NOT just the basename.
+                # Every component's own report is named "results.json", so
+                # basename-only arcnames collided and silently dropped all
+                # but one component's evidence from the ZIP.
+                arc = f"evidence/{evidence_path.parent.name}/{evidence_path.name}"
+                # Dedup identical arcnames (e.g. a screenshot referenced twice)
                 # so the ZIP never carries duplicate entries.
                 if arc in seen_arcs:
                     continue

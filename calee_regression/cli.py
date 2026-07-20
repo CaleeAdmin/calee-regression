@@ -2359,14 +2359,56 @@ def consolidate(
     # captured by the tablet/mobile UI runs travel into the release ZIP too.
     for ui_report in (tablet, mobile_android, mobile_ios):
         evidence_paths.extend(collect_step_diagnostic_paths(ui_report))
-    # Priority 4/6: the machine-config snapshot and the full installation
-    # evidence (bundle verification + APK inspection + install execution) travel
-    # into the release ZIP, so the qualification bundle contains all installer
-    # and configuration evidence, not just reports/*.json.
-    for component_name in ("machine-config", "installation"):
-        component_report = workspace.component_report_path(component_name)
-        if component_report.is_file():
-            evidence_paths.append(component_report)
+    # Priority 9: every component's own results.json travels into the release
+    # ZIP (not just machine-config/installation) -- the qualification bundle
+    # must contain the complete evidence set, not a hand-picked subset. Uses
+    # the SAME path each component was actually resolved from above (an
+    # explicit --foo-report override, not just the default in-workspace path)
+    # so the bundle always contains the exact file that backed the decision --
+    # `loaded is None` means that component was never executed or was
+    # rejected by _resolve_component, and there is nothing to package for it
+    # (already correctly reflected as NOT_RUN/BLOCKED in the status above).
+    for component_name, explicit_override, loaded in (
+        ("machine-config", machine_config_report, machine_config_snapshot),
+        ("release-config", release_config_report, release_config_composition),
+        ("installation", installation_report, installation),
+        ("environment", environment_report, env_report),
+        ("tablet", tablet_report, tablet),
+        ("mobile-api", mobile_api_report, mobile_api),
+        ("mobile-android", mobile_android_report, mobile_android),
+        ("mobile-ios", mobile_ios_report, mobile_ios),
+        ("sync", sync_report, sync),
+        ("kiosk-admin", kiosk_report, kiosk),
+        ("manual-checks", manual_checks_path, manual_checks_raw),
+        ("subscribed-fixture", None, resolve("subscribed-fixture", None)),
+    ):
+        if loaded is None:
+            continue
+        evidence_paths.append(Path(explicit_override) if explicit_override else workspace.component_report_path(component_name))
+    # The today-relative subscribed-fixture ICS sidecar (Priority 7) -- not a
+    # results.json, so it isn't covered by the loop above.
+    subscribed_ics = workspace.component_dir("subscribed-fixture") / "reg_sub_today_relative.ics"
+    if subscribed_ics.is_file():
+        evidence_paths.append(subscribed_ics)
+    # Priority 4/Phase 3-4: the pre/post build-identity snapshots (not under
+    # component_report_path -- see cli.py's build-identity command).
+    for phase in ("pre", "post"):
+        identity_snapshot = workspace.root / "identity" / f"{phase}.json"
+        if identity_snapshot.is_file():
+            evidence_paths.append(identity_snapshot)
+
+    # Priority 9: a file this consolidation resolved and intended to package
+    # (above) but that has since vanished from disk is a hard evidence-
+    # integrity problem -- never silently ship a bundle missing a file it
+    # claims to include. Block rather than produce an incomplete ZIP.
+    vanished_evidence = [p for p in evidence_paths if not p.is_file()]
+    if vanished_evidence:
+        report.overall_status = STATUS_BLOCKED
+        report.summary["suggestedNextAction"] = (
+            "Evidence file(s) resolved for this run vanished before the release ZIP could be written: "
+            + ", ".join(str(p) for p in vanished_evidence) + " -- rerun this run's consolidation."
+        )
+
     bundle_path = write_release_bundle(
         report, out, build_label=build_version, evidence_paths=evidence_paths or None
     )
