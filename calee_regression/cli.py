@@ -2532,6 +2532,60 @@ def machine_config_snapshot_cmd(config_path, legacy_config_path, run_id_opt):
     raise SystemExit(EXIT_SUCCESS)
 
 
+@main.command("run-with-credentials", context_settings={"ignore_unknown_options": True})
+@click.argument("command", nargs=-1, type=click.UNPROCESSED)
+def run_with_credentials_cmd(command):
+    """Resolve regression credentials ONCE and exec a delegated command with the
+    credentials present ONLY in that command's child environment (Priority 5).
+
+        python -m calee_regression run-with-credentials -- <command...>
+
+    The credentials are resolved through the standard chain (injected -> env ->
+    macOS Keychain), so a technical owner who stores them in the Keychain never
+    has to export CALEE_TEST_EMAIL / CALEE_TEST_PASSWORD -- this single secure
+    boundary is how the Bash mobile orchestration (and everything it spawns:
+    Prepare, the CaleeMobile Client API, the mobile UI, the sync receivers)
+    obtains them. The credentials NEVER appear in argv, in any report, in this
+    process's logs, or in a persistent plaintext file; only the specific
+    CALEE_TEST_EMAIL / CALEE_TEST_PASSWORD (and, when present, CALEE_API_TOKEN)
+    are added to the child environment, which is otherwise inherited unchanged.
+    """
+    argv = list(command)
+    while argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        click.echo("run-with-credentials needs a command: run-with-credentials -- <command...>", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    resolver = credentials_mod.default_resolver()
+    try:
+        resolved = resolver.resolve_all([
+            credentials_mod.REGRESSION_USERNAME,
+            credentials_mod.REGRESSION_PASSWORD,
+            credentials_mod.API_TOKEN,
+        ])
+    except credentials_mod.CredentialError as exc:
+        # CredentialError names the env var / keychain item, never a value.
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    mapping = {
+        credentials_mod.REGRESSION_USERNAME.name: credentials_mod.REGRESSION_USERNAME.env_var,
+        credentials_mod.REGRESSION_PASSWORD.name: credentials_mod.REGRESSION_PASSWORD.env_var,
+        credentials_mod.API_TOKEN.name: credentials_mod.API_TOKEN.env_var,
+    }
+    child_env = credentials_mod.build_env(os.environ, resolved, mapping)
+
+    # Replace THIS process with the delegated command: the credentials then live
+    # only in the delegated process tree's environment, never touching a report
+    # or a persistent file. A failed exec (command not found) BLOCKS.
+    try:
+        os.execvpe(argv[0], argv, child_env)
+    except OSError as exc:
+        click.echo(f"run-with-credentials could not exec {argv[0]!r}: {exc}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+
 @main.command("release-config")
 @click.option("--config", "config_path", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
 @click.option("--release-platforms", "platforms_path", envvar="CALEE_RELEASE_PLATFORMS", default=None, type=click.Path(), help="Path to release-platforms.yaml (the release candidate manifest).")

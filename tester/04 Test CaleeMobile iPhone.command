@@ -16,7 +16,10 @@ if [ $BOOTSTRAP_STATUS -ne 0 ]; then
     exit $BOOTSTRAP_STATUS
 fi
 
-bash scripts/test_caleemobile.sh ios
+# Priority 5: credentials come through the single secure boundary (environment
+# OR macOS Keychain), placed only in the child environment -- so a Keychain-only
+# machine needs no exported CALEE_TEST_EMAIL / CALEE_TEST_PASSWORD.
+python3 -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh ios
 STATUS=$?
 
 read -p "Press Enter to close..."

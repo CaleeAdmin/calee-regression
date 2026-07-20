@@ -113,12 +113,18 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     # reports/runs/$CALEE_RUN_ID/mobile-api/results.json. An initial API result
     # therefore stands for the whole release; see scripts/test_caleemobile.sh and
     # Phase 3.
-    bash scripts/test_caleemobile.sh api-only
+    # Priority 5: the Bash mobile orchestration (and run_regression.py /
+    # run_ui_suite.py underneath it) receives CALEE_TEST_EMAIL / CALEE_TEST_
+    # PASSWORD through the single secure credential boundary -- resolved once
+    # from the environment OR the macOS Keychain and placed only in the child
+    # environment, never on a command line. A Keychain-only technical owner does
+    # not have to export the credentials for the mobile suites to run.
+    python3 -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh api-only
 
     if [ "$RELEASE_PLATFORM_ANDROID" = "true" ]; then
         echo ""
         echo "--- Step 4: CaleeMobile Android UI ---"
-        bash scripts/test_caleemobile.sh android --ui-only
+        python3 -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh android --ui-only
     else
         echo ""
         echo "--- Step 4: CaleeMobile Android UI — SKIPPED (not part of this release; see config/release-platforms.yaml) ---"
@@ -127,7 +133,7 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     if [ "$RELEASE_PLATFORM_IOS" = "true" ]; then
         echo ""
         echo "--- Step 5: CaleeMobile iPhone UI ---"
-        bash scripts/test_caleemobile.sh ios --ui-only
+        python3 -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh ios --ui-only
     else
         echo ""
         echo "--- Step 5: CaleeMobile iPhone UI — SKIPPED (not part of this release; see config/release-platforms.yaml) ---"

@@ -239,7 +239,7 @@ if len(argv) >= 3 and argv[0] == "-m" and argv[1] == "calee_regression":
     if order:
         with open(order, "a") as f:
             f.write(cmd + "\\n")
-    if cmd in ("machine-config-snapshot", "install-tablet-release"):
+    if cmd in ("machine-config-snapshot", "install-tablet-release", "run-with-credentials"):
         os.execv(REAL, [REAL, "-m", "calee_regression"] + argv[2:])
     if cmd == "release-platforms":
         sys.stdout.write("export RELEASE_PLATFORM_TABLET=true\\n")

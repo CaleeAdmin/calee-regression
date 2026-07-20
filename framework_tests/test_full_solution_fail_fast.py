@@ -104,6 +104,12 @@ def _install_fakes(repo: Path, tmp_path: Path) -> Path:
         "            done\n"
         '            printf "sync-smoke:%s\\n" "$plat" >> "$FAKE_ORDER_LOG"\n'
         "            exit 0 ;;\n"
+        # The credential wrapper (Priority 5) just execs its delegated command in
+        # this dry-run; real credential resolution is exercised by its own tests.
+        "        run-with-credentials)\n"
+        "            shift 3\n"
+        '            if [ "$1" = "--" ]; then shift; fi\n'
+        '            exec "$@" ;;\n'
         "        *)\n"
         "            exit 0 ;;\n"
         "    esac\n"
