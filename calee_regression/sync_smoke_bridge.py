@@ -129,10 +129,43 @@ def create_scratch_event(*, repo_root: Path, base_url: str, email: str, password
     )
 
 
+def is_ingestion_bridge_available(repo_root: Path) -> bool:
+    """Whether the sibling CaleeMobile-Regression checkout exposes the
+    'find-event-by-title' action find_event_by_title needs (Priority 6). A
+    cheap, side-effect-free pre-flight check so a genuinely unavailable
+    bridge (no sibling checkout) BLOCKS immediately with a precise reason,
+    rather than exhausting an entire ingestion-poll timeout retrying
+    something that can never succeed."""
+    return _find_sibling_with_marker(repo_root, marker_relative_path="api/sync_smoke_actions.py") is not None
+
+
 def get_event(*, repo_root: Path, base_url: str, email: str, password: str, event_id: str) -> dict[str, Any]:
     return _run_api_action(
         "get-event", repo_root=repo_root, base_url=base_url, email=email, password=password,
         extra_args=["--event-id", event_id],
+    )
+
+
+def find_event_by_title(
+    *, repo_root: Path, base_url: str, email: str, password: str, title: str, calendar_id: "str | None" = None,
+) -> dict[str, Any]:
+    """Priority 6: the Calee-ingestion observation this bridge exists for --
+    reuses the existing, already-authenticated GET /client/v1/events
+    operation (CaleeMobile-Regression's sync_smoke_cli.py 'find-event-by-
+    title' action), filtered by the EXACT run-specific subscribed-event
+    title rather than a known id (a subscription-ingested event's id is
+    assigned by the hub and unknown ahead of time). ``calendar_id``, when
+    given, narrows the match to one calendar (e.g. the REG-SUB fixture
+    calendar) so a stale same-titled event elsewhere can't false-positive.
+    Returns {"found": False, "title": ...} when no matching event exists --
+    never raises for "not found", only for a genuine bridge/transport
+    failure (see SyncSmokeBridgeError)."""
+    extra_args = ["--title", title]
+    if calendar_id is not None:
+        extra_args.extend(["--calendar-id", calendar_id])
+    return _run_api_action(
+        "find-event-by-title", repo_root=repo_root, base_url=base_url, email=email, password=password,
+        extra_args=extra_args,
     )
 
 

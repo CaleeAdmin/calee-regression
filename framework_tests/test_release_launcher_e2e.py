@@ -481,13 +481,19 @@ def test_launcher_one_run_id_machine_config_and_install_evidence(tmp_path):
     # 3. bundle path is OUTSIDE the repo, and 5. installer evidence is IN the run.
     install = json.loads((run_dir / "installation" / "results.json").read_text())
     assert str(bundle) not in str(repo)  # sanity: the bundle really is external
-    # 4. APK paths passed to adb are ABSOLUTE (and point inside the external bundle).
+    # 4. APK paths passed to adb are ABSOLUTE. Once release-config has frozen
+    # this run's approved release candidate into an immutable snapshot
+    # (release_candidate.py), install-tablet-release installs ONLY from that
+    # run-scoped snapshot -- never the original external drop folder, even
+    # though that's what --bundle still points at -- closing the TOCTOU gap
+    # between approval and installation.
     argvs = [a for step in install["plan"]["steps"] for a in step["argv"]]
     apk_args = [a for a in argvs if a.endswith(".apk")]
     assert apk_args, install
     for a in apk_args:
         assert a.startswith("/"), a
-        assert str(bundle) in a
+        assert str(run_dir / "release-candidate") in a
+    assert install.get("releaseCandidateFingerprint") is not None, install
 
 
 def test_launcher_verifies_bundle_and_composes_release_config_before_installing(tmp_path):

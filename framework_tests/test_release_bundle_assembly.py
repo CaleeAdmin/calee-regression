@@ -372,6 +372,129 @@ def test_write_release_bundle_refuses_incomplete_assembly(tmp_path):
         rba.write_release_bundle(assembly, tmp_path / "out")
 
 
+# ── Priority 9: atomic assembly -- a reused --out never accumulates stale
+# files, and a failure partway through never corrupts a prior bundle ────────
+
+
+def test_write_release_bundle_reused_out_dir_leaves_no_stale_files(tmp_path):
+    calee_bytes, shell_bytes = b"calee-v1-bytes", b"shell-v1-bytes"
+    calee_apk = _write_apk(tmp_path / "src1", "calee.apk", calee_bytes)
+    shell_apk = _write_apk(tmp_path / "src1", "caleeshell.apk", shell_bytes)
+    assembly1 = rba.assemble_release_bundle(
+        **_base_kwargs(release_id="r1"), calee_apk=calee_apk, calee_git_sha=CALEE_SHA,
+        caleeshell_apk=shell_apk, caleeshell_git_sha=SHELL_SHA,
+        which=_which({"apkanalyzer", "apksigner"}),
+        runner=_runner_for(calee_bytes=calee_bytes, shell_bytes=shell_bytes),
+    )
+    assert assembly1.ok, assembly1.errors
+    out_dir = tmp_path / "out"
+    rba.write_release_bundle(assembly1, out_dir)
+    (out_dir / "unrelated-stale-file.txt").write_text("leftover from a previous release")
+    assert (out_dir / "caleeshell.apk").is_file()
+
+    # Release #2 is Calee-ONLY, reusing the same --out -- the dangerous case:
+    # without atomic replacement, release #1's caleeshell.apk (and its
+    # manifest section) could linger and still verify as part of what looks
+    # like release #2's bundle.
+    calee2_bytes = b"calee-v2-bytes"
+    calee2_apk = _write_apk(tmp_path / "src2", "calee.apk", calee2_bytes)
+    caleeshell_expected = {
+        "packageId": "com.viso.caleeshell", "versionName": "founder-v0.2.12",
+        "versionCode": 212, "gitSha": SHELL_SHA, "signerSha256": SHELL_SIGNER,
+    }
+    assembly2 = rba.assemble_release_bundle(
+        **_base_kwargs(release_id="r2"), calee_apk=calee2_apk, calee_git_sha=CALEE_SHA,
+        caleeshell_expected=caleeshell_expected,
+        which=_which({"apkanalyzer", "apksigner"}), runner=_runner_for(calee_bytes=calee2_bytes),
+    )
+    assert assembly2.ok, assembly2.errors
+    rba.write_release_bundle(assembly2, out_dir)
+
+    # Everything left over from release #1 is gone -- the unrelated file AND
+    # its own caleeshell.apk (release #2 doesn't include one).
+    assert not (out_dir / "unrelated-stale-file.txt").exists()
+    assert not (out_dir / "caleeshell.apk").exists()
+    assert (out_dir / "calee.apk").read_bytes() == calee2_bytes
+
+    manifest_on_disk = json.loads((out_dir / "release-manifest.json").read_text())
+    assert manifest_on_disk["releaseId"] == "r2"
+    verification = verify_release_bundle(out_dir)
+    assert verification.ok, verification.errors
+    assert {a.key for a in verification.verified_apps} == {"calee"}
+
+
+def test_write_release_bundle_failure_partway_through_leaves_prior_bundle_untouched(tmp_path, monkeypatch):
+    calee_bytes, shell_bytes = b"calee-v1-bytes", b"shell-v1-bytes"
+    calee_apk = _write_apk(tmp_path / "src1", "calee.apk", calee_bytes)
+    shell_apk = _write_apk(tmp_path / "src1", "caleeshell.apk", shell_bytes)
+    assembly1 = rba.assemble_release_bundle(
+        **_base_kwargs(release_id="r1"), calee_apk=calee_apk, calee_git_sha=CALEE_SHA,
+        caleeshell_apk=shell_apk, caleeshell_git_sha=SHELL_SHA,
+        which=_which({"apkanalyzer", "apksigner"}),
+        runner=_runner_for(calee_bytes=calee_bytes, shell_bytes=shell_bytes),
+    )
+    assert assembly1.ok, assembly1.errors
+    out_dir = tmp_path / "release-output" / "out"
+    rba.write_release_bundle(assembly1, out_dir)
+    original_manifest = (out_dir / "release-manifest.json").read_text()
+
+    calee2_bytes, shell2_bytes = b"calee-v2-bytes", b"shell-v2-bytes"
+    calee2_apk = _write_apk(tmp_path / "src2", "calee.apk", calee2_bytes)
+    shell2_apk = _write_apk(tmp_path / "src2", "caleeshell.apk", shell2_bytes)
+    assembly2 = rba.assemble_release_bundle(
+        **_base_kwargs(release_id="r2"), calee_apk=calee2_apk, calee_git_sha=CALEE_SHA,
+        caleeshell_apk=shell2_apk, caleeshell_git_sha=SHELL_SHA,
+        which=_which({"apkanalyzer", "apksigner"}),
+        runner=_runner_for(calee_bytes=calee2_bytes, shell_bytes=shell2_bytes),
+    )
+    assert assembly2.ok, assembly2.errors
+
+    # Simulate a crash/kill partway through the second app's copy.
+    real_copyfile = rba.shutil.copyfile
+
+    def _flaky_copyfile(src, dst):
+        if "caleeshell" in str(dst):
+            raise OSError("simulated crash mid-copy")
+        return real_copyfile(src, dst)
+
+    monkeypatch.setattr(rba.shutil, "copyfile", _flaky_copyfile)
+
+    with pytest.raises(OSError):
+        rba.write_release_bundle(assembly2, out_dir)
+
+    # The ORIGINAL bundle (release #1) is completely untouched -- never a mix
+    # of release #1's manifest with release #2's partially-copied APK.
+    assert (out_dir / "release-manifest.json").read_text() == original_manifest
+    assert (out_dir / "calee.apk").read_bytes() == calee_bytes
+    assert (out_dir / "caleeshell.apk").read_bytes() == shell_bytes
+    verification = verify_release_bundle(out_dir)
+    assert verification.ok, verification.errors
+    assert verification.manifest.release_id == "r1"
+
+    # No temp/backup directory left behind alongside out_dir.
+    leftovers = [p.name for p in out_dir.parent.iterdir() if p != out_dir]
+    assert leftovers == [], leftovers
+
+
+def test_write_release_bundle_leaves_no_temp_dir_on_success(tmp_path):
+    calee_bytes = b"calee-bytes"
+    calee_apk = _write_apk(tmp_path / "src", "calee.apk", calee_bytes)
+    caleeshell_expected = {
+        "packageId": "com.viso.caleeshell", "versionName": "founder-v0.2.12",
+        "versionCode": 212, "gitSha": SHELL_SHA, "signerSha256": SHELL_SIGNER,
+    }
+    assembly = rba.assemble_release_bundle(
+        **_base_kwargs(), calee_apk=calee_apk, calee_git_sha=CALEE_SHA,
+        caleeshell_expected=caleeshell_expected,
+        which=_which({"apkanalyzer", "apksigner"}), runner=_runner_for(calee_bytes=calee_bytes),
+    )
+    assert assembly.ok, assembly.errors
+    out_dir = tmp_path / "release-output" / "out"
+    rba.write_release_bundle(assembly, out_dir)
+    leftovers = [p.name for p in out_dir.parent.iterdir() if p != out_dir]
+    assert leftovers == [], leftovers
+
+
 def test_cli_assemble_release_bundle_end_to_end(tmp_path, monkeypatch):
     from click.testing import CliRunner
     from calee_regression import cli

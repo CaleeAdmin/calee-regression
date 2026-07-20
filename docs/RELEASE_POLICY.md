@@ -24,10 +24,81 @@ describes the rule; the code is the source of truth if they ever disagree.
 | Test environment and regression fixture (`prepare`) | **Yes, always — no opt-out.** A non-zero Prepare result blocks the release the same as any other missing mandatory component; there is no "informational note next to an otherwise-green result" — see below. |
 | Calee tablet suite (`full-tester`/`release-technical`) | Yes, always |
 | CaleeMobile Client API suite | Yes, always |
-| CaleeMobile Android UI suite | Driven by `config/release-platforms.yaml`'s `mobile_android` — **defaults to Yes** if that file is absent |
-| CaleeMobile iPhone UI suite | Driven by `config/release-platforms.yaml`'s `mobile_ios` — **defaults to Yes** if that file is absent |
-| Cross-device synchronization (`sync-smoke`) | Driven by `config/release-platforms.yaml`'s `release_features.synchronization` — **defaults to Yes** if that file is absent. Runs after the mobile UI legs and before manual checks, reusing this run's verified backend/fixture/credentials and the same run ID; its report (`reports/runs/<run-id>/sync/results.json`) is auto-discovered and validated like every other component. A missing/stale/run-ID-mismatched/`BLOCKED`/`FAILED` mandatory sync can never PASS. Currently resolves to `BLOCKED` until the tablet-mutation gap closes (`docs/TABLET_MUTATION_COVERAGE_GAPS.md`) and a real device verifies the flows — the intended safety property, not a silent non-gate. An excluded (`synchronization: false`) sync is still shown as an explicit **optional** component. |
+| CaleeMobile Android UI suite | Driven by `mobile_android` — **defaults to Yes** if no scope source is configured. See "Schema-v2 release bundles are authoritative for scope" below for where this actually comes from. |
+| CaleeMobile iPhone UI suite | Driven by `mobile_ios` — **defaults to Yes** if no scope source is configured. Same precedence as above. |
+| Cross-device synchronization (`sync-smoke`) | Driven by `release_features.synchronization` — **defaults to Yes** if no scope source is configured (see precedence below). Runs after the mobile UI legs and before manual checks, reusing this run's verified backend/fixture/credentials and the same run ID; its report (`reports/runs/<run-id>/sync/results.json`) is auto-discovered and validated like every other component. A missing/stale/run-ID-mismatched/`BLOCKED`/`FAILED` mandatory sync can never PASS. Currently resolves to `BLOCKED` until the tablet-mutation gap closes (`docs/TABLET_MUTATION_COVERAGE_GAPS.md`) and a real device verifies the flows — the intended safety property, not a silent non-gate. An excluded (`synchronization: false`) sync is still shown as an explicit **optional** component. |
 | Manual guided checks | Yes, whenever any are defined for the release profile in question — see `docs/NON_TECH_TESTER_GUIDE.md` and `config/manual-checks.example.json` |
+
+### Schema-v2 release bundles are authoritative for scope (Priority 2)
+
+Platform scope, feature scope, the production/staging profile, and every expected application
+identity ultimately come from ONE of two sources, never both at once for the same run:
+
+- **A schema-version-2 release bundle manifest** (`release-manifest.json`'s `schemaVersion: 2` —
+  see `docs/RELEASE_INSTALLER.md`), once verified and composed by `release-config` for this run
+  (`calee_regression/release_config.py::compose_effective_release_config`). This is
+  **self-contained and authoritative**: `platforms`, `features`, `profile`, `backend`, and every
+  `tabletSolution`/`caleeMobile` expected identity in the bundle manifest control the whole run —
+  `config/release-platforms.yaml` is **not consulted at all**, and a malformed/absent
+  `config/release-platforms.yaml` can never block a run driven by a valid schema-v2 bundle.
+  Production profile forcing selector-evidence policy (see `docs/RELEASE_INSTALLER.md`'s selector
+  section) always follows the bundle's own `profile`, never a co-present legacy file's.
+- **`config/release-platforms.yaml`** (schema version 1, or no bundle manifest at all) — the
+  original source of truth, still loaded and cross-checked exactly as before schema v2 existed.
+
+Every downstream command that used to read `config/release-platforms.yaml` directly
+(`consolidate`, `selector-contract`, `sync-smoke`, `kiosk-admin`) now prefers this run's own
+already-composed `release-config` evidence (`reports/runs/<run-id>/release-config/results.json`)
+whenever one exists, falling back to `config/release-platforms.yaml` only when it doesn't
+(`calee_regression/cli.py::_v2_platforms_features_expected` is the shared conversion). An explicit
+CLI flag (e.g. `--android-mandatory`, `--production`) always wins over either source. See
+`calee_regression/cli.py::_emit_release_config_vars` for the full set of `RELEASE_*` shell
+variables `06 Test Full Calee Solution.command` sources from a composed release-config, including
+the per-feature `RELEASE_FEATURE_*` flags and the `RELEASE_EXPECTED_*` identity fields.
+
+### Selector evidence and distributed-build acceptance precedence (Priority 3)
+
+`caleeMobile.selectorEvidenceRequired` and `caleeMobile.distributedBuildAcceptanceRequired` (schema
+v2) are enforced, not merely recorded, in `consolidate`'s gating decision (`calee_regression/cli.py`).
+For **both** flags the precedence, highest first, is:
+
+1. **Production + a mobile release** (selector evidence only) — unconditionally mandatory; a manifest
+   `false` (or a legacy `config/release-platforms.yaml` opt-out) can never suppress it, and
+   `--selector-contract-optional` is rejected outright. This is the one rule that overrides a `false`
+   flag.
+2. **An explicit CLI flag** (`--selector-contract-mandatory/-optional`,
+   `--distributed-build-acceptance-mandatory/-optional`) — always wins over the manifest.
+3. **The manifest's own flag** (via this run's composed `release-config`) — `true` makes the
+   component mandatory (selector evidence: even outside a mobile release); `false` records the
+   component as an explicit, visible **not required for this release**, never a silent omission.
+4. **A structural default** — selector evidence defaults to mandatory whenever a mobile platform is
+   in scope (or a selector-contract report already exists for this run); distributed-build acceptance
+   has no structural default and simply does not apply (omitted entirely) when no release-config was
+   composed for this run at all (ad-hoc/dev consolidation).
+
+With no physical/distributed evidence, distributed-build acceptance BLOCKS rather than passing — it
+is never inferred from a local checkout or an unsigned build (`calee_regression/
+distributed_build_acceptance.py`'s `verifiedVia` allow-list enforces this).
+
+### Subscribed-fixture evidence is bound to the release (Priority 7)
+
+The subscribed-calendar-fixture component (`prepare-subscribed-fixture` /
+`calee_regression/subscribed_publisher.py`, see `docs/SUBSCRIBED_CALENDAR_REGRESSION.md`) is bound to
+the specific release it is evidence for, the same way selector-contract evidence is (Priority 8):
+
+* `prepare-subscribed-fixture` adopts this run's own composed `release-config` `releaseId` (an explicit
+  `--release-id`/`CALEE_RELEASE_ID` always wins) and records it in `subscribed-fixture/results.json`.
+* At consolidation, `component_from_subscribed_fixture_report` requires the report's `releaseId` to be
+  present and match `consolidate`'s own resolved release ID whenever one applies — a missing release id,
+  or one for a different release, BLOCKS. Wrong-run and stale-report rejection are not duplicated here:
+  every component (subscribed-fixture included) already goes through `_resolve_component` ->
+  `run_context.validate_component_report`, which rejects a report with a mismatched run ID or a file
+  older than this run's start, exactly like every other component.
+* A `mode: "published"` report is re-verified, never merely trusted: it must independently show BOTH
+  `publicReadVerificationStatus == "ok"` (Priority 5's exact byte/title/date check) AND
+  `ingestionStatus == "ok"` (Priority 6's Calee-ingestion check) before a bare top-level `status: "ok"`
+  is accepted as PASS. `fixed-date`/`offline-only` reports never set either status (they never claim
+  publication or ingestion at all — Priority 6: "never faked").
 
 ### Prepare is mandatory, unconditionally
 

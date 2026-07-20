@@ -53,21 +53,21 @@ echo "Report root: $CALEE_REPORT_ROOT"
 echo "Workspace: $CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/"
 echo ""
 
-# Determine which platforms this release actually includes (technical-owner
-# config/release-platforms.yaml; defaults to "every platform" if absent --
-# see release_platforms.py). Never silently narrowed by what happens to be
-# convenient to run right now.
-eval "$(python -m calee_regression release-platforms)"
-
 # Priority 3/4: when a machine config exists, the ONE effective release
-# configuration (machine + release candidate/bundle manifest) drives this
-# launcher -- so the MACHINE's platform scope + device ids reach 06, not just
-# the release candidate's. The composed RELEASE_PLATFORM_* (machine capability
-# ∩ release scope) overrides the release-platforms-only values above, the
-# configured iPhone/Android device ids are exported for the UI suite, and a
-# machine/release conflict BLOCKS (recorded in the run's release-config
-# evidence). Absent a machine config (CI/example), the release-platforms
-# defaults above stand.
+# configuration (machine + release candidate/bundle manifest) fully controls
+# this launcher -- platform scope, per-feature mandatoriness, profile, and
+# expected identities all come from its emitted RELEASE_* variables (see
+# calee_regression/cli.py's _emit_release_config_vars), configured iPhone/
+# Android device ids are exported for the UI suite, and a machine/release
+# conflict BLOCKS (recorded in the run's release-config evidence).
+#
+# Priority 2: a schema-v2 release bundle is self-contained and authoritative
+# for platforms/features/profile/expected identity -- config/release-
+# platforms.yaml is NOT consulted for it at all, so a problem with that
+# legacy file can never block a valid v2 bundle. A schema-v1 (or bundle-less)
+# run still loads and cross-checks the legacy file, but only INSIDE release-
+# config's own gate below -- never via a separate, unguarded eval that could
+# abort this launcher before that gate has a chance to run.
 #
 # Priority 1: when launcher "00" already composed this run's release-config
 # (before installing the release), this command CONSUMES that same-run
@@ -83,12 +83,21 @@ if [ -f config/machine.local.yaml ]; then
     else
         RELEASE_CFG_STATUS=$?
     fi
-    # Apply the composed platform scope + device ids regardless (the emitted
-    # values are the safe machine∩release intersection).
+    # Apply the composed platform/feature/profile/expected-identity scope
+    # regardless (the emitted values are the safe machine∩release
+    # intersection, or -- on a BLOCKED composition -- still emitted so the
+    # rest of this script has a consistent, if unusable, view).
     eval "$RELEASE_CFG_OUT" 2>/dev/null || true
     [ -n "${RELEASE_IPHONE_DEVICE:-}" ] && export CALEE_IPHONE_DEVICE="$RELEASE_IPHONE_DEVICE"
     [ -n "${RELEASE_ANDROID_DEVICE:-}" ] && export CALEE_ANDROID_DEVICE="$RELEASE_ANDROID_DEVICE"
 else
+    # No machine config at all: there is no bundle/schema-v2 path in play
+    # (a bundle is always resolved via machine.local.yaml's
+    # release_bundle_dir), so fall back to the legacy release-platforms
+    # profile alone -- a malformed file here still aborts the launcher, which
+    # is correct: schema-v1 (the only possibility with no machine config)
+    # must keep using and cross-checking it (Priority 2 requirement 8).
+    eval "$(python -m calee_regression release-platforms)"
     RELEASE_CFG_STATUS=0
 fi
 

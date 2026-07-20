@@ -16,6 +16,7 @@ from . import appium_lifecycle
 from . import build_identity as build_identity_mod
 from . import config as config_mod
 from . import credentials as credentials_mod
+from . import distributed_build_acceptance as distributed_build_acceptance_mod
 from . import manual_checks as manual_checks_mod
 from . import preflight, release_platforms, reporting, suites
 from . import report_root as report_root_mod
@@ -27,12 +28,14 @@ from . import sync_smoke
 from . import toolchain_verify as toolchain_verify_mod
 from .appium_driver import CaleeDriver
 from .consolidated_report import (
+    DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT_NAME,
     STATUS_BLOCKED,
     STATUS_PASS,
     ManualCheck,
     build_release_report,
     collect_step_diagnostic_paths,
     component_from_caleemobile_sha_agreement,
+    component_from_distributed_build_acceptance_report,
     component_from_identity_stability,
     component_from_release_intent,
     decide_status,
@@ -795,19 +798,25 @@ def sync_smoke_cmd(config_path, run_id_opt, base_url, email, password, platform,
         click.echo(f"Invalid --run-id {run_id_opt!r} (expected letters/digits/._- only).", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
     run_id = run_id_opt
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
 
-    # Mandatory-ness: explicit flag wins, else the release feature profile
-    # (release_features.synchronization), which defaults to True when no config
-    # file is present -- an omitted feature must never silently become optional.
+    # Mandatory-ness (Priority 2): explicit flag wins; else THIS run's own
+    # schema-v2 release-config feature scope (never the legacy file, once
+    # composed); else the release feature profile (release_features.
+    # synchronization), which defaults to True when no config file is present
+    # -- an omitted feature must never silently become optional.
     if mandatory_opt is None:
-        try:
-            mandatory = release_platforms.load_release_features().synchronization
-        except release_platforms.ReleasePlatformsError:
-            mandatory = True
+        release_config_dict = _load_release_config_dict(workspace)
+        if release_config_dict is not None and release_config_dict.get("schemaVersion") == 2:
+            _, v2_features, _ = _v2_platforms_features_expected(release_config_dict)
+            mandatory = v2_features.synchronization
+        else:
+            try:
+                mandatory = release_platforms.load_release_features().synchronization
+            except release_platforms.ReleasePlatformsError:
+                mandatory = True
     else:
         mandatory = mandatory_opt
-
-    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
 
     # Reuse this run's verified backend (from prepare's environment report) when
     # one wasn't passed explicitly -- proving sync talks to the SAME
@@ -1038,16 +1047,24 @@ def kiosk_admin_cmd(config_path, run_id_opt, mandatory_opt, confirm_technical, t
         click.echo(f"Invalid --run-id {run_id_opt!r} (expected letters/digits/._- only).", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
     run_id = run_id_opt
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
 
+    # Mandatory-ness (Priority 2): explicit flag wins; else THIS run's own
+    # schema-v2 release-config feature scope (never the legacy file, once
+    # composed); else config/release-platforms.yaml, defaulting to True.
     if mandatory_opt is None:
-        try:
-            mandatory = release_platforms.load_release_features().kiosk_admin
-        except release_platforms.ReleasePlatformsError:
-            mandatory = True
+        release_config_dict = _load_release_config_dict(workspace)
+        if release_config_dict is not None and release_config_dict.get("schemaVersion") == 2:
+            _, v2_features, _ = _v2_platforms_features_expected(release_config_dict)
+            mandatory = v2_features.kiosk_admin
+        else:
+            try:
+                mandatory = release_platforms.load_release_features().kiosk_admin
+            except release_platforms.ReleasePlatformsError:
+                mandatory = True
     else:
         mandatory = mandatory_opt
 
-    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
     step_name = "CaleeShell kiosk/admin physical suite"
 
     # Excluded (optional): record an explicit optional not-run marker; never run.
@@ -1377,24 +1394,33 @@ def selector_contract_cmd(
     # is for. No release-config composed for this run at all (a bare/dev
     # invocation) leaves this None, so ordinary PR selector checking is
     # completely unaffected (requirement 1).
-    if expected_release_id is None:
-        release_config_path = workspace.component_report_path("release-config")
-        if release_config_path.is_file():
-            try:
-                expected_release_id = json.loads(release_config_path.read_text(encoding="utf-8")).get("releaseId")
-            except (OSError, json.JSONDecodeError):
-                expected_release_id = None
+    release_config_dict = _load_release_config_dict(workspace)
+    if expected_release_id is None and release_config_dict is not None:
+        expected_release_id = release_config_dict.get("releaseId")
+
+    # Priority 2: once this run has composed a schema-v2 release-config, ITS
+    # profile and expected CaleeMobile identity are authoritative -- config/
+    # release-platforms.yaml is not consulted at all for such a run. This is
+    # what makes requirement 6 ("a schema-v2 production release must never
+    # permit local selector generation") hold even when the legacy file is
+    # stale, absent, or declares a different profile.
+    v2_expected_identity = None
+    if release_config_dict is not None and release_config_dict.get("schemaVersion") == 2:
+        _, _, v2_expected_identity = _v2_platforms_features_expected(release_config_dict)
 
     # Production release profile (Problem A): production accepts ONLY a
     # CI-produced selector artifact; local generation is refused. An explicit
-    # --production/--development wins over config/release-platforms.yaml.
-    try:
-        eff_production = (
-            production_opt if production_opt is not None
-            else release_platforms.load_expected_build_identity().production
-        )
-    except release_platforms.ReleasePlatformsError:
-        eff_production = bool(production_opt)
+    # --production/--development wins over the schema-v2 release-config or,
+    # absent one, config/release-platforms.yaml (schema v1 / bare invocation).
+    if production_opt is not None:
+        eff_production = production_opt
+    elif v2_expected_identity is not None:
+        eff_production = v2_expected_identity.production
+    else:
+        try:
+            eff_production = release_platforms.load_expected_build_identity().production
+        except release_platforms.ReleasePlatformsError:
+            eff_production = False
 
     def _finish(status, detail, problems, evidence, source_label, provenance=None,
                 raw_result_bytes=None, raw_zip_bytes=None):
@@ -1468,10 +1494,16 @@ def selector_contract_cmd(
     cm_source = Path(caleemobile_source_opt) if caleemobile_source_opt else (REPO_ROOT.parent / "CaleeMobile")
     detected = build_identity_mod.collect_caleemobile_identity(cm_source)
     if expected_sha is None or expected_version is None:
-        try:
-            configured = release_platforms.load_expected_build_identity()
-        except release_platforms.ReleasePlatformsError as exc:
-            _finish("blocked", [], [f"Invalid release-platforms config: {exc}"], None, "unresolved")
+        if v2_expected_identity is not None:
+            # Schema v2: never fall back to the legacy file (requirement 7 --
+            # a malformed release-platforms.yaml must not block a valid v2
+            # bundle's selector resolution).
+            configured = v2_expected_identity
+        else:
+            try:
+                configured = release_platforms.load_expected_build_identity()
+            except release_platforms.ReleasePlatformsError as exc:
+                _finish("blocked", [], [f"Invalid release-platforms config: {exc}"], None, "unresolved")
         if expected_sha is None:
             expected_sha = configured.caleemobile_git_sha or (detected.git_sha if detected.available else None)
         if expected_version is None:
@@ -1687,6 +1719,92 @@ def selector_contract_cmd(
             raw_result_bytes, raw_zip_bytes)
 
 
+@main.command("record-distributed-build-acceptance")
+@click.option(
+    "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True,
+    help="Shared release run ID. Evidence is recorded at "
+         "reports/runs/<run-id>/distributed-build-acceptance/results.json.",
+)
+@click.option(
+    "--channel", required=True,
+    type=click.Choice(sorted(distributed_build_acceptance_mod.VALID_CHANNELS)),
+    help="Which distribution channel this evidence is for.",
+)
+@click.option(
+    "--distributed-build-id", "distributed_build_id", required=True,
+    help="The distributed build's own identifier (TestFlight build number, App Store Connect "
+         "version, or Play Console release id).",
+)
+@click.option("--tested-git-sha", "tested_git_sha", required=True, help="Full 40-character CaleeMobile Git SHA the distributed build was built from.")
+@click.option("--tested-version", "tested_version", required=True, help="CaleeMobile version the distributed build reports.")
+@click.option(
+    "--verified-via", "verified_via", required=True,
+    help="How this was actually verified -- must be a real distributed/store verification source "
+         f"(one of {sorted(distributed_build_acceptance_mod.VALID_VERIFIED_VIA)}). A local checkout "
+         "or an unsigned build is refused, never fabricated as acceptance.",
+)
+@click.option("--release-id", "release_id_opt", envvar="CALEE_RELEASE_ID", default=None, help="The release ID this evidence is bound to.")
+@click.option("--expected-git-sha", "expected_git_sha", default=None, help="Expected CaleeMobile release SHA; a mismatch BLOCKS.")
+@click.option("--expected-version", "expected_version", default=None, help="Expected CaleeMobile release version; a mismatch BLOCKS.")
+@click.option("--expected-release-id", "expected_release_id", default=None, help="Expected release ID; defaults to this run's own release-config releaseId.")
+def record_distributed_build_acceptance_cmd(
+    run_id_opt, channel, distributed_build_id, tested_git_sha, tested_version, verified_via,
+    release_id_opt, expected_git_sha, expected_version, expected_release_id,
+):
+    """Records distributed-build acceptance evidence for THIS release run
+    (Priority 3): explicit, externally-verifiable proof that a distributed/
+    TestFlight/store build's identity matches the release candidate.
+
+    Never fabricates acceptance from a local checkout or an unsigned build --
+    ``--verified-via`` must name a real TestFlight/App Store Connect/Play
+    Console API check or a signed store export; anything else BLOCKS.
+    """
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
+    workspace.ensure_created()
+    report_path = workspace.component_report_path("distributed-build-acceptance")
+
+    if expected_release_id is None:
+        release_config_dict = _load_release_config_dict(workspace)
+        if release_config_dict is not None:
+            expected_release_id = release_config_dict.get("releaseId")
+
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    result = distributed_build_acceptance_mod.DistributedBuildAcceptanceResult(
+        schema_version=distributed_build_acceptance_mod.DISTRIBUTED_BUILD_ACCEPTANCE_SCHEMA_VERSION,
+        component=distributed_build_acceptance_mod.DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT,
+        channel=channel,
+        distributed_build_id=distributed_build_id,
+        tested_git_sha=tested_git_sha,
+        tested_version=tested_version,
+        verified_via=verified_via,
+        release_id=release_id_opt,
+        timestamp=timestamp,
+    )
+    verdict = distributed_build_acceptance_mod.verify_distributed_build_acceptance_evidence(
+        result, expected_git_sha=expected_git_sha, expected_version=expected_version,
+        expected_release_id=expected_release_id,
+    )
+    status = "passed" if verdict.ok else "blocked"
+    report = {
+        "runId": run_id_opt,
+        "component": distributed_build_acceptance_mod.DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT,
+        "status": status,
+        "evidence": result.to_dict(),
+        "problems": list(verdict.problems),
+        "generatedAt": timestamp,
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    for problem in verdict.problems:
+        click.echo(f"  - {problem}", err=not verdict.ok)
+    click.echo(verdict.summary())
+    click.echo(f"Recorded: {report_path}")
+    raise SystemExit(EXIT_SUCCESS if verdict.ok else EXIT_BLOCKED)
+
+
 @main.command("build-identity")
 @click.option(
     "--caleemobile-source", default=None,
@@ -1790,6 +1908,67 @@ def _load_manual_checks(path: "str | None") -> "list[ManualCheck] | None":
     if isinstance(raw, dict):
         raw = raw.get("checks", [])
     return _manual_checks_from_list(raw)
+
+
+def _load_release_config_dict(workspace: run_context.RunWorkspace) -> "dict | None":
+    """This run's own already-composed release-config evidence
+    (reports/runs/<run-id>/release-config/results.json), or None when no
+    release-config has been composed for this run (a bare/dev invocation) --
+    used throughout Priority 2 to prefer a schema-v2 run's own composed
+    scope over config/release-platforms.yaml."""
+    path = workspace.component_report_path("release-config")
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _v2_platforms_features_expected(release_config_composition: dict):
+    """Priority 2: derive consolidate/selector-contract's platforms/features/
+    expected-identity inputs from THIS run's own already-composed schema-v2
+    release-config evidence, instead of config/release-platforms.yaml. The
+    release bundle manifest is self-contained and authoritative for release
+    scope once a schema-v2 release-config has been composed -- the legacy
+    file is not consulted at all for such a run (Priority 2)."""
+    selections = release_config_composition.get("releaseSelections") or {}
+    enabled_platforms = set(selections.get("enabledPlatforms") or [])
+    enabled_features = set(selections.get("enabledFeatures") or [])
+    expected = selections.get("expectedIdentities") or {}
+    expected_calee = expected.get("calee") or {}
+    expected_shell = expected.get("caleeShell") or {}
+    expected_mobile = expected.get("caleeMobile") or {}
+
+    platforms = release_platforms.ReleasePlatforms(
+        tablet="tablet" in enabled_platforms,
+        mobile_android="android" in enabled_platforms,
+        mobile_ios="ios" in enabled_platforms,
+        source="release-bundle-manifest (schemaVersion 2)",
+    )
+    features = release_platforms.ReleaseFeatures(
+        synchronization="synchronization" in enabled_features,
+        meals="meals" in enabled_features,
+        onboarding="onboarding" in enabled_features,
+        google_calendar="google_calendar" in enabled_features,
+        kiosk_admin="kiosk_admin" in enabled_features,
+        source="release-bundle-manifest (schemaVersion 2)",
+    )
+    expected_identity = release_platforms.ExpectedBuildIdentity(
+        calee_build_version=expected_calee.get("buildVersion"),
+        calee_git_sha=expected_calee.get("gitSha"),
+        calee_application_id=expected_calee.get("applicationId"),
+        calee_version_code=expected_calee.get("versionCode"),
+        caleemobile_build_version=expected_mobile.get("buildVersion"),
+        caleemobile_git_sha=expected_mobile.get("gitSha"),
+        caleeshell_version=expected_shell.get("version"),
+        # Schema v2's own profile controls production/development policy --
+        # a v2 release never falls back to the legacy file's `production:`
+        # flag (Priority 2 requirement 5/6).
+        production=(selections.get("profile") == "production"),
+        source="release-bundle-manifest (schemaVersion 2)",
+    )
+    return platforms, features, expected_identity
 
 
 def _report_build_sha(report: "dict | None") -> "str | None":
@@ -1913,6 +2092,14 @@ def _resolve_component(
          "can never PASS without valid selector evidence for the exact CaleeMobile build.",
 )
 @click.option(
+    "--distributed-build-acceptance-mandatory/--distributed-build-acceptance-optional",
+    "distributed_build_acceptance_mandatory", default=None,
+    help="Whether distributed-build acceptance evidence is release-gating (Priority 3). Defaults "
+         "to this run's own schema-v2 release-config (caleeMobile.distributedBuildAcceptanceRequired), "
+         "recorded as an explicit not-required component when false. With no release-config "
+         "composed for this run at all, the component does not apply and is omitted.",
+)
+@click.option(
     "--installation-mandatory/--installation-optional", "installation_mandatory", default=None,
     help="Whether tablet release installation is release-gating (Priority 6). The full launcher "
          "passes --installation-mandatory; when omitted it is auto-included as mandatory if an "
@@ -1986,7 +2173,7 @@ def consolidate(
     sync_report, installation_report, machine_config_report, release_config_report, kiosk_report, manual_checks_path, environment_report,
     android_mandatory, ios_mandatory, sync_mandatory,
     selector_contract_mandatory, installation_mandatory, machine_config_mandatory, release_config_mandatory,
-    subscribed_fixture_mandatory,
+    subscribed_fixture_mandatory, distributed_build_acceptance_mandatory,
     meals_mandatory, onboarding_mandatory, google_calendar_mandatory, kiosk_admin_mandatory,
     build_version, calee_build_version, expected_calee_build_version,
     caleemobile_build_version, expected_caleemobile_build_version, caleeshell_version,
@@ -2057,6 +2244,10 @@ def consolidate(
     # Subscribed-calendar fixture (Priority 7). Auto-discovered the same way;
     # its mandatory-ness (below) defaults to the scenario's promotion state.
     subscribed_fixture_report = resolve("subscribed-fixture", None)
+    # Distributed-build acceptance (Priority 3). Auto-discovered the same way;
+    # its mandatory-ness (below) defaults to this run's release-config
+    # composition (caleeMobile.distributedBuildAcceptanceRequired).
+    distributed_build_acceptance_report = resolve("distributed-build-acceptance", None)
 
     manual_checks_raw = resolve("manual-checks", manual_checks_path)
     manual_checks_list = None
@@ -2093,13 +2284,29 @@ def consolidate(
         meta["fixtureVerificationStatus"] = env_report.get("fixtureVerificationStatus")
     meta = {k: v for k, v in meta.items() if v not in (None, "")}
 
+    # Priority 2: once a schema-v2 release-config has been composed for this
+    # run, config/release-platforms.yaml is no longer consulted at all -- a
+    # malformed legacy file must never block a valid schema-v2 bundle, and
+    # the bundle's own platform/feature/expected-identity scope is what
+    # controls the rest of this command, not the legacy file's.
+    release_config_is_v2 = (
+        release_config_composition is not None
+        and release_config_composition.get("schemaVersion") == 2
+    )
     try:
         platforms = release_platforms.load_release_platforms()
         features = release_platforms.load_release_features()
         expected_identity = release_platforms.load_expected_build_identity()
     except release_platforms.ReleasePlatformsError as exc:
-        click.echo(str(exc), err=True)
-        raise SystemExit(EXIT_INVALID_CONFIG)
+        if release_config_is_v2:
+            platforms = release_platforms.ReleasePlatforms()
+            features = release_platforms.ReleaseFeatures()
+            expected_identity = release_platforms.ExpectedBuildIdentity()
+        else:
+            click.echo(str(exc), err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+    if release_config_is_v2:
+        platforms, features, expected_identity = _v2_platforms_features_expected(release_config_composition)
     android_gating = android_mandatory if android_mandatory is not None else platforms.mobile_android
     ios_gating = ios_mandatory if ios_mandatory is not None else platforms.mobile_ios
     # Cross-device synchronization gating (Workstream 1): explicit
@@ -2140,6 +2347,25 @@ def consolidate(
             ).release_suite_eligible
         except (promotion_mod.PromotionError, OSError):
             subscribed_fixture_gating = False
+
+    # Distributed-build acceptance gating (Priority 3): an explicit flag wins;
+    # else this run's own release-config composition's distributedBuildRequired
+    # (sourced from a schema-v2 bundle's caleeMobile.distributedBuildAcceptance
+    # Required, or the legacy release-platforms.yaml distributed_build_required
+    # key for schema v1 -- release_config.py already unifies both into ONE
+    # field). No release-config composed for this run at all (ad-hoc/dev
+    # consolidation) leaves this None -- the component does not apply and is
+    # never added, so ordinary/legacy consolidation is unaffected. When it DOES
+    # apply, False is recorded as an explicit not-required component, never
+    # silently omitted.
+    if distributed_build_acceptance_mandatory is not None:
+        distributed_build_gating = distributed_build_acceptance_mandatory
+    elif release_config_composition is not None:
+        distributed_build_gating = bool(
+            (release_config_composition.get("releaseSelections") or {}).get("distributedBuildRequired", False)
+        )
+    else:
+        distributed_build_gating = None
 
     # Independent release-feature gating (Workstream 3): explicit
     # --<feature>-mandatory/--<feature>-optional wins, else the release feature
@@ -2193,6 +2419,22 @@ def consolidate(
     # report then surfaces as a visible NOT_RUN/BLOCKED component (see
     # build_release_report), never omission.
     mobile_in_scope = bool(android_gating or ios_gating)
+    # Priority 3: the schema-v2 manifest's own caleeMobile.selectorEvidence
+    # Required (via this run's composed release-config) is the default
+    # whenever no explicit --selector-contract-mandatory/-optional flag is
+    # given -- true makes it mandatory even outside a mobile release; false
+    # is recorded as an explicit not-required component, never silently
+    # omitted. It never overrides an explicit CLI flag, and production policy
+    # (immediately below) still overrides a manifest false -- see
+    # docs/RELEASE_POLICY.md's selector-evidence precedence section.
+    manifest_selector_required = None
+    if release_config_composition is not None:
+        manifest_selector_required = (
+            (release_config_composition.get("releaseSelections") or {})
+            .get("expectedIdentities", {})
+            .get("caleeMobile", {})
+            .get("selectorEvidenceRequired")
+        )
     if eff_production and mobile_in_scope:
         if selector_contract_mandatory is False:
             click.echo(
@@ -2224,6 +2466,10 @@ def consolidate(
                 )
     elif selector_contract_mandatory is True:
         selector_contract_gating = True
+    elif manifest_selector_required is True:
+        selector_contract_gating = True
+    elif manifest_selector_required is False:
+        selector_contract_gating = False
     elif mobile_in_scope:
         # Default for any mobile release: mandatory.
         selector_contract_gating = True
@@ -2343,6 +2589,19 @@ def consolidate(
         release_config_composition.get("releaseId") if release_config_composition is not None else None
     )
 
+    # Distributed-build acceptance (Priority 3): built only when it applies
+    # (distributed_build_gating is not None) so ad-hoc/legacy consolidation
+    # that never had a release-config composed for it is unaffected.
+    if distributed_build_gating is not None:
+        distributed_build_component = component_from_distributed_build_acceptance_report(
+            DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT_NAME, distributed_build_acceptance_report,
+            mandatory=distributed_build_gating,
+            expected_git_sha=eff_expected_caleemobile_sha,
+            expected_version=eff_expected_caleemobile_build,
+            expected_release_id=expected_release_id_for_selector,
+        )
+        extra_components.append(distributed_build_component)
+
     report = build_release_report(
         environment=env_report,
         tablet=tablet,
@@ -2445,6 +2704,7 @@ def consolidate(
         ("kiosk-admin", kiosk_report, kiosk),
         ("manual-checks", manual_checks_path, manual_checks_raw),
         ("subscribed-fixture", None, subscribed_fixture_report),
+        ("distributed-build-acceptance", None, distributed_build_acceptance_report),
     ):
         if loaded is None:
             continue
@@ -2460,6 +2720,24 @@ def consolidate(
         identity_snapshot = workspace.root / "identity" / f"{phase}.json"
         if identity_snapshot.is_file():
             evidence_paths.append(identity_snapshot)
+    # Priority 12: the frozen release-candidate's fingerprint + manifest +
+    # checksums (Priority 4's snapshot_release_candidate) travel with the
+    # release ZIP too -- the exact proof of what THIS run approved and
+    # installed from, not just a claim in a report. The APK bytes themselves
+    # are deliberately NOT included here (they are the far larger installer
+    # artifacts, already tracked at their own installation-evidence paths) --
+    # only the small identity/proof files a reviewer or a later audit needs.
+    from . import release_candidate as release_candidate_mod
+
+    release_candidate_dir = workspace.component_dir("release-candidate")
+    for name in (
+        release_candidate_mod.FINGERPRINT_FILENAME,
+        release_candidate_mod.MANIFEST_NAME,
+        release_candidate_mod.CHECKSUMS_NAME,
+    ):
+        candidate = release_candidate_dir / name
+        if candidate.is_file():
+            evidence_paths.append(candidate)
 
     # Priority 9: a file this consolidation resolved and intended to package
     # (above) but that has since vanished from disk is a hard evidence-
@@ -2743,6 +3021,27 @@ def _load_subscribed_fixture_config(config_path: "Path | None") -> dict:
     return section if isinstance(section, dict) else {}
 
 
+def _load_machine_backend_url(config_path: "Path | None") -> "str | None":
+    """The top-level machine.local.yaml backend_url -- the SAME backend the
+    rest of this run already talks to -- used as the default Calee API base
+    URL for Priority 6's ingestion-verification bridge call. Best-effort:
+    an absent/malformed file just means no default is available (the
+    ingestion check is then unavailable, not a crash)."""
+    import yaml as _yaml
+
+    path = config_path or (REPO_ROOT / "config" / "machine.local.yaml")
+    if not path.is_file():
+        return None
+    try:
+        raw = _yaml.safe_load(path.read_text(encoding="utf-8"))
+    except _yaml.YAMLError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get("backend_url")
+    return value if isinstance(value, str) and value.strip() else None
+
+
 @main.command("prepare-subscribed-fixture")
 @click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True, help="Shared release run ID (run_context.py).")
 @click.option("--release-id", "release_id_opt", envvar="CALEE_RELEASE_ID", default=None, help="Release id recorded in this component's evidence.")
@@ -2781,6 +3080,16 @@ def prepare_subscribed_fixture_cmd(run_id_opt, release_id_opt, config_path, mode
     workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
     workspace.ensure_created()
 
+    # Priority 7: an explicit --release-id wins; else, when this run already
+    # composed its release-config (launcher "00" always does before this step
+    # runs), adopt ITS releaseId -- the same release the whole run is for,
+    # exactly like selector-contract's Priority 8 adoption. No release-config
+    # composed for this run at all (a bare/dev invocation) leaves this None,
+    # so ordinary ad-hoc use is unaffected.
+    release_config_dict = _load_release_config_dict(workspace)
+    if release_id_opt is None and release_config_dict is not None:
+        release_id_opt = release_config_dict.get("releaseId")
+
     target_date = None
     if date_opt:
         try:
@@ -2800,14 +3109,14 @@ def prepare_subscribed_fixture_cmd(run_id_opt, release_id_opt, config_path, mode
         target_date=target_date, timezone=tz_opt or section.get("timezone") or sp.DEFAULT_TIMEZONE,
     )
     if mode == sp.MODE_PUBLISHED:
-        publisher, publisher_type, public_url = sp.build_publisher_from_config(section)
+        publisher, publisher_type, public_url = sp.build_publisher_from_config(section, mode=mode)
         poll_check = None
         if public_url:
-            # Re-fetches the run's OWN published URL until the (freshly
-            # published) content is retrievable -- the generic, product-API-
-            # free "existing API" this offline CLI layer can poll without a
-            # live tablet/device. The scenario's own tablet-side visibility
-            # check remains a separate, physical, out-of-scope concern here.
+            # Re-fetches the run's OWN published URL; prepare_subscribed_
+            # fixture (Priority 5) wraps this raw fetch with the full
+            # verification contract (byte SHA-256, both run-specific titles,
+            # expected target date) -- this callable only needs to return the
+            # downloaded bytes, never merely a nonempty-response check.
             def poll_check(_url=public_url):
                 import urllib.request
                 with urllib.request.urlopen(_url, timeout=15) as resp:
@@ -2817,6 +3126,57 @@ def prepare_subscribed_fixture_cmd(run_id_opt, release_id_opt, config_path, mode
             poll_check=poll_check,
             poll_interval_seconds=float(section.get("poll_interval_seconds", 10)),
             poll_timeout_seconds=float(section.get("timeout_seconds", 300)),
+        )
+
+        # Priority 6: the SECOND, separate phase -- proving Calee actually
+        # INGESTED the published feed, via the EXISTING authenticated
+        # GET /client/v1/events operation (CaleeMobile-Regression's
+        # sync_smoke_cli.py 'find-event-by-title'), never a new backend
+        # endpoint. Only wired when every prerequisite is genuinely
+        # available (regression credentials, a resolvable backend, and the
+        # sibling CaleeMobile-Regression checkout with the bridge action) --
+        # otherwise ingestion_check stays None and prepare_subscribed_fixture
+        # itself records the precise BLOCKED reason (never silently passing
+        # from public-URL readability alone).
+        ingestion_backend = section.get("ingestion_backend") or _load_machine_backend_url(
+            Path(config_path) if config_path else None
+        )
+        ingestion_calendar_id = section.get("ingestion_calendar_id", "regression:regsub")
+        ingestion_email = ingestion_password = None
+        try:
+            ingestion_resolver = credentials_mod.default_resolver()
+            ingestion_email = ingestion_resolver.require(credentials_mod.REGRESSION_USERNAME)
+            ingestion_password = ingestion_resolver.require(credentials_mod.REGRESSION_PASSWORD)
+        except credentials_mod.CredentialError:
+            ingestion_email = ingestion_password = None
+
+        from . import sync_smoke_bridge as ssb_mod
+
+        ingestion_check = None
+        if (
+            ingestion_backend and ingestion_email and ingestion_password
+            and ssb_mod.is_ingestion_bridge_available(REPO_ROOT)
+        ):
+            ingestion_titles = sp.scenario_variables(
+                sp.resolve_target_date(target_date), run_token=sp.build_run_token(run_id_opt),
+            )
+            ingestion_title = ingestion_titles["REG_SUB_TIMED_TITLE"]
+
+            def ingestion_check(
+                _repo_root=REPO_ROOT, _base_url=ingestion_backend, _email=ingestion_email,
+                _password=ingestion_password, _title=ingestion_title, _calendar_id=ingestion_calendar_id,
+            ):
+                return ssb_mod.find_event_by_title(
+                    repo_root=_repo_root, base_url=_base_url, email=_email, password=_password,
+                    title=_title, calendar_id=_calendar_id,
+                )
+
+        kwargs.update(
+            ingestion_check=ingestion_check,
+            ingestion_interval_seconds=float(section.get("ingestion_poll_interval_seconds", 10)),
+            ingestion_timeout_seconds=float(section.get("ingestion_timeout_seconds", 300)),
+            ingestion_api_label="CaleeMobile-Regression sync_smoke_cli.py find-event-by-title (GET /client/v1/events)",
+            ingestion_expected_calendar_id=ingestion_calendar_id,
         )
     elif mode == sp.MODE_FIXED_DATE:
         kwargs.update(fixed_date=section.get("fixed_date"), fixed_date_titles=section.get("fixed_date_titles"))
@@ -2908,28 +3268,69 @@ def _emit_release_config_vars(workspace: run_context.RunWorkspace, effective_dic
     """Emits the eval-able RELEASE_* shell assignments launchers "00"/"06"
     source, from an ``EffectiveReleaseConfig.to_dict()`` payload (freshly
     composed OR loaded back from this run's own already-written evidence --
-    see release_config_cmd's reuse-not-recompute path)."""
+    see release_config_cmd's reuse-not-recompute path).
+
+    Priority 2: this is the ONE choke point both launchers eval, so every
+    schema-v2 value that must be authoritative for the rest of the run --
+    release id/schema version, the full per-feature scope (not just the
+    flattened comma list), the expected Calee/CaleeShell/CaleeMobile
+    identities, and the selector-evidence/distributed-build-acceptance
+    requirement flags -- is emitted here, not only recorded in the JSON
+    evidence."""
     import shlex as _shlex
 
     def _emit(name, value):
         click.echo(f"RELEASE_{name}={_shlex.quote(str('' if value is None else value))}")
 
+    def _emit_bool(name, value):
+        _emit(name, "true" if value else "false")
+
     release_selections = effective_dict.get("releaseSelections") or {}
     machine_selections = effective_dict.get("machineSelections") or {}
     device_ids = effective_dict.get("deviceIds") or {}
     enabled_platforms = release_selections.get("enabledPlatforms") or []
+    enabled_features = release_selections.get("enabledFeatures") or []
+    expected_identities = release_selections.get("expectedIdentities") or {}
+    expected_calee = expected_identities.get("calee") or {}
+    expected_caleeshell = expected_identities.get("caleeShell") or {}
+    expected_caleemobile = expected_identities.get("caleeMobile") or {}
 
+    _emit("ID", effective_dict.get("releaseId") or "")
+    _emit("SCHEMA_VERSION", effective_dict.get("schemaVersion"))
     _emit("EFFECTIVE_CONFIG", str(workspace.component_report_path("release-config")))
     _emit("PROFILE", release_selections.get("profile"))
     _emit("SELECTED_BACKEND", release_selections.get("selectedBackend") or "")
     _emit("PLATFORM_TABLET", "true" if "tablet" in enabled_platforms else "false")
     _emit("PLATFORM_ANDROID", "true" if "android" in enabled_platforms else "false")
     _emit("PLATFORM_IOS", "true" if "ios" in enabled_platforms else "false")
-    _emit("ENABLED_FEATURES", ",".join(release_selections.get("enabledFeatures") or []))
+    _emit("ENABLED_FEATURES", ",".join(enabled_features))
+    _emit_bool("FEATURE_SYNCHRONIZATION", "synchronization" in enabled_features)
+    _emit_bool("FEATURE_MEALS", "meals" in enabled_features)
+    _emit_bool("FEATURE_ONBOARDING", "onboarding" in enabled_features)
+    _emit_bool("FEATURE_GOOGLE_CALENDAR", "google_calendar" in enabled_features)
+    _emit_bool("FEATURE_KIOSK_ADMIN", "kiosk_admin" in enabled_features)
+    _emit_bool("FEATURE_NOTIFICATIONS", "notifications" in enabled_features)
     _emit("TABLET_SERIAL", device_ids.get("tablet") or "")
     _emit("IPHONE_DEVICE", device_ids.get("ios") or "")
     _emit("ANDROID_DEVICE", device_ids.get("android") or "")
     _emit("REPORT_ROOT", machine_selections.get("reportRoot") or "")
+
+    _emit("EXPECTED_CALEE_VERSION", expected_calee.get("buildVersion") or "")
+    _emit("EXPECTED_CALEE_VERSION_CODE", expected_calee.get("versionCode"))
+    _emit("EXPECTED_CALEE_GIT_SHA", expected_calee.get("gitSha") or "")
+    _emit("EXPECTED_CALEE_PACKAGE_ID", expected_calee.get("applicationId") or "")
+    _emit("EXPECTED_CALEE_SIGNER_SHA256", expected_calee.get("signerSha256") or "")
+
+    _emit("EXPECTED_CALEESHELL_VERSION", expected_caleeshell.get("version") or "")
+    _emit("EXPECTED_CALEESHELL_VERSION_CODE", expected_caleeshell.get("versionCode"))
+    _emit("EXPECTED_CALEESHELL_GIT_SHA", expected_caleeshell.get("gitSha") or "")
+    _emit("EXPECTED_CALEESHELL_PACKAGE_ID", expected_caleeshell.get("applicationId") or "")
+    _emit("EXPECTED_CALEESHELL_SIGNER_SHA256", expected_caleeshell.get("signerSha256") or "")
+
+    _emit("EXPECTED_CALEEMOBILE_VERSION", expected_caleemobile.get("buildVersion") or "")
+    _emit("EXPECTED_CALEEMOBILE_GIT_SHA", expected_caleemobile.get("gitSha") or "")
+    _emit_bool("SELECTOR_EVIDENCE_REQUIRED", expected_caleemobile.get("selectorEvidenceRequired", True))
+    _emit_bool("DISTRIBUTED_BUILD_ACCEPTANCE_REQUIRED", expected_caleemobile.get("distributedBuildAcceptanceRequired", True))
 
 
 _RELEASE_CONFIG_REQUIRED_KEYS = {"status", "machineSelections", "releaseSelections", "deviceIds", "conflicts"}
@@ -3018,6 +3419,7 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, bundle_path,
     import yaml as _yaml
 
     from . import machine_config as machine_mod
+    from . import release_candidate as release_candidate_mod
     from . import release_config as rc_mod
     from . import release_installer as ri_mod
     from . import release_platforms as rp_mod
@@ -3048,6 +3450,7 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, bundle_path,
     # exactly as before Priority 2 existed, even if a machine config happens
     # to declare a release_bundle_dir for unrelated (installation) purposes.
     bundle_manifest = None
+    candidate_fingerprint = None
     if bundle_path:
         verification = ri_mod.verify_release_bundle(bundle_path)
         if not verification.ok:
@@ -3062,31 +3465,67 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, bundle_path,
             raise SystemExit(EXIT_BLOCKED)
         bundle_manifest = verification.manifest
 
-    try:
-        platforms = rp_mod.load_release_platforms(platforms_path)
-        features = rp_mod.load_release_features(platforms_path)
-        expected = rp_mod.load_expected_build_identity(platforms_path)
-    except rp_mod.ReleasePlatformsError as exc:
-        _record({"status": STATUS_BLOCKED, "detail": [f"release-platforms.yaml problem: {exc}"]}, EXIT_BLOCKED)
-        click.echo(str(exc), err=True)
-        raise SystemExit(EXIT_BLOCKED)
-
-    # Optional release-candidate extras (backend/environment pin + distributed
-    # build acceptance) read from the same release-platforms.yaml top level.
-    # Schema v2 does not consult release-platforms.yaml at all -- the bundle
-    # manifest is authoritative -- so these are only meaningful for schema v1.
-    expected_backend = None
-    distributed_build_required = False
-    resolved_platforms_path = Path(platforms_path) if platforms_path else rp_mod.DEFAULT_CONFIG_PATH
-    if resolved_platforms_path.is_file():
+        # Priority 4: freeze the just-verified release candidate into a run-
+        # scoped immutable snapshot + content-addressed fingerprint BEFORE
+        # composing anything from it, closing the TOCTOU gap between this
+        # approval and install-tablet-release's first mutating ADB command --
+        # see release_candidate.py. A snapshot failure (source vanished/
+        # changed mid-copy) is itself a hard BLOCK; nothing is composed from
+        # an unsnapshotted bundle.
         try:
-            raw = _yaml.safe_load(resolved_platforms_path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                expected_backend = (raw.get("backend") or raw.get("expected_backend") or None)
-                distributed_build_required = bool(raw.get("distributed_build_required", False))
-                release_id_opt = release_id_opt or raw.get("release_id")
-        except _yaml.YAMLError:
-            pass
+            candidate_fingerprint = release_candidate_mod.snapshot_release_candidate(
+                verification, workspace.component_dir("release-candidate"),
+                release_id=bundle_manifest.release_id, schema_version=bundle_manifest.schema_version,
+            )
+        except release_candidate_mod.CandidateFingerprintError as exc:
+            _record({
+                "status": STATUS_BLOCKED,
+                "detail": [f"Could not freeze the approved release candidate: {exc}"],
+                "bundleVerification": verification.to_dict(),
+            }, EXIT_BLOCKED)
+            click.echo(click.style(f"[BLOCKED] Could not freeze the approved release candidate: {exc}", fg="red"), err=True)
+            raise SystemExit(EXIT_BLOCKED)
+
+    # Priority 2 (requirement 7): once a schema-v2 bundle has been verified,
+    # config/release-platforms.yaml is not consulted AT ALL -- the bundle
+    # manifest is self-contained and authoritative for scope. A malformed
+    # legacy file must never block a valid schema-v2 bundle, so it is not
+    # even loaded here for a v2 run. Schema v1 (or no bundle) keeps loading
+    # and cross-checking it exactly as before.
+    is_v2_bundle = bundle_manifest is not None and bundle_manifest.is_schema_v2
+    if is_v2_bundle:
+        platforms = rp_mod.ReleasePlatforms()
+        features = rp_mod.ReleaseFeatures()
+        expected = rp_mod.ExpectedBuildIdentity()
+        expected_backend = None
+        distributed_build_required = False
+    else:
+        try:
+            platforms = rp_mod.load_release_platforms(platforms_path)
+            features = rp_mod.load_release_features(platforms_path)
+            expected = rp_mod.load_expected_build_identity(platforms_path)
+        except rp_mod.ReleasePlatformsError as exc:
+            _record({"status": STATUS_BLOCKED, "detail": [f"release-platforms.yaml problem: {exc}"]}, EXIT_BLOCKED)
+            click.echo(str(exc), err=True)
+            raise SystemExit(EXIT_BLOCKED)
+
+        # Optional release-candidate extras (backend/environment pin +
+        # distributed build acceptance) read from the same release-platforms.
+        # yaml top level. Schema v2 does not consult release-platforms.yaml at
+        # all -- the bundle manifest is authoritative -- so these are only
+        # meaningful for schema v1.
+        expected_backend = None
+        distributed_build_required = False
+        resolved_platforms_path = Path(platforms_path) if platforms_path else rp_mod.DEFAULT_CONFIG_PATH
+        if resolved_platforms_path.is_file():
+            try:
+                raw = _yaml.safe_load(resolved_platforms_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    expected_backend = (raw.get("backend") or raw.get("expected_backend") or None)
+                    distributed_build_required = bool(raw.get("distributed_build_required", False))
+                    release_id_opt = release_id_opt or raw.get("release_id")
+            except _yaml.YAMLError:
+                pass
 
     effective = rc_mod.compose_effective_release_config(
         machine, platforms, features, expected,
@@ -3095,8 +3534,14 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, bundle_path,
         bundle_manifest=bundle_manifest,
     )
     exit_code = EXIT_SUCCESS if effective.ok else EXIT_BLOCKED
-    _record(effective.to_dict(), exit_code)
-    _emit_release_config_vars(workspace, effective.to_dict())
+    effective_dict = effective.to_dict()
+    if candidate_fingerprint is not None:
+        # Priority 4: the same fingerprint install-tablet-release will later
+        # re-verify against, so release-config and installation evidence
+        # always reference the identical approved candidate.
+        effective_dict["releaseCandidateFingerprint"] = candidate_fingerprint.to_dict()
+    _record(effective_dict, exit_code)
+    _emit_release_config_vars(workspace, effective_dict)
 
     if not effective.ok:
         click.echo(click.style("[BLOCKED] Machine/release configuration conflict:", fg="red"), err=True)
@@ -3320,10 +3765,69 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     # launcher-driven release run (Priority 2 policy -- see docstring above).
     signer_trust_required = bool(eff_production) or bool(run_id_opt)
 
+    # Candidate freeze enforcement: once release-config has snapshotted +
+    # fingerprinted this run's approved release candidate (release_candidate.
+    # py), install ONLY from that immutable snapshot -- never the original,
+    # still-mutable --bundle path, even if the caller still points at it, and
+    # even if the original has since been corrupted or deleted entirely. This
+    # redirect happens BEFORE the bundle is verified from any path, so a
+    # since-tampered original drop folder can never even be READ again, let
+    # alone block a run that already has a valid frozen candidate. Refuses
+    # outright if the snapshot's CURRENT bytes disagree with the recorded
+    # fingerprint, closing the TOCTOU gap between release-config approval and
+    # the first mutating ADB command below. A run with no same-run snapshot
+    # (a bare/diagnostic invocation, or release-config composed without
+    # --bundle) is unaffected -- it installs from --bundle exactly as before
+    # this existed.
+    fingerprint = None
+    if run_id_opt:
+        from . import release_candidate as release_candidate_mod
+
+        candidate_workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
+        snapshot_dir = candidate_workspace.component_dir("release-candidate")
+        fingerprint_path = snapshot_dir / release_candidate_mod.FINGERPRINT_FILENAME
+        if fingerprint_path.is_file():
+            try:
+                fingerprint = release_candidate_mod.load_candidate_fingerprint(fingerprint_path)
+            except release_candidate_mod.CandidateFingerprintError as exc:
+                payload = {
+                    "status": "invalid",
+                    "detail": [f"This run's release-candidate fingerprint is unreadable: {exc}"],
+                }
+                _write_installer_report(Path(report_path) if report_path else None, payload)
+                _record_installation_component(run_id_opt, payload, EXIT_INVALID_CONFIG)
+                click.echo(click.style(f"[INVALID] {payload['detail'][0]}", fg="red"), err=True)
+                raise SystemExit(EXIT_INVALID_CONFIG)
+            fp_problems = release_candidate_mod.verify_candidate_fingerprint(snapshot_dir, fingerprint)
+            if fp_problems:
+                payload = {
+                    "status": "blocked",
+                    "detail": (
+                        ["The approved release candidate changed after release-config approved it -- "
+                         "refusing to install:"] + fp_problems
+                    ),
+                    "releaseCandidateFingerprint": fingerprint.to_dict(),
+                }
+                _write_installer_report(Path(report_path) if report_path else None, payload)
+                _record_installation_component(run_id_opt, payload, EXIT_BLOCKED)
+                click.echo(click.style(
+                    "[BLOCKED] Approved release candidate changed since release-config -- refusing to install:",
+                    fg="red",
+                ), err=True)
+                for p in fp_problems:
+                    click.echo(f"  - {p}", err=True)
+                raise SystemExit(EXIT_BLOCKED)
+            # Install ONLY from the frozen snapshot from here on -- the
+            # original --bundle path is never read again in this run.
+            bundle_path = str(snapshot_dir)
+
     verification = release_installer.verify_release_bundle(bundle_path)
     if not verification.ok:
-        payload = {"status": "invalid", "detail": list(verification.errors),
-                   "bundleVerification": verification.to_dict()}
+        payload = {
+            "status": "invalid", "detail": list(verification.errors),
+            "bundleVerification": verification.to_dict(),
+            "releaseCandidateFingerprint": fingerprint.to_dict() if fingerprint is not None else None,
+        }
         _write_installer_report(Path(report_path) if report_path else None, payload)
         _record_installation_component(run_id_opt, payload, EXIT_INVALID_CONFIG)
         click.echo(click.style("[INVALID] Bundle failed verification -- refusing to install:", fg="red"), err=True)
@@ -3433,6 +3937,7 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
         "releaseId": plan.release_id,
         "productionProfile": bool(eff_production),
         "signerTrustRequired": signer_trust_required,
+        "releaseCandidateFingerprint": fingerprint.to_dict() if fingerprint is not None else None,
     }
     _write_installer_report(Path(report_path) if report_path else None, payload)
     exit_code = EXIT_SUCCESS if status == "ok" else EXIT_BLOCKED

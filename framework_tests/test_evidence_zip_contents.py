@@ -38,6 +38,10 @@ MANDATED_EVIDENCE_PATHS = [
     "manual-checks/results.json",
     "identity/pre.json",
     "identity/post.json",
+    "distributed-build-acceptance/results.json",
+    "release-candidate/release-manifest.json",
+    "release-candidate/checksums.sha256",
+    "release-candidate/release-candidate-fingerprint.json",
 ]
 
 # Selector-contract provenance artifacts (Priority 9: "selector-contract
@@ -120,6 +124,23 @@ def _seed_complete_run(tmp_path):
     (identity_dir / "pre.json").write_text(json.dumps({"tablet": base_tablet, "caleemobile": {}}))
     (identity_dir / "post.json").write_text(json.dumps({"tablet": base_tablet, "caleemobile": {}}))
 
+    # distributed-build-acceptance (Priority 3/12): auto-discovered the same
+    # way subscribed-fixture/selector-contract are -- present in the ZIP
+    # regardless of whether this seed's release-config actually requires it.
+    _w(workspace, "distributed-build-acceptance", {
+        "status": "blocked", "detail": ["seeded for ZIP-contents test only"],
+    })
+
+    # release-candidate (Priority 4/12): the frozen candidate's fingerprint +
+    # manifest + checksums (not under component_report_path -- see
+    # release_candidate.py's snapshot_release_candidate).
+    from calee_regression import release_candidate as release_candidate_mod
+
+    rc_dir = workspace.component_dir("release-candidate")
+    (rc_dir / release_candidate_mod.MANIFEST_NAME).write_text(json.dumps({"seeded": True}))
+    (rc_dir / release_candidate_mod.CHECKSUMS_NAME).write_text("0" * 64 + "  calee.apk\n")
+    (rc_dir / release_candidate_mod.FINGERPRINT_FILENAME).write_text(json.dumps({"seeded": True}))
+
     return workspace
 
 
@@ -176,6 +197,41 @@ def test_zip_never_collides_same_named_results_json_across_components(tmp_path, 
     assert len(results_json_entries) >= 12, results_json_entries
 
 
+def test_release_candidate_and_distributed_build_evidence_bytes_match_source_exactly(tmp_path, monkeypatch):
+    """Priority 12: not just present-by-name -- the release-candidate
+    fingerprint/manifest/checksums and the distributed-build-acceptance
+    report travel into the ZIP byte-for-byte unchanged (digest-verified
+    against the on-disk source), so the packaged evidence can never silently
+    diverge from what this run actually recorded."""
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    workspace = _seed_complete_run(tmp_path)
+    out_dir = tmp_path / "out"
+    CliRunner().invoke(cli.main, ["consolidate", "--run-id", RUN_ID, *_CONSOLIDATE_ARGS, "--out-dir", str(out_dir)])
+    zips = list(out_dir.glob("*.zip"))
+    assert len(zips) == 1, zips
+
+    import hashlib
+
+    from calee_regression import release_candidate as release_candidate_mod
+
+    rc_dir = workspace.component_dir("release-candidate")
+    targets = [
+        (rc_dir / release_candidate_mod.MANIFEST_NAME, "evidence/release-candidate/release-manifest.json"),
+        (rc_dir / release_candidate_mod.CHECKSUMS_NAME, "evidence/release-candidate/checksums.sha256"),
+        (rc_dir / release_candidate_mod.FINGERPRINT_FILENAME, "evidence/release-candidate/release-candidate-fingerprint.json"),
+        (
+            workspace.component_report_path("distributed-build-acceptance"),
+            "evidence/distributed-build-acceptance/results.json",
+        ),
+    ]
+    with zipfile.ZipFile(zips[0]) as zf:
+        for source_path, arcname in targets:
+            source_bytes = source_path.read_bytes()
+            zipped_bytes = zf.read(arcname)
+            assert zipped_bytes == source_bytes, f"{arcname!r} content diverges from the on-disk source"
+            assert hashlib.sha256(zipped_bytes).hexdigest() == hashlib.sha256(source_bytes).hexdigest()
+
+
 def test_evidence_zip_contents_contract_matches_task_mandated_list():
     """A structural lock: the mandated-paths list above must stay in sync
     with this session's task requirements if this test file is ever edited."""
@@ -186,4 +242,7 @@ def test_evidence_zip_contents_contract_matches_task_mandated_list():
         "mobile-api/results.json", "mobile-android/results.json", "mobile-ios/results.json",
         "sync/results.json", "kiosk-admin/results.json", "manual-checks/results.json",
         "identity/pre.json", "identity/post.json",
+        "distributed-build-acceptance/results.json",
+        "release-candidate/release-manifest.json", "release-candidate/checksums.sha256",
+        "release-candidate/release-candidate-fingerprint.json",
     }
