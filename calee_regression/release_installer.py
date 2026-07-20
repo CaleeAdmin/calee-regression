@@ -95,6 +95,44 @@ OUTCOME_INSTALL_FAILED = "install_failed"
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _APK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$")
 
+# Schema-v2 key allow-lists (Priority 1). An unrecognised/misspelled key at
+# any of these levels is rejected outright rather than silently ignored --
+# e.g. a manifest author who typos "signerSha246" gets a clear error instead
+# of a silently-omitted signerSha256. Schema v1 is unconstrained (unchanged).
+_V2_TOP_LEVEL_KEYS = {
+    "schemaVersion", "releaseId", "profile", "backend", "platforms", "features",
+    "tabletSolution", "caleeMobile", "provenance",
+}
+_TABLET_SOLUTION_KEYS = {"calee", "caleeShell"}
+_APP_KEYS = {
+    "installArtifact", "included", "apk", "sha256", "expectedInstalled",
+    "packageId", "versionName", "versionCode", "gitSha", "signerSha256",
+}
+_EXPECTED_INSTALLED_KEYS = {"packageId", "versionName", "versionCode", "gitSha", "signerSha256"}
+_PLATFORMS_KEYS = {"tablet", "mobileAndroid", "mobileIos"}
+_FEATURES_KEYS = {"synchronization", "meals", "onboarding", "googleCalendar", "kioskAdmin", "notifications"}
+_CALEE_MOBILE_KEYS = {"version", "gitSha", "selectorEvidenceRequired", "distributedBuildAcceptanceRequired"}
+
+
+def _require_bool(raw: dict, key: str, errors: "list[str]", path: str, default: bool) -> bool:
+    """Read a JSON-boolean field, rejecting any non-boolean value (a string
+    "false", 0/1, null, or an array/object) instead of silently coercing it
+    via Python truthiness -- an explicit ``"installArtifact": "false"`` must
+    never be inverted into an install."""
+    if key not in raw:
+        return default
+    value = raw[key]
+    if not isinstance(value, bool):
+        errors.append(f"{path}.{key} must be a JSON boolean (got {value!r}).")
+        return default
+    return value
+
+
+def _reject_unknown_keys(raw: dict, allowed: "set[str]", errors: "list[str]", path: str) -> None:
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        errors.append(f"{path} has unexpected key(s): {unknown}.")
+
 
 class ReleaseInstallerError(Exception):
     """A programmer/usage error in this module (e.g. asked to build a plan
@@ -273,7 +311,7 @@ class ReleaseManifest:
 _EXPECTED_PACKAGE = {"calee": CALEE_PACKAGE_ID, "caleeShell": CALEESHELL_PACKAGE_ID}
 
 
-def _parse_app(key: str, raw: Any, errors: "list[str]") -> "AppRelease | None":
+def _parse_app(key: str, raw: Any, errors: "list[str]", *, strict: bool = False) -> "AppRelease | None":
     """Parse and validate one app section. ``key`` is the manifest key
     (``calee``/``caleeShell``). Returns an AppRelease or None if the section is
     missing entirely.
@@ -293,29 +331,60 @@ def _parse_app(key: str, raw: Any, errors: "list[str]") -> "AppRelease | None":
         identity that the post-reboot check verifies).
 
     The "at least one app must be installed" rule is enforced by
-    ``parse_manifest`` after both sections are parsed."""
+    ``parse_manifest`` after both sections are parsed.
+
+    ``strict`` is set only for schema version 2 (Priority 1): it rejects
+    unrecognised keys, requires every JSON-boolean field to actually be a
+    boolean (never a truthy/falsy string, number, null or array), requires
+    the ``expectedInstalled`` block to be present, and requires
+    ``signerSha256`` to be present -- all of this MUST be caught here, before
+    ``parse_manifest`` returns, so a caller never reaches a real ADB command
+    with an incomplete or type-confused schema-v2 identity."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
         errors.append(f"manifest.{key} must be an object.")
         return None
 
+    if strict:
+        _reject_unknown_keys(raw, _APP_KEYS, errors, f"manifest.{key}")
+
     # installArtifact supersedes the legacy 'included'; default install.
     if "installArtifact" in raw:
-        install_artifact = bool(raw.get("installArtifact"))
+        if strict:
+            install_artifact = _require_bool(raw, "installArtifact", errors, f"manifest.{key}", True)
+        else:
+            install_artifact = bool(raw.get("installArtifact"))
     else:
-        install_artifact = bool(raw.get("included", True))
+        if strict:
+            install_artifact = _require_bool(raw, "included", errors, f"manifest.{key}", True)
+        else:
+            install_artifact = bool(raw.get("included", True))
 
     # Expected installed identity: an explicit expectedInstalled block wins;
     # otherwise the flat fields carry it (legacy). ``signerSha256`` may live in
     # either the expectedInstalled block or (legacy) at the top of the section.
     exp = raw.get("expectedInstalled")
     if isinstance(exp, dict):
+        if strict:
+            _reject_unknown_keys(exp, _EXPECTED_INSTALLED_KEYS, errors, f"manifest.{key}.expectedInstalled")
         package_id = exp.get("packageId")
         version_name = exp.get("versionName")
         version_code = exp.get("versionCode")
         git_sha = exp.get("gitSha")
         signer_sha256 = exp.get("signerSha256")
+        has_expected = True
+    elif strict:
+        # Schema v2: BOTH apps must carry a complete expected installed
+        # identity regardless of installArtifact -- an absent/malformed
+        # expectedInstalled block is a hard error, not a silently-skipped app.
+        if exp is not None:
+            errors.append(f"manifest.{key}.expectedInstalled must be an object.")
+        else:
+            errors.append(
+                f"manifest.{key}.expectedInstalled is required and must be an object for schemaVersion 2."
+            )
+        package_id = version_name = version_code = git_sha = signer_sha256 = None
         has_expected = True
     else:
         if exp is not None:
@@ -373,6 +442,8 @@ def _parse_app(key: str, raw: Any, errors: "list[str]") -> "AppRelease | None":
         errors.append(
             f"manifest.{key} expected signerSha256 {signer_sha256!r} must be a 64-character hex SHA-256."
         )
+    elif strict and signer_sha256 is None:
+        errors.append(f"manifest.{key} expected signerSha256 is required for schemaVersion 2.")
 
     # Install-artifact-only fields: an app we actually install must ship a valid
     # APK + checksum. An unchanged (installArtifact:false) app must NOT.
@@ -394,48 +465,60 @@ def _parse_app(key: str, raw: Any, errors: "list[str]") -> "AppRelease | None":
 
 
 def _parse_platform_scope(raw: Any, errors: "list[str]") -> "PlatformScope | None":
+    # This function is reached only for schema version 2 (parse_manifest never
+    # calls it for v1), so every JSON-boolean field is strictly typed and
+    # unknown keys are rejected -- there is no v1 legacy shape to preserve here.
     if raw is None:
         return None
     if not isinstance(raw, dict):
         errors.append("manifest.platforms must be an object.")
         return None
+    _reject_unknown_keys(raw, _PLATFORMS_KEYS, errors, "manifest.platforms")
     return PlatformScope(
-        tablet=bool(raw.get("tablet", True)),
-        mobile_android=bool(raw.get("mobileAndroid", True)),
-        mobile_ios=bool(raw.get("mobileIos", True)),
+        tablet=_require_bool(raw, "tablet", errors, "manifest.platforms", True),
+        mobile_android=_require_bool(raw, "mobileAndroid", errors, "manifest.platforms", True),
+        mobile_ios=_require_bool(raw, "mobileIos", errors, "manifest.platforms", True),
     )
 
 
 def _parse_feature_scope(raw: Any, errors: "list[str]") -> "FeatureScope | None":
+    # Schema-v2-only, as above.
     if raw is None:
         return None
     if not isinstance(raw, dict):
         errors.append("manifest.features must be an object.")
         return None
+    _reject_unknown_keys(raw, _FEATURES_KEYS, errors, "manifest.features")
     return FeatureScope(
-        synchronization=bool(raw.get("synchronization", True)),
-        meals=bool(raw.get("meals", True)),
-        onboarding=bool(raw.get("onboarding", True)),
-        google_calendar=bool(raw.get("googleCalendar", True)),
-        kiosk_admin=bool(raw.get("kioskAdmin", True)),
-        notifications=bool(raw.get("notifications", True)),
+        synchronization=_require_bool(raw, "synchronization", errors, "manifest.features", True),
+        meals=_require_bool(raw, "meals", errors, "manifest.features", True),
+        onboarding=_require_bool(raw, "onboarding", errors, "manifest.features", True),
+        google_calendar=_require_bool(raw, "googleCalendar", errors, "manifest.features", True),
+        kiosk_admin=_require_bool(raw, "kioskAdmin", errors, "manifest.features", True),
+        notifications=_require_bool(raw, "notifications", errors, "manifest.features", True),
     )
 
 
 def _parse_calee_mobile_expected(raw: Any, errors: "list[str]") -> "CaleeMobileExpected | None":
+    # Schema-v2-only, as above.
     if raw is None:
         return None
     if not isinstance(raw, dict):
         errors.append("manifest.caleeMobile must be an object.")
         return None
+    _reject_unknown_keys(raw, _CALEE_MOBILE_KEYS, errors, "manifest.caleeMobile")
     version = raw.get("version")
     git_sha = raw.get("gitSha")
-    if version is not None and not is_wellformed_version(version):
+    if version is None:
+        errors.append("manifest.caleeMobile.version is required for schemaVersion 2.")
+    elif not is_wellformed_version(version):
         errors.append(
             f"manifest.caleeMobile.version {version!r} is not a recognisable version "
             f"(e.g. 0.0.24+24)."
         )
-    if git_sha is not None and not is_full_git_sha(git_sha):
+    if git_sha is None:
+        errors.append("manifest.caleeMobile.gitSha is required for schemaVersion 2.")
+    elif not is_full_git_sha(git_sha):
         errors.append(
             f"manifest.caleeMobile.gitSha {git_sha!r} must be a full 40-character Git SHA; an "
             f"abbreviated SHA is ambiguous and is rejected."
@@ -443,8 +526,10 @@ def _parse_calee_mobile_expected(raw: Any, errors: "list[str]") -> "CaleeMobileE
     return CaleeMobileExpected(
         version=version,
         git_sha=git_sha,
-        selector_evidence_required=bool(raw.get("selectorEvidenceRequired", True)),
-        distributed_build_acceptance_required=bool(raw.get("distributedBuildAcceptanceRequired", True)),
+        selector_evidence_required=_require_bool(raw, "selectorEvidenceRequired", errors, "manifest.caleeMobile", True),
+        distributed_build_acceptance_required=_require_bool(
+            raw, "distributedBuildAcceptanceRequired", errors, "manifest.caleeMobile", True
+        ),
     )
 
 
@@ -486,12 +571,26 @@ def parse_manifest(raw: Any) -> "tuple[ReleaseManifest, list[str]]":
     platforms = features = calee_mobile = None
 
     if schema_version == RELEASE_MANIFEST_SCHEMA_V2:
+        # Reject unrecognised/misspelled top-level keys up front -- schema v1
+        # stays unconstrained (its shape has always been open-ended).
+        _reject_unknown_keys(raw, _V2_TOP_LEVEL_KEYS, errors, "manifest")
+
         tablet_solution = raw.get("tabletSolution")
         if not isinstance(tablet_solution, dict):
             errors.append("manifest.tabletSolution is required and must be an object for schemaVersion 2.")
             tablet_solution = {}
-        calee = _parse_app("calee", tablet_solution.get("calee"), errors)
-        caleeshell = _parse_app("caleeShell", tablet_solution.get("caleeShell"), errors)
+        else:
+            _reject_unknown_keys(tablet_solution, _TABLET_SOLUTION_KEYS, errors, "manifest.tabletSolution")
+            # Both apps must be present with complete expected identities in
+            # schema v2, even though only one needs installArtifact:true --
+            # an entirely-absent section must not silently fall through as
+            # "no expected identity to verify" (Priority 1).
+            if "calee" not in tablet_solution:
+                errors.append("manifest.tabletSolution.calee is required for schemaVersion 2.")
+            if "caleeShell" not in tablet_solution:
+                errors.append("manifest.tabletSolution.caleeShell is required for schemaVersion 2.")
+        calee = _parse_app("calee", tablet_solution.get("calee"), errors, strict=True)
+        caleeshell = _parse_app("caleeShell", tablet_solution.get("caleeShell"), errors, strict=True)
 
         profile = raw.get("profile")
         if profile is None:
@@ -504,6 +603,10 @@ def parse_manifest(raw: Any) -> "tuple[ReleaseManifest, list[str]]":
             errors.append("manifest.backend is required for schemaVersion 2.")
         elif not isinstance(backend, str) or not backend.strip():
             errors.append("manifest.backend must be a non-empty string.")
+        elif not backend.strip().lower().startswith("https://"):
+            # Staging/production are the only valid v2 profiles (checked
+            # above), so an HTTPS backend is unconditionally required here.
+            errors.append(f"manifest.backend {backend!r} must be an HTTPS URL for schemaVersion 2.")
 
         if raw.get("platforms") is None:
             errors.append("manifest.platforms is required for schemaVersion 2.")

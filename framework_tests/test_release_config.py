@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from click.testing import CliRunner
 
 from calee_regression import cli
@@ -505,6 +506,9 @@ def _write_v2_bundle(tmp_path, **overrides):
             "calee": {"installArtifact": True, "apk": "calee.apk", "sha256": hashlib.sha256(calee_bytes).hexdigest(),
                       "expectedInstalled": {"packageId": "com.viso.calee", "versionName": "founder-v0.3.26",
                                             "versionCode": 326, "gitSha": "a" * 40, "signerSha256": "1" * 64}},
+            "caleeShell": {"installArtifact": False,
+                           "expectedInstalled": {"packageId": "com.viso.caleeshell", "versionName": "founder-v0.2.12",
+                                                 "versionCode": 212, "gitSha": "b" * 40, "signerSha256": "2" * 64}},
         },
         "caleeMobile": {"version": "0.0.24+24", "gitSha": "c" * 40,
                         "selectorEvidenceRequired": True, "distributedBuildAcceptanceRequired": True},
@@ -637,3 +641,82 @@ def test_cli_release_config_reuse_rejects_unreadable_evidence(tmp_path, monkeypa
     result = CliRunner().invoke(cli.main, ["release-config", "--run-id", run_id])
     assert result.exit_code == EXIT_BLOCKED, result.output
     assert "unreadable" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# Priority 2 requirement 7: a malformed legacy release-platforms.yaml must
+# never block a valid schema-v2 bundle -- release-config does not even load
+# the legacy file for a v2 bundle.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_release_config_v2_bundle_ignores_malformed_legacy_release_platforms_yaml(tmp_path, monkeypatch):
+    machine = _write_machine_yaml(tmp_path, mobile_platforms=["android", "ios"])
+    # Tab-indented YAML is a parse error (PyYAML rejects tabs for indentation).
+    malformed_platforms = _write_platforms_yaml(tmp_path, "release_platforms:\n\ttablet: true\n")
+    # Sanity check: this file really is malformed, so a v1/bare run WOULD block on it.
+    import yaml as _yaml
+    with pytest.raises(_yaml.YAMLError):
+        _yaml.safe_load(malformed_platforms.read_text())
+
+    bundle = _write_v2_bundle(tmp_path)
+    run_id = "release-20260720-101010-v2ignoreslegacy"
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    result = CliRunner().invoke(
+        cli.main,
+        ["release-config", "--config", str(machine), "--release-platforms", str(malformed_platforms),
+         "--bundle", str(bundle), "--run-id", run_id],
+    )
+    assert result.exit_code == EXIT_SUCCESS, result.output
+    payload = json.loads((tmp_path / "reports" / "runs" / run_id / "release-config" / "results.json").read_text())
+    assert payload["schemaVersion"] == 2
+    assert payload["status"] == "ok"
+
+
+def test_v2_platforms_features_expected_derives_from_composition_not_legacy():
+    # Priority 2 requirement 3/4/9: cli._v2_platforms_features_expected is the
+    # single choke point consolidate/selector-contract/sync-smoke/kiosk-admin
+    # all use to prefer a schema-v2 composition over config/release-
+    # platforms.yaml. Deliberately different values than any legacy default
+    # prove the composition alone drives the result.
+    composition = {
+        "schemaVersion": 2,
+        "releaseSelections": {
+            "profile": "production",
+            "enabledPlatforms": ["tablet", "ios"],  # android deliberately EXCLUDED
+            "enabledFeatures": ["meals", "kiosk_admin"],  # sync/onboarding/google_calendar EXCLUDED
+            "expectedIdentities": {
+                "calee": {
+                    "buildVersion": "founder-v0.9.9", "gitSha": "9" * 40,
+                    "applicationId": "com.viso.calee", "versionCode": 999,
+                    "signerSha256": "8" * 64,
+                },
+                "caleeShell": {"version": "founder-v0.8.8", "gitSha": "7" * 40, "signerSha256": "6" * 64},
+                "caleeMobile": {"buildVersion": "0.0.99+99", "gitSha": "5" * 40},
+            },
+        },
+    }
+    platforms, features, expected = cli._v2_platforms_features_expected(composition)
+    assert platforms.tablet is True and platforms.mobile_ios is True and platforms.mobile_android is False
+    assert features.meals is True and features.kiosk_admin is True
+    assert features.synchronization is False and features.onboarding is False and features.google_calendar is False
+    assert expected.calee_build_version == "founder-v0.9.9"
+    assert expected.calee_git_sha == "9" * 40
+    assert expected.caleeshell_version == "founder-v0.8.8"
+    assert expected.caleemobile_git_sha == "5" * 40
+    assert expected.production is True
+
+
+def test_cli_release_config_v1_bundleless_still_blocks_on_malformed_legacy_yaml(tmp_path, monkeypatch):
+    # requirement 8: schema-v1 (no --bundle at all) must keep using and
+    # cross-checking the legacy file -- a malformed one still BLOCKS.
+    machine = _write_machine_yaml(tmp_path)
+    malformed_platforms = _write_platforms_yaml(tmp_path, "release_platforms:\n\ttablet: true\n")
+    run_id = "release-20260720-101010-v1stillblocks"
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    result = CliRunner().invoke(
+        cli.main,
+        ["release-config", "--config", str(machine), "--release-platforms", str(malformed_platforms),
+         "--run-id", run_id],
+    )
+    assert result.exit_code == EXIT_BLOCKED, result.output

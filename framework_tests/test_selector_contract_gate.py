@@ -645,6 +645,62 @@ def test_gate_auto_derives_expected_release_id_from_this_runs_release_config(tmp
 
 
 # ---------------------------------------------------------------------------
+# Priority 2: a schema-v2 release-config's profile is authoritative for
+# production selector policy -- a co-present legacy release-platforms.yaml
+# declaring the opposite must never override it.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_schema_v2_production_profile_overrides_legacy_development_profile(tmp_path, monkeypatch):
+    # requirement 5/6: a schema-v2 production release must never permit local
+    # selector generation, even when config/release-platforms.yaml (present on
+    # the same machine, deliberately disagreeing) declares production: false.
+    workspace = _make_workspace(tmp_path)
+    release_config_path = workspace.component_report_path("release-config")
+    release_config_path.write_text(json.dumps({
+        "runId": RUN_ID, "status": "ok", "releaseId": RELEASE_A, "schemaVersion": 2,
+        "machineSelections": {}, "deviceIds": {},
+        "releaseSelections": {
+            "profile": "production", "selectedBackend": "https://hub.calee.com.au",
+            "enabledPlatforms": ["tablet", "android", "ios"],
+            "enabledFeatures": ["synchronization"],
+            "expectedIdentities": {
+                "calee": {}, "caleeShell": {},
+                "caleeMobile": {"buildVersion": VERSION_RELEASE, "gitSha": SHA_RELEASE},
+            },
+        },
+        "conflicts": [],
+    }))
+    legacy = tmp_path / "release-platforms.yaml"
+    legacy.write_text("expected_build_identity:\n  production: false\n")
+    monkeypatch.setenv("CALEE_RELEASE_PLATFORMS", str(legacy))
+
+    # No --production/--development flag, no GitHub chain, no --source: a
+    # development/local generation would proceed unless schema v2's profile
+    # is what actually decides eff_production.
+    result = CliRunner().invoke(main, ["selector-contract", "--run-id", RUN_ID])
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    assert "Production release accepts ONLY a CI-produced selector artifact" in result.output
+
+
+def test_gate_schema_v1_still_honours_legacy_production_profile(tmp_path, monkeypatch):
+    # requirement 8: no release-config composed for this run at all (a bare/
+    # ad-hoc invocation, or a genuine schema-v1 run) -- config/release-
+    # platforms.yaml's production flag still applies, unaffected.
+    _make_workspace(tmp_path)
+    legacy = tmp_path / "release-platforms.yaml"
+    legacy.write_text(
+        "expected_build_identity:\n"
+        f"  production: true\n  caleemobile_git_sha: {SHA_RELEASE!r}\n"
+        f"  caleemobile_build_version: {VERSION_RELEASE!r}\n"
+    )
+    monkeypatch.setenv("CALEE_RELEASE_PLATFORMS", str(legacy))
+    result = CliRunner().invoke(main, ["selector-contract", "--run-id", RUN_ID])
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    assert "Production release accepts ONLY a CI-produced selector artifact" in result.output
+
+
+# ---------------------------------------------------------------------------
 # Priority 8: consolidate independently re-derives + re-enforces the same
 # release-ID binding (never merely trusting the gate's own recorded status).
 # ---------------------------------------------------------------------------

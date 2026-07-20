@@ -1,4 +1,13 @@
-"""Priority 6 -- the today-relative subscribed fixture is generated, provisioned
+"""SUPERSEDED -- exercises calee_regression.subscribed_provision, which is
+itself superseded by subscribed_publisher.py (see that module's docstring and
+docs/SUBSCRIBED_CALENDAR_REGRESSION.md). Kept only because subscribed_provision.py
+is kept as reference; nothing in cli.py wires this path up any longer. The
+LIVE Priority 5/6 coverage is framework_tests/test_subscribed_publisher.py and
+framework_tests/test_subscribed_fixture_component.py.
+
+Original docstring, describing the superseded contract, follows:
+
+Priority 6 -- the today-relative subscribed fixture is generated, provisioned
 through an authenticated regression-only seam, recorded, and its titles reach
 the tablet scenario. Offline: the provisioner is injected; no hub backend.
 

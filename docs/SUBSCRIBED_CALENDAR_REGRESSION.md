@@ -27,30 +27,62 @@ customer calendar or an unauthenticated production reset endpoint. The private
 subscription URL is **not** recorded here or in any report — only the fixture
 calendar id is.
 
-**Client workflow (Priority 6).** `prepare-subscribed-fixture` (run by the
-`06` launcher, and standalone) resolves ONE date + timezone for the run,
+**Client workflow (Priorities 5 & 6).** `prepare-subscribed-fixture` (run by
+the `06` launcher, and standalone) resolves ONE date + timezone for the run,
 generates the today-relative ICS (`subscribed_fixture.generate_today_relative_ics`),
 records `reports/runs/<run-id>/subscribed-fixture/results.json` and the generated
 event titles as scenario variables (`REG_SUB_TIMED_TITLE` / `REG_SUB_ALLDAY_TITLE`
 / `REG_SUB_DATE`) — which the tablet scenario substitutes into its `${…}`
 placeholders so it asserts the exact events THIS run provisioned on both Today
-and Calendar — and provisions the ICS through the authenticated provisioner seam
-(`subscribed_provision.http_provisioner`). With no hub backend (offline/CI, and
-until the backend endpoint below ships) provisioning records BLOCKED and is
-**never faked** — the subscribed scenario stays draft-unverified.
+and Calendar.
 
-**REQUIRED backend contract (a separate calee-hub-core change, not yet
-implemented).** The client calls `POST /v1/admin/regression/subscribed-source`.
-The backend endpoint MUST be: admin-authenticated (never a customer bearer
-token); scoped to the dedicated regression account / `regression:regsub` only
-(it must refuse any other account or calendar, so no customer calendar is ever
-touched); production-disabled by default (invisible/404 unless a non-production
-`APP_ENV`); audited; and a deterministic replace of any stale feed. It must NOT
-be an unauthenticated reset. Note for the implementer: the regression source
-must not be picked up by the normal `sources_due_for_refresh` sync worker (its
-feed is supplied directly, not network-fetched) — e.g. mark it orphaned/disabled
-or set a far-future `refresh_after` so the worker never tries (and fails) to
-fetch it.
+Publishing itself goes through `subscribed_publisher.build_publisher_from_config`,
+which selects one of four adapters from `machine.local.yaml`'s `subscribed_publisher`
+section — `webdav`, `presigned-put`, `s3-cli`, or `local` — and PUTs the generated
+ICS to the configured publicly-readable URL. `local` (writes to a filesystem path,
+no real publish) is accepted only for `fixed-date`/`offline-only` modes; it is
+rejected outright when `mode` is `published`, so a published run can never
+silently downgrade to a no-op local write.
+
+In `published` mode, `prepare_subscribed_fixture` then runs two independent,
+mandatory verification phases before it will report success — neither is ever
+faked or skipped:
+
+1. **Public-read verification (Priority 5).** Polls the published URL over
+   plain HTTP(S) GET (`ics_contract.parse_ics`) until the downloaded bytes'
+   SHA-256 matches exactly what was PUT, both this run's exact titles
+   (`REG_SUB_TIMED_TITLE`/`REG_SUB_ALLDAY_TITLE`) are present, and the event
+   date matches `REG_SUB_DATE` — a stale or wrong-date ICS left over from a
+   prior run never false-passes. Recorded as `publicReadVerificationStatus` /
+   `publicReadAttempts` / `publicReadObservedSha256` / `publicReadVerifiedAt`.
+2. **Calee-ingestion verification (Priority 6).** Only after phase 1 succeeds,
+   polls the *existing, already-authenticated* `GET /client/v1/events` API —
+   reusing CaleeMobile-Regression's `sync_smoke_actions.py` receiver via the
+   `sync_smoke_bridge.find_event_by_title` subprocess bridge (never a direct
+   cross-repo import; credentials travel in the child process environment,
+   never on argv) — until the hub reports it actually ingested the
+   subscription and shows the exact run-specific event (optionally narrowed
+   to the `regression:regsub` calendar id). This is the real proof that Calee
+   picked up the feed, not just that the file is reachable. Recorded as
+   `ingestionStatus` / `ingestionAttempts` / `ingestionElapsedSeconds` /
+   `ingestionTimestamp` / `ingestionApi` / `ingestionObservedEvent`.
+
+`published` mode only reports overall success when **both** phases report
+verified. If no publisher is configured, no sibling CaleeMobile-Regression
+checkout is available for the ingestion bridge, or either phase times out,
+the step records **BLOCKED** — never faked — and the subscribed scenario
+stays draft-unverified. `fixed-date` and `offline-only` modes never attempt
+either verification phase and are never promoted past draft-unverified either;
+they exist only to prove the ICS-generation and date-expansion logic offline.
+
+**Release-identity binding (Priority 7).** `reports/runs/<run-id>/subscribed-fixture/results.json`
+records `releaseId` (adopted from this run's own composed `release-config`, or an explicit
+`--release-id`/`CALEE_RELEASE_ID`) and `generatedAt` alongside the run ID it already carried. At
+consolidation, this evidence is bound to the release the same way selector-contract evidence is: a
+missing or mismatched `releaseId` BLOCKS, and a `published`-mode report is re-verified against its own
+`publicReadVerificationStatus`/`ingestionStatus` rather than a bare top-level `status: "ok"` being
+trusted outright — see `docs/RELEASE_POLICY.md`'s "Subscribed-fixture evidence is bound to the release"
+section for the full precedence and rejection rules.
 
 Exercise **both** ingestion paths:
 

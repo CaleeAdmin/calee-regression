@@ -52,6 +52,80 @@ def test_component_from_report_unrecognized_status_is_blocked_never_silent_pass(
     assert any("Unrecognized" in d for d in c.detail)
 
 
+# ── release-identity binding (Priority 7) ───────────────────────────────────
+
+
+def test_component_from_report_accepts_matching_release_id():
+    c = component_from_subscribed_fixture_report(
+        "x", {"status": "ok", "releaseId": "2026.07.20-rc1"}, mandatory=True,
+        expected_release_id="2026.07.20-rc1",
+    )
+    assert c.status == STATUS_PASS
+
+
+def test_component_from_report_rejects_missing_release_id_when_expected():
+    c = component_from_subscribed_fixture_report(
+        "x", {"status": "ok"}, mandatory=True, expected_release_id="2026.07.20-rc1",
+    )
+    assert c.status == STATUS_BLOCKED
+    assert any("has none" in d for d in c.detail)
+
+
+def test_component_from_report_rejects_release_id_mismatch():
+    c = component_from_subscribed_fixture_report(
+        "x", {"status": "ok", "releaseId": "some-other-release"}, mandatory=True,
+        expected_release_id="2026.07.20-rc1",
+    )
+    assert c.status == STATUS_BLOCKED
+    joined = " ".join(c.detail)
+    assert "some-other-release" in joined and "2026.07.20-rc1" in joined
+
+
+def test_component_from_report_published_ok_requires_public_read_verification_ok():
+    # A tampered/inconsistent report claiming overall success while the
+    # Priority 5 public-read phase never actually verified must still BLOCK.
+    c = component_from_subscribed_fixture_report(
+        "x", {
+            "status": "ok", "mode": "published",
+            "publicReadVerificationStatus": "blocked-mismatch", "ingestionStatus": "ok",
+        }, mandatory=True,
+    )
+    assert c.status == STATUS_BLOCKED
+    assert any("publicReadVerificationStatus" in d for d in c.detail)
+
+
+def test_component_from_report_published_ok_requires_ingestion_status_ok():
+    # Same, for the Priority 6 ingestion phase.
+    c = component_from_subscribed_fixture_report(
+        "x", {
+            "status": "ok", "mode": "published",
+            "publicReadVerificationStatus": "ok", "ingestionStatus": "blocked",
+        }, mandatory=True,
+    )
+    assert c.status == STATUS_BLOCKED
+    assert any("ingestionStatus" in d for d in c.detail)
+
+
+def test_component_from_report_published_ok_with_both_phases_verified_passes():
+    c = component_from_subscribed_fixture_report(
+        "x", {
+            "status": "ok", "mode": "published",
+            "publicReadVerificationStatus": "ok", "ingestionStatus": "ok",
+        }, mandatory=True,
+    )
+    assert c.status == STATUS_PASS
+
+
+def test_component_from_report_fixed_date_ok_unaffected_by_phase_checks():
+    # fixed-date/offline-only never set publicReadVerificationStatus/
+    # ingestionStatus at all (Priority 6: never faked for those modes) -- the
+    # phase-consistency check applies only to mode == "published" reports.
+    c = component_from_subscribed_fixture_report(
+        "x", {"status": "ok", "mode": "offline-only"}, mandatory=True,
+    )
+    assert c.status == STATUS_PASS
+
+
 # ── CLI integration: auto-discovery + optional-while-draft ─────────────────
 
 
@@ -206,6 +280,137 @@ def test_consolidate_rejects_stale_subscribed_fixture_evidence(tmp_path, monkeyp
     assert result.exit_code != EXIT_SUCCESS
 
 
+# ── release-identity binding at consolidation (Priority 7) ─────────────────
+
+
+def _seed_release_config(ws, *, release_id):
+    ws.component_report_path("release-config").write_text(json.dumps({
+        "runId": RUN_ID, "status": "ok", "releaseId": release_id, "schemaVersion": 2,
+        "machineSelections": {}, "deviceIds": {},
+        "releaseSelections": {
+            "profile": "staging", "selectedBackend": "https://hub-dev.calee.com.au",
+            "enabledPlatforms": [], "enabledFeatures": [],
+            "expectedIdentities": {"calee": {}, "caleeShell": {}, "caleeMobile": {}},
+        },
+        "conflicts": [],
+    }))
+
+
+def _component_detail(out_dir, name):
+    report = json.loads((out_dir / "consolidated-report.json").read_text(encoding="utf-8"))
+    for c in report["components"]:
+        if c["name"] == name:
+            return " ".join(c["detail"])
+    raise AssertionError(f"no component named {name!r} in consolidated report")
+
+
+def test_consolidate_rejects_subscribed_fixture_evidence_for_a_different_release(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    ws = _workspace(tmp_path)
+    _seed_minimal_passing_run(ws)
+    _seed_release_config(ws, release_id="2026.07.20-rc1")
+    path = ws.component_report_path("subscribed-fixture")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"runId": RUN_ID, "status": "ok", "releaseId": "some-other-release"}))
+
+    out_dir = tmp_path / "out"
+    result = CliRunner().invoke(
+        cli.main, ["consolidate", "--run-id", RUN_ID, *_MINIMAL_CONSOLIDATE_ARGS,
+                   "--subscribed-fixture-mandatory", "--allow-unknown-build-identity", "--out-dir", str(out_dir)],
+    )
+    assert "Subscribed-calendar fixture: BLOCKED" in result.output
+    detail = _component_detail(out_dir, "Subscribed-calendar fixture")
+    assert "some-other-release" in detail and "2026.07.20-rc1" in detail
+    assert result.exit_code != EXIT_SUCCESS
+
+
+def test_consolidate_rejects_subscribed_fixture_evidence_with_no_release_id_when_release_bound(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    ws = _workspace(tmp_path)
+    _seed_minimal_passing_run(ws)
+    _seed_release_config(ws, release_id="2026.07.20-rc1")
+    path = ws.component_report_path("subscribed-fixture")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"runId": RUN_ID, "status": "ok"}))  # no releaseId at all
+
+    result = CliRunner().invoke(
+        cli.main, ["consolidate", "--run-id", RUN_ID, *_MINIMAL_CONSOLIDATE_ARGS,
+                   "--subscribed-fixture-mandatory", "--allow-unknown-build-identity"],
+    )
+    assert "Subscribed-calendar fixture: BLOCKED" in result.output
+    assert result.exit_code != EXIT_SUCCESS
+
+
+def test_consolidate_accepts_subscribed_fixture_evidence_for_the_matching_release(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    ws = _workspace(tmp_path)
+    _seed_minimal_passing_run(ws)
+    _seed_release_config(ws, release_id="2026.07.20-rc1")
+    path = ws.component_report_path("subscribed-fixture")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"runId": RUN_ID, "status": "ok", "releaseId": "2026.07.20-rc1"}))
+
+    result = CliRunner().invoke(
+        cli.main, ["consolidate", "--run-id", RUN_ID, *_MINIMAL_CONSOLIDATE_ARGS,
+                   "--subscribed-fixture-mandatory", "--allow-unknown-build-identity"],
+    )
+    assert "Subscribed-calendar fixture: PASS" in result.output
+    assert result.exit_code == EXIT_SUCCESS, result.output
+
+
+# ── prepare-subscribed-fixture adopts this run's own release-config releaseId
+# (Priority 7), exactly like selector-contract's Priority 8 adoption ────────
+
+
+def test_cli_prepare_subscribed_fixture_adopts_release_id_from_this_runs_release_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    ws = run_context.RunWorkspace(tmp_path, RUN_ID)
+    ws.ensure_created()
+    _seed_release_config(ws, release_id="2026.07.20-rc9")
+
+    result = CliRunner().invoke(cli.main, ["prepare-subscribed-fixture", "--run-id", RUN_ID])
+    assert result.exit_code == EXIT_SUCCESS, result.output
+
+    data = json.loads(ws.component_report_path("subscribed-fixture").read_text(encoding="utf-8"))
+    assert data["releaseId"] == "2026.07.20-rc9", data
+
+
+def test_cli_prepare_subscribed_fixture_explicit_release_id_wins_over_release_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    ws = run_context.RunWorkspace(tmp_path, RUN_ID)
+    ws.ensure_created()
+    _seed_release_config(ws, release_id="2026.07.20-rc9")
+
+    result = CliRunner().invoke(
+        cli.main, ["prepare-subscribed-fixture", "--run-id", RUN_ID, "--release-id", "explicit-override"],
+    )
+    assert result.exit_code == EXIT_SUCCESS, result.output
+
+    data = json.loads(ws.component_report_path("subscribed-fixture").read_text(encoding="utf-8"))
+    assert data["releaseId"] == "explicit-override", data
+
+
+def test_cli_prepare_subscribed_fixture_no_release_config_leaves_release_id_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    ws = run_context.RunWorkspace(tmp_path, RUN_ID)
+
+    result = CliRunner().invoke(cli.main, ["prepare-subscribed-fixture", "--run-id", RUN_ID])
+    assert result.exit_code == EXIT_SUCCESS, result.output
+
+    data = json.loads(ws.component_report_path("subscribed-fixture").read_text(encoding="utf-8"))
+    assert data["releaseId"] is None, data
+
+
+def test_cli_prepare_subscribed_fixture_records_generated_at(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    result = CliRunner().invoke(cli.main, ["prepare-subscribed-fixture", "--run-id", RUN_ID])
+    assert result.exit_code == EXIT_SUCCESS, result.output
+
+    ws = run_context.RunWorkspace(tmp_path, RUN_ID)
+    data = json.loads(ws.component_report_path("subscribed-fixture").read_text(encoding="utf-8"))
+    assert data["generatedAt"], data
+
+
 # ── #24: no secret in commands/output/JSON, through the REAL CLI command ───
 #
 # Every other subscribed-publisher test (test_subscribed_publisher.py) calls
@@ -217,6 +422,7 @@ def test_consolidate_rejects_stale_subscribed_fixture_evidence(tmp_path, monkeyp
 
 
 def test_cli_prepare_subscribed_fixture_published_mode_leaks_no_credential(tmp_path, monkeypatch):
+    import stat
     import urllib.request
 
     monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
@@ -225,10 +431,43 @@ def test_cli_prepare_subscribed_fixture_published_mode_leaks_no_credential(tmp_p
     monkeypatch.setenv("CALEE_SUBSCRIBED_WEBDAV_USERNAME", fake_username)
     monkeypatch.setenv("CALEE_SUBSCRIBED_WEBDAV_PASSWORD", fake_password)
 
-    ics_bytes = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n"
+    # Priority 6: the second, ingestion phase needs its own credentials
+    # (also never allowed to leak) and a sibling CaleeMobile-Regression
+    # checkout exposing find-event-by-title.
+    reg_email = "reg-tester@example.invalid"
+    reg_password = "hunter2-DO-NOT-LEAK-either"
+    monkeypatch.setenv("CALEE_TEST_EMAIL", reg_email)
+    monkeypatch.setenv("CALEE_TEST_PASSWORD", reg_password)
+
+    sibling_api_dir = tmp_path.parent / "CaleeMobile-Regression" / "api"
+    sibling_api_dir.mkdir(parents=True, exist_ok=True)
+    fake_ingestion_script = sibling_api_dir / "sync_smoke_actions.py"
+    fake_ingestion_script.write_text(
+        "import argparse, json, sys\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('action')\n"
+        "p.add_argument('--base-url'); p.add_argument('--email'); p.add_argument('--password')\n"
+        "p.add_argument('--title', default=None); p.add_argument('--calendar-id', default=None)\n"
+        "p.add_argument('--report')\n"
+        "args = p.parse_args()\n"
+        "payload = {'found': True, 'id': 'evt_ingested', 'title': args.title, 'calendarId': args.calendar_id}\n"
+        "open(args.report, 'w').write(json.dumps(payload))\n"
+        "sys.exit(0)\n"
+    )
+    fake_ingestion_script.chmod(fake_ingestion_script.stat().st_mode | stat.S_IEXEC)
+
+    # A real WebDAV server serves back exactly the bytes it was PUT with --
+    # this fake does the same (Priority 5: the published-mode verification
+    # now checks byte SHA-256 + both run-specific titles + the target date
+    # against the exact generated ICS, so a fake server returning unrelated
+    # placeholder bytes would -- correctly -- fail verification).
+    published = {}
 
     class _FakeResponse:
         status = 201
+
+        def __init__(self, body=b""):
+            self._body = body
 
         def __enter__(self):
             return self
@@ -237,20 +476,28 @@ def test_cli_prepare_subscribed_fixture_published_mode_leaks_no_credential(tmp_p
             return False
 
         def read(self):
-            return ics_bytes
+            return self._body
 
     def _fake_urlopen(req, timeout=None):
-        return _FakeResponse()
+        # The publisher passes a urllib.request.Request (PUT); the CLI's
+        # own read-back poll passes a bare URL string (GET).
+        if hasattr(req, "get_method") and req.get_method() == "PUT":
+            published["ics"] = req.data
+            return _FakeResponse()
+        return _FakeResponse(published.get("ics", b""))
 
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
 
     config_path = tmp_path / "machine.local.yaml"
     config_path.write_text(
+        "backend_url: https://hub-dev.calee.com.au\n"
         "subscribed_fixture:\n"
         "  publisher: webdav\n"
         "  public_url: https://fixtures.example.invalid/calee/regression-calendar.ics\n"
         "  poll_interval_seconds: 1\n"
-        "  timeout_seconds: 5\n",
+        "  timeout_seconds: 5\n"
+        "  ingestion_poll_interval_seconds: 1\n"
+        "  ingestion_timeout_seconds: 5\n",
         encoding="utf-8",
     )
 
@@ -266,6 +513,8 @@ def test_cli_prepare_subscribed_fixture_published_mode_leaks_no_credential(tmp_p
     # Neither credential ever appears in the command's own stdout...
     assert fake_username not in result.output
     assert fake_password not in result.output
+    assert reg_email not in result.output
+    assert reg_password not in result.output
 
     # ...nor in the results.json it wrote...
     ws = run_context.RunWorkspace(tmp_path, RUN_ID)
@@ -273,6 +522,8 @@ def test_cli_prepare_subscribed_fixture_published_mode_leaks_no_credential(tmp_p
     report_text = report_path.read_text(encoding="utf-8")
     assert fake_username not in report_text
     assert fake_password not in report_text
+    assert reg_email not in report_text
+    assert reg_password not in report_text
 
     # ...nor in the ICS sidecar written next to it (regression titles only).
     ics_path = report_path.parent / "reg_sub_today_relative.ics"
@@ -281,10 +532,15 @@ def test_cli_prepare_subscribed_fixture_published_mode_leaks_no_credential(tmp_p
     assert fake_username not in ics_text
     assert fake_password not in ics_text
 
-    # Sanity: this genuinely exercised the published path (not a silent
-    # short-circuit) -- publication and observation both actually succeeded.
+    # Sanity: this genuinely exercised the FULL two-phase published path
+    # (Priority 5 public-read verification AND Priority 6 Calee-ingestion
+    # verification via the bridged find-event-by-title action) -- not a
+    # silent short-circuit.
     data = json.loads(report_text)
     assert data["status"] == "ok", report_text
     assert data["publicationStatus"] == "ok", report_text
     assert data["observationStatus"] == "ok", report_text
     assert data["publisherType"] == "webdav", report_text
+    assert data["publicReadVerificationStatus"] == "ok", report_text
+    assert data["ingestionStatus"] == "ok", report_text
+    assert data["ingestionObservedEvent"]["id"] == "evt_ingested", report_text

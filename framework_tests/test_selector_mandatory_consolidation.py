@@ -184,3 +184,77 @@ def test_diagnostic_waiver_allows_optional_selector(tmp_path):
     # Either absent or present-but-optional -- never a silent mandatory block.
     if SELECTOR_NAME in comps:
         assert comps[SELECTOR_NAME]["mandatory"] is False
+
+
+# ---------------------------------------------------------------------------
+# Priority 3: caleeMobile.selectorEvidenceRequired (via this run's own
+# schema-v2 release-config composition) is the default whenever no explicit
+# --selector-contract-mandatory/-optional flag is given.
+# ---------------------------------------------------------------------------
+
+
+def _write_release_config(workspace, *, selector_evidence_required, profile="staging"):
+    _write(workspace, "release-config", {
+        "runId": RUN_ID, "status": "ok", "releaseId": "2026.07.20-rc1", "schemaVersion": 2,
+        "machineSelections": {}, "deviceIds": {},
+        "releaseSelections": {
+            "profile": profile, "selectedBackend": "https://hub-dev.calee.com.au",
+            "enabledPlatforms": ["tablet"], "enabledFeatures": [],
+            "expectedIdentities": {
+                "calee": {}, "caleeShell": {},
+                "caleeMobile": {
+                    "buildVersion": VERSION_RELEASE, "gitSha": SHA_RELEASE,
+                    "selectorEvidenceRequired": selector_evidence_required,
+                },
+            },
+        },
+        "conflicts": [],
+    })
+
+
+def test_manifest_true_forces_mandatory_even_with_no_mobile_in_scope(tmp_path):
+    # No Android/iOS in scope would normally make selector evidence "not
+    # applicable" -- but the manifest explicitly requires it.
+    workspace = _seed_base(tmp_path, android=False, ios=False, selector=None)
+    _write_release_config(workspace, selector_evidence_required=True)
+    result = _consolidate(tmp_path, "--android-optional", "--ios-optional")
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    comp = _components(tmp_path)[SELECTOR_NAME]
+    assert comp["mandatory"] is True
+
+
+def test_manifest_false_records_explicit_optional_component_not_omitted(tmp_path):
+    workspace = _seed_base(tmp_path, android=True, ios=False, selector=None)
+    _write_release_config(workspace, selector_evidence_required=False)
+    result = _consolidate(
+        tmp_path, "--android-mandatory", "--ios-optional",
+        "--caleemobile-git-sha", SHA_RELEASE, "--caleemobile-build-version", VERSION_RELEASE,
+    )
+    assert result.exit_code == EXIT_SUCCESS, result.output
+    comps = _components(tmp_path)
+    assert SELECTOR_NAME in comps, "false must be RECORDED, never silently omitted"
+    assert comps[SELECTOR_NAME]["mandatory"] is False
+
+
+def test_explicit_cli_flag_still_wins_over_manifest_false(tmp_path):
+    workspace = _seed_base(tmp_path, android=True, ios=False, selector=None)
+    _write_release_config(workspace, selector_evidence_required=False)
+    result = _consolidate(tmp_path, "--android-mandatory", "--ios-optional", "--selector-contract-mandatory")
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    assert _components(tmp_path)[SELECTOR_NAME]["mandatory"] is True
+
+
+def test_production_forces_selector_evidence_despite_manifest_false(tmp_path):
+    # requirement: "production policy may still require selector evidence
+    # regardless of a false flag."
+    workspace = _seed_base(tmp_path, android=True, ios=False, selector=None)
+    _write_release_config(workspace, selector_evidence_required=False, profile="production")
+    result = _consolidate(
+        tmp_path, "--production", "--android-mandatory", "--ios-optional",
+        "--expected-caleemobile-git-sha", SHA_RELEASE,
+        "--expected-caleemobile-build-version", VERSION_RELEASE,
+        "--caleemobile-git-sha", SHA_RELEASE, "--caleemobile-build-version", VERSION_RELEASE,
+    )
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    comp = _components(tmp_path)[SELECTOR_NAME]
+    assert comp["mandatory"] is True

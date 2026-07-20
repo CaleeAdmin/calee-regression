@@ -1,4 +1,23 @@
-"""Priority 6 -- provision the today-relative subscribed fixture and hand its
+"""SUPERSEDED -- see subscribed_publisher.py.
+
+This module's ``provisioner`` seam assumed a not-yet-shipped, authenticated
+calee-hub-core admin endpoint (``POST /v1/admin/regression/subscribed-source``)
+that writes the fixture directly into the hub's subscription source. That
+endpoint was never built, and per this project's rule against proposing
+backend changes as the solution, Priority 6 was instead implemented against
+the EXISTING, already-shipped contract: ``subscribed_publisher.py`` publishes
+the fixture ICS to a real publicly-readable URL (webdav/presigned-put/s3-cli/
+local) the way an actual subscription source would be, verifies it is
+byte-exact readable there (Priority 5), and then verifies Calee itself
+ingested it via the existing authenticated ``GET /client/v1/events`` API
+(Priority 6) -- see docs/SUBSCRIBED_CALENDAR_REGRESSION.md. Nothing in
+``cli.py`` wires this module up any longer; it is kept only because it is
+still exercised by its own offline unit tests and may be useful reference if
+calee-hub-core ever does ship that admin endpoint.
+
+Original docstring, describing the superseded contract, follows:
+
+Priority 6 -- provision the today-relative subscribed fixture and hand its
 event titles to the tablet scenario.
 
 The end-to-end contract (see docs/SUBSCRIBED_CALENDAR_REGRESSION.md):

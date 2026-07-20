@@ -17,6 +17,7 @@ from calee_regression.sync_smoke_bridge import (
     SyncSmokeBridgeError,
     create_scratch_event,
     delete_event,
+    find_event_by_title,
     get_calendar,
     get_event,
     reopen_task,
@@ -74,6 +75,14 @@ if args.action == "create-scratch-event":
     payload = {"found": True, "id": "evt_fake_1", "title": args.title, "calendarId": "cal_fake"}
 elif args.action == "get-event":
     payload = {"found": True, "id": args.event_id, "title": "whatever"}
+elif args.action == "find-event-by-title":
+    if args.title == "REG-SUB-TIMED-nonexistent":
+        payload = {"found": False, "title": args.title}
+    else:
+        payload = {
+            "found": True, "id": "evt_ingested_1", "title": args.title,
+            "calendarId": args.calendar_id or "cal_fake", "startsAt": "2026-07-20T09:00:00", "allDay": False,
+        }
 elif args.action == "delete-event":
     payload = {"found": False, "id": args.event_id, "alreadyGone": False}
 elif args.action == "reopen-task":
@@ -113,6 +122,33 @@ def test_get_event_returns_parsed_report(tmp_path):
     result = get_event(repo_root=repo_root, base_url="https://x", email="a@x", password="p", event_id="evt_1")
     assert result["found"] is True
     assert result["id"] == "evt_1"
+
+
+def test_find_event_by_title_returns_parsed_report_when_found(tmp_path):
+    repo_root = _make_sibling_with_api_script(tmp_path, _FAKE_API_SCRIPT)
+    result = find_event_by_title(
+        repo_root=repo_root, base_url="https://x", email="a@x", password="p", title="REG-SUB-TIMED-abc123",
+    )
+    assert result["found"] is True
+    assert result["id"] == "evt_ingested_1"
+    assert result["title"] == "REG-SUB-TIMED-abc123"
+
+
+def test_find_event_by_title_passes_calendar_id_filter(tmp_path):
+    repo_root = _make_sibling_with_api_script(tmp_path, _FAKE_API_SCRIPT)
+    result = find_event_by_title(
+        repo_root=repo_root, base_url="https://x", email="a@x", password="p",
+        title="REG-SUB-TIMED-abc123", calendar_id="regression:regsub",
+    )
+    assert result["calendarId"] == "regression:regsub"
+
+
+def test_find_event_by_title_returns_not_found(tmp_path):
+    repo_root = _make_sibling_with_api_script(tmp_path, _FAKE_API_SCRIPT)
+    result = find_event_by_title(
+        repo_root=repo_root, base_url="https://x", email="a@x", password="p", title="REG-SUB-TIMED-nonexistent",
+    )
+    assert result["found"] is False
 
 
 def test_delete_event_returns_parsed_report(tmp_path):

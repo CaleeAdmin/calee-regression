@@ -106,16 +106,29 @@ allow_caleeshell_technical: false
 #   # s3_key: "calee/regression-calendar.ics"
 #   # s3_cli_path: "aws"
 #   # local only (offline-only mode, for validating the publisher plumbing
-#   # itself without any external endpoint):
+#   # itself without any external endpoint) -- REJECTED outright in
+#   # published mode (mode: "published"), which then BLOCKS honestly rather
+#   # than "publishing" to a local file no one can subscribe to:
 #   # local_path: "/tmp/reg-sub-calendar.ics"
 #   #
 #   # fixed-date only:
 #   # fixed_date: "2026-08-05"
 #
-# Credentials the chosen publisher needs (webdav: username+password;
-# presigned-put: the presigned PUT URL itself; s3-cli: the bucket name, plus
-# whatever AWS_* the installed `aws` CLI already reads from its own
-# environment/profile) are resolved from the environment or the macOS
-# Keychain (service "calee-regression"), exactly like the regression
-# account's own credentials -- never written here, never in argv, never in a
-# report.
+# Credentials the chosen publisher needs are resolved from the environment or
+# the macOS Keychain (service "calee-regression"), exactly like the
+# regression account's own credentials -- never written here, never in argv,
+# never in a report:
+#   webdav:        CALEE_SUBSCRIBED_WEBDAV_USERNAME / CALEE_SUBSCRIBED_WEBDAV_PASSWORD
+#   presigned-put: CALEE_SUBSCRIBED_PRESIGNED_PUT_URL
+#   s3-cli:        CALEE_SUBSCRIBED_S3_BUCKET (the bucket name), plus
+#                  CALEE_SUBSCRIBED_AWS_ACCESS_KEY_ID / CALEE_SUBSCRIBED_AWS_SECRET_ACCESS_KEY
+#                  (required) and CALEE_SUBSCRIBED_AWS_SESSION_TOKEN (optional,
+#                  only for temporary/STS-issued credentials). These are
+#                  DELIBERATELY namespaced under CALEE_SUBSCRIBED_* rather than
+#                  the bare AWS_* names, so the "aws s3 cp" child process never
+#                  silently inherits an operator's own ambient AWS session/SSO
+#                  credentials for something unrelated -- resolution is always
+#                  explicit, and the resolved values are mapped onto the
+#                  standard AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/
+#                  AWS_SESSION_TOKEN names only in the child process's own
+#                  environment.

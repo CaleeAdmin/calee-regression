@@ -511,6 +511,9 @@ def compose_effective_release_config(
             },
             "caleeShell": {
                 "version": shell_app.version_name if shell_app else None,
+                "gitSha": shell_app.git_sha if shell_app else None,
+                "applicationId": shell_app.package_id if shell_app else None,
+                "versionCode": shell_app.version_code if shell_app else None,
                 "signerSha256": shell_app.signer_sha256 if shell_app else None,
             },
             "caleeMobile": {

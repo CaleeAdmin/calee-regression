@@ -532,7 +532,11 @@ SUBSCRIBED_FIXTURE_COMPONENT_NAME = "Subscribed-calendar fixture"
 
 
 def component_from_subscribed_fixture_report(
-    name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = False
+    name: str,
+    report_dict: "dict[str, Any] | None",
+    *,
+    mandatory: bool = False,
+    expected_release_id: "str | None" = None,
 ) -> ComponentResult:
     """Build a ComponentResult from the subscribed-fixture component
     (Priority 7): publication + bounded-polling observation evidence for the
@@ -546,21 +550,81 @@ def component_from_subscribed_fixture_report(
     releaseSuiteEligible: true -- the component then automatically becomes
     mandatory, exactly like every other release-gating component.
 
-    A ``status: "ok"`` report is PASS; any other status (a real BLOCKED
-    publication/observation failure, or a missing/unreadable report) BLOCKS --
-    an unrecognized status is never silently trusted as a pass."""
+    Wrong-run / stale-report rejection already happens one layer up, before
+    this function ever sees the report: cli.py's consolidate resolves EVERY
+    component (subscribed-fixture included) through ``_resolve_component`` ->
+    ``run_context.validate_component_report``, which rejects a report with a
+    missing/mismatched run ID or a file mtime older than this run's start --
+    exactly the same generic protection every other component gets. This
+    function does not duplicate that.
+
+    What this function DOES add (Priority 7 -- release-identity binding):
+
+      * when ``expected_release_id`` is given, the report's own ``releaseId``
+        must be present and match exactly (a missing release id, or one for a
+        different release, BLOCKS -- otherwise evidence from one release
+        could be silently reused to certify another);
+      * a ``mode: "published"`` report must independently show BOTH
+        ``publicReadVerificationStatus == "ok"`` (Priority 5) AND
+        ``ingestionStatus == "ok"`` (Priority 6) -- the top-level ``status``
+        is re-derived from, never merely trusted over, these two checks, so a
+        tampered report claiming ``status: "ok"`` while one phase's status
+        was never actually reached still BLOCKS. ``fixed-date``/
+        ``offline-only`` reports never claim either status (Priority 6:
+        "never faked"), so this check applies only to ``published`` reports.
+
+    A ``status: "ok"`` report (with no release-identity/phase problem above)
+    is PASS; any other status (a real BLOCKED publication/observation
+    failure, or a missing/unreadable report) BLOCKS -- an unrecognized status
+    is never silently trusted as a pass.
+    """
     if report_dict is None:
         return ComponentResult(
             name=name, status=STATUS_NOT_RUN, mandatory=mandatory,
             detail=["No subscribed-fixture evidence was recorded for this run."],
         )
+
+    problems: "list[str]" = []
     status = report_dict.get("status")
+    mode = report_dict.get("mode")
     detail = list(report_dict.get("detail", []))
-    if status == "ok":
-        return ComponentResult(name=name, status=STATUS_PASS, mandatory=mandatory, detail=detail, evidence=report_dict)
-    if status != "blocked":
-        detail = detail + [f"Unrecognized subscribed-fixture status {report_dict.get('status')!r}."]
-    return ComponentResult(name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1, detail=detail, evidence=report_dict)
+
+    report_release_id = report_dict.get("releaseId")
+    if expected_release_id is not None:
+        if not report_release_id:
+            problems.append(
+                f"expected releaseId {expected_release_id!r}, but the subscribed-fixture evidence has none "
+                f"-- it is not bound to this release."
+            )
+        elif str(report_release_id).strip() != str(expected_release_id).strip():
+            problems.append(
+                f"subscribed-fixture evidence releaseId {report_release_id!r} != expected {expected_release_id!r} "
+                f"-- this evidence was produced for a different release."
+            )
+
+    if status == "ok" and mode == "published":
+        if report_dict.get("publicReadVerificationStatus") != "ok":
+            problems.append(
+                "published-mode subscribed-fixture report claims status \"ok\" but "
+                f"publicReadVerificationStatus is {report_dict.get('publicReadVerificationStatus')!r} "
+                "(Priority 5 exact-content verification was not independently confirmed)."
+            )
+        if report_dict.get("ingestionStatus") != "ok":
+            problems.append(
+                "published-mode subscribed-fixture report claims status \"ok\" but "
+                f"ingestionStatus is {report_dict.get('ingestionStatus')!r} "
+                "(Priority 6 Calee-ingestion verification was not independently confirmed)."
+            )
+
+    if status != "ok" and status != "blocked":
+        problems.append(f"Unrecognized subscribed-fixture status {status!r}.")
+
+    if status == "ok" and not problems:
+        return ComponentResult(name=name, status=STATUS_PASS, mandatory=mandatory, passed=1, detail=detail, evidence=report_dict)
+    return ComponentResult(
+        name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
+        detail=detail + problems, evidence=report_dict,
+    )
 
 
 def component_from_machine_config_report(
@@ -922,6 +986,87 @@ def component_from_selector_contract(
     return ComponentResult(
         name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
         detail=list(prov_problems) + list(verdict.problems), evidence=evidence_summary,
+    )
+
+
+DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT_NAME = "Distributed-build acceptance"
+
+
+def component_from_distributed_build_acceptance_report(
+    name: str,
+    report_dict: "dict[str, Any] | None",
+    *,
+    mandatory: bool = True,
+    expected_git_sha: "str | None" = None,
+    expected_version: "str | None" = None,
+    expected_release_id: "str | None" = None,
+    now: "Any | None" = None,
+) -> ComponentResult:
+    """Build a ComponentResult from the recorded distributed-build-acceptance
+    report (Priority 3).
+
+    ``mandatory`` reflects the release manifest's own
+    ``caleeMobile.distributedBuildAcceptanceRequired`` flag (or an explicit
+    CLI override): when False, this component is still recorded -- an
+    explicit, visible "not required for this release" -- never silently
+    omitted. When True and no report exists at all, this BLOCKS: with no
+    physical/distributed evidence, acceptance is never inferred from a local
+    checkout or an unsigned build.
+    """
+    from . import distributed_build_acceptance as dba
+
+    if report_dict is None:
+        if not mandatory:
+            return ComponentResult(
+                name=name, status=STATUS_NOT_RUN, mandatory=False,
+                detail=["Not required for this release "
+                        "(caleeMobile.distributedBuildAcceptanceRequired=false)."],
+            )
+        return ComponentResult(
+            name=name, status=STATUS_NOT_RUN, mandatory=True,
+            detail=["Not executed -- no distributed-build acceptance evidence recorded for this "
+                    "run. Acceptance is never inferred from a local checkout or an unsigned build."],
+        )
+
+    evidence = report_dict.get("evidence") if isinstance(report_dict.get("evidence"), dict) else report_dict
+    try:
+        result = dba.parse_distributed_build_acceptance_result(evidence)
+    except dba.DistributedBuildAcceptanceError as exc:
+        return ComponentResult(
+            name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
+            detail=[f"Distributed-build acceptance evidence is malformed: {exc}"],
+        )
+
+    verdict = dba.verify_distributed_build_acceptance_evidence(
+        result,
+        expected_git_sha=expected_git_sha,
+        expected_version=expected_version,
+        expected_release_id=expected_release_id,
+        now=now,
+    )
+    evidence_summary = {
+        "channel": result.channel,
+        "distributedBuildId": result.distributed_build_id,
+        "testedGitSha": result.tested_git_sha,
+        "testedVersion": result.tested_version,
+        "verifiedVia": result.verified_via,
+        "releaseId": result.release_id,
+        "timestamp": result.timestamp,
+        "expectedReleaseId": expected_release_id,
+    }
+    if verdict.ok:
+        return ComponentResult(
+            name=name, status=STATUS_PASS, mandatory=mandatory, passed=1,
+            detail=[
+                f"Distributed-build acceptance PASS via {result.verified_via} "
+                f"({result.channel} build {result.distributed_build_id}) for CaleeMobile "
+                f"{result.tested_version} @ {result.tested_git_sha}."
+            ],
+            evidence=evidence_summary,
+        )
+    return ComponentResult(
+        name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
+        detail=list(verdict.problems), evidence=evidence_summary,
     )
 
 
@@ -1587,6 +1732,7 @@ def build_release_report(
             insert_at,
             component_from_subscribed_fixture_report(
                 SUBSCRIBED_FIXTURE_COMPONENT_NAME, subscribed_fixture, mandatory=subscribed_fixture_mandatory,
+                expected_release_id=expected_release_id,
             ),
         )
         insert_at += 1

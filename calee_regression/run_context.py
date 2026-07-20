@@ -48,6 +48,14 @@ COMPONENT_NAMES = (
     # expected identities, device ids, report root, and every conflict decision.
     # An unresolved machine/release conflict is recorded here and BLOCKS.
     "release-config",
+    # Immutable release-candidate snapshot + fingerprint (Priority 4): once
+    # release-config verifies a --bundle, its manifest, checksums file, and
+    # every verified app's actual APK bytes are copied here and a content-
+    # addressed fingerprint is recorded, closing the TOCTOU gap between
+    # release-config approval and install-tablet-release's first mutating
+    # ADB command. install-tablet-release installs ONLY from this snapshot
+    # once one exists for the run, never the original mutable drop folder.
+    "release-candidate",
     # Tablet release installation (Priority 5/6): bundle verification, actual
     # APK content + signer inspection, tablet pre-install inspection, the
     # install plan, its execution, and post-install package/HOME verification --
@@ -77,6 +85,13 @@ COMPONENT_NAMES = (
     # while scenarios/subscribed_calendar.yaml stays draft-unverified;
     # automatically mandatory once that scenario is promoted.
     "subscribed-fixture",
+    # Distributed-build acceptance evidence (Priority 3): explicit proof that a
+    # distributed/TestFlight/store build's identity matches the release
+    # candidate, required only when the release manifest's
+    # caleeMobile.distributedBuildAcceptanceRequired is true. Never fabricated
+    # from a local checkout or an unsigned build -- absent physical/distributed
+    # evidence, this component records BLOCKED, never a silent PASS.
+    "distributed-build-acceptance",
 )
 
 

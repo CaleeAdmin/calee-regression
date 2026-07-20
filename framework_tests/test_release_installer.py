@@ -431,6 +431,215 @@ def test_v2_manifest_verifies_as_a_full_bundle(tmp_path):
     assert {a.key for a in result.verified_apps} == {"calee"}
 
 
+# ── schema version 2: adversarial strictness (Priority 1) ────────────────
+#
+# Every case below proves a defect is caught by parse_manifest() itself --
+# i.e. before verify_release_bundle/install-tablet-release ever reach a real
+# ADB command -- never merely by a later, post-install check.
+
+
+_V2_BOOL_FIELD_CASES = [
+    # (path description, mutator) -- each sets one JSON-boolean field to a
+    # non-boolean value and asserts parse_manifest rejects it.
+    ("tabletSolution.calee.installArtifact", lambda m: m["tabletSolution"]["calee"].__setitem__("installArtifact", "false")),
+    ("tabletSolution.caleeShell.installArtifact", lambda m: m["tabletSolution"]["caleeShell"].__setitem__("installArtifact", "true")),
+    ("platforms.tablet", lambda m: m["platforms"].__setitem__("tablet", "false")),
+    ("platforms.mobileAndroid", lambda m: m["platforms"].__setitem__("mobileAndroid", 0)),
+    ("platforms.mobileIos", lambda m: m["platforms"].__setitem__("mobileIos", None)),
+    ("features.synchronization", lambda m: m["features"].__setitem__("synchronization", "false")),
+    ("features.meals", lambda m: m["features"].__setitem__("meals", 1)),
+    ("features.onboarding", lambda m: m["features"].__setitem__("onboarding", [])),
+    ("features.googleCalendar", lambda m: m["features"].__setitem__("googleCalendar", "true")),
+    ("features.kioskAdmin", lambda m: m["features"].__setitem__("kioskAdmin", None)),
+    ("features.notifications", lambda m: m["features"].__setitem__("notifications", "no")),
+    ("caleeMobile.selectorEvidenceRequired", lambda m: m["caleeMobile"].__setitem__("selectorEvidenceRequired", "false")),
+    ("caleeMobile.distributedBuildAcceptanceRequired", lambda m: m["caleeMobile"].__setitem__("distributedBuildAcceptanceRequired", "true")),
+]
+
+
+@pytest.mark.parametrize("path,mutate", _V2_BOOL_FIELD_CASES, ids=[c[0] for c in _V2_BOOL_FIELD_CASES])
+def test_v2_manifest_rejects_non_boolean_json_types(path, mutate):
+    # A string "false" must never be truthy-coerced into True -- an explicit
+    # exclusion inverted into an inclusion is exactly the defect this guards.
+    raw = _v2_manifest()
+    mutate(raw)
+    manifest, errors = parse_manifest(raw)
+    assert errors, f"{path} with a non-boolean value must be rejected"
+    assert any("must be a JSON boolean" in e for e in errors), errors
+
+
+@pytest.mark.parametrize("bad_value", ["false", "true", 0, 1, None, [], {}])
+def test_v2_manifest_install_artifact_non_boolean_is_never_truthy_coerced(bad_value):
+    # A manifest author's explicit "installArtifact": "false" (a truthy
+    # Python string) must never be silently inverted into an install.
+    raw = _v2_manifest()
+    raw["tabletSolution"]["calee"]["installArtifact"] = bad_value
+    manifest, errors = parse_manifest(raw)
+    assert any("installArtifact" in e and "JSON boolean" in e for e in errors), errors
+
+
+def test_v2_manifest_missing_caleeshell_section_is_rejected():
+    raw = _v2_manifest()
+    del raw["tabletSolution"]["caleeShell"]
+    manifest, errors = parse_manifest(raw)
+    assert any("tabletSolution.caleeShell is required" in e for e in errors), errors
+
+
+def test_v2_manifest_missing_calee_section_is_rejected():
+    raw = _v2_manifest()
+    del raw["tabletSolution"]["calee"]
+    manifest, errors = parse_manifest(raw)
+    assert any("tabletSolution.calee is required" in e for e in errors), errors
+
+
+def test_v2_manifest_calee_missing_signer_sha256_is_rejected():
+    raw = _v2_manifest()
+    del raw["tabletSolution"]["calee"]["expectedInstalled"]["signerSha256"]
+    manifest, errors = parse_manifest(raw)
+    assert any("calee expected signerSha256 is required" in e for e in errors), errors
+
+
+def test_v2_manifest_caleeshell_missing_signer_sha256_is_rejected():
+    raw = _v2_manifest()
+    del raw["tabletSolution"]["caleeShell"]["expectedInstalled"]["signerSha256"]
+    manifest, errors = parse_manifest(raw)
+    assert any("caleeShell expected signerSha256 is required" in e for e in errors), errors
+
+
+def test_v2_manifest_calee_missing_expected_installed_block_is_rejected():
+    raw = _v2_manifest()
+    del raw["tabletSolution"]["calee"]["expectedInstalled"]
+    manifest, errors = parse_manifest(raw)
+    assert any("calee.expectedInstalled is required" in e for e in errors), errors
+
+
+def test_v2_manifest_caleeshell_missing_expected_installed_block_is_rejected():
+    # Even though caleeShell is unchanged (installArtifact: false) this
+    # release, its expected identity is still mandatory (Priority 1).
+    raw = _v2_manifest()
+    del raw["tabletSolution"]["caleeShell"]["expectedInstalled"]
+    manifest, errors = parse_manifest(raw)
+    assert any("caleeShell.expectedInstalled is required" in e for e in errors), errors
+
+
+def test_v2_manifest_caleemobile_missing_version_only_is_rejected():
+    raw = _v2_manifest()
+    del raw["caleeMobile"]["version"]
+    manifest, errors = parse_manifest(raw)
+    assert any("caleeMobile.version is required" in e for e in errors), errors
+
+
+def test_v2_manifest_caleemobile_missing_gitsha_only_is_rejected():
+    raw = _v2_manifest()
+    del raw["caleeMobile"]["gitSha"]
+    manifest, errors = parse_manifest(raw)
+    assert any("caleeMobile.gitSha is required" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "bad_backend",
+    ["not-a-url-at-all", "http://hub-dev.calee.com.au", "ftp://hub-dev.calee.com.au", "  "],
+)
+def test_v2_manifest_non_https_backend_is_rejected(bad_backend):
+    raw = _v2_manifest(backend=bad_backend)
+    manifest, errors = parse_manifest(raw)
+    assert any("backend" in e for e in errors), errors
+
+
+def test_v2_manifest_unknown_top_level_key_is_rejected():
+    raw = _v2_manifest()
+    raw["extraUnknownTopLevelKey"] = "surprise"
+    manifest, errors = parse_manifest(raw)
+    assert any("unexpected key" in e and "extraUnknownTopLevelKey" in e for e in errors), errors
+
+
+def test_v2_manifest_unknown_tablet_solution_key_is_rejected():
+    raw = _v2_manifest()
+    raw["tabletSolution"]["extraApp"] = {}
+    manifest, errors = parse_manifest(raw)
+    assert any("tabletSolution has unexpected key" in e for e in errors), errors
+
+
+def test_v2_manifest_misspelled_signer_sha_key_is_rejected_as_unknown():
+    # A typo'd key ("signerSha246") must not silently produce
+    # signerSha256=None -- it must be flagged as an unrecognised key AND the
+    # real signerSha256 must be reported missing.
+    raw = _v2_manifest()
+    exp = raw["tabletSolution"]["calee"]["expectedInstalled"]
+    exp["signerSha246"] = exp.pop("signerSha256")
+    manifest, errors = parse_manifest(raw)
+    joined = "\n".join(errors)
+    assert "unexpected key" in joined and "signerSha246" in joined
+    assert "calee expected signerSha256 is required" in joined
+
+
+def test_v2_manifest_unknown_platforms_key_is_rejected():
+    raw = _v2_manifest()
+    raw["platforms"]["desktop"] = True
+    manifest, errors = parse_manifest(raw)
+    assert any("platforms has unexpected key" in e for e in errors), errors
+
+
+def test_v2_manifest_unknown_features_key_is_rejected():
+    raw = _v2_manifest()
+    raw["features"]["darkMode"] = True
+    manifest, errors = parse_manifest(raw)
+    assert any("features has unexpected key" in e for e in errors), errors
+
+
+def test_v2_manifest_unknown_caleemobile_key_is_rejected():
+    raw = _v2_manifest()
+    raw["caleeMobile"]["extraFlag"] = True
+    manifest, errors = parse_manifest(raw)
+    assert any("caleeMobile has unexpected key" in e for e in errors), errors
+
+
+def test_v2_manifest_provenance_metadata_is_allowed():
+    # Optional assembly-time provenance metadata (Priority 4) is not an
+    # "unexpected key" -- confirm it doesn't trip the strict top-level check.
+    raw = _v2_manifest(provenance={"repository": "CaleeAdmin/Calee", "sourceCommit": "a" * 40})
+    manifest, errors = parse_manifest(raw)
+    assert errors == [], errors
+
+
+def test_v2_manifest_all_defects_reported_together():
+    # Multiple independent schema-v2 defects at once are all surfaced in a
+    # single parse -- a manifest author does not have to fix-and-resubmit
+    # one error at a time.
+    raw = _v2_manifest()
+    raw["tabletSolution"]["calee"]["installArtifact"] = "false"
+    del raw["tabletSolution"]["caleeShell"]["expectedInstalled"]["signerSha256"]
+    raw["backend"] = "not-a-url"
+    raw["extraUnknownTopLevelKey"] = True
+    del raw["caleeMobile"]["gitSha"]
+    manifest, errors = parse_manifest(raw)
+    joined = "\n".join(errors)
+    assert "installArtifact" in joined and "JSON boolean" in joined
+    assert "caleeShell expected signerSha256 is required" in joined
+    assert "backend" in joined
+    assert "unexpected key" in joined and "extraUnknownTopLevelKey" in joined
+    assert "caleeMobile.gitSha is required" in joined
+
+
+def test_v2_manifest_defects_are_all_caught_before_bundle_verification_ok(tmp_path):
+    # End-to-end proof for Priority 1 requirement 9: a schema-v2 defect makes
+    # verify_release_bundle() fail -- which is what gates every downstream
+    # ADB-issuing CLI command (install-tablet-release exits before ever
+    # calling adb when verification fails). This is the ordering guarantee.
+    bundle = tmp_path / "v2-bundle-defective"
+    bundle.mkdir()
+    calee_bytes = b"calee-v2-apk-bytes"
+    (bundle / "calee.apk").write_bytes(calee_bytes)
+    manifest = _v2_manifest()
+    manifest["tabletSolution"]["calee"]["sha256"] = _sha256(calee_bytes)
+    del manifest["tabletSolution"]["caleeShell"]["expectedInstalled"]["signerSha256"]
+    (bundle / "release-manifest.json").write_text(json.dumps(manifest))
+    (bundle / "checksums.sha256").write_text(f"{_sha256(calee_bytes)}  calee.apk\n")
+    result = verify_release_bundle(bundle)
+    assert not result.ok
+    assert any("caleeShell expected signerSha256 is required" in e for e in result.errors)
+
+
 # ── install-command construction + ordering ──────────────────────────────
 
 
