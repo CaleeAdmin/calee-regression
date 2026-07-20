@@ -109,6 +109,14 @@ class SelectorContractResult:
     workflow_run_id: "str | None" = None  # CI workflow run ID (when CI-produced)
     generated_by: "str | None" = None  # "ci" | "local" -- how it was produced
     artifact_digest: "str | None" = None  # sha256 of the evidence, where available
+    # Release-certification binding (Priority 8): the PRODUCT release this
+    # evidence is bound to, distinct from release_run_id (the calee-regression
+    # TEST run it was adopted into). See schemas/selector_release_certification.
+    # schema.json (duplicated verbatim in CaleeMobile-Regression).
+    release_id: "str | None" = None
+    correlation_id: "str | None" = None
+    expected_sha: "str | None" = None
+    expected_version: "str | None" = None
 
     @property
     def passed(self) -> bool:
@@ -136,6 +144,10 @@ class SelectorContractResult:
             ("workflowRunId", self.workflow_run_id),
             ("generatedBy", self.generated_by),
             ("artifactDigest", self.artifact_digest),
+            ("releaseId", self.release_id),
+            ("correlationId", self.correlation_id),
+            ("expectedSha", self.expected_sha),
+            ("expectedVersion", self.expected_version),
         ):
             if value is not None:
                 data[key] = value
@@ -192,6 +204,10 @@ def parse_selector_contract_result(data: "Any") -> SelectorContractResult:
         workflow_run_id=_opt_str(data.get("workflowRunId")),
         generated_by=_opt_str(data.get("generatedBy")),
         artifact_digest=_opt_str(data.get("artifactDigest")),
+        release_id=_opt_str(data.get("releaseId")),
+        correlation_id=_opt_str(data.get("correlationId")),
+        expected_sha=_opt_str(data.get("expectedSha")),
+        expected_version=_opt_str(data.get("expectedVersion")),
     )
 
 
@@ -257,6 +273,7 @@ def verify_selector_contract_evidence(
     future_skew: datetime.timedelta = FUTURE_SKEW,
     expected_release_run_id: "str | None" = None,
     require_release_provenance: bool = False,
+    expected_release_id: "str | None" = None,
 ) -> SelectorEvidenceVerdict:
     """Reject selector evidence that doesn't prove the *expected* CaleeMobile
     release build. Returns a verdict listing every problem (never raises for a
@@ -384,6 +401,28 @@ def verify_selector_contract_evidence(
             problems.append(
                 f"tested version {result.pubspec_version!r} != expected release version {expected_version!r} -- "
                 f"this evidence is for a different CaleeMobile version than the one being released."
+            )
+
+    # --- release-ID binding (Priority 8) ------------------------------------
+    # expected_release_id is set ONLY for a release-certification request
+    # (ordinary PR selector checking never passes it and stays unaffected).
+    # Missing release identity, on EITHER side, fails certification -- a
+    # release-certification request must state up front which release it's
+    # for, and evidence must be bound to a release. calee-regression rejects
+    # evidence for another release ID even when SHA/version match (Priority
+    # 8, requirement 8) -- two releases must never share one selector proof.
+    if expected_release_id is not None:
+        if not (expected_release_id or "").strip():
+            problems.append("expected release ID is empty -- a release-certification request must state its release ID.")
+        elif not result.release_id:
+            problems.append(
+                "no releaseId recorded in the evidence -- a release-certification request requires evidence "
+                "bound to a release ID; missing release identity fails certification."
+            )
+        elif result.release_id.strip() != expected_release_id.strip():
+            problems.append(
+                f"evidence releaseId {result.release_id!r} != expected release {expected_release_id!r} -- "
+                f"refusing to accept selector evidence for another release, even if SHA/version match."
             )
 
     # --- release-run provenance (release gate only) ------------------------

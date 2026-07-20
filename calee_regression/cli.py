@@ -1329,12 +1329,19 @@ def verify_selector_evidence_cmd(evidence_path, expected_sha, expected_version, 
     "--mandatory/--optional", "mandatory", default=True,
     help="Whether this selector contract is release-gating (default: mandatory).",
 )
+@click.option(
+    "--expected-release-id", "expected_release_id", envvar="CALEE_RELEASE_ID", default=None,
+    help="Priority 8: when set, this is a RELEASE-CERTIFICATION request, not ordinary PR selector "
+         "checking -- the adopted evidence must carry a matching releaseId (missing release identity, "
+         "or a mismatched one, fails certification even if SHA/version match). Defaults to the "
+         "release-config composition's releaseId when this run already composed one.",
+)
 def selector_contract_cmd(
     run_id_opt, source_path, expected_sha, expected_version, expected_ref,
     caleemobile_source_opt, regression_source_opt, flutter_version_opt,
     production_opt, source_artifact_id, source_artifact_digest,
     github_run_id, github_artifact_id, github_artifact_zip, dirty_waiver_opt,
-    adopted_by, mandatory,
+    adopted_by, mandatory, expected_release_id,
 ):
     """Release gate: obtain/generate CaleeMobile selector evidence for the EXACT
     release build, validate it, and record it under this run BEFORE any mobile
@@ -1364,6 +1371,20 @@ def selector_contract_cmd(
     component_dir.mkdir(parents=True, exist_ok=True)
     report_path = workspace.component_report_path("selector-contract")
 
+    # Priority 8: an explicit --expected-release-id wins; else, when this run
+    # already composed its release-config (launcher "00" always does before
+    # this gate runs), adopt ITS releaseId -- the same release the whole run
+    # is for. No release-config composed for this run at all (a bare/dev
+    # invocation) leaves this None, so ordinary PR selector checking is
+    # completely unaffected (requirement 1).
+    if expected_release_id is None:
+        release_config_path = workspace.component_report_path("release-config")
+        if release_config_path.is_file():
+            try:
+                expected_release_id = json.loads(release_config_path.read_text(encoding="utf-8")).get("releaseId")
+            except (OSError, json.JSONDecodeError):
+                expected_release_id = None
+
     # Production release profile (Problem A): production accepts ONLY a
     # CI-produced selector artifact; local generation is refused. An explicit
     # --production/--development wins over config/release-platforms.yaml.
@@ -1386,6 +1407,7 @@ def selector_contract_cmd(
             "production": eff_production,
             "expectedSha": expected_sha,
             "expectedVersion": expected_version,
+            "expectedReleaseId": expected_release_id,
             "source": source_label,
             "detail": list(detail),
             "problems": list(problems),
@@ -1650,6 +1672,7 @@ def selector_contract_cmd(
         expected_version=expected_version,
         expected_ref=expected_ref,
         expected_flutter_version=required_flutter,
+        expected_release_id=expected_release_id,
     )
     if verdict.ok:
         detail = [
@@ -2311,6 +2334,15 @@ def consolidate(
     if release_intent is not None:
         extra_components.append(release_intent)
 
+    # Priority 8: the release ID this run's selector-contract evidence must be
+    # bound to -- this run's OWN composed release-config releaseId when one
+    # was recorded (the same release the whole run is for). No release-config
+    # for this run (ad-hoc/dev consolidation) leaves this None, so ordinary
+    # selector-contract validation is unaffected.
+    expected_release_id_for_selector = (
+        release_config_composition.get("releaseId") if release_config_composition is not None else None
+    )
+
     report = build_release_report(
         environment=env_report,
         tablet=tablet,
@@ -2339,6 +2371,7 @@ def consolidate(
             str(workspace.component_dir("selector-contract"))
             if selector_contract_report is not None else None
         ),
+        expected_release_id=expected_release_id_for_selector,
         calee_build_version=calee_build_version,
         expected_calee_build_version=eff_expected_calee_build,
         caleemobile_build_version=caleemobile_build_version,

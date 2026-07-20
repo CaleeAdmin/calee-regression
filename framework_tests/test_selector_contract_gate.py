@@ -578,3 +578,108 @@ def test_selector_component_included_in_every_report_format(tmp_path):
         assert "consolidated-report.junit.xml" in names
         # The raw selector evidence travels with the bundle as an artifact.
         assert any(n.startswith("evidence/") and "selector-contract-result" in n for n in names)
+
+
+# ---------------------------------------------------------------------------
+# Priority 8: release-ID-bound selector certification (the "selector-contract"
+# gate command). Ordinary --source adoption above (no --expected-release-id)
+# is completely unaffected by any of this.
+# ---------------------------------------------------------------------------
+
+RELEASE_A = "2026.07.20-rc3"
+RELEASE_B = "2026.07.21-rc1"
+
+
+def test_gate_without_expected_release_id_is_unaffected_ordinary_checking(tmp_path):
+    # No --expected-release-id, no release-config for this run: exactly
+    # today's ordinary PR-style selector checking.
+    result = _run_gate(tmp_path, _evidence())
+    assert result.exit_code == EXIT_SUCCESS, result.output
+    assert _recorded(tmp_path)["expectedReleaseId"] is None
+
+
+def test_gate_accepts_matching_release_id(tmp_path):
+    result = _run_gate(
+        tmp_path, _evidence(releaseId=RELEASE_A),
+        extra_args=["--expected-release-id", RELEASE_A],
+    )
+    assert result.exit_code == EXIT_SUCCESS, result.output
+    assert _recorded(tmp_path)["expectedReleaseId"] == RELEASE_A
+
+
+def test_gate_rejects_missing_release_id_when_certifying(tmp_path):
+    # requirement 2: a release-certification request (--expected-release-id
+    # given) fails when the adopted evidence has no releaseId at all.
+    result = _run_gate(
+        tmp_path, _evidence(),  # no releaseId key
+        extra_args=["--expected-release-id", RELEASE_A],
+    )
+    assert result.exit_code == EXIT_BLOCKED
+    assert "no releaseId recorded" in result.output
+    assert _recorded(tmp_path)["status"] == "blocked"
+
+
+def test_gate_rejects_release_id_mismatch_even_with_matching_sha_version(tmp_path):
+    # requirement 6 + 8: evidence bound to a DIFFERENT release fails
+    # certification even though testedSha/pubspecVersion match exactly.
+    result = _run_gate(
+        tmp_path, _evidence(releaseId=RELEASE_B),
+        extra_args=["--expected-release-id", RELEASE_A],
+    )
+    assert result.exit_code == EXIT_BLOCKED
+    assert RELEASE_B in result.output and RELEASE_A in result.output
+
+
+def test_gate_auto_derives_expected_release_id_from_this_runs_release_config(tmp_path):
+    # No --expected-release-id flag at all: adopts THIS run's own
+    # release-config releaseId (written by launcher 00 before this gate runs).
+    workspace = _make_workspace(tmp_path)
+    release_config_path = workspace.component_report_path("release-config")
+    release_config_path.write_text(json.dumps({
+        "runId": RUN_ID, "status": "ok", "releaseId": RELEASE_A,
+        "machineSelections": {}, "releaseSelections": {}, "deviceIds": {}, "conflicts": [],
+    }))
+    result = _run_gate(tmp_path, _evidence(releaseId=RELEASE_B))  # wrong release
+    assert result.exit_code == EXIT_BLOCKED
+    assert RELEASE_A in result.output
+
+
+# ---------------------------------------------------------------------------
+# Priority 8: consolidate independently re-derives + re-enforces the same
+# release-ID binding (never merely trusting the gate's own recorded status).
+# ---------------------------------------------------------------------------
+
+
+def test_consolidate_blocks_on_selector_release_id_mismatch(tmp_path):
+    workspace = _seed_release(tmp_path, selector_report="valid")
+    # This run's OWN release-config says RELEASE_A...
+    release_config_path = workspace.component_report_path("release-config")
+    release_config_path.write_text(json.dumps({
+        "runId": RUN_ID, "status": "ok", "releaseId": RELEASE_A,
+        "machineSelections": {}, "releaseSelections": {}, "deviceIds": {}, "conflicts": [],
+    }))
+    # ...but the adopted selector evidence is bound to RELEASE_B.
+    selector_report_path = workspace.component_report_path("selector-contract")
+    selector_report = json.loads(selector_report_path.read_text())
+    selector_report["evidence"]["releaseId"] = RELEASE_B
+    selector_report_path.write_text(json.dumps(selector_report))
+
+    result = _consolidate(tmp_path, extra_args=["--release-config-mandatory"])
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    assert "CaleeMobile selector contract: BLOCKED" in result.output
+
+
+def test_consolidate_passes_when_selector_release_id_matches_release_config(tmp_path):
+    workspace = _seed_release(tmp_path, selector_report="valid")
+    release_config_path = workspace.component_report_path("release-config")
+    release_config_path.write_text(json.dumps({
+        "runId": RUN_ID, "status": "ok", "releaseId": RELEASE_A,
+        "machineSelections": {}, "releaseSelections": {}, "deviceIds": {}, "conflicts": [],
+    }))
+    selector_report_path = workspace.component_report_path("selector-contract")
+    selector_report = json.loads(selector_report_path.read_text())
+    selector_report["evidence"]["releaseId"] = RELEASE_A
+    selector_report_path.write_text(json.dumps(selector_report))
+
+    result = _consolidate(tmp_path, extra_args=["--release-config-mandatory"])
+    assert result.exit_code == EXIT_SUCCESS, result.output

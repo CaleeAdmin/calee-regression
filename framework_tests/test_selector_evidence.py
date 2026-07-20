@@ -88,6 +88,74 @@ def test_abbreviated_expected_sha_is_rejected():
     assert any("expected CaleeMobile SHA" in p for p in verdict.problems)
 
 
+# --- Priority 8: release-ID binding (release certification only) -----------
+
+
+RELEASE_A = "2026.07.20-rc3"
+RELEASE_B = "2026.07.21-rc1"
+
+
+def test_no_expected_release_id_is_ordinary_pr_checking_unaffected():
+    # expected_release_id omitted entirely (the default): this is ordinary PR
+    # selector checking, never touched by release-ID binding, even when the
+    # evidence itself carries no releaseId at all.
+    verdict = _verify(_result(), expected_git_sha=SHA_RELEASE, expected_version=VERSION_RELEASE)
+    assert verdict.ok, verdict.problems
+
+
+def test_matching_release_id_is_accepted():
+    verdict = _verify(
+        _result(release_id=RELEASE_A), expected_git_sha=SHA_RELEASE, expected_version=VERSION_RELEASE,
+        expected_release_id=RELEASE_A,
+    )
+    assert verdict.ok, verdict.problems
+
+
+def test_missing_release_identity_in_evidence_fails_certification():
+    # requirement 2: a release-certification request (expected_release_id set)
+    # fails when the evidence carries no releaseId at all.
+    verdict = _verify(
+        _result(release_id=None), expected_git_sha=SHA_RELEASE, expected_version=VERSION_RELEASE,
+        expected_release_id=RELEASE_A,
+    )
+    assert not verdict.ok
+    assert any("no releaseId recorded" in p for p in verdict.problems)
+
+
+def test_empty_expected_release_id_fails_certification():
+    verdict = _verify(_result(release_id=RELEASE_A), expected_release_id="   ")
+    assert not verdict.ok
+    assert any("expected release ID is empty" in p for p in verdict.problems)
+
+
+def test_release_id_mismatch_fails_even_with_matching_sha_and_version():
+    # requirement 6 + 8: calee-regression must reject selector evidence for
+    # another release ID even if SHA and version match.
+    verdict = _verify(
+        _result(release_id=RELEASE_B), expected_git_sha=SHA_RELEASE, expected_version=VERSION_RELEASE,
+        expected_release_id=RELEASE_A,
+    )
+    assert not verdict.ok
+    assert any(RELEASE_B in p and RELEASE_A in p for p in verdict.problems)
+
+
+def test_release_id_round_trips_through_to_dict_and_parse():
+    result = _result(release_id=RELEASE_A, correlation_id="corr-123", expected_sha=SHA_RELEASE, expected_version=VERSION_RELEASE)
+    data = result.to_dict()
+    assert data["releaseId"] == RELEASE_A
+    assert data["correlationId"] == "corr-123"
+    assert data["expectedSha"] == SHA_RELEASE
+    assert data["expectedVersion"] == VERSION_RELEASE
+    reparsed = se.parse_selector_contract_result(data)
+    assert reparsed.release_id == RELEASE_A
+    assert reparsed.correlation_id == "corr-123"
+
+
+def test_release_id_absent_from_to_dict_when_unset():
+    data = _result().to_dict()
+    assert "releaseId" not in data and "correlationId" not in data
+
+
 def test_ref_mismatch_is_a_nonblocking_note():
     verdict = _verify(
         _result(caleemobile_ref="main"),

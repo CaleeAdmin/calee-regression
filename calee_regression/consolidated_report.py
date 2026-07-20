@@ -770,6 +770,7 @@ def component_from_selector_contract(
     component_dir: "Any | None" = None,
     expected_envelope_digest: "str | None" = None,
     now: "Any | None" = None,
+    expected_release_id: "str | None" = None,
 ) -> ComponentResult:
     """Build a ComponentResult from the recorded selector-contract gate report
     (Priority 1).
@@ -890,6 +891,7 @@ def component_from_selector_contract(
         expected_release_run_id=None if provenance is not None else expected_release_run_id,
         require_release_provenance=provenance is None,
         now=now,
+        expected_release_id=expected_release_id,
     )
     evidence_summary = {
         "testedSha": result.tested_sha,
@@ -903,6 +905,9 @@ def component_from_selector_contract(
         "workflowRunId": result.workflow_run_id,
         "generatedBy": result.generated_by,
         "regressionSha": result.regression_sha,
+        "releaseId": result.release_id,
+        "correlationId": result.correlation_id,
+        "expectedReleaseId": expected_release_id,
     }
     if verdict.ok and not prov_problems:
         detail = [
@@ -1435,6 +1440,7 @@ def build_release_report(
     selector_contract: "dict[str, Any] | None" = None,
     selector_contract_mandatory: "bool | None" = None,
     selector_contract_dir: "Any | None" = None,
+    expected_release_id: "str | None" = None,
     calee_build_version: "str | None" = None,
     expected_calee_build_version: "str | None" = None,
     caleemobile_build_version: "str | None" = None,
@@ -1531,6 +1537,7 @@ def build_release_report(
                 expected_version=sel_expected_version,
                 expected_release_run_id=sel_release_run_id,
                 component_dir=selector_contract_dir,
+                expected_release_id=expected_release_id,
             ),
         )
 
