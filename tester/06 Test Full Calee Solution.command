@@ -60,18 +60,29 @@ if [ -f config/machine.local.yaml ]; then
     eval "$RELEASE_CFG_OUT" 2>/dev/null || true
     [ -n "${RELEASE_IPHONE_DEVICE:-}" ] && export CALEE_IPHONE_DEVICE="$RELEASE_IPHONE_DEVICE"
     [ -n "${RELEASE_ANDROID_DEVICE:-}" ] && export CALEE_ANDROID_DEVICE="$RELEASE_ANDROID_DEVICE"
-    if [ "$RELEASE_CFG_STATUS" -ne 0 ]; then
-        echo ""
-        echo "BLOCKED: the machine and release-candidate configurations conflict —"
-        echo "see reports/runs/$CALEE_RUN_ID/release-config/results.json. Continuing to"
-        echo "produce ONE consolidated BLOCKED report."
-    fi
+else
+    RELEASE_CFG_STATUS=0
 fi
 
 echo ""
-echo "--- Step 1: Prepare Test Environment (incl. Appium) ---"
-python -m calee_regression prepare --config "$CALEE_TEST_CONFIG" --suite tablet-full --run-id "$CALEE_RUN_ID"
-PREPARE_STATUS=$?
+if [ "$RELEASE_CFG_STATUS" -ne 0 ]; then
+    # Priority 1: release-config is a PRE-PRODUCT gate, exactly like
+    # machine-config and installation. A machine/release-candidate conflict
+    # (profile disagreement, backend pin mismatch, a required platform the
+    # machine can't provide, ...) BLOCKS BEFORE Prepare ever runs -- Prepare is
+    # never attempted, and NONE of the downstream product checks (tablet,
+    # mobile, sync, kiosk, manual) run. This is a setup/configuration blocker,
+    # never a product FAIL.
+    echo "BLOCKED: the machine and release-candidate configurations conflict —"
+    echo "see reports/runs/$CALEE_RUN_ID/release-config/results.json."
+    echo ""
+    echo "--- Step 1: Prepare Test Environment — SKIPPED (release-config gate blocked) ---"
+    PREPARE_STATUS=$RELEASE_CFG_STATUS
+else
+    echo "--- Step 1: Prepare Test Environment (incl. Appium) ---"
+    python -m calee_regression prepare --config "$CALEE_TEST_CONFIG" --suite tablet-full --run-id "$CALEE_RUN_ID"
+    PREPARE_STATUS=$?
+fi
 
 echo ""
 echo "--- Collecting pre-run build identity ---"
@@ -250,18 +261,35 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     python -m calee_regression record-manual-checks --run-id "$CALEE_RUN_ID"
 else
     echo ""
-    echo "=== Prepare did not succeed (status $PREPARE_STATUS) — FAIL FAST ==="
-    echo "The test environment is not in a known-good state, so NONE of the"
-    echo "downstream functional tests will run for this release:"
-    echo "  - Calee Tablet suite:          SKIPPED (Prepare not ready)"
-    echo "  - CaleeMobile Client API:      SKIPPED (Prepare not ready)"
-    echo "  - CaleeMobile Android UI:      SKIPPED (Prepare not ready)"
-    echo "  - CaleeMobile iPhone UI:       SKIPPED (Prepare not ready)"
-    echo "  - Cross-device synchronization: SKIPPED (Prepare not ready)"
-    echo "  - CaleeShell kiosk/admin:      SKIPPED (Prepare not ready)"
-    echo "  - Manual functional checks:    SKIPPED (Prepare not ready)"
-    echo "The environment report Prepare wrote is preserved and consolidated"
-    echo "below into one BLOCKED bundle."
+    if [ "$RELEASE_CFG_STATUS" -ne 0 ]; then
+        echo "=== release-config gate blocked (status $RELEASE_CFG_STATUS) — FAIL FAST ==="
+        echo "The machine and release-candidate configurations conflict (see"
+        echo "reports/runs/$CALEE_RUN_ID/release-config/results.json), so NONE of the"
+        echo "downstream steps ran for this release:"
+        echo "  - Prepare Test Environment:    SKIPPED (release-config gate blocked)"
+        echo "  - Calee Tablet suite:          SKIPPED (release-config gate blocked)"
+        echo "  - CaleeMobile Client API:      SKIPPED (release-config gate blocked)"
+        echo "  - CaleeMobile Android UI:      SKIPPED (release-config gate blocked)"
+        echo "  - CaleeMobile iPhone UI:       SKIPPED (release-config gate blocked)"
+        echo "  - Cross-device synchronization: SKIPPED (release-config gate blocked)"
+        echo "  - CaleeShell kiosk/admin:      SKIPPED (release-config gate blocked)"
+        echo "  - Manual functional checks:    SKIPPED (release-config gate blocked)"
+        echo "The release-config report is preserved and consolidated below into one"
+        echo "BLOCKED bundle."
+    else
+        echo "=== Prepare did not succeed (status $PREPARE_STATUS) — FAIL FAST ==="
+        echo "The test environment is not in a known-good state, so NONE of the"
+        echo "downstream functional tests will run for this release:"
+        echo "  - Calee Tablet suite:          SKIPPED (Prepare not ready)"
+        echo "  - CaleeMobile Client API:      SKIPPED (Prepare not ready)"
+        echo "  - CaleeMobile Android UI:      SKIPPED (Prepare not ready)"
+        echo "  - CaleeMobile iPhone UI:       SKIPPED (Prepare not ready)"
+        echo "  - Cross-device synchronization: SKIPPED (Prepare not ready)"
+        echo "  - CaleeShell kiosk/admin:      SKIPPED (Prepare not ready)"
+        echo "  - Manual functional checks:    SKIPPED (Prepare not ready)"
+        echo "The environment report Prepare wrote is preserved and consolidated"
+        echo "below into one BLOCKED bundle."
+    fi
 fi
 
 echo ""
@@ -339,6 +367,12 @@ fi
 if [ -f "reports/runs/$CALEE_RUN_ID/installation/results.json" ]; then
     CONSOLIDATE_ARGS+=(--installation-mandatory)
 fi
+# Release-config composition (Priority 1/3) is release-gating exactly like
+# machine-config and installation: a BLOCKED/missing composition can never
+# read as a release PASS.
+if [ -f "reports/runs/$CALEE_RUN_ID/release-config/results.json" ]; then
+    CONSOLIDATE_ARGS+=(--release-config-mandatory)
+fi
 # Build/commit identity -- auto-collected above (a technical owner can still
 # override any value via the matching env var). The detected identity is
 # always passed so the consolidator can gate on it; see Phase 3.
@@ -375,12 +409,42 @@ case $STATUS in
     *) echo "BLOCKED: Full Calee Solution (run $CALEE_RUN_ID) — see the messages above and in the report. This is NOT necessarily a product failure." ;;
 esac
 if [ "$PREPARE_STATUS" -ne 0 ]; then
-    # Fail-fast run: surface the EXACT Prepare problem from the environment
-    # report (Prepare's own words) so the tester sees why the whole release
-    # stopped without opening the bundle. Read-only, best-effort.
+    # Fail-fast run: surface the EXACT problem from the report of whichever
+    # pre-product gate actually stopped the run (Priority 1) -- release-config
+    # if IT blocked before Prepare ever ran, else Prepare's own environment
+    # report -- so the tester sees why the whole release stopped without
+    # opening the bundle. Read-only, best-effort.
     echo ""
-    echo "Prepare did not succeed (status $PREPARE_STATUS). Exact problem(s) from the environment report:"
-    python - "$CALEE_RUN_ID" <<'PY'
+    if [ "$RELEASE_CFG_STATUS" -ne 0 ]; then
+        echo "The release-config gate blocked (status $RELEASE_CFG_STATUS) before Prepare ran. Exact problem(s) from the release-config report:"
+        python - "$CALEE_RUN_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+run_id = sys.argv[1]
+report = pathlib.Path("reports") / "runs" / run_id / "release-config" / "results.json"
+try:
+    data = json.loads(report.read_text(encoding="utf-8"))
+except Exception as exc:  # noqa: BLE001 - best-effort, never crash the launcher
+    print(f"  (release-config report could not be read: {exc})")
+    sys.exit(0)
+detail = data.get("detail") or []
+if isinstance(detail, str):
+    detail = [detail]
+print(f"  Release-config status: {data.get('status', 'unknown')}")
+for line in detail:
+    print(f"  - {line}")
+conflicts = data.get("conflicts") or []
+blocking_conflicts = [c for c in conflicts if isinstance(c, dict) and c.get("blocking")]
+for c in blocking_conflicts:
+    print(f"  - CONFLICT [{c.get('axis')}]: {c.get('explanation')}")
+if not detail and not blocking_conflicts:
+    print("  - (no further detail recorded)")
+PY
+    else
+        echo "Prepare did not succeed (status $PREPARE_STATUS). Exact problem(s) from the environment report:"
+        python - "$CALEE_RUN_ID" <<'PY'
 import json
 import pathlib
 import sys
@@ -401,12 +465,13 @@ for line in detail:
 if not detail:
     print("  - (no further detail recorded)")
 PY
+    fi
     if [ "$STATUS" -eq 0 ]; then
-        # Not reachable in practice any more: Prepare is now a mandatory
-        # consolidated component (see consolidated_report.py), so a failed
-        # Prepare always makes $STATUS non-zero too. Kept as a hard backstop --
-        # a passing consolidate must never mask a failed Prepare step.
-        echo "NOTE: Prepare Test Environment reported a problem earlier in this run — see Step 1 above."
+        # Not reachable in practice any more: Prepare/release-config are now
+        # mandatory consolidated components (see consolidated_report.py), so a
+        # blocked gate always makes $STATUS non-zero too. Kept as a hard
+        # backstop -- a passing consolidate must never mask a blocked gate.
+        echo "NOTE: an early pre-product gate reported a problem earlier in this run — see above."
         STATUS=3
     fi
 fi

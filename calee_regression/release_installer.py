@@ -1122,14 +1122,31 @@ class SolutionVerification:
         }
 
 
-def _check_installed_signer(app: AppRelease, reader) -> SolutionCheck:
+def _check_installed_signer(app: AppRelease, reader, *, signer_trust_required: bool = False) -> SolutionCheck:
     """Compare the app's currently-installed signer against its expected trusted
-    signer. No expected digest / no reader -> not_compared (recorded, never a
-    silent pass). An unreadable installed signer or a mismatch -> BLOCKED."""
+    signer.
+
+    ``signer_trust_required`` (Priority 2) is True for a release-gating
+    production or staging run: there, a missing expected digest or a missing
+    reader can no longer resolve to a silently-tolerated ``not_compared`` --
+    trusted signer identity is a REQUIRED part of release qualification, so
+    both become BLOCKED instead. Only a non-release-gating development run
+    (``signer_trust_required=False``, the default) may still record
+    ``not_compared`` for these two cases. An unreadable installed signer or an
+    actual mismatch is ALWAYS BLOCKED, regardless of this flag -- that is a
+    real trust failure, never something a profile can downgrade."""
     if not app.signer_sha256:
+        if signer_trust_required:
+            return SolutionCheck(app.key, "signer", CHECK_BLOCKED,
+                                 "No expected signerSha256 declared -- trusted signer identity is REQUIRED for "
+                                 "this release qualification and cannot be established. BLOCKED.")
         return SolutionCheck(app.key, "signer", CHECK_NOT_COMPARED,
                              "No expected signerSha256 declared -- installed-signer trust not verified.")
     if reader is None:
+        if signer_trust_required:
+            return SolutionCheck(app.key, "signer", CHECK_BLOCKED,
+                                 "No installed-signer reader available -- trusted signer identity is REQUIRED for "
+                                 "this release qualification and cannot be established. BLOCKED.")
         return SolutionCheck(app.key, "signer", CHECK_NOT_COMPARED,
                              "No installed-signer reader supplied -- installed-signer trust not verified.")
     read = reader(app.package_id)
@@ -1155,6 +1172,7 @@ def verify_tablet_solution(
     release_id: "str | None" = None,
     installed_signer_reader=None,
     calee_launch_action: str = "com.viso.calee.action.START",
+    signer_trust_required: bool = False,
 ) -> SolutionVerification:
     """Verify the COMPLETE installed Calee tablet solution after a release.
 
@@ -1165,7 +1183,14 @@ def verify_tablet_solution(
     testable. With no device, returns ``blocked`` honestly.
 
     A missing expected identity for either app is itself a BLOCK: a release must
-    declare what the tablet should carry for both Calee and CaleeShell."""
+    declare what the tablet should carry for both Calee and CaleeShell.
+
+    ``signer_trust_required`` (Priority 2) is the release-gating signer policy:
+    True for a production release, or any release-gating staging run -- there, a
+    missing/unreadable/mismatching signer for EITHER app BLOCKS, closing the gap
+    where an absent ``signerSha256`` let a release qualify with signer trust
+    merely ``not_compared``. False (the default) is for non-release-gating
+    development/diagnostic use, where ``not_compared`` may still be recorded."""
     result = SolutionVerification(status=STATUS_OK, release_id=release_id, serial=serial)
 
     if calee is None or not calee.has_expected:
@@ -1207,7 +1232,9 @@ def verify_tablet_solution(
                 result.checks.append(SolutionCheck(app.key, "version", CHECK_BLOCKED,
                                                     f"Installed {ident.version_name}/{ident.version_code} != expected "
                                                     f"{app.version_name}/{app.version_code} -- BLOCKED."))
-        result.checks.append(_check_installed_signer(app, installed_signer_reader))
+        result.checks.append(_check_installed_signer(
+            app, installed_signer_reader, signer_trust_required=signer_trust_required,
+        ))
 
     _verify_app(calee, CALEE_PACKAGE_ID)
     _verify_app(caleeshell, CALEESHELL_PACKAGE_ID)

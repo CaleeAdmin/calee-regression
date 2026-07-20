@@ -1858,6 +1858,7 @@ def _resolve_component(
 @click.option("--sync-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's sync/results.json")
 @click.option("--installation-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's installation/results.json (bundle verify + APK inspection + install)")
 @click.option("--machine-config-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's machine-config/results.json (secrets-excluded snapshot)")
+@click.option("--release-config-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's release-config/results.json (machine + release-candidate composition)")
 @click.option("--kiosk-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's kiosk-admin/results.json (kiosk/admin feature evidence)")
 @click.option("--manual-checks", "manual_checks_path", type=click.Path(exists=True), default=None, help="Override: defaults to this run's manual-checks/results.json")
 @click.option(
@@ -1897,6 +1898,14 @@ def _resolve_component(
     "--machine-config-mandatory/--machine-config-optional", "machine_config_mandatory", default=None,
     help="Whether the machine-config snapshot is release-gating (Priority 4). Auto-included as "
          "mandatory if a machine-config snapshot exists for this run.",
+)
+@click.option(
+    "--release-config-mandatory/--release-config-optional", "release_config_mandatory", default=None,
+    help="Whether the release-config composition (machine + release-candidate) is release-gating "
+         "(Priority 1/3). The full launcher passes --release-config-mandatory whenever a machine "
+         "config is present; when omitted it is auto-included as mandatory if a release-config "
+         "report exists. A BLOCKED/missing release-config composition can never read as a release "
+         "PASS, and no product test may run once it is BLOCKED.",
 )
 # Independent release-feature gating (Workstream 3). Each defaults to the
 # release feature profile (config/release-platforms.yaml release_features.*),
@@ -1942,9 +1951,9 @@ def _resolve_component(
 @click.option("--out-dir", type=click.Path(), default=None, help="Where to write the consolidated bundle (default: this run's workspace)")
 def consolidate(
     run_id_opt, tablet_report, mobile_api_report, mobile_android_report, mobile_ios_report,
-    sync_report, installation_report, machine_config_report, kiosk_report, manual_checks_path, environment_report,
+    sync_report, installation_report, machine_config_report, release_config_report, kiosk_report, manual_checks_path, environment_report,
     android_mandatory, ios_mandatory, sync_mandatory,
-    selector_contract_mandatory, installation_mandatory, machine_config_mandatory,
+    selector_contract_mandatory, installation_mandatory, machine_config_mandatory, release_config_mandatory,
     meals_mandatory, onboarding_mandatory, google_calendar_mandatory, kiosk_admin_mandatory,
     build_version, calee_build_version, expected_calee_build_version,
     caleemobile_build_version, expected_caleemobile_build_version, caleeshell_version,
@@ -2004,6 +2013,7 @@ def consolidate(
     sync = resolve("sync", sync_report)
     installation = resolve("installation", installation_report)
     machine_config_snapshot = resolve("machine-config", machine_config_report)
+    release_config_composition = resolve("release-config", release_config_report)
     kiosk = resolve("kiosk-admin", kiosk_report)
     # CaleeMobile selector contract (Priority 1/2). Auto-discovered from this
     # run's workspace and run-ID-validated like every other component. The
@@ -2072,6 +2082,10 @@ def consolidate(
     machine_config_gating = (
         machine_config_mandatory if machine_config_mandatory is not None
         else (True if machine_config_snapshot is not None else None)
+    )
+    release_config_gating = (
+        release_config_mandatory if release_config_mandatory is not None
+        else (True if release_config_composition is not None else None)
     )
 
     # Independent release-feature gating (Workstream 3): explicit
@@ -2279,6 +2293,8 @@ def consolidate(
         installation_mandatory=installation_gating,
         machine_config=machine_config_snapshot,
         machine_config_mandatory=machine_config_gating,
+        release_config=release_config_composition,
+        release_config_mandatory=release_config_gating,
         feature_profile=feature_profile,
         manual_checks=manual_checks_list,
         meta=meta,
@@ -2945,7 +2961,14 @@ def _record_installation_component(
          "execution) is written into reports/runs/<run-id>/installation/results.json as this run's "
          "mandatory installation component.",
 )
-def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade, plan_only, report_path, retain_diagnostics, run_id_opt):
+@click.option(
+    "--production/--development", "production_opt", default=None,
+    help="Production release profile (Priority 2): trusted signer identity for BOTH Calee and "
+         "CaleeShell becomes REQUIRED (a missing/malformed/unreadable/mismatching signer BLOCKS the "
+         "complete-solution verification, instead of recording 'not_compared'). Defaults to "
+         "config/release-platforms.yaml (expected_build_identity.production).",
+)
+def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade, plan_only, report_path, retain_diagnostics, run_id_opt, production_opt):
     """Verify a release bundle, INSPECT each APK's actual contents + signer, and
     then install it in the correct, data-preserving order (Calee first,
     CaleeShell second, reassert HOME, reboot, verify identities/HOME/launch).
@@ -2963,9 +2986,30 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     A malformed bundle exits EXIT_INVALID_CONFIG; a tool/signer/device/version/
     HOME problem exits EXIT_BLOCKED. The installer NEVER auto-uninstalls or
     clears data. ``--plan-only`` records the ordered plan without running it.
+
+    Priority 2 -- trusted signer policy: the post-install complete-solution
+    verification requires a trusted ``signerSha256`` for BOTH Calee and
+    CaleeShell (a missing/malformed/unreadable/mismatching signer BLOCKS)
+    whenever this is a release-gating run -- a production release
+    (``--production``, or config/release-platforms.yaml's
+    ``expected_build_identity.production``), or ANY run carrying a ``--run-id``
+    (every real release run through the launcher always does; only a bare
+    ad-hoc/diagnostic invocation with no run ID is treated as non-release
+    development, where an undeclared signer may still record 'not_compared').
     """
     from . import apk_inspect
     from . import release_installer
+
+    try:
+        expected_identity = release_platforms.load_expected_build_identity()
+    except release_platforms.ReleasePlatformsError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    eff_production = production_opt if production_opt is not None else expected_identity.production
+    # Release-gating: unconditionally true in production; for a staging/
+    # development profile, a run carrying a shared run ID is a real
+    # launcher-driven release run (Priority 2 policy -- see docstring above).
+    signer_trust_required = bool(eff_production) or bool(run_id_opt)
 
     verification = release_installer.verify_release_bundle(bundle_path)
     if not verification.ok:
@@ -3061,6 +3105,7 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
             serial=serial,
             release_id=plan.release_id,
             installed_signer_reader=signer_reader,
+            signer_trust_required=signer_trust_required,
             **solution_kwargs,
         )
         if solution.status != release_installer.STATUS_OK:
@@ -3077,6 +3122,8 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
         "execution": execution.to_dict(),
         "solutionVerification": solution.to_dict() if solution is not None else None,
         "releaseId": plan.release_id,
+        "productionProfile": bool(eff_production),
+        "signerTrustRequired": signer_trust_required,
     }
     _write_installer_report(Path(report_path) if report_path else None, payload)
     exit_code = EXIT_SUCCESS if status == "ok" else EXIT_BLOCKED

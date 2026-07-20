@@ -44,6 +44,12 @@ from calee_regression.suites import REPO_ROOT
 
 CALEE_SHA = "a" * 40
 CM_SHA = "c" * 40
+CALEESHELL_SHA = "b" * 40
+# The digest the fake `apksigner` script in _fakebin() reports for ANY app
+# (Priority 2: verify_tablet_solution now requires a matching signerSha256 for
+# BOTH Calee and CaleeShell whenever a run-id is present -- every launcher run
+# always carries one, so this must be declared and correct for a clean PASS).
+FAKE_SIGNER_SHA256 = "1" * 64
 
 SECRET_EMAIL = "secret-tester@example.com"
 SECRET_PASSWORD = "hunter2-DO-NOT-LEAK"
@@ -180,7 +186,12 @@ def _copy_repo(tmp_path):
 
 
 def _external_bundle(tmp_path):
-    """A release bundle OUTSIDE the repo (like ~/Calee-Releases/current)."""
+    """A release bundle OUTSIDE the repo (like ~/Calee-Releases/current). Calee
+    is installed this release; CaleeShell is unchanged but -- like every real
+    complete-solution manifest -- still declares its expected installed
+    identity (Priority 2: BOTH apps' identity, including a trusted signer, is
+    always required for verify_tablet_solution to resolve OK, whether or not
+    this release touches that app)."""
     bundle = tmp_path / "Calee-Releases" / "current"
     bundle.mkdir(parents=True)
     calee_bytes = b"calee-apk-bytes"
@@ -190,13 +201,34 @@ def _external_bundle(tmp_path):
     (bundle / "release-manifest.json").write_text(json.dumps({
         "releaseId": "2026.07.20-rc1",
         "calee": {"included": True, "packageId": "com.viso.calee", "versionName": "founder-v0.3.25",
-                  "versionCode": 325, "gitSha": CALEE_SHA, "apk": "calee.apk", "sha256": sha},
+                  "versionCode": 325, "gitSha": CALEE_SHA, "apk": "calee.apk", "sha256": sha,
+                  "signerSha256": FAKE_SIGNER_SHA256},
+        "caleeShell": {"installArtifact": False, "expectedInstalled": {
+            "packageId": "com.viso.caleeshell", "versionName": "founder-v0.2.12",
+            "versionCode": 212, "gitSha": CALEESHELL_SHA, "signerSha256": FAKE_SIGNER_SHA256,
+        }},
     }))
     (bundle / "checksums.sha256").write_text(f"{sha}  calee.apk\n")
     return bundle
 
 
 def _machine_yaml(repo, bundle):
+    # A release-platforms.yaml narrowed to exactly what this fake machine can
+    # provide (android + tablet, no iOS device, no kiosk/technical
+    # authorisation) -- without it, release-config's default "every platform
+    # and feature is required" scope conflicts with this machine (missing iOS,
+    # unauthorised kiosk_admin) and BLOCKS before Prepare ever runs (Priority
+    # 1: this is now a hard gate, so an inconsistent fixture like the old
+    # "release_profile: production" below -- with no matching
+    # expected_build_identity.production -- would stop these tests dead
+    # instead of silently being ignored).
+    (repo / "config" / "release-platforms.yaml").write_text(yaml.safe_dump({
+        "release_platforms": {"tablet": True, "mobile_android": True, "mobile_ios": False},
+        "release_features": {
+            "synchronization": True, "meals": True, "onboarding": True,
+            "google_calendar": True, "kiosk_admin": False,
+        },
+    }))
     (repo / "config" / "machine.local.yaml").write_text(yaml.safe_dump({
         "tablet_serial": "TAB123",
         "expected_tablet_state": "logged_in_tablet",
@@ -206,7 +238,7 @@ def _machine_yaml(repo, bundle):
         "calee_launch_action": "com.viso.calee.action.START",
         "release_bundle_dir": str(bundle),
         "backend_url": "https://hub-dev.calee.com.au",
-        "release_profile": "production",
+        "release_profile": "staging",
         "report_dir": "reports",
         "mobile_platforms": ["android"],
     }))
@@ -297,15 +329,31 @@ args=("$@")
 joined="$*"
 case "$joined" in
   *get-state*) echo "{dev_line}"; exit {dev_rc} ;;
-  *"pm path"*) echo ""; exit 0 ;;
-  *dumpsys*calee* ) echo "versionName=founder-v0.3.25"; echo "versionCode=325"; exit 0 ;;
+  # Priority 2: device_installed_signer_reader needs a real "package:<path>"
+  # line to proceed to the (faked) pull + apksigner read -- an empty pm path
+  # reads as SIGNER_NOT_INSTALLED, which used to be masked by defect #2 never
+  # letting the launcher reach this far. Not package-specific: the reader
+  # doesn't cross-check the returned path against the requested package id.
+  *"pm path"*) echo "package:/data/app/fake/base.apk"; exit 0 ;;
+  # "caleeshell" contains "calee" as a substring, so the more specific pattern
+  # MUST be checked first -- otherwise every caleeShell dumpsys query would
+  # match the calee pattern above it and report Calee's version/code instead.
   *dumpsys*caleeshell* ) echo "versionName=founder-v0.2.12"; echo "versionCode=212"; exit 0 ;;
+  *dumpsys*calee* ) echo "versionName=founder-v0.3.25"; echo "versionCode=325"; exit 0 ;;
   *"category.HOME"*) echo "packageName=com.viso.caleeshell"; exit 0 ;;
   *"action.START"*) echo "packageName=com.viso.calee"; exit 0 ;;
   *install*) echo "Success"; exit 0 ;;
   *wait-for-device*) exit 0 ;;
-  *reboot*) exit 0 ;;
-  *) exit 0 ;;
+  # release_installer.execute_install_plan classifies every non-"verify" step
+  # (reboot included) through classify_install_output, which requires
+  # "success" in the output to resolve OK -- matching test_release_installer.py's
+  # own FakeAdb, whose default for an unmatched command is Success text.
+  # Without this, the real (delegated-to) execute_install_plan halts at
+  # "reboot" as OUTCOME_INSTALL_FAILED and BLOCKS the whole install, which
+  # Priority 1's fail-fast fix (defect #2) now correctly stops the launcher
+  # on -- so this fake must actually simulate the reboot succeeding.
+  *reboot*) echo "Success"; exit 0 ;;
+  *) echo "Success"; exit 0 ;;
 esac
 '''
     (fakebin / "adb").write_text(adb)

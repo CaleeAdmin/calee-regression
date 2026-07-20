@@ -159,12 +159,24 @@ fi
 if [ $INSTALL_STATUS -eq 0 ]; then
     state_pass "Release installed on the tablet and verified."
 else
-    # BLOCKED (no device, missing SDK tools, signer mismatch, version/HOME
-    # mismatch): the installation evidence is already recorded into the run. We
-    # still delegate to "06" so the release produces ONE consolidated bundle
-    # that INCLUDES this BLOCKED installation -- installation can never read as a
-    # release PASS, and the tester gets a complete report.
-    state_block "The release could not be installed (see the installation report). Continuing to produce a full report…"
+    # BLOCKED (no device, missing SDK tools, signer trust could not be
+    # established, version/HOME mismatch, or any other installation-time
+    # problem): the installation evidence is already recorded into the run.
+    # Priority 1: installation is a PRE-PRODUCT gate -- do NOT delegate to "06"
+    # (never run the tablet/mobile/sync/kiosk/manual product checks) against a
+    # release that never finished installing. Still produce ONE consolidated
+    # report (Priority 7): the BLOCKED installation evidence is already
+    # recorded, and consolidate marks every downstream component not-run
+    # because of this gate.
+    state_block "The release could not be installed (see the installation report)."
+    needs_owner "The release could not be installed on the tablet (see the installation report)." \
+                "No — this is an installation/environment blocker (missing device, missing SDK tool, signer trust, or a version/HOME mismatch), not a proven product failure." \
+                "Check the tablet is connected, unlocked, and awake, then run this again. If it keeps happening, ask your technical owner to check the installation report." \
+                "reports/runs/$CALEE_RUN_ID/installation/results.json"
+    consolidate_gate
+    CONSOLIDATED_STATUS=$?
+    read -r -p "Press Enter to close..." _
+    exit $CONSOLIDATED_STATUS
 fi
 
 # ── 4. run the full regression under the SAME run (delegate to 06) ───────────
