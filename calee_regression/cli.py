@@ -3285,5 +3285,134 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     raise SystemExit(EXIT_BLOCKED)
 
 
+def _load_expected_identity_json(path: "str | None", flag_name: str) -> "dict | None":
+    if not path:
+        return None
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        click.echo(f"{flag_name} {path!r} could not be read as JSON: {exc}", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    if not isinstance(raw, dict):
+        click.echo(f"{flag_name} {path!r} must contain a JSON object.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    return raw
+
+
+@main.command("assemble-release-bundle")
+@click.option("--release-id", required=True, help="Release candidate id, e.g. 2026.07.20-rc3. Ambiguous references (e.g. 'latest') are rejected downstream by the identity checks below.")
+@click.option("--profile", type=click.Choice(["staging", "production"]), required=True)
+@click.option("--backend", required=True, help="Backend base URL this release targets.")
+@click.option("--calee-apk", type=click.Path(exists=True), default=None, help="Path to an already-signed calee.apk. Omit when Calee is unchanged this release (then --calee-expected is required).")
+@click.option("--calee-git-sha", default=None, help="Full 40-character Git SHA the Calee APK was built from. Required with --calee-apk.")
+@click.option("--calee-expected", type=click.Path(exists=True), default=None, help="JSON file with Calee's expected installed identity (packageId/versionName/versionCode/gitSha/signerSha256), required when --calee-apk is omitted.")
+@click.option("--caleeshell-apk", type=click.Path(exists=True), default=None, help="Path to an already-signed caleeshell.apk. Omit when CaleeShell is unchanged this release (then --caleeshell-expected is required).")
+@click.option("--caleeshell-git-sha", default=None, help="Full 40-character Git SHA the CaleeShell APK was built from. Required with --caleeshell-apk.")
+@click.option("--caleeshell-expected", type=click.Path(exists=True), default=None, help="JSON file with CaleeShell's expected installed identity, required when --caleeshell-apk is omitted.")
+@click.option("--caleemobile-sha", required=True, help="Full 40-character CaleeMobile Git SHA this release expects.")
+@click.option("--caleemobile-version", required=True, help="CaleeMobile pubspec version+build, e.g. 0.0.24+24.")
+@click.option("--selector-evidence-required/--no-selector-evidence-required", default=True, help="Whether release certification requires CaleeMobile selector evidence (Priority 8).")
+@click.option("--distributed-build-acceptance-required/--no-distributed-build-acceptance-required", default=True)
+@click.option("--tablet/--no-tablet", "platform_tablet", default=True)
+@click.option("--mobile-android/--no-mobile-android", "platform_android", default=True)
+@click.option("--mobile-ios/--no-mobile-ios", "platform_ios", default=True)
+@click.option("--sync/--no-sync", "feature_sync", default=True)
+@click.option("--meals/--no-meals", "feature_meals", default=True)
+@click.option("--onboarding/--no-onboarding", "feature_onboarding", default=True)
+@click.option("--google-calendar/--no-google-calendar", "feature_google_calendar", default=True)
+@click.option("--kiosk-admin/--no-kiosk-admin", "feature_kiosk_admin", default=True)
+@click.option("--notifications/--no-notifications", "feature_notifications", default=True)
+@click.option("--source-repo", default=None, help="Optional provenance: the source repository (e.g. CaleeAdmin/Calee). Metadata only -- never used to fetch anything.")
+@click.option("--source-workflow-run-id", default=None, help="Optional provenance: the CI workflow run id these APKs came from.")
+@click.option("--source-artifact-name", default=None, help="Optional provenance: the CI artifact name these APKs came from.")
+@click.option("--source-commit", default=None, help="Optional provenance: the source commit these APKs were built from.")
+@click.option("--source-artifact-digest", default=None, help="Optional provenance: the CI artifact's own digest.")
+@click.option("--out", "out_dir", required=True, type=click.Path(), help="Output directory for the assembled bundle (e.g. ~/Calee-Releases/current).")
+@click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON assembly result.")
+def assemble_release_bundle_cmd(
+    release_id, profile, backend, calee_apk, calee_git_sha, calee_expected,
+    caleeshell_apk, caleeshell_git_sha, caleeshell_expected, caleemobile_sha, caleemobile_version,
+    selector_evidence_required, distributed_build_acceptance_required,
+    platform_tablet, platform_android, platform_ios,
+    feature_sync, feature_meals, feature_onboarding, feature_google_calendar, feature_kiosk_admin, feature_notifications,
+    source_repo, source_workflow_run_id, source_artifact_name, source_commit, source_artifact_digest,
+    out_dir, report_path,
+):
+    """Deterministically assemble a schema-version-2 release bundle from
+    already-signed, locally-available APKs (Priority 4): inspects each APK's
+    ACTUAL package id/version/signer (never signs anything), generates SHA-256
+    checksums, and writes a release-manifest.json that verify-release-bundle/
+    install-tablet-release/release-config can consume directly.
+
+    Supports a Calee-only, CaleeShell-only, or both-app release. An app this
+    release does not ship an APK for still needs an EXPLICIT expected
+    installed identity (--calee-expected/--caleeshell-expected) -- an
+    unchanged application is never silently dropped from the manifest.
+
+    Never downloads anything: every APK is an already-local path, and the
+    optional --source-* provenance flags are recorded verbatim as metadata,
+    never used to fetch an artifact. No GitHub (or any other) credential is
+    ever a parameter here, so none can leak into arguments, this command's
+    report, or the generated manifest.
+    """
+    from . import release_bundle_assembly as rba_mod
+
+    if calee_apk and not calee_git_sha:
+        click.echo("--calee-git-sha is required when --calee-apk is given.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    if caleeshell_apk and not caleeshell_git_sha:
+        click.echo("--caleeshell-git-sha is required when --caleeshell-apk is given.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    calee_expected_raw = _load_expected_identity_json(calee_expected, "--calee-expected")
+    caleeshell_expected_raw = _load_expected_identity_json(caleeshell_expected, "--caleeshell-expected")
+
+    provenance = {}
+    if source_repo:
+        provenance["repository"] = source_repo
+    if source_workflow_run_id:
+        provenance["workflowRunId"] = source_workflow_run_id
+    if source_artifact_name:
+        provenance["artifactName"] = source_artifact_name
+    if source_commit:
+        provenance["sourceCommit"] = source_commit
+    if source_artifact_digest:
+        provenance["artifactDigest"] = source_artifact_digest
+
+    assembly = rba_mod.assemble_release_bundle(
+        release_id=release_id, profile=profile, backend=backend,
+        calee_apk=calee_apk, calee_git_sha=calee_git_sha, calee_expected=calee_expected_raw,
+        caleeshell_apk=caleeshell_apk, caleeshell_git_sha=caleeshell_git_sha, caleeshell_expected=caleeshell_expected_raw,
+        caleemobile_sha=caleemobile_sha, caleemobile_version=caleemobile_version,
+        selector_evidence_required=selector_evidence_required,
+        distributed_build_acceptance_required=distributed_build_acceptance_required,
+        platforms={"tablet": platform_tablet, "mobileAndroid": platform_android, "mobileIos": platform_ios},
+        features={
+            "synchronization": feature_sync, "meals": feature_meals, "onboarding": feature_onboarding,
+            "googleCalendar": feature_google_calendar, "kioskAdmin": feature_kiosk_admin,
+            "notifications": feature_notifications,
+        },
+        provenance=provenance or None,
+    )
+
+    if not assembly.ok:
+        _write_installer_report(Path(report_path) if report_path else None, assembly.to_dict())
+        click.echo(click.style(f"[INVALID] Release bundle assembly has {len(assembly.errors)} problem(s):", fg="red"), err=True)
+        for err in assembly.errors:
+            click.echo(f"  - {err}", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    written = rba_mod.write_release_bundle(assembly, out_dir)
+    _write_installer_report(Path(report_path) if report_path else None, assembly.to_dict())
+    click.echo(click.style(f"[OK] Assembled release bundle {release_id} at {written}.", fg="green"))
+    for key in ("calee", "caleeShell"):
+        section = assembly.manifest["tabletSolution"][key]
+        if section["installArtifact"]:
+            click.echo(f"     {key}: installing {section['apk']} -> {section['expectedInstalled']['versionName']} (code {section['expectedInstalled']['versionCode']})")
+        else:
+            click.echo(f"     {key}: unchanged, expected {section['expectedInstalled']['versionName']} (code {section['expectedInstalled']['versionCode']})")
+    raise SystemExit(EXIT_SUCCESS)
+
+
 if __name__ == "__main__":
     main()
