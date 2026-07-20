@@ -199,7 +199,13 @@ def test_cli_record_manual_checks_rejects_missing_checks_file(tmp_path):
 def test_numbered_launchers_include_a_manual_check_recorder_before_full_solution():
     tester_dir = REPO_ROOT / "tester"
     names = sorted(p.name for p in tester_dir.glob("*.command"))
+    # The canonical numbered launchers must all be present and in order. "00
+    # Run Calee Release Regression" (Phase 3) is the nontechnical one-button
+    # front door that sits before them; assert the full expected set including
+    # it, so both a missing canonical launcher AND an unexpected extra one are
+    # caught.
     assert names == [
+        "00 Run Calee Release Regression.command",
         "01 Prepare Test Environment.command",
         "02 Test Calee Tablet.command",
         "03 Test CaleeMobile Android.command",
@@ -208,6 +214,8 @@ def test_numbered_launchers_include_a_manual_check_recorder_before_full_solution
         "06 Test Full Calee Solution.command",
         "07 Open Latest Report.command",
     ]
+    # The record-manual-checks recorder must come before the full-solution run.
+    assert names.index("05 Record Manual Checks.command") < names.index("06 Test Full Calee Solution.command")
 
 
 def test_manual_checks_launcher_calls_the_record_manual_checks_command():
@@ -216,3 +224,21 @@ def test_manual_checks_launcher_calls_the_record_manual_checks_command():
     # Never instruct the tester to edit JSON/YAML directly.
     assert ".json" not in text
     assert ".yaml" not in text
+
+
+def test_one_button_launcher_uses_plain_language_and_installer_and_delegates():
+    text = (REPO_ROOT / "tester" / "00 Run Calee Release Regression.command").read_text()
+    # Plain-language states the tester sees (Phase 3).
+    for state in ("READY", "INSTALLING", "TESTING", "PASSED", "FAILED", "BLOCKED", "NEEDS TECHNICAL OWNER"):
+        assert state in text, state
+    # It drives the installer subsystem and delegates the regression to "06".
+    assert "verify-release-bundle" in text
+    assert "install-tablet-release" in text
+    assert "machine-config" in text
+    assert "06 Test Full Calee Solution.command" in text
+    # Every blocker path tells the tester whether it is a product failure and
+    # what safe action to take (the needs_owner helper carries all three).
+    assert "Is this a product failure?" in text
+    assert "What you can do now" in text or "What could not run" in text
+    # It never asks the tester to hand-edit a config file.
+    assert "edit" not in text.lower() or "double-click" in text.lower()

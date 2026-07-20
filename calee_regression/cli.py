@@ -2295,5 +2295,230 @@ def consolidate(
     raise SystemExit(exit_code)
 
 
+@main.command("machine-config")
+@click.option("--config", "config_path", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
+def machine_config_cmd(config_path):
+    """Load and validate config/machine.local.yaml and emit its values as
+    shell assignments a launcher can `eval`. Prints MACHINE_* variables on
+    success; on a malformed config (or an inline secret) exits
+    EXIT_INVALID_CONFIG with the problems on stderr so a launcher stops.
+    """
+    from . import machine_config as machine_mod
+
+    path = Path(config_path) if config_path else (REPO_ROOT / "config" / "machine.local.yaml")
+    try:
+        cfg = machine_mod.load_machine_config(path)
+    except machine_mod.MachineConfigError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    def _emit(name, value):
+        import shlex as _shlex
+
+        if value is None:
+            value = ""
+        click.echo(f"MACHINE_{name}={_shlex.quote(str(value))}")
+
+    _emit("TABLET_SERIAL", cfg.tablet_serial or "")
+    _emit("EXPECTED_TABLET_STATE", cfg.expected_tablet_state)
+    _emit("CALEE_PACKAGE_ID", cfg.calee_package_id)
+    _emit("CALEESHELL_PACKAGE_ID", cfg.caleeshell_package_id)
+    _emit("HOME_ACTIVITY", cfg.home_activity)
+    _emit("CALEE_LAUNCH_ACTION", cfg.calee_launch_action)
+    _emit("RELEASE_BUNDLE_DIR", str(cfg.resolved_bundle_dir()))
+    _emit("BACKEND_URL", cfg.backend_url)
+    _emit("RELEASE_PROFILE", cfg.release_profile)
+    _emit("REPORT_DIR", cfg.report_dir)
+    _emit("MOBILE_PLATFORMS", ",".join(cfg.mobile_platforms))
+    _emit("IPHONE_DEVICE", cfg.iphone_device or "")
+    _emit("ALLOW_CALEESHELL_TECHNICAL", "true" if cfg.allow_caleeshell_technical else "false")
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@main.command("coverage-report")
+@click.option("--manifest", "manifest_path", default=None, type=click.Path(), help="Path to coverage-manifest.yaml (defaults to coverage/coverage-manifest.yaml).")
+@click.option("--check", is_flag=True, default=False, help="Validate the manifest and cross-check it against suites.py; exit non-zero on any contradiction.")
+def coverage_report_cmd(manifest_path, check):
+    """Render the human-readable coverage report from the machine-readable
+    coverage manifest, or (with --check) validate the manifest and prove it
+    does not contradict the actual suite membership.
+
+    --check is what CI runs: a draft component slipped into a release suite, or
+    a release-gating component missing from every composite, exits
+    EXIT_INVALID_CONFIG with the exact contradiction.
+    """
+    from . import coverage_manifest as coverage_mod
+
+    try:
+        manifest = coverage_mod.load_manifest(manifest_path)
+    except coverage_mod.CoverageManifestError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    if check:
+        from . import promotion as promotion_mod
+
+        problems = list(coverage_mod.cross_check_against_suites(manifest))
+        # Also validate every scenario-promotion file and its consistency with
+        # the scenario YAML + suites.py, so one CI gate covers all
+        # release-metadata consistency (coverage + promotion state machine).
+        try:
+            for record in promotion_mod.load_all():
+                for p in promotion_mod.check_consistency(record):
+                    problems.append(f"promotion[{record.scenario}]: {p}")
+        except promotion_mod.PromotionError as exc:
+            problems.append(f"promotion file invalid: {exc}")
+        if problems:
+            click.echo(click.style("Release-metadata consistency check FAILED:", fg="red"), err=True)
+            for p in problems:
+                click.echo(f"  - {p}", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        click.echo(click.style(
+            "[OK] Coverage manifest + promotion files are internally consistent and agree with suites.py.",
+            fg="green",
+        ))
+        raise SystemExit(EXIT_SUCCESS)
+
+    click.echo(coverage_mod.render_report(manifest))
+    raise SystemExit(EXIT_SUCCESS)
+
+
+def _write_installer_report(report_path: "Path | None", payload: dict) -> None:
+    """Write an installer/inspection report JSON, best-effort. A missing
+    --report just means the result is printed, never a hard failure."""
+    if report_path is None:
+        return
+    try:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        click.echo(f"Report: {report_path}")
+    except OSError as exc:
+        click.echo(f"Could not write report to {report_path}: {exc}", err=True)
+
+
+@main.command("verify-release-bundle")
+@click.option("--bundle", "bundle_path", required=True, type=click.Path(), help="Path to the release bundle directory.")
+@click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON result.")
+def verify_release_bundle_cmd(bundle_path, report_path):
+    """Verify a release bundle (manifest schema, full Git SHAs, package ids,
+    version formats, APK existence, SHA-256 match, no unexpected files, no
+    duplicate/traversal APK names) WITHOUT touching any device.
+
+    Exits 0 when the bundle is fully trustworthy, EXIT_INVALID_CONFIG when the
+    bundle the technical owner supplied is malformed (with every problem
+    listed), so a broken bundle can never silently proceed to an install.
+    """
+    from . import release_installer
+
+    result = release_installer.verify_release_bundle(bundle_path)
+    _write_installer_report(Path(report_path) if report_path else None, result.to_dict())
+    if result.ok:
+        click.echo(click.style(f"[OK] Release bundle verified: {result.manifest.release_id}", fg="green"))
+        for app in result.verified_apps:
+            click.echo(f"     {app.key}: {app.package_id} {app.version_name} (code {app.version_code}) sha {app.git_sha[:12]}…")
+        raise SystemExit(EXIT_SUCCESS)
+    click.echo(click.style(f"[INVALID] Release bundle has {len(result.errors)} problem(s):", fg="red"), err=True)
+    for err in result.errors:
+        click.echo(f"  - {err}", err=True)
+    raise SystemExit(EXIT_INVALID_CONFIG)
+
+
+@main.command("inspect-tablet")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
+@click.option("--serial", "serial", default=None, help="ADB serial; falls back to the config's udid.")
+@click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON result.")
+def inspect_tablet_cmd(config_path, serial, report_path):
+    """Read-only inspection of the connected tablet: adb availability, device
+    presence, installed Calee/CaleeShell versions, and the resolved HOME
+    package. Uses only read-only adb commands -- never installs or mutates.
+
+    With no device/adb (as in a CI or a laptop with nothing plugged in), this
+    exits EXIT_BLOCKED with an honest "no device" result -- it never fabricates
+    an inspection.
+    """
+    from . import release_installer
+
+    if serial is None and config_path:
+        try:
+            serial = config_mod.load_config(config_path).udid
+        except config_mod.ConfigError:
+            serial = None
+    inspection = release_installer.inspect_tablet(release_installer.real_adb_runner, serial=serial)
+    _write_installer_report(Path(report_path) if report_path else None, inspection.to_dict())
+    if inspection.status == release_installer.STATUS_OK:
+        click.echo(click.style("[OK] Tablet inspected.", fg="green"))
+        for ident in inspection.installed:
+            state = f"{ident.version_name} (code {ident.version_code})" if ident.present else "not installed"
+            click.echo(f"     {ident.package_id}: {state}")
+        click.echo(f"     HOME resolves to: {inspection.home_package}")
+        raise SystemExit(EXIT_SUCCESS)
+    click.echo(click.style(f"[BLOCKED] {inspection.detail}", fg="yellow"), err=True)
+    raise SystemExit(EXIT_BLOCKED)
+
+
+@main.command("install-tablet-release")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
+@click.option("--bundle", "bundle_path", required=True, type=click.Path(), help="Path to the release bundle directory.")
+@click.option("--serial", "serial", default=None, help="ADB serial; falls back to the config's udid.")
+@click.option("--allow-downgrade", is_flag=True, default=False, help="Explicitly authorise a version downgrade (normally BLOCKED).")
+@click.option("--plan-only", is_flag=True, default=False, help="Print/write the ordered install plan without executing it.")
+@click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON result.")
+def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade, plan_only, report_path):
+    """Verify a release bundle and then install it in the correct,
+    data-preserving order (Calee first, CaleeShell second, reassert HOME,
+    reboot, verify identities/HOME/launch).
+
+    A malformed bundle exits EXIT_INVALID_CONFIG before any device command is
+    even constructed. A signature mismatch, version mismatch, HOME mismatch, an
+    unavailable adb, or an unavailable device each exit EXIT_BLOCKED -- and the
+    installer NEVER auto-uninstalls or clears data to work around them.
+
+    ``--plan-only`` constructs and records the ordered plan without running it
+    (useful for review, and the honest outcome when no device is attached).
+    """
+    from . import release_installer
+
+    verification = release_installer.verify_release_bundle(bundle_path)
+    if not verification.ok:
+        _write_installer_report(
+            Path(report_path) if report_path else None,
+            {"status": "invalid", "verification": verification.to_dict()},
+        )
+        click.echo(click.style(f"[INVALID] Bundle failed verification -- refusing to install:", fg="red"), err=True)
+        for err in verification.errors:
+            click.echo(f"  - {err}", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    if serial is None and config_path:
+        try:
+            serial = config_mod.load_config(config_path).udid
+        except config_mod.ConfigError:
+            serial = None
+
+    plan = release_installer.build_install_plan(verification, serial=serial, allow_downgrade=allow_downgrade)
+
+    if plan_only:
+        _write_installer_report(
+            Path(report_path) if report_path else None,
+            {"status": "plan-only", "verification": verification.to_dict(), "plan": plan.to_dict()},
+        )
+        click.echo(f"[PLAN] {len(plan.steps)} step(s) for release {plan.release_id} (not executed):")
+        for step in plan.steps:
+            click.echo(f"  {step.label}: {' '.join(step.argv)}")
+        raise SystemExit(EXIT_SUCCESS)
+
+    execution = release_installer.execute_install_plan(plan, verification, release_installer.real_adb_runner)
+    _write_installer_report(
+        Path(report_path) if report_path else None,
+        {"status": execution.status, "verification": verification.to_dict(),
+         "plan": plan.to_dict(), "execution": execution.to_dict()},
+    )
+    if execution.status == release_installer.STATUS_OK:
+        click.echo(click.style(f"[OK] Installed release {plan.release_id}.", fg="green"))
+        raise SystemExit(EXIT_SUCCESS)
+    click.echo(click.style(f"[BLOCKED] {execution.detail}", fg="yellow"), err=True)
+    raise SystemExit(EXIT_BLOCKED)
+
+
 if __name__ == "__main__":
     main()
