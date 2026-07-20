@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -29,7 +30,38 @@ class ScenarioError(Exception):
     pass
 
 
-def load_scenario(path) -> Scenario:
+_VAR_RE = re.compile(r"\$\{([A-Z0-9_]+)\}")
+
+
+def substitute_variables(obj, variables: dict):
+    """Recursively replace ``${VAR}`` placeholders in every string within a
+    scenario step structure using ``variables``. A referenced-but-undefined
+    variable raises ScenarioError (BLOCKED) -- a scenario must NEVER run with an
+    unresolved placeholder (e.g. asserting the literal text ``${REG_SUB_TIMED_
+    TITLE}`` instead of the run's generated subscribed event). Used to inject the
+    today-relative subscribed-fixture event titles (Priority 6) so the scenario
+    asserts the exact events the fixture provisioned for THIS run."""
+
+    if isinstance(obj, str):
+        def _repl(m):
+            name = m.group(1)
+            if name not in variables:
+                raise ScenarioError(
+                    f"Scenario references undefined variable ${{{name}}}. Provide it via the run's "
+                    f"fixture variables (e.g. prepare-subscribed-fixture writes the subscribed event "
+                    f"titles); a scenario must never run with an unresolved placeholder."
+                )
+            return str(variables[name])
+
+        return _VAR_RE.sub(_repl, obj)
+    if isinstance(obj, list):
+        return [substitute_variables(x, variables) for x in obj]
+    if isinstance(obj, dict):
+        return {k: substitute_variables(v, variables) for k, v in obj.items()}
+    return obj
+
+
+def load_scenario(path, *, variables: "dict | None" = None) -> Scenario:
     path = Path(path)
     try:
         with path.open("r", encoding="utf-8") as f:
@@ -46,6 +78,12 @@ def load_scenario(path) -> Scenario:
     steps = raw.get("steps")
     if not isinstance(steps, list) or not steps:
         raise ScenarioError(f"Scenario file at {path} is missing a non-empty 'steps' list.")
+
+    # Inject run-scoped variables (e.g. the today-relative subscribed event
+    # titles). Opt-in: without variables, placeholders are left verbatim so
+    # parse-contract tests can still load a templated scenario.
+    if variables:
+        steps = substitute_variables(steps, variables)
 
     requires_state = raw.get("requires_state", "any")
     if requires_state not in VALID_REQUIRES_STATES:
@@ -514,9 +552,13 @@ def _execute_step(ctx, step: dict) -> StepResult:
 
 
 class ScenarioRunner:
-    def __init__(self, config, report_builder=None):
+    def __init__(self, config, report_builder=None, *, variables: "dict | None" = None):
         self.config = config
         self.report_builder = report_builder
+        # Run-scoped scenario variables (e.g. the today-relative subscribed-event
+        # titles from prepare-subscribed-fixture). Substituted into every loaded
+        # scenario's ${VAR} placeholders (Priority 6).
+        self.variables = variables or None
 
     def check_state_compatibility(self, scenario: Scenario) -> "str | None":
         if scenario.requires_state == "logged_in_tablet" and self.config.expected_state == "fresh":
@@ -540,7 +582,11 @@ class ScenarioRunner:
         loaded = []
         for path in scenario_paths:
             try:
-                loaded.append(load_scenario(path))
+                # Pass variables only when set, so a caller/mock that overrides
+                # load_scenario with a single-arg signature keeps working.
+                loaded.append(
+                    load_scenario(path, variables=self.variables) if self.variables else load_scenario(path)
+                )
             except ScenarioError as exc:
                 # A scenario file that fails to parse is a framework/authoring
                 # problem, not evidence the product regressed — it must never

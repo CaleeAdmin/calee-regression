@@ -76,6 +76,17 @@ python -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase pre >
 # bundle so the release has an auditable record of exactly why it stopped.
 if [ "$PREPARE_STATUS" -eq 0 ]; then
     echo ""
+    echo "--- Step 1.5: Provision the today-relative subscribed calendar fixture ---"
+    # Priority 6: resolve ONE date for the run, generate the today-relative
+    # subscribed ICS, provision it through the AUTHENTICATED regression endpoint
+    # (never an unauthenticated reset), record evidence under this run, and make
+    # the generated event titles available to the tablet scenario as
+    # ${REG_SUB_*} variables. Without a hub backend this records BLOCKED and is
+    # never faked; it never blocks the run on its own (the subscribed scenario
+    # is draft-unverified). CALEE_HUB_BASE selects the endpoint when present.
+    python -m calee_regression prepare-subscribed-fixture --run-id "$CALEE_RUN_ID"
+
+    echo ""
     echo "--- Step 2: Calee Tablet ---"
     python -m calee_regression suite --config "$CALEE_TEST_CONFIG" --suite full-tester --run-id "$CALEE_RUN_ID"
 

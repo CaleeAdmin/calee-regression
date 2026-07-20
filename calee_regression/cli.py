@@ -590,7 +590,8 @@ def run(config_path, scenario_arg, run_id_opt):
     scenario_path = _resolve_scenario_path(scenario_arg)
     out_dir, run_id = _tablet_out_dir(run_id_opt)
     rb = reporting.ReportBuilder(cfg, run_name=scenario_path.stem, out_dir=out_dir)
-    result = ScenarioRunner(cfg, report_builder=rb).run_scenarios([scenario_path], suite_name=scenario_path.stem)
+    variables = _load_run_scenario_variables(run_id)
+    result = ScenarioRunner(cfg, report_builder=rb, variables=variables).run_scenarios([scenario_path], suite_name=scenario_path.stem)
     if run_id:
         result.run_id = run_id
     report_dir = rb.write(result)
@@ -610,6 +611,25 @@ def _tablet_out_dir(run_id_opt: "str | None") -> "tuple[Path | None, str | None]
     workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
     workspace.ensure_created()
     return workspace.component_dir("tablet"), run_id
+
+
+def _load_run_scenario_variables(run_id: "str | None") -> "dict | None":
+    """Load run-scoped scenario variables (Priority 6): the today-relative
+    subscribed-event titles that prepare-subscribed-fixture recorded, so a
+    scenario's ${VAR} placeholders resolve to THIS run's provisioned events.
+    None when there is no run or no subscribed-fixture evidence."""
+    if not run_id or not run_context.is_valid_run_id(run_id):
+        return None
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id)
+    evidence = workspace.component_report_path("subscribed-fixture")
+    if not evidence.is_file():
+        return None
+    try:
+        data = json.loads(evidence.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    variables = data.get("variables")
+    return variables if isinstance(variables, dict) and variables else None
 
 
 def _record_tablet_component(run_id: "str | None", report_dir: Path, result) -> None:
@@ -655,7 +675,8 @@ def suite(config_path, suite_name, confirm_technical, run_id_opt):
 
     out_dir, run_id = _tablet_out_dir(run_id_opt)
     rb = reporting.ReportBuilder(cfg, run_name=suite_name, out_dir=out_dir)
-    result = ScenarioRunner(cfg, report_builder=rb).run_scenarios(scenario_paths, suite_name=suite_name)
+    variables = _load_run_scenario_variables(run_id)
+    result = ScenarioRunner(cfg, report_builder=rb, variables=variables).run_scenarios(scenario_paths, suite_name=suite_name)
     if run_id:
         result.run_id = run_id
     report_dir = rb.write(result)
@@ -2529,6 +2550,76 @@ def machine_config_snapshot_cmd(config_path, legacy_config_path, run_id_opt):
     _emit("PLATFORM_ANDROID", "true" if "android" in effective.mobile_platforms else "false")
     _emit("PLATFORM_IOS", "true" if "ios" in effective.mobile_platforms else "false")
     _emit("ALLOW_CALEESHELL_TECHNICAL", "true" if effective.allow_caleeshell_technical else "false")
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@main.command("prepare-subscribed-fixture")
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True, help="Shared release run ID (run_context.py).")
+@click.option("--target-date", "date_opt", default=None, help="Pin the subscribed target date (YYYY-MM-DD); defaults to today.")
+@click.option("--timezone", "tz_opt", default=None, help="Timezone label recorded in evidence (default Australia/Perth).")
+@click.option("--hub-base", "hub_base", envvar="CALEE_HUB_BASE", default=None, help="Hub base URL for the authenticated regression provisioning endpoint.")
+def prepare_subscribed_fixture_cmd(run_id_opt, date_opt, tz_opt, hub_base):
+    """Generate the today-relative subscribed ICS, provision it through the
+    AUTHENTICATED regression endpoint, and record evidence + scenario variables
+    (Priority 6).
+
+    Resolves ONE target date + timezone for the run, generates the subscribed
+    ICS for that date, provisions it (replacing any stale regression feed) via
+    the authenticated, regression-only, production-disabled hub endpoint, writes
+    reports/runs/<run-id>/subscribed-fixture/results.json, and records the
+    generated event titles as scenario variables so the tablet scenario asserts
+    the exact events THIS run provisioned. With no hub backend/token (offline/
+    CI), provisioning is recorded as BLOCKED and never faked -- the subscribed
+    scenario stays draft-unverified.
+    """
+    import datetime as _dt
+
+    from . import subscribed_provision as sp
+
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+    workspace.ensure_created()
+
+    target_date = None
+    if date_opt:
+        try:
+            target_date = _dt.date.fromisoformat(date_opt)
+        except ValueError:
+            click.echo(f"Invalid --target-date {date_opt!r}; expected YYYY-MM-DD.", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+
+    # Build the authenticated provisioner only when a hub base URL and an
+    # operator token are both available. Absent either, provisioning is
+    # BLOCKED-recorded, never faked and never an unauthenticated reset.
+    provisioner = None
+    if hub_base:
+        token = credentials_mod.default_resolver().get(credentials_mod.API_TOKEN)
+        if token:
+            provisioner = sp.http_provisioner(hub_base, token=token)
+
+    result = sp.provision_subscribed_fixture(
+        run_id=run_id_opt, target_date=target_date,
+        timezone=tz_opt or sp.DEFAULT_TIMEZONE, provisioner=provisioner,
+    )
+
+    report_path = workspace.component_report_path("subscribed-fixture")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps({"runId": run_id_opt, **result.to_dict()}, indent=2) + "\n", encoding="utf-8")
+    # The generated ICS is provisioning INPUT (recorded next to, not inside, the
+    # results json). It carries only regression event titles, never a secret.
+    if result.ics:
+        (report_path.parent / "reg_sub_today_relative.ics").write_text(result.ics, encoding="utf-8")
+
+    click.echo(f"Subscribed-fixture evidence: {report_path}")
+    click.echo(f"  status: {result.status}  date: {result.resolved_date}  events: "
+               f"{result.events.get('timed')} / {result.events.get('allDay')}")
+    for d in result.detail:
+        click.echo(f"  - {d}")
+    # This preparation step itself succeeds when it has generated + recorded the
+    # fixture; the subscribed scenario (draft-unverified, mandatory:false) is what
+    # honours a BLOCKED provisioning, so this never blocks the whole run on its own.
     raise SystemExit(EXIT_SUCCESS)
 
 
