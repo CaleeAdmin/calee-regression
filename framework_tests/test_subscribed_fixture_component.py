@@ -204,3 +204,87 @@ def test_consolidate_rejects_stale_subscribed_fixture_evidence(tmp_path, monkeyp
     assert "subscribed-fixture report rejected" in result.output
     assert "stale" in result.output.lower() or "before this run started" in result.output.lower()
     assert result.exit_code != EXIT_SUCCESS
+
+
+# ── #24: no secret in commands/output/JSON, through the REAL CLI command ───
+#
+# Every other subscribed-publisher test (test_subscribed_publisher.py) calls
+# sp.prepare_subscribed_fixture()/the adapter functions directly. Nothing
+# elsewhere exercises the actual `prepare-subscribed-fixture` CLI command --
+# the real credential-resolution-to-results.json path a technical owner's
+# machine actually runs -- so this is the one place that wiring gets proven,
+# not just the pure functions underneath it.
+
+
+def test_cli_prepare_subscribed_fixture_published_mode_leaks_no_credential(tmp_path, monkeypatch):
+    import urllib.request
+
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    fake_username = "reg-webdav-user"
+    fake_password = "S3cr3t-WebDAV-P@ss-9f8e"
+    monkeypatch.setenv("CALEE_SUBSCRIBED_WEBDAV_USERNAME", fake_username)
+    monkeypatch.setenv("CALEE_SUBSCRIBED_WEBDAV_PASSWORD", fake_password)
+
+    ics_bytes = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n"
+
+    class _FakeResponse:
+        status = 201
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return ics_bytes
+
+    def _fake_urlopen(req, timeout=None):
+        return _FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+    config_path = tmp_path / "machine.local.yaml"
+    config_path.write_text(
+        "subscribed_fixture:\n"
+        "  publisher: webdav\n"
+        "  public_url: https://fixtures.example.invalid/calee/regression-calendar.ics\n"
+        "  poll_interval_seconds: 1\n"
+        "  timeout_seconds: 5\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            "prepare-subscribed-fixture", "--run-id", RUN_ID, "--release-id", "2026.07.20-rc3",
+            "--config", str(config_path), "--mode", "published",
+        ],
+    )
+    assert result.exit_code == EXIT_SUCCESS, result.output
+
+    # Neither credential ever appears in the command's own stdout...
+    assert fake_username not in result.output
+    assert fake_password not in result.output
+
+    # ...nor in the results.json it wrote...
+    ws = run_context.RunWorkspace(tmp_path, RUN_ID)
+    report_path = ws.component_report_path("subscribed-fixture")
+    report_text = report_path.read_text(encoding="utf-8")
+    assert fake_username not in report_text
+    assert fake_password not in report_text
+
+    # ...nor in the ICS sidecar written next to it (regression titles only).
+    ics_path = report_path.parent / "reg_sub_today_relative.ics"
+    assert ics_path.is_file()
+    ics_text = ics_path.read_text(encoding="utf-8")
+    assert fake_username not in ics_text
+    assert fake_password not in ics_text
+
+    # Sanity: this genuinely exercised the published path (not a silent
+    # short-circuit) -- publication and observation both actually succeeded.
+    data = json.loads(report_text)
+    assert data["status"] == "ok", report_text
+    assert data["publicationStatus"] == "ok", report_text
+    assert data["observationStatus"] == "ok", report_text
+    assert data["publisherType"] == "webdav", report_text
