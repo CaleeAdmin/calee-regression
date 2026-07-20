@@ -15,6 +15,7 @@ import click
 from . import appium_lifecycle
 from . import build_identity as build_identity_mod
 from . import config as config_mod
+from . import credentials as credentials_mod
 from . import manual_checks as manual_checks_mod
 from . import preflight, release_platforms, reporting, suites
 from . import run_context
@@ -239,6 +240,32 @@ def _write_environment_report(
     return path
 
 
+def _fill_credentials_from_providers(email, password):
+    """Fill a missing regression email/password from the environment and then the
+    macOS Keychain (credentials.default_resolver's chain: injected CLI value ->
+    env -> Keychain). An explicit CLI/env value always wins; anything still
+    unresolved stays None so the caller's existing BLOCKED guard fires.
+
+    Returns ``(email, password, resolver)`` -- ``resolver.secret_values()`` is
+    the set of every secret actually resolved, fed to ``credentials.redact``
+    before any report/log text is written so a secret can never leak (Priority
+    3). Never places a secret on a command line and never prints the resolver
+    (its repr is secret-free by construction)."""
+    injected = {}
+    if email:
+        injected[credentials_mod.REGRESSION_USERNAME.name] = email
+    if password:
+        injected[credentials_mod.REGRESSION_PASSWORD.name] = password
+    resolver = credentials_mod.default_resolver(injected=injected or None)
+    resolved_email = resolver.get(credentials_mod.REGRESSION_USERNAME)
+    resolved_password = resolver.get(credentials_mod.REGRESSION_PASSWORD)
+    # Optional secrets (API token, AI-analysis key) are resolved too so their
+    # values are in the redaction set even though they are never required here.
+    for optional in credentials_mod.OPTIONAL_SECRETS:
+        resolver.get(optional)
+    return resolved_email, resolved_password, resolver
+
+
 @main.command()
 @click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
 @click.option("--fixture-base-url", envvar="CALEE_API_BASE", default=None)
@@ -353,10 +380,18 @@ def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suit
             fixture_reset_status="skipped", fixture_verification_status="skipped", suite_name=suite_name,
         )
 
+    # Integrate the environment + macOS Keychain credential providers (Priority
+    # 3): a fixture email/password not passed on the CLI/env can still resolve
+    # from the login Keychain. Anything still unresolved falls through to the
+    # BLOCKED guard below -- a required credential is never silently empty.
+    fixture_email, fixture_password, _cred_resolver = _fill_credentials_from_providers(
+        fixture_email, fixture_password
+    )
     if not (fixture_base_url and fixture_email and fixture_password):
         detail = [
             "Fixture credentials are not configured (set CALEE_API_BASE, CALEE_TEST_EMAIL, "
-            "CALEE_TEST_PASSWORD, or pass --fixture-base-url/--fixture-email/--fixture-password)."
+            "CALEE_TEST_PASSWORD, the macOS Keychain, or pass --fixture-base-url/--fixture-email/"
+            "--fixture-password)."
         ]
         click.echo(
             f"\nBLOCKED: {detail[0]} Release-gating scenarios that require the deterministic "
@@ -784,10 +819,17 @@ def sync_smoke_cmd(config_path, run_id_opt, base_url, email, password, platform,
         click.echo("BLOCKED: no in-scope CaleeMobile platform for cross-device synchronization.", err=True)
         raise SystemExit(EXIT_BLOCKED)
 
+    # Integrate the environment + macOS Keychain credential providers (Priority
+    # 3): email/password not on the CLI/env can still resolve from the Keychain.
+    # Resolved BEFORE any workspace/report directory is created, so a
+    # missing-credential invocation stays BLOCKED without leaving a half-formed
+    # reports/runs/<id>/ behind.
+    email, password, cred_resolver = _fill_credentials_from_providers(email, password)
     if not base_url or not email or not password:
         click.echo(
             "BLOCKED: sync-smoke needs --base-url/--email/--password (or CALEE_EXPECTED_BACKEND/"
-            "CALEE_TEST_EMAIL/CALEE_TEST_PASSWORD) to reach the Calee Client API and CaleeMobile.",
+            "CALEE_TEST_EMAIL/CALEE_TEST_PASSWORD, or the macOS Keychain) to reach the Calee Client "
+            "API and CaleeMobile.",
             err=True,
         )
         raise SystemExit(EXIT_BLOCKED)
@@ -822,11 +864,12 @@ def sync_smoke_cmd(config_path, run_id_opt, base_url, email, password, platform,
             tablet_driver.quit()
 
     report_path = report_dir / "results.json"
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {"runId": run_id, "mandatory": True, "flows": [r.to_dict() for r in results]}, f, indent=2
-        )
-        f.write("\n")
+    payload = {"runId": run_id, "mandatory": True, "flows": [r.to_dict() for r in results]}
+    # Redact any resolved secret value from the serialized report before it is
+    # written to disk (Priority 3): even though the flows never intentionally
+    # record credentials, a subprocess error excerpt could carry one.
+    report_text = credentials_mod.redact(json.dumps(payload, indent=2), cred_resolver.secret_values())
+    report_path.write_text(report_text + "\n", encoding="utf-8")
 
     for result in results:
         click.echo(f"{result.flow}: {result.status.upper()}")
@@ -1792,6 +1835,8 @@ def _resolve_component(
 @click.option("--mobile-android-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's mobile-android/results.json")
 @click.option("--mobile-ios-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's mobile-ios/results.json")
 @click.option("--sync-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's sync/results.json")
+@click.option("--installation-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's installation/results.json (bundle verify + APK inspection + install)")
+@click.option("--machine-config-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's machine-config/results.json (secrets-excluded snapshot)")
 @click.option("--kiosk-report", type=click.Path(exists=True), default=None, help="Override: defaults to this run's kiosk-admin/results.json (kiosk/admin feature evidence)")
 @click.option("--manual-checks", "manual_checks_path", type=click.Path(exists=True), default=None, help="Override: defaults to this run's manual-checks/results.json")
 @click.option(
@@ -1820,6 +1865,17 @@ def _resolve_component(
          "launcher passes --selector-contract-mandatory. When omitted, the component is still "
          "auto-included as mandatory if a selector-contract report exists for this run; a release "
          "can never PASS without valid selector evidence for the exact CaleeMobile build.",
+)
+@click.option(
+    "--installation-mandatory/--installation-optional", "installation_mandatory", default=None,
+    help="Whether tablet release installation is release-gating (Priority 6). The full launcher "
+         "passes --installation-mandatory; when omitted it is auto-included as mandatory if an "
+         "installation report exists. Installation BLOCKED/FAILED can never read as a release PASS.",
+)
+@click.option(
+    "--machine-config-mandatory/--machine-config-optional", "machine_config_mandatory", default=None,
+    help="Whether the machine-config snapshot is release-gating (Priority 4). Auto-included as "
+         "mandatory if a machine-config snapshot exists for this run.",
 )
 # Independent release-feature gating (Workstream 3). Each defaults to the
 # release feature profile (config/release-platforms.yaml release_features.*),
@@ -1865,8 +1921,9 @@ def _resolve_component(
 @click.option("--out-dir", type=click.Path(), default=None, help="Where to write the consolidated bundle (default: this run's workspace)")
 def consolidate(
     run_id_opt, tablet_report, mobile_api_report, mobile_android_report, mobile_ios_report,
-    sync_report, kiosk_report, manual_checks_path, environment_report, android_mandatory, ios_mandatory, sync_mandatory,
-    selector_contract_mandatory,
+    sync_report, installation_report, machine_config_report, kiosk_report, manual_checks_path, environment_report,
+    android_mandatory, ios_mandatory, sync_mandatory,
+    selector_contract_mandatory, installation_mandatory, machine_config_mandatory,
     meals_mandatory, onboarding_mandatory, google_calendar_mandatory, kiosk_admin_mandatory,
     build_version, calee_build_version, expected_calee_build_version,
     caleemobile_build_version, expected_caleemobile_build_version, caleeshell_version,
@@ -1924,6 +1981,8 @@ def consolidate(
     mobile_android = resolve("mobile-android", mobile_android_report)
     mobile_ios = resolve("mobile-ios", mobile_ios_report)
     sync = resolve("sync", sync_report)
+    installation = resolve("installation", installation_report)
+    machine_config_snapshot = resolve("machine-config", machine_config_report)
     kiosk = resolve("kiosk-admin", kiosk_report)
     # CaleeMobile selector contract (Priority 1/2). Auto-discovered from this
     # run's workspace and run-ID-validated like every other component. The
@@ -1980,6 +2039,19 @@ def consolidate(
     # --sync-mandatory/--sync-optional wins, else the release feature profile
     # (release_features.synchronization), which defaults to True.
     sync_gating = sync_mandatory if sync_mandatory is not None else features.synchronization
+    # Installation (Priority 6) and machine-config (Priority 4) gating: an
+    # explicit flag wins; else the component is auto-included as MANDATORY when a
+    # report for it exists in this run's workspace (a real release run always
+    # produces both), and left out entirely (None) for ad-hoc/unit consolidation
+    # that has neither -- so existing callers are unaffected.
+    installation_gating = (
+        installation_mandatory if installation_mandatory is not None
+        else (True if installation is not None else None)
+    )
+    machine_config_gating = (
+        machine_config_mandatory if machine_config_mandatory is not None
+        else (True if machine_config_snapshot is not None else None)
+    )
 
     # Independent release-feature gating (Workstream 3): explicit
     # --<feature>-mandatory/--<feature>-optional wins, else the release feature
@@ -2182,6 +2254,10 @@ def consolidate(
         mobile_ios_ui=mobile_ios,
         sync=sync,
         kiosk_admin=kiosk,
+        installation=installation,
+        installation_mandatory=installation_gating,
+        machine_config=machine_config_snapshot,
+        machine_config_mandatory=machine_config_gating,
         feature_profile=feature_profile,
         manual_checks=manual_checks_list,
         meta=meta,
@@ -2245,6 +2321,14 @@ def consolidate(
     # captured by the tablet/mobile UI runs travel into the release ZIP too.
     for ui_report in (tablet, mobile_android, mobile_ios):
         evidence_paths.extend(collect_step_diagnostic_paths(ui_report))
+    # Priority 4/6: the machine-config snapshot and the full installation
+    # evidence (bundle verification + APK inspection + install execution) travel
+    # into the release ZIP, so the qualification bundle contains all installer
+    # and configuration evidence, not just reports/*.json.
+    for component_name in ("machine-config", "installation"):
+        component_report = workspace.component_report_path(component_name)
+        if component_report.is_file():
+            evidence_paths.append(component_report)
     bundle_path = write_release_bundle(
         report, out, build_label=build_version, evidence_paths=evidence_paths or None
     )
@@ -2332,6 +2416,118 @@ def machine_config_cmd(config_path):
     _emit("MOBILE_PLATFORMS", ",".join(cfg.mobile_platforms))
     _emit("IPHONE_DEVICE", cfg.iphone_device or "")
     _emit("ALLOW_CALEESHELL_TECHNICAL", "true" if cfg.allow_caleeshell_technical else "false")
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@main.command("machine-config-snapshot")
+@click.option("--config", "config_path", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
+@click.option("--legacy-config", "legacy_config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(), help="Legacy tester config to reconcile (defaults to config/tester.local.yaml).")
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True, help="Shared release run ID (run_context.py).")
+def machine_config_snapshot_cmd(config_path, legacy_config_path, run_id_opt):
+    """Make config/machine.local.yaml AUTHORITATIVE for this run (Priority 4).
+
+    Loads and validates the machine config ONCE, reconciles it with the legacy
+    tester config (machine config wins every overlap; a differing legacy value
+    is OVERRIDDEN with a recorded explanation), writes an effective tester
+    config the runner loads, and records a secrets-excluded snapshot at
+    reports/runs/<run-id>/machine-config/results.json (the selected backend,
+    devices, package ids and release profile appear in the run evidence).
+
+    Emits eval-able shell assignments on stdout -- including MACHINE_EFFECTIVE_
+    CONFIG (the reconciled tester config the launcher points CALEE_TEST_CONFIG
+    at, so machine config actually controls execution with no second, conflicting
+    source of truth) and derived MACHINE_PLATFORM_ANDROID/IOS. On a malformed or
+    secret-bearing machine config, records a BLOCKED snapshot and exits BLOCKED
+    so the whole release stops.
+    """
+    import shlex as _shlex
+
+    import yaml as _yaml
+
+    from . import machine_adapter
+    from . import machine_config as machine_mod
+
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+    workspace.ensure_created()
+
+    def _record_blocked(detail: "list[str]") -> None:
+        payload = {"runId": run_id_opt, "status": STATUS_BLOCKED, "detail": detail}
+        path = workspace.component_report_path("machine-config")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        manifest = _load_or_init_manifest(workspace)
+        manifest.record_component("machine-config", report_path=str(path), exit_code=EXIT_BLOCKED)
+        manifest.write(workspace.manifest_path)
+
+    path = Path(config_path) if config_path else (REPO_ROOT / "config" / "machine.local.yaml")
+    try:
+        cfg = machine_mod.load_machine_config(path)
+    except machine_mod.MachineConfigError as exc:
+        _record_blocked([str(exc)])
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    # Legacy tester config (raw) -- best-effort; its non-overlapping keys are
+    # preserved. A missing/unreadable one just means machine config supplies the
+    # overlaps and the rest come from placeholders the caller must still fill in.
+    legacy_path = Path(legacy_config_path) if legacy_config_path else (REPO_ROOT / "config" / "tester.local.yaml")
+    legacy_raw = None
+    legacy_note = None
+    if legacy_path.is_file():
+        try:
+            loaded = _yaml.safe_load(legacy_path.read_text(encoding="utf-8"))
+            legacy_raw = loaded if isinstance(loaded, dict) else None
+            if legacy_raw is None:
+                legacy_note = f"Legacy tester config at {legacy_path} is not a mapping -- ignored."
+        except _yaml.YAMLError as exc:
+            legacy_note = f"Legacy tester config at {legacy_path} did not parse ({exc}) -- ignored."
+    else:
+        legacy_note = f"No legacy tester config at {legacy_path}; machine config supplies the overlapping values."
+
+    effective = machine_adapter.reconcile(cfg, legacy_raw)
+
+    # Write the reconciled effective tester config the runner will load.
+    effective_config_path = workspace.component_dir("machine-config") / "effective-tester-config.yaml"
+    effective_config_path.parent.mkdir(parents=True, exist_ok=True)
+    effective_config_path.write_text(_yaml.safe_dump(effective.tester_config, sort_keys=True), encoding="utf-8")
+
+    snapshot = machine_adapter.snapshot(
+        effective, machine_config_path=str(path), effective_tester_config_path=str(effective_config_path)
+    )
+    snapshot["runId"] = run_id_opt
+    if legacy_note:
+        snapshot["detail"].append(legacy_note)
+
+    report_path = workspace.component_report_path("machine-config")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
+    manifest = _load_or_init_manifest(workspace)
+    manifest.record_component("machine-config", report_path=str(report_path), exit_code=EXIT_SUCCESS)
+    manifest.target_backend = effective.backend_url or manifest.target_backend
+    manifest.write(workspace.manifest_path)
+
+    def _emit(name, value):
+        if value is None:
+            value = ""
+        click.echo(f"MACHINE_{name}={_shlex.quote(str(value))}")
+
+    _emit("EFFECTIVE_CONFIG", str(effective_config_path))
+    _emit("TABLET_SERIAL", effective.tablet_serial or "")
+    _emit("RELEASE_BUNDLE_DIR", effective.release_bundle_dir or "")
+    _emit("BACKEND_URL", effective.backend_url)
+    _emit("RELEASE_PROFILE", effective.release_profile)
+    _emit("REPORT_DIR", effective.report_dir)
+    _emit("IPHONE_DEVICE", effective.iphone_device or "")
+    _emit("CALEE_PACKAGE_ID", effective.calee_package_id)
+    _emit("CALEESHELL_PACKAGE_ID", effective.caleeshell_package_id)
+    _emit("HOME_ACTIVITY", effective.home_activity)
+    _emit("CALEE_LAUNCH_ACTION", effective.calee_launch_action)
+    _emit("PLATFORM_ANDROID", "true" if "android" in effective.mobile_platforms else "false")
+    _emit("PLATFORM_IOS", "true" if "ios" in effective.mobile_platforms else "false")
+    _emit("ALLOW_CALEESHELL_TECHNICAL", "true" if effective.allow_caleeshell_technical else "false")
     raise SystemExit(EXIT_SUCCESS)
 
 
@@ -2456,6 +2652,28 @@ def inspect_tablet_cmd(config_path, serial, report_path):
     raise SystemExit(EXIT_BLOCKED)
 
 
+def _record_installation_component(
+    run_id_opt: "str | None", payload: dict, exit_code: int
+) -> None:
+    """Write the installation evidence into this run's workspace (Priority 6):
+    reports/runs/<run-id>/installation/results.json + a manifest record, so the
+    install is a first-class consolidated component. A payload always carries
+    ``runId`` so consolidation's run-ID validation accepts it. No-op when the
+    command is run standalone without a --run-id."""
+    if not run_id_opt or not run_context.is_valid_run_id(run_id_opt):
+        return
+    workspace = run_context.RunWorkspace(REPO_ROOT, run_id_opt)
+    workspace.ensure_created()
+    payload = {"runId": run_id_opt, **payload}
+    report_path = workspace.component_report_path("installation")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    manifest = _load_or_init_manifest(workspace)
+    manifest.record_component("installation", report_path=str(report_path), exit_code=exit_code)
+    manifest.write(workspace.manifest_path)
+    click.echo(f"Installation evidence: {report_path}")
+
+
 @main.command("install-tablet-release")
 @click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
 @click.option("--bundle", "bundle_path", required=True, type=click.Path(), help="Path to the release bundle directory.")
@@ -2463,28 +2681,42 @@ def inspect_tablet_cmd(config_path, serial, report_path):
 @click.option("--allow-downgrade", is_flag=True, default=False, help="Explicitly authorise a version downgrade (normally BLOCKED).")
 @click.option("--plan-only", is_flag=True, default=False, help="Print/write the ordered install plan without executing it.")
 @click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON result.")
-def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade, plan_only, report_path):
-    """Verify a release bundle and then install it in the correct,
-    data-preserving order (Calee first, CaleeShell second, reassert HOME,
-    reboot, verify identities/HOME/launch).
+@click.option(
+    "--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None,
+    help="Shared release run ID (run_context.py). When given, the full installation evidence "
+         "(bundle verification + APK content/signer inspection + tablet inspection + plan + "
+         "execution) is written into reports/runs/<run-id>/installation/results.json as this run's "
+         "mandatory installation component.",
+)
+def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade, plan_only, report_path, run_id_opt):
+    """Verify a release bundle, INSPECT each APK's actual contents + signer, and
+    then install it in the correct, data-preserving order (Calee first,
+    CaleeShell second, reassert HOME, reboot, verify identities/HOME/launch).
 
-    A malformed bundle exits EXIT_INVALID_CONFIG before any device command is
-    even constructed. A signature mismatch, version mismatch, HOME mismatch, an
-    unavailable adb, or an unavailable device each exit EXIT_BLOCKED -- and the
-    installer NEVER auto-uninstalls or clears data to work around them.
+    Order of gates (each BLOCKS before the next when it can't be trusted):
+      1. bundle verification (manifest schema, checksums, absolute APK paths);
+      2. actual APK content + signer inspection (Priority 5) -- the real
+         application id/version must match the manifest and the canonical Calee/
+         CaleeShell package; a missing SDK tool BLOCKS with setup guidance; an
+         already-installed app whose signer MISMATCHES the release APK BLOCKS
+         (data is never wiped to work around it);
+      3. read-only tablet inspection (no device -> BLOCKED, honestly);
+      4. the ordered, data-preserving install plan + its execution.
 
-    ``--plan-only`` constructs and records the ordered plan without running it
-    (useful for review, and the honest outcome when no device is attached).
+    A malformed bundle exits EXIT_INVALID_CONFIG; a tool/signer/device/version/
+    HOME problem exits EXIT_BLOCKED. The installer NEVER auto-uninstalls or
+    clears data. ``--plan-only`` records the ordered plan without running it.
     """
+    from . import apk_inspect
     from . import release_installer
 
     verification = release_installer.verify_release_bundle(bundle_path)
     if not verification.ok:
-        _write_installer_report(
-            Path(report_path) if report_path else None,
-            {"status": "invalid", "verification": verification.to_dict()},
-        )
-        click.echo(click.style(f"[INVALID] Bundle failed verification -- refusing to install:", fg="red"), err=True)
+        payload = {"status": "invalid", "detail": list(verification.errors),
+                   "bundleVerification": verification.to_dict()}
+        _write_installer_report(Path(report_path) if report_path else None, payload)
+        _record_installation_component(run_id_opt, payload, EXIT_INVALID_CONFIG)
+        click.echo(click.style("[INVALID] Bundle failed verification -- refusing to install:", fg="red"), err=True)
         for err in verification.errors:
             click.echo(f"  - {err}", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
@@ -2498,22 +2730,54 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     plan = release_installer.build_install_plan(verification, serial=serial, allow_downgrade=allow_downgrade)
 
     if plan_only:
-        _write_installer_report(
-            Path(report_path) if report_path else None,
-            {"status": "plan-only", "verification": verification.to_dict(), "plan": plan.to_dict()},
-        )
+        payload = {"status": "plan-only", "detail": ["Plan constructed, not executed."],
+                   "bundleVerification": verification.to_dict(), "plan": plan.to_dict()}
+        _write_installer_report(Path(report_path) if report_path else None, payload)
         click.echo(f"[PLAN] {len(plan.steps)} step(s) for release {plan.release_id} (not executed):")
         for step in plan.steps:
             click.echo(f"  {step.label}: {' '.join(step.argv)}")
         raise SystemExit(EXIT_SUCCESS)
 
+    # Priority 5: inspect ACTUAL APK contents + signer before any install.
+    signer_reader = apk_inspect.device_installed_signer_reader(serial=serial)
+    inspection = apk_inspect.preinstall_inspect_bundle(verification, installed_signer_reader=signer_reader)
+    if inspection.status != apk_inspect.STATUS_OK:
+        exit_code = EXIT_INVALID_CONFIG if inspection.status == apk_inspect.STATUS_INVALID else EXIT_BLOCKED
+        payload = {"status": inspection.status, "detail": list(inspection.detail),
+                   "bundleVerification": verification.to_dict(),
+                   "apkInspection": inspection.to_dict(), "plan": plan.to_dict()}
+        _write_installer_report(Path(report_path) if report_path else None, payload)
+        _record_installation_component(run_id_opt, payload, exit_code)
+        label = "INVALID" if inspection.status == apk_inspect.STATUS_INVALID else "BLOCKED"
+        click.echo(click.style(f"[{label}] APK content/signer inspection did not pass:", fg="yellow"), err=True)
+        for d in inspection.detail:
+            click.echo(f"  - {d}", err=True)
+        raise SystemExit(exit_code)
+
+    # Read-only tablet pre-install inspection (installed identities + HOME).
+    tablet_inspection = release_installer.inspect_tablet(release_installer.real_adb_runner, serial=serial)
+
     execution = release_installer.execute_install_plan(plan, verification, release_installer.real_adb_runner)
-    _write_installer_report(
-        Path(report_path) if report_path else None,
-        {"status": execution.status, "verification": verification.to_dict(),
-         "plan": plan.to_dict(), "execution": execution.to_dict()},
-    )
-    if execution.status == release_installer.STATUS_OK:
+    status = "ok" if execution.status == release_installer.STATUS_OK else "blocked"
+    detail = [] if status == "ok" else [execution.detail or "Installation did not complete."]
+    if tablet_inspection.status != release_installer.STATUS_OK and status == "ok":
+        # The install steps succeeded but the pre-install device read did not --
+        # record it, but the execution's own verify steps are authoritative.
+        detail.append(f"Tablet pre-install inspection: {tablet_inspection.detail}")
+    payload = {
+        "status": status,
+        "detail": detail,
+        "bundleVerification": verification.to_dict(),
+        "apkInspection": inspection.to_dict(),
+        "tabletInspection": tablet_inspection.to_dict(),
+        "plan": plan.to_dict(),
+        "execution": execution.to_dict(),
+        "releaseId": plan.release_id,
+    }
+    _write_installer_report(Path(report_path) if report_path else None, payload)
+    exit_code = EXIT_SUCCESS if status == "ok" else EXIT_BLOCKED
+    _record_installation_component(run_id_opt, payload, exit_code)
+    if status == "ok":
         click.echo(click.style(f"[OK] Installed release {plan.release_id}.", fg="green"))
         raise SystemExit(EXIT_SUCCESS)
     click.echo(click.style(f"[BLOCKED] {execution.detail}", fg="yellow"), err=True)

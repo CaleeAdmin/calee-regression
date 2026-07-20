@@ -83,7 +83,7 @@ behaviour is unit-tested in-repo at `calee-hub-core`
 | 1 | subscribed timed + all-day events render on Calendar | in scenario |
 | 2 | recurring daily events appear on every correct date | in scenario (title render; per-date nav needs device) |
 | 3 | all-day event display dates do not shift by one day | offline-proven + in scenario |
-| 4 | Today and Calendar show the same visible events | in scenario (`llToday` vs `llCalendar`) |
+| 4 | Today and Calendar show the same visible events | in scenario, verified with the OWNED today-relative event `REG-EVENT-TIMED-001` (provisioned on `ctx.today`), NOT a fixed-date subscribed event — so the Today↔Calendar check is date-correct on any execution date (Priority 7). The fixed-date subscribed events themselves are verified in the date-scoped Agenda list. A today-relative subscribed generator (`calee_regression/subscribed_fixture.py`) exists for when authenticated subscription-source provisioning is wired. |
 | 5 | opening a subscribed event shows read-only status | in scenario |
 | 6 | Edit is absent | in scenario (`fail_if_id btnEventDetailEdit`) |
 | 7 | Delete is absent | in scenario (`fail_if_id btnEventDetailDelete`) |

@@ -22,6 +22,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from . import credentials
 from .fixture_bridge import DEFAULT_SIBLING_NAME
 
 SYNC_TASK_COMPLETE_TARGET = "integration_test/flows/sync_task_complete_test.dart"
@@ -32,6 +33,22 @@ class SyncSmokeBridgeError(Exception):
     """Raised when a sync-smoke subprocess bridge itself can't run or
     reports failure. Callers should record this as a failed/blocked step
     (see sync_smoke.py), never crash the whole orchestration run."""
+
+
+def _child_env_with_credentials(email: str, password: str) -> "dict[str, str]":
+    """A child-process environment carrying the regression credentials in the
+    ENVIRONMENT (never on argv), using the canonical CALEE_TEST_EMAIL/
+    CALEE_TEST_PASSWORD names the CaleeMobile-Regression receiver scripts
+    already default to. Secrets are injected via credentials.build_env; the full
+    environment is never printed or logged (Priority 3)."""
+    return credentials.build_env(
+        None,  # start from a copy of os.environ
+        {"regression_username": email, "regression_password": password},
+        {
+            "regression_username": credentials.REGRESSION_USERNAME.env_var,
+            "regression_password": credentials.REGRESSION_PASSWORD.env_var,
+        },
+    )
 
 
 def _find_sibling_with_marker(repo_root: Path, *, marker_relative_path: str) -> "Path | None":
@@ -68,15 +85,19 @@ def _run_api_action(
     with tempfile.NamedTemporaryFile(mode="r", suffix=".json", delete=False) as tmp:
         report_path = Path(tmp.name)
     try:
+        # Secrets go in the child ENVIRONMENT, never on argv (Priority 3). Only
+        # non-secret flags (--base-url, --report, action extras) appear here.
         cmd = [
             sys.executable, "sync_smoke_actions.py", action,
-            "--base-url", base_url, "--email", email, "--password", password,
+            "--base-url", base_url,
             "--report", str(report_path),
         ]
         cmd.extend(extra_args or [])
+        child_env = _child_env_with_credentials(email, password)
         try:
             result = subprocess.run(
-                cmd, cwd=str(sibling / "api"), capture_output=True, text=True, timeout=timeout_seconds,
+                cmd, cwd=str(sibling / "api"), capture_output=True, text=True,
+                timeout=timeout_seconds, env=child_env,
             )
         except subprocess.TimeoutExpired as exc:
             raise SyncSmokeBridgeError(f"sync_smoke_actions.py {action} timed out after {timeout_seconds}s.") from exc
@@ -84,9 +105,14 @@ def _run_api_action(
             raise SyncSmokeBridgeError(f"Could not run sync_smoke_actions.py: {exc}") from exc
 
         if result.returncode != 0:
+            # Redact any credential value that a child might have echoed into
+            # stdout/stderr before it enters an exception string / report.
             raise SyncSmokeBridgeError(
-                f"sync_smoke_actions.py {action} did not succeed (exit code {result.returncode}).\n"
-                f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+                credentials.redact(
+                    f"sync_smoke_actions.py {action} did not succeed (exit code {result.returncode}).\n"
+                    f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}",
+                    {email, password},
+                )
             )
         try:
             return json.loads(report_path.read_text(encoding="utf-8"))
@@ -180,20 +206,25 @@ def run_mobile_flow(
     report_path = report_dir / f"{Path(target).stem}-results.json"
     log_path = report_dir / f"{Path(target).stem}.log"
 
+    # Secrets go in the child ENVIRONMENT, never on argv (Priority 3).
+    # run_ui_suite.py already re-secures them into a --dart-define-from-file and
+    # redacts its own logs; here we simply stop exposing them on this hop.
     cmd = [
         sys.executable, "run_ui_suite.py",
         "--platform", platform,
         "--target", target,
         "--report", str(report_path),
         "--log", str(log_path),
-        "--email", email,
-        "--password", password,
     ]
     if device_id:
         cmd.extend(["--device-id", device_id])
+    child_env = _child_env_with_credentials(email, password)
 
     try:
-        result = subprocess.run(cmd, cwd=str(ui_dir), capture_output=True, text=True, timeout=timeout_seconds)
+        result = subprocess.run(
+            cmd, cwd=str(ui_dir), capture_output=True, text=True,
+            timeout=timeout_seconds, env=child_env,
+        )
     except subprocess.TimeoutExpired as exc:
         raise SyncSmokeBridgeError(f"run_ui_suite.py --target {target} timed out after {timeout_seconds}s.") from exc
     except OSError as exc:

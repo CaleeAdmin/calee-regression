@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import credentials
 from .models import EXIT_SUCCESS
 
 DEFAULT_SIBLING_NAME = "CaleeMobile-Regression"
@@ -61,16 +62,28 @@ def run_fixture_action(
             f"requires it to be checked out alongside calee-regression."
         )
 
+    # Secrets go in the child ENVIRONMENT, never on argv (Priority 3):
+    # manage_fixture.py already defaults --email/--password to CALEE_TEST_EMAIL/
+    # CALEE_TEST_PASSWORD, so it picks them up transparently.
+    child_env = credentials.build_env(
+        None,
+        {"regression_username": email, "regression_password": password},
+        {
+            "regression_username": credentials.REGRESSION_USERNAME.env_var,
+            "regression_password": credentials.REGRESSION_PASSWORD.env_var,
+        },
+    )
     try:
         result = subprocess.run(
             [
                 sys.executable, "manage_fixture.py", action,
-                "--base-url", base_url, "--email", email, "--password", password,
+                "--base-url", base_url,
             ],
             cwd=str(sibling / "api"),
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
+            env=child_env,
         )
     except subprocess.TimeoutExpired as exc:
         raise FixtureBridgeError(f"Fixture {action} timed out after {timeout_seconds}s.") from exc
@@ -78,8 +91,13 @@ def run_fixture_action(
         raise FixtureBridgeError(f"Could not run manage_fixture.py: {exc}") from exc
 
     if result.returncode != EXIT_SUCCESS:
+        # Redact any credential value a child might have echoed before it enters
+        # an exception string / report.
         raise FixtureBridgeError(
-            f"Fixture {action} did not succeed (exit code {result.returncode}).\n"
-            f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+            credentials.redact(
+                f"Fixture {action} did not succeed (exit code {result.returncode}).\n"
+                f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}",
+                {email, password},
+            )
         )
-    return result.stdout
+    return credentials.redact(result.stdout, {email, password})

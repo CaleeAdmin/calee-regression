@@ -64,18 +64,44 @@ steps:
     screenshot_name: 00_calendar_subscribed_events
     compare: false
 
-  # --- Today and Calendar agree on the visible subscribed event (4) ---
+  # --- Today and Calendar agree, verified with an event that GENUINELY belongs
+  #     to Today (4) -----------------------------------------------------------
+  # Priority 7: the subscribed REG-SUB-* events are a FIXED-DATE static feed
+  # (fixtures/subscribed_calendar/reg_sub_calendar.ics, provisioned via the
+  # authenticated regression subscription-source endpoint). Asserting a
+  # fixed-date subscribed event on the device's "Today" is only ever true on the
+  # single day the fixture's date happens to equal the run date -- a false FAIL
+  # on every other execution date. The Today<->Calendar agreement is therefore
+  # verified here with REG-EVENT-TIMED-001, the OWNED today-relative event the
+  # regression fixture reset genuinely provisions on `ctx.today` at 09:00-10:00
+  # (see CaleeMobile-Regression/api/caleemobile_regression/fixture.py). That
+  # event belongs to Today by construction, so this assertion is date-correct on
+  # any future execution date and never depends on a hardcoded calendar day.
+  # The fixed-date subscribed events themselves are verified in the date-scoped
+  # Agenda list above (they render regardless of which day is "Today").
   - name: Open Today
     action: tap
     id: llToday
 
-  - name: The same subscribed timed event is visible on Today
+  - name: A genuinely-today event is visible on Today (owned, provisioned on ctx.today)
     action: assert_text
-    text: REG-SUB-TIMED
+    text: REG-EVENT-TIMED-001
 
-  - name: Capture Today with the subscribed event
+  - name: Back to Calendar to confirm Today and Calendar agree on that event
+    action: tap
+    id: llCalendar
+
+  - name: Switch to Agenda view to confirm the same today event is listed
+    action: tap
+    id: llSchedule
+
+  - name: The same today event appears in the Calendar agenda
+    action: assert_text
+    text: REG-EVENT-TIMED-001
+
+  - name: Capture Today/Calendar agreement on a genuinely-today event
     action: screenshot
-    screenshot_name: 01_today_subscribed_event
+    screenshot_name: 01_today_calendar_agreement
     compare: false
 
   # --- read-only: open a subscribed event, Edit + Delete are ABSENT (5,6,7,8) ---

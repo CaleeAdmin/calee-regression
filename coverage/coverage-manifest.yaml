@@ -252,12 +252,23 @@ components:
     automated: true
     offlineTested: true
     physicalVerified: false
-    releaseGating: false
+    releaseGating: true
     blocked: false
     optional: false
     unsupported: false
     owningRepo: calee-regression
-    notes: "Release-installer subsystem: bundle verify + install-plan construction + classification, fully fake-tested. Actual install needs a device."
+    notes: "Release-installer subsystem: bundle verify (absolute APK paths) + actual APK content/signer inspection (apkanalyzer/aapt2/apksigner) + install-plan construction/classification, fully fake-tested. Now a run-scoped, release-gating consolidated component (reports/runs/<run-id>/installation/); the actual on-device install stays BLOCKED until a physical MacBook qualification session."
+
+  machine_config:
+    automated: true
+    offlineTested: true
+    physicalVerified: false
+    releaseGating: true
+    blocked: false
+    optional: false
+    unsupported: false
+    owningRepo: calee-regression
+    notes: "Per-MacBook config/machine.local.yaml is the single authoritative source: loaded/validated once, reconciled with the legacy tester config (overrides recorded), snapshot (secrets excluded) recorded as a run-scoped gating component."
 
   report_consolidation:
     automated: true

@@ -159,8 +159,19 @@ def _step_tap(ctx, step):
     _tap_target(ctx["driver"], step)
 
 
-def _step_tap_unique_text(ctx, step):
-    ctx["driver"].tap_unique_text(step["text"])
+def _step_tap_unique_text(ctx, step, result: StepResult):
+    # Optional per-step tuning (Priority 8): a dynamic Android list can opt into
+    # a longer wait for a delayed item and bounded scrolling to bring an
+    # off-screen match into view. Absent keys keep the driver defaults.
+    kwargs = {}
+    if "timeout" in step:
+        kwargs["timeout"] = float(step["timeout"])
+    if step.get("scroll"):
+        kwargs["scroll"] = True
+    if "max_swipes" in step:
+        kwargs["max_swipes"] = int(step["max_swipes"])
+    resolution = ctx["driver"].tap_unique_text(step["text"], **kwargs)
+    result.message = f"tapped the unique element with exact text {step['text']!r}" + _row_metrics_suffix(resolution)
 
 
 def _step_is_optional(step: dict) -> bool:

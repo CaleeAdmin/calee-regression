@@ -37,6 +37,17 @@ RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # gets a results.json, which component_from_* already reports as
 # "not executed").
 COMPONENT_NAMES = (
+    # Per-MacBook machine configuration snapshot (Priority 4): the single
+    # authoritative config (config/machine.local.yaml) resolved for THIS run,
+    # secrets excluded, so the selected backend/devices/package-ids/profile are
+    # captured in the run evidence. Written before any release verification.
+    "machine-config",
+    # Tablet release installation (Priority 5/6): bundle verification, actual
+    # APK content + signer inspection, tablet pre-install inspection, the
+    # install plan, its execution, and post-install package/HOME verification --
+    # one run-scoped, release-gating component. Installation BLOCKED/FAIL can
+    # never read as a release PASS.
+    "installation",
     "environment",
     # CaleeMobile selector-contract evidence (Priority 1): the release gate
     # obtains/generates the machine-readable selector proof for the EXACT
