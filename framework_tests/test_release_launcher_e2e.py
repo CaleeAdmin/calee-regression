@@ -277,7 +277,10 @@ if len(argv) >= 3 and argv[0] == "-m" and argv[1] == "calee_regression":
     if order:
         with open(order, "a") as f:
             f.write(cmd + "\\n")
-    if cmd in ("machine-config-snapshot", "install-tablet-release", "run-with-credentials", "report-root"):
+    if cmd in (
+        "machine-config-snapshot", "install-tablet-release", "run-with-credentials", "report-root",
+        "verify-release-bundle", "release-config",
+    ):
         os.execv(REAL, [REAL, "-m", "calee_regression"] + argv[2:])
     if cmd == "release-platforms":
         sys.stdout.write("export RELEASE_PLATFORM_TABLET=true\\n")
@@ -367,6 +370,13 @@ os.execv(REAL, [REAL] + argv)
     adb = f'''#!/bin/bash
 args=("$@")
 joined="$*"
+# Priority 1, requirement 10: every invocation of this fake adb -- mutating or
+# not -- is logged when FAKE_ADB_LOG is set, so a test can prove NO adb command
+# of any kind ran before release-config succeeded (install-tablet-release,
+# the only step that ever invokes adb, must never even start).
+if [ -n "${{FAKE_ADB_LOG:-}}" ]; then
+    echo "$joined" >> "$FAKE_ADB_LOG"
+fi
 case "$joined" in
   *get-state*) echo "{dev_line}"; exit {dev_rc} ;;
   # Priority 2: device_installed_signer_reader needs a real "package:<path>"
@@ -425,6 +435,10 @@ def _run_launcher(repo, fakebin, *, stdin="", extra_env=None):
     env["PATH"] = f"{fakebin}:{env['PATH']}"
     env["FAKE_REPO_ROOT"] = str(repo)
     env["FAKE_ORDER_LOG"] = str(repo / "order.log")
+    # Priority 1, requirement 10: every fake-adb invocation this run makes is
+    # logged here (see _fakebin's adb script) so a test can prove none at all
+    # happened before release-config succeeded.
+    env["FAKE_ADB_LOG"] = str(repo / "adb.log")
     env.setdefault("CALEE_TEST_EMAIL", SECRET_EMAIL)
     env.setdefault("CALEE_TEST_PASSWORD", SECRET_PASSWORD)
     if extra_env:
@@ -476,6 +490,131 @@ def test_launcher_one_run_id_machine_config_and_install_evidence(tmp_path):
         assert str(bundle) in a
 
 
+def test_launcher_verifies_bundle_and_composes_release_config_before_installing(tmp_path):
+    """Priority 1's required order: machine-config-snapshot -> verify-release-
+    bundle -> release-config -> install-tablet-release."""
+    repo = _copy_repo(tmp_path)
+    bundle = _external_bundle(tmp_path)
+    _machine_yaml(repo, bundle)
+    fakebin = _fakebin(tmp_path)
+
+    proc = _run_launcher(repo, fakebin, stdin="")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    order = (repo / "order.log").read_text().splitlines()
+
+    for cmd in ("machine-config-snapshot", "verify-release-bundle", "release-config", "install-tablet-release"):
+        assert cmd in order, f"{cmd!r} missing from order: {order}"
+    assert order.index("machine-config-snapshot") < order.index("verify-release-bundle")
+    assert order.index("verify-release-bundle") < order.index("release-config")
+    assert order.index("release-config") < order.index("install-tablet-release")
+
+    # release-config evidence recorded for this run, folding in the verified
+    # bundle manifest (Priority 1 requirement 5).
+    run_dir = _only_run_dir(repo)
+    release_cfg = json.loads((run_dir / "release-config" / "results.json").read_text())
+    assert release_cfg["status"] == "ok"
+    assert release_cfg["releaseId"] == "2026.07.20-rc1"
+
+    # "06" (delegated to by "00") CONSUMES the same evidence rather than
+    # recomputing -- its own release-config invocation (order.log records
+    # BOTH "00"'s and "06"'s calls when both actually run the real command)
+    # must not have overwritten it with a different run/composition.
+    assert order.count("release-config") >= 1
+
+
+def _machine_yaml_with_conflict(repo, bundle, *, report_dir="."):
+    """Like _machine_yaml, but the machine is NOT capable of a platform the
+    release candidate requires (no iPhone device, yet release-platforms.yaml
+    requires mobile_ios) -- release-config must BLOCK on this."""
+    (repo / "config" / "release-platforms.yaml").write_text(yaml.safe_dump({
+        "release_platforms": {"tablet": True, "mobile_android": True, "mobile_ios": True},
+        "release_features": {
+            "synchronization": True, "meals": True, "onboarding": True,
+            "google_calendar": True, "kiosk_admin": False,
+        },
+    }))
+    (repo / "config" / "machine.local.yaml").write_text(yaml.safe_dump({
+        "tablet_serial": "TAB123",
+        "expected_tablet_state": "logged_in_tablet",
+        "calee_package_id": "com.viso.calee",
+        "caleeshell_package_id": "com.viso.caleeshell",
+        "home_activity": "com.viso.caleeshell/.ui.LauncherActivity",
+        "calee_launch_action": "com.viso.calee.action.START",
+        "release_bundle_dir": str(bundle),
+        "backend_url": "https://hub-dev.calee.com.au",
+        "release_profile": "staging",
+        "report_dir": report_dir,
+        "mobile_platforms": ["android"],  # no ios -- conflicts with release-platforms.yaml above
+    }))
+
+
+def test_launcher_release_config_conflict_blocks_before_any_adb_command(tmp_path):
+    """Priority 1, requirement 10: when release-config BLOCKS (a machine/
+    release conflict here), NO mutating -- or indeed ANY -- adb command may
+    have occurred, install-tablet-release must never even start, and no
+    product test may run. Still produces ONE consolidated BLOCKED report."""
+    repo = _copy_repo(tmp_path)
+    bundle = _external_bundle(tmp_path)
+    _machine_yaml_with_conflict(repo, bundle)
+    fakebin = _fakebin(tmp_path)
+
+    proc = _run_launcher(repo, fakebin, stdin="", extra_env={"FAKE_CONSOLIDATE_EXIT": "3"})
+    order = (repo / "order.log").read_text().splitlines()
+
+    # release-config was attempted and blocked...
+    assert "verify-release-bundle" in order
+    assert "release-config" in order
+    # ...but installation, and every product test, never ran.
+    assert "install-tablet-release" not in order
+    assert "prepare" not in order and "suite" not in order
+    assert "sync-smoke" not in order and "kiosk-admin" not in order
+    assert "record-manual-checks" not in order
+
+    # No adb command of any kind ran -- the log is either empty or absent.
+    adb_log = repo / "adb.log"
+    adb_calls = adb_log.read_text().strip() if adb_log.is_file() else ""
+    assert adb_calls == "", f"adb was invoked before release-config succeeded: {adb_calls!r}"
+
+    # No installation evidence was ever written (nothing to mutate a device
+    # for was ever attempted) -- consolidate must record it as not-run,
+    # never fabricate a result.
+    run_dir = _only_run_dir(repo)
+    assert not (run_dir / "installation" / "results.json").is_file()
+
+    # release-config's own evidence records the blocking conflict.
+    release_cfg = json.loads((run_dir / "release-config" / "results.json").read_text())
+    assert release_cfg["status"] == "blocked"
+    assert any(c["blocking"] and c["field"] == "platform:ios" for c in release_cfg["conflicts"])
+
+    # Still ONE consolidated BLOCKED report -- the run never exits silently.
+    assert proc.returncode == 3
+    assert "consolidate" in order
+
+
+def test_launcher_invalid_bundle_blocks_before_release_config_and_any_adb_command(tmp_path):
+    """An invalid bundle stops at bundle verification -- release-config is
+    never even attempted, and no adb command runs."""
+    repo = _copy_repo(tmp_path)
+    bundle = _external_bundle(tmp_path)
+    manifest = json.loads((bundle / "release-manifest.json").read_text())
+    manifest["calee"]["sha256"] = "0" * 64  # corrupt checksum
+    (bundle / "release-manifest.json").write_text(json.dumps(manifest))
+    _machine_yaml(repo, bundle)
+    fakebin = _fakebin(tmp_path)
+
+    proc = _run_launcher(repo, fakebin, stdin="", extra_env={"FAKE_CONSOLIDATE_EXIT": "3"})
+    order = (repo / "order.log").read_text().splitlines()
+
+    assert "verify-release-bundle" in order
+    assert "release-config" not in order
+    assert "install-tablet-release" not in order
+
+    adb_log = repo / "adb.log"
+    adb_calls = adb_log.read_text().strip() if adb_log.is_file() else ""
+    assert adb_calls == "", f"adb was invoked before bundle verification passed: {adb_calls!r}"
+    assert proc.returncode == 3
+
+
 def test_launcher_manual_input_reaches_delegated_workflow(tmp_path):
     repo = _copy_repo(tmp_path)
     bundle = _external_bundle(tmp_path)
@@ -519,11 +658,17 @@ def test_launcher_missing_credentials_becomes_blocked(tmp_path):
 
 def test_launcher_invalid_bundle_still_consolidates(tmp_path):
     """Priority 7: an invalid bundle stops before the product tests, but the
-    launcher STILL consolidates -- it never exits without producing one report."""
+    launcher STILL consolidates -- it never exits without producing one report.
+
+    Priority 1 moved bundle verification to its own standalone step BEFORE
+    release-config/installation, so a corrupted bundle is now caught there --
+    install-tablet-release (and release-config) is never even attempted; see
+    test_launcher_invalid_bundle_blocks_before_release_config_and_any_adb_command
+    for the "no adb at all" proof. This test focuses on Priority 7's "still
+    consolidates" guarantee."""
     repo = _copy_repo(tmp_path)
     bundle = _external_bundle(tmp_path)
-    # Corrupt the manifest checksum so verify_release_bundle fails -> the real
-    # install-tablet-release returns INVALID (exit 2).
+    # Corrupt the manifest checksum so verify_release_bundle fails.
     manifest = json.loads((bundle / "release-manifest.json").read_text())
     manifest["calee"]["sha256"] = "0" * 64
     (bundle / "release-manifest.json").write_text(json.dumps(manifest))
@@ -534,15 +679,18 @@ def test_launcher_invalid_bundle_still_consolidates(tmp_path):
     proc = _run_launcher(repo, fakebin, stdin="", extra_env={"FAKE_CONSOLIDATE_EXIT": "3"})
     order = (repo / "order.log").read_text().splitlines()
 
-    # install ran (real) and the launcher STILL consolidated afterwards...
-    assert "install-tablet-release" in order
+    # verify-release-bundle ran (real) and caught the corruption; the launcher
+    # STILL consolidated afterwards...
+    assert "verify-release-bundle" in order
     assert "consolidate" in order
-    assert order.index("install-tablet-release") < order.index("consolidate")
-    # ...but NO product test ran after the invalid bundle.
+    assert order.index("verify-release-bundle") < order.index("consolidate")
+    # ...but installation/release-config/product tests never ran.
+    assert "install-tablet-release" not in order
+    assert "release-config" not in order
     assert "suite" not in order and "sync-smoke" not in order and "kiosk-admin" not in order
-    # The installation evidence is recorded INVALID, and the run exits BLOCKED.
-    install = json.loads((_only_run_dir(repo) / "installation" / "results.json").read_text())
-    assert install["status"] == "invalid"
+    # No installation evidence was ever written -- nothing was attempted.
+    assert not (_only_run_dir(repo) / "installation" / "results.json").is_file()
+    assert proc.returncode == 3
     assert proc.returncode == 3
 
 

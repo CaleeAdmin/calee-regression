@@ -63,6 +63,22 @@ STATUS_OK = "ok"
 STATUS_INVALID = "invalid"
 STATUS_BLOCKED = "blocked"
 
+# Release-manifest schema versions (Priority 2). Version 1 is the original,
+# implicit (no ``schemaVersion`` key), flat/``expectedInstalled`` shape parsed
+# below -- it carries ONLY the tablet-solution identity (releaseId, calee,
+# caleeShell) and relies on a separate config/release-platforms.yaml for
+# profile/backend/platform/feature scope. Version 2 folds that scope directly
+# into the release bundle manifest (top-level profile/backend/platforms/
+# features/caleeMobile, and calee/caleeShell nested under tabletSolution),
+# making the bundle self-contained and authoritative; release-platforms.yaml
+# is then not required. An explicit, unrecognised schemaVersion is rejected
+# up front rather than guessed at -- see selector_evidence.py's
+# SUPPORTED_SCHEMA_VERSIONS for the precedent this mirrors.
+RELEASE_MANIFEST_SCHEMA_V1 = 1
+RELEASE_MANIFEST_SCHEMA_V2 = 2
+SUPPORTED_MANIFEST_SCHEMA_VERSIONS = frozenset({RELEASE_MANIFEST_SCHEMA_V1, RELEASE_MANIFEST_SCHEMA_V2})
+VALID_RELEASE_PROFILES = frozenset({"staging", "production"})
+
 # Install-outcome classifications. Each non-OK value is a BLOCKED release
 # reason -- never a product FAIL, and never a trigger for a destructive
 # recovery action.
@@ -152,10 +168,77 @@ class AppRelease:
 
 
 @dataclass
+class PlatformScope:
+    """Schema-v2 top-level ``platforms`` block -- the release's platform
+    scope, folded into the bundle manifest itself instead of living only in
+    the separate config/release-platforms.yaml (schema v1)."""
+
+    tablet: bool = True
+    mobile_android: bool = True
+    mobile_ios: bool = True
+
+    def to_dict(self) -> dict:
+        return {"tablet": self.tablet, "mobileAndroid": self.mobile_android, "mobileIos": self.mobile_ios}
+
+
+@dataclass
+class FeatureScope:
+    """Schema-v2 top-level ``features`` block -- the release's feature scope."""
+
+    synchronization: bool = True
+    meals: bool = True
+    onboarding: bool = True
+    google_calendar: bool = True
+    kiosk_admin: bool = True
+    notifications: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "synchronization": self.synchronization,
+            "meals": self.meals,
+            "onboarding": self.onboarding,
+            "googleCalendar": self.google_calendar,
+            "kioskAdmin": self.kiosk_admin,
+            "notifications": self.notifications,
+        }
+
+
+@dataclass
+class CaleeMobileExpected:
+    """Schema-v2 top-level ``caleeMobile`` block -- the expected CaleeMobile
+    identity + certification requirements, authoritative in the bundle
+    manifest itself rather than only in release-platforms.yaml."""
+
+    version: "str | None" = None
+    git_sha: "str | None" = None
+    selector_evidence_required: bool = True
+    distributed_build_acceptance_required: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "version": self.version,
+            "gitSha": self.git_sha,
+            "selectorEvidenceRequired": self.selector_evidence_required,
+            "distributedBuildAcceptanceRequired": self.distributed_build_acceptance_required,
+        }
+
+
+@dataclass
 class ReleaseManifest:
     release_id: "str | None" = None
     calee: "AppRelease | None" = None
     caleeshell: "AppRelease | None" = None
+    # Priority 2: defaults to schema version 1 (the original, implicit shape)
+    # when a manifest carries no ``schemaVersion`` key at all -- every bundle
+    # verified before schema v2 existed is still valid, unchanged.
+    schema_version: int = RELEASE_MANIFEST_SCHEMA_V1
+    # Schema-v2-only fields (None for a v1 manifest -- release-platforms.yaml
+    # is the source of truth for these instead; see release_config.py).
+    profile: "str | None" = None
+    backend: "str | None" = None
+    platforms: "PlatformScope | None" = None
+    features: "FeatureScope | None" = None
+    calee_mobile: "CaleeMobileExpected | None" = None
 
     def included_apps(self) -> "list[AppRelease]":
         """Apps whose APK this release installs (installArtifact/included)."""
@@ -167,12 +250,24 @@ class ReleaseManifest:
         check verifies after reboot. An unchanged app is never dropped here."""
         return [a for a in (self.calee, self.caleeshell) if a is not None and a.has_expected]
 
+    @property
+    def is_schema_v2(self) -> bool:
+        return self.schema_version == RELEASE_MANIFEST_SCHEMA_V2
+
     def to_dict(self) -> dict:
-        return {
+        d = {
             "releaseId": self.release_id,
+            "schemaVersion": self.schema_version,
             "calee": self.calee.to_dict() if self.calee else None,
             "caleeShell": self.caleeshell.to_dict() if self.caleeshell else None,
         }
+        if self.is_schema_v2:
+            d["profile"] = self.profile
+            d["backend"] = self.backend
+            d["platforms"] = self.platforms.to_dict() if self.platforms else None
+            d["features"] = self.features.to_dict() if self.features else None
+            d["caleeMobile"] = self.calee_mobile.to_dict() if self.calee_mobile else None
+        return d
 
 
 _EXPECTED_PACKAGE = {"calee": CALEE_PACKAGE_ID, "caleeShell": CALEESHELL_PACKAGE_ID}
@@ -298,21 +393,144 @@ def _parse_app(key: str, raw: Any, errors: "list[str]") -> "AppRelease | None":
     return app
 
 
+def _parse_platform_scope(raw: Any, errors: "list[str]") -> "PlatformScope | None":
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        errors.append("manifest.platforms must be an object.")
+        return None
+    return PlatformScope(
+        tablet=bool(raw.get("tablet", True)),
+        mobile_android=bool(raw.get("mobileAndroid", True)),
+        mobile_ios=bool(raw.get("mobileIos", True)),
+    )
+
+
+def _parse_feature_scope(raw: Any, errors: "list[str]") -> "FeatureScope | None":
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        errors.append("manifest.features must be an object.")
+        return None
+    return FeatureScope(
+        synchronization=bool(raw.get("synchronization", True)),
+        meals=bool(raw.get("meals", True)),
+        onboarding=bool(raw.get("onboarding", True)),
+        google_calendar=bool(raw.get("googleCalendar", True)),
+        kiosk_admin=bool(raw.get("kioskAdmin", True)),
+        notifications=bool(raw.get("notifications", True)),
+    )
+
+
+def _parse_calee_mobile_expected(raw: Any, errors: "list[str]") -> "CaleeMobileExpected | None":
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        errors.append("manifest.caleeMobile must be an object.")
+        return None
+    version = raw.get("version")
+    git_sha = raw.get("gitSha")
+    if version is not None and not is_wellformed_version(version):
+        errors.append(
+            f"manifest.caleeMobile.version {version!r} is not a recognisable version "
+            f"(e.g. 0.0.24+24)."
+        )
+    if git_sha is not None and not is_full_git_sha(git_sha):
+        errors.append(
+            f"manifest.caleeMobile.gitSha {git_sha!r} must be a full 40-character Git SHA; an "
+            f"abbreviated SHA is ambiguous and is rejected."
+        )
+    return CaleeMobileExpected(
+        version=version,
+        git_sha=git_sha,
+        selector_evidence_required=bool(raw.get("selectorEvidenceRequired", True)),
+        distributed_build_acceptance_required=bool(raw.get("distributedBuildAcceptanceRequired", True)),
+    )
+
+
 def parse_manifest(raw: Any) -> "tuple[ReleaseManifest, list[str]]":
     """Parse a raw manifest dict into a ReleaseManifest plus a list of schema
-    errors (empty when valid). Pure -- no filesystem access."""
+    errors (empty when valid). Pure -- no filesystem access.
+
+    Schema version (Priority 2): an absent ``schemaVersion`` means version 1 --
+    the original flat shape, ``calee``/``caleeShell`` at the top level, no
+    profile/backend/platform/feature scope (that lives in the separate
+    config/release-platforms.yaml instead; see release_config.py). Version 2
+    nests the app identities under ``tabletSolution`` and requires
+    ``profile``/``backend``/``platforms``/``features``/``caleeMobile`` at the
+    top level, making the bundle self-contained and authoritative for release
+    scope -- release-platforms.yaml is then not consulted for it. Any other
+    ``schemaVersion`` is rejected up front rather than guessed at.
+    """
     errors: "list[str]" = []
     if not isinstance(raw, dict):
         return ReleaseManifest(), ["release-manifest.json must contain a JSON object at the top level."]
+
+    schema_version = raw.get("schemaVersion", RELEASE_MANIFEST_SCHEMA_V1)
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in SUPPORTED_MANIFEST_SCHEMA_VERSIONS
+    ):
+        errors.append(
+            f"manifest.schemaVersion {raw.get('schemaVersion')!r} is not supported "
+            f"(supported: {sorted(SUPPORTED_MANIFEST_SCHEMA_VERSIONS)})."
+        )
+        return ReleaseManifest(), errors
 
     release_id = raw.get("releaseId")
     if not isinstance(release_id, str) or not release_id.strip():
         errors.append("manifest.releaseId is required and must be a non-empty string.")
 
-    calee = _parse_app("calee", raw.get("calee"), errors)
-    caleeshell = _parse_app("caleeShell", raw.get("caleeShell"), errors)
+    profile = backend = None
+    platforms = features = calee_mobile = None
 
-    manifest = ReleaseManifest(release_id=release_id, calee=calee, caleeshell=caleeshell)
+    if schema_version == RELEASE_MANIFEST_SCHEMA_V2:
+        tablet_solution = raw.get("tabletSolution")
+        if not isinstance(tablet_solution, dict):
+            errors.append("manifest.tabletSolution is required and must be an object for schemaVersion 2.")
+            tablet_solution = {}
+        calee = _parse_app("calee", tablet_solution.get("calee"), errors)
+        caleeshell = _parse_app("caleeShell", tablet_solution.get("caleeShell"), errors)
+
+        profile = raw.get("profile")
+        if profile is None:
+            errors.append("manifest.profile is required for schemaVersion 2.")
+        elif profile not in VALID_RELEASE_PROFILES:
+            errors.append(f"manifest.profile {profile!r} must be one of {sorted(VALID_RELEASE_PROFILES)}.")
+
+        backend = raw.get("backend")
+        if backend is None:
+            errors.append("manifest.backend is required for schemaVersion 2.")
+        elif not isinstance(backend, str) or not backend.strip():
+            errors.append("manifest.backend must be a non-empty string.")
+
+        if raw.get("platforms") is None:
+            errors.append("manifest.platforms is required for schemaVersion 2.")
+        platforms = _parse_platform_scope(raw.get("platforms"), errors)
+
+        if raw.get("features") is None:
+            errors.append("manifest.features is required for schemaVersion 2.")
+        features = _parse_feature_scope(raw.get("features"), errors)
+
+        if raw.get("caleeMobile") is None:
+            errors.append("manifest.caleeMobile is required for schemaVersion 2.")
+        calee_mobile = _parse_calee_mobile_expected(raw.get("caleeMobile"), errors)
+    else:
+        calee = _parse_app("calee", raw.get("calee"), errors)
+        caleeshell = _parse_app("caleeShell", raw.get("caleeShell"), errors)
+
+    manifest = ReleaseManifest(
+        release_id=release_id,
+        calee=calee,
+        caleeshell=caleeshell,
+        schema_version=schema_version,
+        profile=profile,
+        backend=backend,
+        platforms=platforms,
+        features=features,
+        calee_mobile=calee_mobile,
+    )
     if not manifest.included_apps():
         errors.append(
             "A release bundle must install at least one app (calee and/or caleeShell) with "

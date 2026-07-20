@@ -2745,37 +2745,123 @@ def run_with_credentials_cmd(command):
         raise SystemExit(EXIT_BLOCKED)
 
 
-@main.command("release-config")
-@click.option("--config", "config_path", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
-@click.option("--release-platforms", "platforms_path", envvar="CALEE_RELEASE_PLATFORMS", default=None, type=click.Path(), help="Path to release-platforms.yaml (the release candidate manifest).")
-@click.option("--release-id", "release_id_opt", envvar="CALEE_RELEASE_ID", default=None, help="Release candidate id (from the bundle manifest).")
-@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True, help="Shared release run ID (run_context.py).")
-def release_config_cmd(config_path, platforms_path, release_id_opt, run_id_opt):
-    """Compose the ONE effective RELEASE configuration for this run (Priority 3).
-
-    Combines the MACHINE config (how/where a run executes) with the RELEASE
-    CANDIDATE manifest (config/release-platforms.yaml -- what the release is)
-    under one precedence rule: the release candidate is authoritative for scope
-    (platforms, features, profile, expected identities, backend), and the
-    machine must be consistent with and capable of it. Any disagreement or
-    missing capability is a CONFLICT that BLOCKS. Writes the composed config +
-    every conflict decision to reports/runs/<run-id>/release-config/results.json
-    and emits eval-able RELEASE_* assignments (enabled platforms, device ids,
-    selected backend, profile) so the composition actually drives execution.
-    """
+def _emit_release_config_vars(workspace: run_context.RunWorkspace, effective_dict: dict) -> None:
+    """Emits the eval-able RELEASE_* shell assignments launchers "00"/"06"
+    source, from an ``EffectiveReleaseConfig.to_dict()`` payload (freshly
+    composed OR loaded back from this run's own already-written evidence --
+    see release_config_cmd's reuse-not-recompute path)."""
     import shlex as _shlex
 
-    import yaml as _yaml
+    def _emit(name, value):
+        click.echo(f"RELEASE_{name}={_shlex.quote(str('' if value is None else value))}")
 
-    from . import machine_config as machine_mod
-    from . import release_config as rc_mod
-    from . import release_platforms as rp_mod
+    release_selections = effective_dict.get("releaseSelections") or {}
+    machine_selections = effective_dict.get("machineSelections") or {}
+    device_ids = effective_dict.get("deviceIds") or {}
+    enabled_platforms = release_selections.get("enabledPlatforms") or []
 
+    _emit("EFFECTIVE_CONFIG", str(workspace.component_report_path("release-config")))
+    _emit("PROFILE", release_selections.get("profile"))
+    _emit("SELECTED_BACKEND", release_selections.get("selectedBackend") or "")
+    _emit("PLATFORM_TABLET", "true" if "tablet" in enabled_platforms else "false")
+    _emit("PLATFORM_ANDROID", "true" if "android" in enabled_platforms else "false")
+    _emit("PLATFORM_IOS", "true" if "ios" in enabled_platforms else "false")
+    _emit("ENABLED_FEATURES", ",".join(release_selections.get("enabledFeatures") or []))
+    _emit("TABLET_SERIAL", device_ids.get("tablet") or "")
+    _emit("IPHONE_DEVICE", device_ids.get("ios") or "")
+    _emit("ANDROID_DEVICE", device_ids.get("android") or "")
+    _emit("REPORT_ROOT", machine_selections.get("reportRoot") or "")
+
+
+_RELEASE_CONFIG_REQUIRED_KEYS = {"status", "machineSelections", "releaseSelections", "deviceIds", "conflicts"}
+
+
+@main.command("release-config")
+@click.option("--config", "config_path", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
+@click.option("--release-platforms", "platforms_path", envvar="CALEE_RELEASE_PLATFORMS", default=None, type=click.Path(), help="Path to release-platforms.yaml (schema-v1 release candidate manifest).")
+@click.option("--release-id", "release_id_opt", envvar="CALEE_RELEASE_ID", default=None, help="Release candidate id override; a schema-v2 bundle manifest's releaseId is authoritative and a mismatch BLOCKS.")
+@click.option("--bundle", "bundle_path", default=None, type=click.Path(), help="Path to the release bundle directory. When given, it is verified and folded into this composition (Priority 1/2). Omit for a bundle-less diagnostic/dev run.")
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True, help="Shared release run ID (run_context.py).")
+def release_config_cmd(config_path, platforms_path, release_id_opt, bundle_path, run_id_opt):
+    """Compose the ONE effective RELEASE configuration for this run (Priority 3),
+    or -- when this run already recorded one -- CONSUME that same evidence
+    instead of recomputing a second, possibly-different composition (Priority 1).
+
+    Combines the MACHINE config (how/where a run executes) with the RELEASE
+    CANDIDATE -- the verified release bundle manifest when schema version 2
+    (authoritative for scope: platforms, features, profile, backend, expected
+    identity; config/release-platforms.yaml is then not consulted), else
+    config/release-platforms.yaml (schema version 1) -- under one precedence
+    rule: the release candidate is authoritative for scope, and the machine
+    must be consistent with and capable of it. Any disagreement or missing
+    capability is a CONFLICT that BLOCKS. Writes the composed config, the full
+    pre-install identity comparison matrix, and every conflict decision to
+    reports/runs/<run-id>/release-config/results.json, and emits eval-able
+    RELEASE_* assignments (enabled platforms, device ids, selected backend,
+    profile) so the composition actually drives execution.
+
+    Idempotent per run: called a second time for the SAME run ID (e.g. by "06"
+    after "00" already composed it), this reuses and re-validates the
+    already-written evidence instead of recomposing -- rejecting it if it is
+    missing, malformed, stale, or was written for a different run.
+    """
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
     workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
     workspace.ensure_created()
+
+    existing_path = workspace.component_report_path("release-config")
+    if existing_path.is_file():
+        # Priority 1: launcher 06 must CONSUME the same-run release-config
+        # evidence launcher 00 already composed, never recompute a second,
+        # possibly-different one. Reject missing/malformed/stale/wrong-run
+        # evidence rather than silently trusting or silently recomposing it.
+        try:
+            existing_report = json.loads(existing_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            click.echo(f"This run's release-config evidence at {existing_path} is unreadable: {exc}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        run_manifest = _load_or_init_manifest(workspace)
+        run_started_at_epoch = None
+        if run_manifest.started_at:
+            try:
+                run_started_at_epoch = time.mktime(time.strptime(run_manifest.started_at, "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                run_started_at_epoch = None
+        try:
+            run_context.validate_component_report(
+                existing_report, report_path=existing_path, run_id=run_id_opt, workspace=workspace,
+                component="release-config", run_started_at_epoch=run_started_at_epoch,
+            )
+        except run_context.RunIdError as exc:
+            click.echo(f"This run's release-config evidence was rejected: {exc}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        if not _RELEASE_CONFIG_REQUIRED_KEYS.issubset(existing_report):
+            click.echo(
+                f"This run's release-config evidence at {existing_path} is malformed "
+                f"(missing one of {sorted(_RELEASE_CONFIG_REQUIRED_KEYS)}).", err=True,
+            )
+            raise SystemExit(EXIT_BLOCKED)
+        _emit_release_config_vars(workspace, existing_report)
+        if existing_report.get("status") != "ok":  # matches release_config.STATUS_OK
+            click.echo(click.style(
+                "[BLOCKED] Reusing this run's already-composed (and already-BLOCKED) release configuration "
+                "-- see the detail above/in the report.", fg="red",
+            ), err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        click.echo(click.style(
+            f"[OK] Reusing this run's already-composed effective release configuration for {run_id_opt}.",
+            fg="green",
+        ), err=True)
+        raise SystemExit(EXIT_SUCCESS)
+
+    import yaml as _yaml
+
+    from . import machine_config as machine_mod
+    from . import release_config as rc_mod
+    from . import release_installer as ri_mod
+    from . import release_platforms as rp_mod
 
     def _record(payload: dict, exit_code: int) -> None:
         payload = {"runId": run_id_opt, **payload}
@@ -2794,6 +2880,29 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, run_id_opt):
         click.echo(str(exc), err=True)
         raise SystemExit(EXIT_BLOCKED)
 
+    # Priority 1: verify and parse the release bundle -- WITHOUT touching any
+    # device -- before composing. Its manifest feeds the composition below
+    # (schema v2: authoritative for scope; schema v1: cross-checked against
+    # release-platforms.yaml). Only when EXPLICITLY given --bundle (the
+    # launcher always passes the machine's release_bundle_dir) -- a bare
+    # dev/diagnostic `release-config` invocation with no --bundle composes
+    # exactly as before Priority 2 existed, even if a machine config happens
+    # to declare a release_bundle_dir for unrelated (installation) purposes.
+    bundle_manifest = None
+    if bundle_path:
+        verification = ri_mod.verify_release_bundle(bundle_path)
+        if not verification.ok:
+            _record({
+                "status": STATUS_BLOCKED,
+                "detail": ["Release bundle failed verification:"] + list(verification.errors),
+                "bundleVerification": verification.to_dict(),
+            }, EXIT_BLOCKED)
+            click.echo(click.style("[BLOCKED] Release bundle failed verification:", fg="red"), err=True)
+            for err in verification.errors:
+                click.echo(f"  - {err}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        bundle_manifest = verification.manifest
+
     try:
         platforms = rp_mod.load_release_platforms(platforms_path)
         features = rp_mod.load_release_features(platforms_path)
@@ -2805,6 +2914,8 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, run_id_opt):
 
     # Optional release-candidate extras (backend/environment pin + distributed
     # build acceptance) read from the same release-platforms.yaml top level.
+    # Schema v2 does not consult release-platforms.yaml at all -- the bundle
+    # manifest is authoritative -- so these are only meaningful for schema v1.
     expected_backend = None
     distributed_build_required = False
     resolved_platforms_path = Path(platforms_path) if platforms_path else rp_mod.DEFAULT_CONFIG_PATH
@@ -2822,24 +2933,11 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, run_id_opt):
         machine, platforms, features, expected,
         run_id=run_id_opt, release_id=release_id_opt,
         expected_backend=expected_backend, distributed_build_required=distributed_build_required,
+        bundle_manifest=bundle_manifest,
     )
     exit_code = EXIT_SUCCESS if effective.ok else EXIT_BLOCKED
     _record(effective.to_dict(), exit_code)
-
-    def _emit(name, value):
-        click.echo(f"RELEASE_{name}={_shlex.quote(str('' if value is None else value))}")
-
-    _emit("EFFECTIVE_CONFIG", str(workspace.component_report_path("release-config")))
-    _emit("PROFILE", effective.profile)
-    _emit("SELECTED_BACKEND", effective.selected_backend or "")
-    _emit("PLATFORM_TABLET", "true" if "tablet" in effective.enabled_platforms else "false")
-    _emit("PLATFORM_ANDROID", "true" if "android" in effective.enabled_platforms else "false")
-    _emit("PLATFORM_IOS", "true" if "ios" in effective.enabled_platforms else "false")
-    _emit("ENABLED_FEATURES", ",".join(effective.enabled_features))
-    _emit("TABLET_SERIAL", effective.tablet_serial or "")
-    _emit("IPHONE_DEVICE", effective.iphone_device or "")
-    _emit("ANDROID_DEVICE", effective.android_device or "")
-    _emit("REPORT_ROOT", effective.report_root or "")
+    _emit_release_config_vars(workspace, effective.to_dict())
 
     if not effective.ok:
         click.echo(click.style("[BLOCKED] Machine/release configuration conflict:", fg="red"), err=True)

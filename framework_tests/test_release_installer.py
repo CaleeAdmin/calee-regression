@@ -294,6 +294,143 @@ def test_parse_manifest_reports_all_errors_at_once():
     assert "gitSha" in joined
 
 
+def test_manifest_with_no_schema_version_defaults_to_v1():
+    manifest, errors = parse_manifest({
+        "releaseId": "r1",
+        "calee": {"included": True, "packageId": "com.viso.calee", "versionName": "founder-v0.3.25",
+                  "versionCode": 325, "gitSha": CALEE_SHA, "apk": "calee.apk", "sha256": "0" * 64},
+    })
+    assert errors == []
+    assert manifest.schema_version == 1
+    assert manifest.is_schema_v2 is False
+    assert manifest.profile is None and manifest.platforms is None
+
+
+# ── schema version 2 (Priority 2: canonical release manifest) ────────────
+
+
+def _v2_manifest(**overrides):
+    base = {
+        "schemaVersion": 2,
+        "releaseId": "2026.07.20-rc3",
+        "profile": "staging",
+        "backend": "https://hub-dev.calee.com.au",
+        "platforms": {"tablet": True, "mobileAndroid": False, "mobileIos": True},
+        "features": {
+            "synchronization": True, "meals": True, "onboarding": True,
+            "googleCalendar": True, "kioskAdmin": True, "notifications": True,
+        },
+        "tabletSolution": {
+            "calee": {
+                "installArtifact": True, "apk": "calee.apk", "sha256": "0" * 64,
+                "expectedInstalled": {
+                    "packageId": "com.viso.calee", "versionName": "founder-v0.3.26",
+                    "versionCode": 326, "gitSha": CALEE_SHA, "signerSha256": "1" * 64,
+                },
+            },
+            "caleeShell": {
+                "installArtifact": False,
+                "expectedInstalled": {
+                    "packageId": "com.viso.caleeshell", "versionName": "founder-v0.2.12",
+                    "versionCode": 212, "gitSha": SHELL_SHA, "signerSha256": "2" * 64,
+                },
+            },
+        },
+        "caleeMobile": {
+            "version": "0.0.24+24", "gitSha": "c" * 40,
+            "selectorEvidenceRequired": True, "distributedBuildAcceptanceRequired": True,
+        },
+    }
+    base.update(overrides)
+    return base
+
+
+def test_v2_manifest_parses_authoritative_scope_and_identity():
+    manifest, errors = parse_manifest(_v2_manifest())
+    assert errors == [], errors
+    assert manifest.schema_version == 2
+    assert manifest.is_schema_v2 is True
+    assert manifest.release_id == "2026.07.20-rc3"
+    assert manifest.profile == "staging"
+    assert manifest.backend == "https://hub-dev.calee.com.au"
+    assert manifest.platforms.tablet is True and manifest.platforms.mobile_android is False
+    assert manifest.features.kiosk_admin is True and manifest.features.notifications is True
+    assert manifest.calee.package_id == "com.viso.calee" and manifest.calee.version_code == 326
+    assert manifest.caleeshell.install_artifact is False and manifest.caleeshell.version_name == "founder-v0.2.12"
+    assert manifest.calee_mobile.version == "0.0.24+24" and manifest.calee_mobile.git_sha == "c" * 40
+
+
+def test_v2_manifest_missing_tablet_solution_is_rejected():
+    raw = _v2_manifest()
+    del raw["tabletSolution"]
+    manifest, errors = parse_manifest(raw)
+    assert any("tabletSolution" in e for e in errors)
+
+
+def test_v2_manifest_missing_profile_backend_platforms_features_caleemobile_is_rejected():
+    raw = _v2_manifest()
+    del raw["profile"]
+    del raw["backend"]
+    del raw["platforms"]
+    del raw["features"]
+    del raw["caleeMobile"]
+    manifest, errors = parse_manifest(raw)
+    joined = "\n".join(errors)
+    assert "manifest.profile is required" in joined
+    assert "manifest.backend is required" in joined
+    assert "manifest.platforms is required" in joined
+    assert "manifest.features is required" in joined
+    assert "manifest.caleeMobile is required" in joined
+
+
+def test_v2_manifest_invalid_profile_value_is_rejected():
+    manifest, errors = parse_manifest(_v2_manifest(profile="prod"))
+    assert any("manifest.profile" in e for e in errors)
+
+
+def test_v2_manifest_abbreviated_caleemobile_sha_is_rejected():
+    raw = _v2_manifest()
+    raw["caleeMobile"]["gitSha"] = "short"
+    manifest, errors = parse_manifest(raw)
+    assert any("caleeMobile.gitSha" in e for e in errors)
+
+
+def test_v2_manifest_malformed_caleemobile_version_is_rejected():
+    raw = _v2_manifest()
+    raw["caleeMobile"]["version"] = "latest"
+    manifest, errors = parse_manifest(raw)
+    assert any("caleeMobile.version" in e for e in errors)
+
+
+def test_unsupported_schema_version_is_rejected_up_front():
+    manifest, errors = parse_manifest({"schemaVersion": 3, "releaseId": "r1"})
+    assert len(errors) == 1
+    assert "schemaVersion" in errors[0] and "not supported" in errors[0]
+    # No partial parse is attempted once the schema version itself is unknown.
+    assert manifest.calee is None and manifest.release_id is None
+
+
+def test_non_integer_schema_version_is_rejected():
+    manifest, errors = parse_manifest({"schemaVersion": "2", "releaseId": "r1"})
+    assert any("schemaVersion" in e for e in errors)
+
+
+def test_v2_manifest_verifies_as_a_full_bundle(tmp_path):
+    bundle = tmp_path / "v2-bundle"
+    bundle.mkdir()
+    calee_bytes = b"calee-v2-apk-bytes"
+    (bundle / "calee.apk").write_bytes(calee_bytes)
+    manifest = _v2_manifest()
+    manifest["tabletSolution"]["calee"]["sha256"] = _sha256(calee_bytes)
+    (bundle / "release-manifest.json").write_text(json.dumps(manifest))
+    (bundle / "checksums.sha256").write_text(f"{_sha256(calee_bytes)}  calee.apk\n")
+    result = verify_release_bundle(bundle)
+    assert result.ok, result.errors
+    assert result.manifest.is_schema_v2
+    assert result.manifest.profile == "staging"
+    assert {a.key for a in result.verified_apps} == {"calee"}
+
+
 # ── install-command construction + ordering ──────────────────────────────
 
 

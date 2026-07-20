@@ -59,14 +59,24 @@ echo ""
 # convenient to run right now.
 eval "$(python -m calee_regression release-platforms)"
 
-# Priority 3/4: when a machine config exists, compose the ONE effective release
-# configuration (machine + release candidate) and let it drive this launcher --
-# so the MACHINE's platform scope + device ids reach 06, not just the release
-# candidate's. The composed RELEASE_PLATFORM_* (machine capability ∩ release
-# scope) overrides the release-platforms-only values above, the configured
-# iPhone/Android device ids are exported for the UI suite, and a machine/release
-# conflict BLOCKS (recorded in the run's release-config evidence). Absent a
-# machine config (CI/example), the release-platforms defaults above stand.
+# Priority 3/4: when a machine config exists, the ONE effective release
+# configuration (machine + release candidate/bundle manifest) drives this
+# launcher -- so the MACHINE's platform scope + device ids reach 06, not just
+# the release candidate's. The composed RELEASE_PLATFORM_* (machine capability
+# ∩ release scope) overrides the release-platforms-only values above, the
+# configured iPhone/Android device ids are exported for the UI suite, and a
+# machine/release conflict BLOCKS (recorded in the run's release-config
+# evidence). Absent a machine config (CI/example), the release-platforms
+# defaults above stand.
+#
+# Priority 1: when launcher "00" already composed this run's release-config
+# (before installing the release), this command CONSUMES that same-run
+# evidence and does NOT recompute a second, possibly-different composition --
+# see calee_regression/cli.py's release_config_cmd, which detects the
+# already-written reports/runs/$CALEE_RUN_ID/release-config/results.json and
+# re-validates + re-emits it instead of composing again. Run standalone (no
+# "00" delegation), no such evidence exists yet, so this composes it fresh,
+# exactly as before Priority 1.
 if [ -f config/machine.local.yaml ]; then
     if RELEASE_CFG_OUT="$(python -m calee_regression release-config --run-id "$CALEE_RUN_ID" 2>/dev/null)"; then
         RELEASE_CFG_STATUS=0
