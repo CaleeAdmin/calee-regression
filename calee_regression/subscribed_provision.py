@@ -104,9 +104,12 @@ class SubscribedProvisionResult:
         }
 
 
-# The authenticated regression endpoint the real provisioner calls. It is
-# APP_ENV-gated off in production and scoped to the dedicated regression account
-# server-side (see the calee-hub-core regression provisioning PR).
+# The authenticated regression endpoint the real provisioner calls. This is the
+# REQUIRED backend contract, NOT yet implemented in calee-hub-core: the backend
+# owners must expose it (admin-authenticated, scoped to the dedicated regression
+# account, APP_ENV-gated off in production, audited, deterministic replace, and
+# never an unauthenticated reset). Until it ships, provisioning records BLOCKED
+# and is never faked. See docs/SUBSCRIBED_CALENDAR_REGRESSION.md for the contract.
 PROVISION_ENDPOINT_PATH = "/v1/admin/regression/subscribed-source"
 
 
