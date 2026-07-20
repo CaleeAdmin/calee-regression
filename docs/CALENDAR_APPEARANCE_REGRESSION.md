@@ -378,13 +378,25 @@ change; not attempted here, and not faked.
 Stated as plainly as `docs/SUBSCRIBED_CALENDAR_REGRESSION.md` already does
 for the subscription type:
 
+**Update (Phase 5): these fixtures now have machine-readable CONTRACTS** --
+`CaleeMobile-Regression/api/caleemobile_regression/appearance_fixtures.py`
+defines each one deterministically (name, `serviceId:rawCalendarId` public id,
+`appearanceMode`, the exact capability set it must expose, and its precise
+secure provisioning requirement), validated offline against the fake server's
+capability taxonomy (`tests/test_appearance_fixtures.py`) so a fixture's
+declared capabilities can never drift from the backend contract. What is still
+BLOCKED is **real provisioning** (a live backend / second account / Google
+connection), reported honestly by `real_environment_status(...)` -- the
+contract exists; the live fixture does not.
+
 | Calendar type | `appearanceMode` | Fixture status |
 |---|---|---|
-| Subscription | `subscription_mapping` | **Provisioned** -- reuses the existing REG-SUB fixture (`fixtures/subscribed_calendar/reg_sub_calendar.ics`, calendar id `regression:regsub`, display name `REG-SUB Regression Subscription` from its `X-WR-CALNAME`). Still needs the hub backend + a prepared tablet to actually load it -- BLOCKED here, not because the fixture is undefined. |
-| Owned CalDAV | `source_metadata` | **Not provisioned.** No deterministic, uniquely-named REG-* calendar fixture exists in this repo today (only REG-EVENT-*/REG-TASK-*/REG-CHORE-* *records* are documented in `docs/TEST_DATA_RESET_CONTRACT.md`, which imply an owned calendar exists behind them but never name it). This doc **proposes** a new entry, `REG-OWNED-CALENDAR-APPEARANCE-001`, provisioned the same way the rest of the REG-* fixture is -- ordinary `POST /client/v1/calendars` via the Calee Client API (calee-hub-core has no seed/test-data endpoint). **Not implemented anywhere in this repo or `CaleeMobile-Regression` as of this change.** |
-| External calendar | `external_calendar` | **Not provisioned; now targeted by `calendar_appearance_external.yaml`** (destructive-action absence guard + appearance editing). This doc **proposes** `REG-EXTERNAL-GOOGLE-CALENDAR-001`: a dedicated calendar in a regression-owned Google account, connected via the hub's external calendar connection flow, display name `REG-EXT Google Calendar`. **Not implemented anywhere as of this change** -- the scenario stays BLOCKED on provisioning. |
-| Subscription (partial-override flow) | `subscription_mapping` | **Not provisioned.** `run_partial_appearance_override_flow` needs a SECOND, pristine subscription (`REG-SUB-PARTIAL`, proposed calendar id `regression:regsub-partial`) whose name/colour have never been locally overridden -- the main REG-SUB fixture is renamed by `run_calendar_appearance_sync_flow` earlier in the same `run_all_sync_flows` pass. Also needs the upstream-source mutation plumbing described in `SOURCE_SIMULATION_NOT_WIRED_DETAIL` (rewriting the feed's `X-WR-CALNAME`/colour and re-serving it). **Not implemented as of this change.** |
-| Shared read-only CalDAV | `unsupported` | **Not provisioned -- the hardest of the three.** Proposes `REG-SHARED-READONLY-CALENDAR-001`: a calendar owned by a *second* regression-owned account, shared read-only to the primary regression account under test. Unlike the owned-calendar proposal above, this cannot be provisioned via ordinary single-account CRUD -- it needs either a second regression account to share from, or a backend admin/fixture endpoint that does not exist today. **Not implemented anywhere in this repo or its siblings as of this change.** |
+| Subscription | `subscription_mapping` | **Contract: `REG-SUB-APPEARANCE`** (reuses the existing REG-SUB feed, `fixtures/subscribed_calendar/reg_sub_calendar.ics`, public id `regression:regsub`). Real provisioning still needs the hub backend + prepared tablet -- BLOCKED, not undefined. |
+| Owned CalDAV | `source_metadata` | **Contract: `REG-OWNED-APPEARANCE`** (public id `regression-owned:reg-owned-appearance`). Provisionable via ordinary `POST /client/v1/calendars` -- but still needs a live hub backend, so BLOCKED here. |
+| External calendar | `external_calendar` | **Contract: `REG-EXTERNAL-CALENDAR`** (public id `external:reg-external-google`, reader role → events non-editable). Real provisioning needs a regression-owned Google account connected via the hub's external-calendar flow -- BLOCKED. |
+| Subscription (partial-override flow) | `subscription_mapping` | **Contract: `REG-SUB-PARTIAL`** (public id `regression:regsub-partial`, must start with no local override). Real provisioning needs a SECOND pristine feed + upstream-source mutation plumbing (`SOURCE_SIMULATION_NOT_WIRED_DETAIL`) -- BLOCKED. |
+| Shared read-only CalDAV | `unsupported` | **Contract: `REG-SHARED-READONLY`** (public id `regression-shared:reg-shared-readonly`, `canEditAppearance=false`). Real provisioning needs a second regression account to share from (not single-account CRUD) -- BLOCKED, the hardest of the set. |
+| Two services, same raw id | `subscription_mapping` | **Contracts: `REG-SERVICE-A-DUPLICATE-ID` / `REG-SERVICE-B-DUPLICATE-ID`** -- same `rawCalendarId` (`shared-raw-id`), distinct public ids, proving service isolation (Calee `hubCalendarKey` / hub-core `client_api_public_calendar_id`). Real provisioning needs a two-service fixture -- BLOCKED. |
 
 None of these proposed fixture entries are added to
 `docs/TEST_DATA_RESET_CONTRACT.md` itself in this change -- that document
