@@ -34,16 +34,20 @@ ANY point:
     an atomic-publish transaction are what ``build_fn`` writes and what is
     already recorded on disk from a previous successful publish;
   * old versions are deleted only AFTER the pointer switch is verified;
-  * a lock file (created with ``O_CREAT | O_EXCL``, containing the owning
-    host, PID, a random owner token, and a lease/acquisition timestamp)
-    serialises concurrent writers to the same publication root -- including
-    ``recover()`` itself (Priority 4 this session: recovery mutates the
-    pointer, journal, and version directories exactly like a publish does,
-    so it must never run outside this same lock). A lock left behind by a
-    process that is no longer alive is detected and reclaimed rather than
-    wedging every future publish attempt forever -- but ONLY under a
-    documented safe rule (see ``_lock``'s docstring): a lock whose owning PID
-    is confirmed alive ON THIS HOST is never reclaimed merely for being old.
+  * a single, never-deleted lock file at a stable path serialises concurrent
+    writers to the same publication root -- including ``recover()`` itself
+    (recovery mutates the pointer, journal, and version directories exactly
+    like a publish does, so it must never run outside this same lock).
+    Mutual exclusion is a real OS advisory lock (POSIX ``flock`` via the
+    ``fcntl`` module), not a hand-rolled staleness heuristic: the kernel
+    itself releases a process's ``flock`` the instant that process exits, by
+    any means (including a ``kill -9``), so a dead writer's lock is gone on
+    its own -- there is nothing to detect or reclaim, and no age-based
+    unlinking of any kind. Host/PID/a random token/acquisition-timestamp
+    metadata is still written into the lock file once the lock is held, but
+    purely as diagnostics (e.g. so a human can ``cat`` the lock file to see
+    who currently holds it, or so a timeout error can name the holder's
+    pid) -- it plays no role whatsoever in acquiring or releasing the lock.
 
 A consumer that simply opens/reads/iterates ``pub_root`` (e.g.
 ``release_installer.verify_release_bundle``) is unaffected -- ``pathlib``
@@ -60,6 +64,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -67,18 +72,9 @@ import secrets
 import shutil
 import socket
 import tempfile
-import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
-
-# How long a lock file may be held before it is considered abandoned by a
-# dead process even when the owning PID cannot be checked (e.g. the lock was
-# left by a process on a different host sharing this filesystem, so its PID
-# cannot be tested against this host's process table at all). A lock whose
-# PID IS checkable on this host (see _lock's docstring) is never reclaimed on
-# age alone -- only this cross-host/unattributable case falls back to it.
-_STALE_LOCK_SECONDS = 6 * 60 * 60
 
 
 def _current_host() -> str:
@@ -200,42 +196,13 @@ class _Paths:
         self.link_tmp_prefix = f".{pub_root.name}.link-tmp-"
 
 
-def _write_lock_file(path: Path, owner: dict) -> None:
-    """Publish ``path`` fully-formed or not at all (Priority 4).
-
-    A naive ``O_CREAT | O_EXCL`` open followed by a separate write leaves a
-    window where ``path`` exists but is empty/partially written; a
-    concurrent ``_read_lock_file`` that lands in that window gets a
-    ``JSONDecodeError``, which ``_lock_is_stale`` (correctly, for a
-    genuinely corrupt leftover file) treats as "abandoned -- reclaim it".
-    Against a live, mid-write owner that is wrong: the reader steals a lock
-    that is not actually abandoned, and two writers end up unlocked at once.
-    This was a real, reproducible flake in the concurrency tests, not a
-    theoretical concern.
-
-    The fix: write the complete content to a private temp file (same
-    directory, so the next step is same-filesystem) and fsync it, THEN
-    publish it at ``path`` with ``os.link`` -- a hard link, like
-    ``O_CREAT | O_EXCL``, is created atomically and fails with
-    ``FileExistsError`` if ``path`` is already taken, so a reader can only
-    ever observe ``path`` as absent or as a complete, valid lock file --
-    never partially written.
-    """
-    tmp_path = path.parent / f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(8)}"
-    fd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(json.dumps(owner).encode("utf-8"))
-            f.flush()
-            os.fsync(f.fileno())
-        os.link(str(tmp_path), str(path))
-    finally:
-        with contextlib.suppress(OSError):
-            tmp_path.unlink()
-    _fsync_dir(path.parent)
-
-
 def _read_lock_file(path: Path) -> "dict | None":
+    """Best-effort, JSON-tolerant read of the diagnostic metadata a lock
+    holder writes into ``path``. Returns ``None`` for anything that isn't a
+    readable JSON object (missing file, garbage content, a JSON scalar/array
+    instead of an object, etc.) -- callers only ever use this for diagnostics
+    (e.g. naming the current holder's pid in a timeout error), never to
+    decide whether the lock may be acquired."""
     try:
         held = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
@@ -245,85 +212,73 @@ def _read_lock_file(path: Path) -> "dict | None":
     return held
 
 
-def _lock_is_stale(held: "dict | None") -> bool:
-    """The ONE documented safe reclaim rule (Priority 4):
-
-      * an unreadable/corrupt/non-object lock file can never legitimately be
-        held by a live writer -- abandoned;
-      * a lock recorded as created ON THIS HOST (``host`` matches
-        :func:`_current_host`) whose PID is confirmed dead (``_pid_alive`` is
-        False) -- abandoned;
-      * a lock recorded as created on THIS HOST whose PID is confirmed ALIVE
-        is NEVER reclaimed on age alone -- a demonstrably live owner is
-        always protected, however long it has held the lock;
-      * a lock whose ``host`` is missing, or does not match this host (a
-        shared filesystem: the owning process cannot be PID-checked from
-        here at all) falls back to the age-only rule: abandoned once older
-        than ``_STALE_LOCK_SECONDS``, exactly the same "how long may a lock
-        be held before it's abandoned by a process we cannot check" case the
-        module docstring has always described.
-    """
-    if held is None:
-        return True
-    try:
-        held_pid = int(held.get("pid", -1))
-        acquired_at = float(held.get("acquiredAt", 0))
-    except (TypeError, ValueError):
-        return True
-    held_host = held.get("host")
-    same_host = isinstance(held_host, str) and held_host == _current_host()
-    if same_host:
-        return not _pid_alive(held_pid)
-    return (time.time() - acquired_at) > _STALE_LOCK_SECONDS
-
-
 @contextlib.contextmanager
 def _lock(paths: _Paths, *, timeout: float = 30.0):
+    """Serialises concurrent writers (including ``recover()``) with a real OS
+    advisory lock -- POSIX ``flock`` via the ``fcntl`` module -- on ONE
+    stable file at ``paths.lock_path``.
+
+    The file is created once, if absent, and is never deleted, renamed, or
+    replaced by this function -- not here on release, and there is no
+    "reclaim" step anywhere any more. Every acquirer opens the exact same
+    path/inode and calls ``fcntl.flock(fd, LOCK_EX | LOCK_NB)`` in a retry
+    loop, sleeping briefly between attempts, until it succeeds or ``timeout``
+    seconds have elapsed (in which case ``ConcurrentWriterError`` is raised,
+    same as always).
+
+    Because the kernel releases every ``flock`` a process holds when that
+    process exits -- by any means, including ``SIGKILL``/``os._exit`` -- a
+    writer that dies while holding this lock releases it automatically, with
+    no age-based or PID-based staleness heuristic needed (or present) to
+    reclaim anything.
+
+    Once acquired, owner metadata (host, pid, a fresh random token, and an
+    acquisition timestamp) is written into the same fd purely as diagnostics
+    -- e.g. so a human can ``cat`` the lock file to see who currently holds
+    it. This metadata plays NO role in whether or how the lock is acquired
+    or released.
+    """
     paths.pub_root.parent.mkdir(parents=True, exist_ok=True)
-    owner = {
-        "host": _current_host(),
-        "pid": os.getpid(),
-        "token": secrets.token_hex(16),
-        "acquiredAt": time.time(),
-    }
-    deadline = None
-    while True:
-        try:
-            _write_lock_file(paths.lock_path, owner)
-            break
-        except FileExistsError:
-            held = _read_lock_file(paths.lock_path)
-            if _lock_is_stale(held):
-                # Reclaim by replacing (not blindly unlinking) the exact file
-                # we inspected -- if a third process races us and replaces it
-                # first, our unlink() would otherwise silently steal or
-                # destroy THEIR fresh lock. Fall through to retry either way;
-                # the next loop iteration re-inspects whatever is there now.
-                with contextlib.suppress(OSError):
-                    paths.lock_path.unlink()
-                continue
-            held_pid = held.get("pid") if held else None
-            if deadline is None:
-                deadline = time.time() + timeout
-            if time.time() >= deadline:
-                raise ConcurrentWriterError(
-                    f"another process (pid {held_pid}) is already publishing to {paths.pub_root} -- "
-                    f"refusing to write concurrently."
-                )
-            time.sleep(0.05)
+    fd = os.open(str(paths.lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        yield
-    finally:
-        # Compare-and-delete: only remove the lock file if it still records
-        # OUR acquisition (Priority 4). If it now names a different token, a
-        # reclaimer decided (correctly, under _lock_is_stale's rule, or
-        # incorrectly) that we were abandoned and has already taken over --
-        # unconditionally unlinking here would delete THEIR live lock and let
-        # a third acquirer in underneath them.
-        current = _read_lock_file(paths.lock_path)
-        if current is not None and current.get("token") == owner["token"]:
+        deadline = time.time() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                if time.time() >= deadline:
+                    # Best-effort: name the current holder's pid if its
+                    # diagnostic metadata happens to be readable right now.
+                    held = _read_lock_file(paths.lock_path)
+                    held_pid = held.get("pid") if held else None
+                    raise ConcurrentWriterError(
+                        f"another process (pid {held_pid}) is already publishing to {paths.pub_root} -- "
+                        f"refusing to write concurrently."
+                    ) from exc
+                time.sleep(0.05)
+
+        owner = {
+            "host": _current_host(),
+            "pid": os.getpid(),
+            "token": secrets.token_hex(16),
+            "acquiredAt": time.time(),
+        }
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps(owner).encode("utf-8"))
+        with contextlib.suppress(OSError):
+            os.fsync(fd)
+
+        try:
+            yield
+        finally:
             with contextlib.suppress(OSError):
-                paths.lock_path.unlink()
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _current_version_name(paths: _Paths) -> "str | None":

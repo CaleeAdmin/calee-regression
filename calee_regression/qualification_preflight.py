@@ -52,6 +52,16 @@ from typing import Any, Callable, Optional
 STATUS_READY = "ready"
 STATUS_BLOCKED = "blocked"
 STATUS_WARNING = "warning"
+# Priority 11 (this session): a SECTION-level status (see PreflightReport.
+# sections) meaning "nothing in this release scope needs this capability at
+# all" -- distinct from STATUS_WARNING, which still means "this might matter
+# and its state is unresolved/ambiguous". Never returned as an individual
+# PreflightCheck.status (existing callers/tests keep seeing WARNING there
+# unchanged); a check instead sets PreflightCheck.not_applicable=True
+# alongside its existing WARNING status, and section rollup (below) is what
+# turns "every check in this section is READY or not_applicable" into an
+# overall NOT_APPLICABLE for that section.
+STATUS_NOT_APPLICABLE = "not_applicable"
 
 WhichFn = Callable[[str], "Optional[str]"]
 RunnerFn = Callable[..., "subprocess.CompletedProcess"]
@@ -68,16 +78,24 @@ class PreflightCheck:
     status: str
     detail: str
     hint: "str | None" = None
+    # Priority 11 (this session): set alongside status=STATUS_WARNING when
+    # this check's absence/ambiguity is WARNING only because it isn't
+    # required for the current release scope -- never changes .status
+    # itself (existing callers keep seeing WARNING there), only feeds
+    # section-level NOT_APPLICABLE rollup (see PreflightReport.sections).
+    not_applicable: bool = False
 
     def to_dict(self) -> dict:
         data = {"name": self.name, "status": self.status, "detail": self.detail}
         if self.hint:
             data["hint"] = self.hint
+        if self.not_applicable:
+            data["notApplicableToReleaseScope"] = True
         return data
 
 
-def _check(name: str, status: str, detail: str, hint: "str | None" = None) -> PreflightCheck:
-    return PreflightCheck(name=name, status=status, detail=detail, hint=hint)
+def _check(name: str, status: str, detail: str, hint: "str | None" = None, not_applicable: bool = False) -> PreflightCheck:
+    return PreflightCheck(name=name, status=status, detail=detail, hint=hint, not_applicable=not_applicable)
 
 
 def _required_or_warning(*, required: bool, ok: bool, name: str, ok_detail: str, missing_detail: str, hint: "str | None" = None) -> PreflightCheck:
@@ -85,7 +103,7 @@ def _required_or_warning(*, required: bool, ok: bool, name: str, ok_detail: str,
     (required) / WARNING (not required)" -- never silently PASS."""
     if ok:
         return _check(name, STATUS_READY, ok_detail)
-    return _check(name, STATUS_BLOCKED if required else STATUS_WARNING, missing_detail, hint=hint)
+    return _check(name, STATUS_BLOCKED if required else STATUS_WARNING, missing_detail, hint=hint, not_applicable=not required)
 
 
 # ── individual checks (each pure/injectable, no hidden global state) ────
@@ -230,9 +248,19 @@ def _load_appium_url(repo_root: Path) -> "str | None":
     return None
 
 
-def check_appium(appium_url: "str | None", *, opener: "Callable[[str], Any] | None" = None) -> PreflightCheck:
+def check_appium(
+    appium_url: "str | None", *, opener: "Callable[[str], Any] | None" = None, required: bool = False,
+) -> PreflightCheck:
+    """Priority 9 (this session): ``required`` reflects whether the release
+    scope actually needs Appium-driven mobile UI testing at all (any of
+    tablet/android/ios) -- a technical owner running a scope with no mobile
+    platform in it is never blocked merely because Appium isn't configured.
+    When it IS required, an unconfigured Appium is a real gap and BLOCKS,
+    not a mere warning; an appium_url that IS configured but unreachable
+    always BLOCKS regardless, since a stale/wrong URL is worth surfacing
+    hard either way."""
     if not appium_url:
-        return _check("appium", STATUS_WARNING, "No appium_url configured.")
+        return _check("appium", STATUS_BLOCKED if required else STATUS_WARNING, "No appium_url configured.", not_applicable=not required)
     url = appium_url.rstrip("/") + "/status"
     opener = opener or (lambda u: urllib.request.urlopen(u, timeout=5))
     try:
@@ -254,7 +282,7 @@ def check_appium_drivers(
     or every session request for that platform fails regardless of Appium's
     own health."""
     if not required_drivers:
-        return _check("appium_drivers", STATUS_WARNING, "No platform in scope requires a specific Appium driver.")
+        return _check("appium_drivers", STATUS_WARNING, "No platform in scope requires a specific Appium driver.", not_applicable=True)
     tool = which("appium")
     if not tool:
         return _check(
@@ -282,29 +310,47 @@ def check_appium_drivers(
 
 def check_flutter(
     which: WhichFn = shutil.which, *, runner: "Optional[RunnerFn]" = None,
-    expected_version: str = EXPECTED_FLUTTER_VERSION,
+    expected_version: str = EXPECTED_FLUTTER_VERSION, required: bool = True,
 ) -> PreflightCheck:
     """Priority 7 requirement 8: the EXACT pinned Flutter version, not just
     executable presence -- selectors/the UI suite verified on a different
-    toolchain are not evidence for what will actually run."""
+    toolchain are not evidence for what will actually run.
+
+    Priority 9 (this session): ``required`` reflects whether the release
+    scope actually needs the CaleeMobile Flutter toolchain at all (any of
+    tablet/android/ios in scope -- CaleeMobile's Flutter codebase underlies
+    all three) -- a release scope with no mobile platform enabled is never
+    blocked merely because Flutter isn't installed on this machine.
+    Defaults to ``True`` (the previous, unconditional behaviour) so a
+    direct/legacy caller sees no change; :func:`run_qualification_preflight`
+    passes the release-derived value."""
     path = which("flutter")
     if not path:
-        return _check("flutter", STATUS_BLOCKED, "flutter is not on PATH.", hint="Install Flutter and add it to PATH.")
+        return _check(
+            "flutter", STATUS_BLOCKED if required else STATUS_WARNING, "flutter is not on PATH.",
+            hint="Install Flutter and add it to PATH.", not_applicable=not required,
+        )
     runner = runner or (lambda argv: subprocess.run(argv, capture_output=True, text=True, timeout=30))
     try:
         result = runner([path, "--version", "--machine"])
     except (OSError, subprocess.SubprocessError) as exc:
-        return _check("flutter", STATUS_BLOCKED, f"Could not run 'flutter --version --machine': {exc}")
+        return _check(
+            "flutter", STATUS_BLOCKED if required else STATUS_WARNING, f"Could not run 'flutter --version --machine': {exc}",
+            not_applicable=not required,
+        )
     from . import toolchain_verify as tv_mod
 
     version, _dart = tv_mod.parse_flutter_version_machine(result.stdout or "")
     if not version:
-        return _check("flutter", STATUS_BLOCKED, f"Could not parse 'flutter --version --machine' output from {path}.")
+        return _check(
+            "flutter", STATUS_BLOCKED if required else STATUS_WARNING,
+            f"Could not parse 'flutter --version --machine' output from {path}.", not_applicable=not required,
+        )
     if expected_version is not None and version != expected_version:
         return _check(
-            "flutter", STATUS_BLOCKED,
+            "flutter", STATUS_BLOCKED if required else STATUS_WARNING,
             f"flutter version {version!r} (at {path}) != pinned {expected_version!r} -- selectors/the UI "
-            f"suite must run on the same toolchain product CI uses.",
+            f"suite must run on the same toolchain product CI uses.", not_applicable=not required,
         )
     return _check("flutter", STATUS_READY, f"flutter {version} (pinned) found at {path}.")
 
@@ -424,20 +470,26 @@ def check_sibling_checkout_sha(
     identities)."""
     check_name = f"{name}_sha"
     if not expected_sha:
-        return _check(check_name, STATUS_WARNING, f"No expected SHA supplied to check {name} against.")
+        return _check(check_name, STATUS_WARNING, f"No expected SHA supplied to check {name} against.", not_applicable=True)
     if not (path / ".git").exists():
         return _check(
             check_name, STATUS_BLOCKED if required else STATUS_WARNING,
-            f"{path} is not a Git checkout -- cannot verify its SHA.",
+            f"{path} is not a Git checkout -- cannot verify its SHA.", not_applicable=not required,
         )
     runner = runner or (lambda argv: subprocess.run(argv, capture_output=True, text=True, timeout=10))
     try:
         result = runner(["git", "-C", str(path), "rev-parse", "HEAD"])
     except (OSError, subprocess.SubprocessError) as exc:
-        return _check(check_name, STATUS_BLOCKED if required else STATUS_WARNING, f"Could not read {name}'s HEAD SHA: {exc}")
+        return _check(
+            check_name, STATUS_BLOCKED if required else STATUS_WARNING, f"Could not read {name}'s HEAD SHA: {exc}",
+            not_applicable=not required,
+        )
     actual = (result.stdout or "").strip()
     if not actual:
-        return _check(check_name, STATUS_BLOCKED if required else STATUS_WARNING, f"Could not determine {name}'s HEAD SHA.")
+        return _check(
+            check_name, STATUS_BLOCKED if required else STATUS_WARNING, f"Could not determine {name}'s HEAD SHA.",
+            not_applicable=not required,
+        )
     if actual.lower() != expected_sha.strip().lower():
         return _check(
             check_name, STATUS_BLOCKED,
@@ -470,13 +522,17 @@ def check_ics_publisher_config(section: "dict | None", *, required: bool = False
     if not section:
         return _check(
             "external_ics_publisher", STATUS_BLOCKED if required else STATUS_WARNING,
-            "No subscribed_fixture section configured (offline-only mode will be used).",
+            "No subscribed_fixture section configured (offline-only mode will be used).", not_applicable=not required,
         )
     publisher = section.get("publisher")
     public_url = section.get("public_url")
     if section.get("mode") != "published":
         status = STATUS_BLOCKED if required else STATUS_WARNING
-        return _check("external_ics_publisher", status, f"subscribed_fixture.mode is {section.get('mode')!r}, not 'published' -- publisher config not required.")
+        return _check(
+            "external_ics_publisher", status,
+            f"subscribed_fixture.mode is {section.get('mode')!r}, not 'published' -- publisher config not required.",
+            not_applicable=not required,
+        )
     if not publisher:
         return _check("external_ics_publisher", STATUS_BLOCKED, "published mode configured but no publisher adapter is set.")
     if not public_url:
@@ -489,7 +545,10 @@ def check_ics_publisher_config(section: "dict | None", *, required: bool = False
 
 def check_public_ics_url(public_url: "str | None", *, opener: "Callable[[str], Any] | None" = None, required: bool = False) -> PreflightCheck:
     if not public_url:
-        return _check("public_ics_url", STATUS_BLOCKED if required else STATUS_WARNING, "No public_url configured to check.")
+        return _check(
+            "public_ics_url", STATUS_BLOCKED if required else STATUS_WARNING, "No public_url configured to check.",
+            not_applicable=not required,
+        )
     opener = opener or (lambda u: urllib.request.urlopen(u, timeout=10))
     try:
         opener(public_url)
@@ -498,18 +557,43 @@ def check_public_ics_url(public_url: "str | None", *, opener: "Callable[[str], A
     return _check("public_ics_url", STATUS_READY, f"public_url {public_url} is reachable.")
 
 
-def check_ingestion_bridge(repo_root: Path) -> PreflightCheck:
+def check_ingestion_bridge(repo_root: Path, *, required: bool = False) -> PreflightCheck:
+    """Priority 9 (this session): ``required`` reflects whether the release
+    scope actually enables the ``google_calendar`` (subscribed-calendar)
+    feature -- the ingestion bridge only matters for that sync path. A
+    release with no subscribed-calendar feature enabled is never blocked
+    merely because the bridge is unavailable; one that DOES enable it BLOCKS
+    on a missing bridge instead of merely warning, mirroring
+    check_ics_publisher_config/check_public_ics_url's existing scoping."""
     from . import sync_smoke_bridge as ssb_mod
 
     if ssb_mod.is_ingestion_bridge_available(repo_root):
         return _check("ingestion_api_bridge", STATUS_READY, "CaleeMobile-Regression ingestion bridge is available.")
     return _check(
-        "ingestion_api_bridge", STATUS_WARNING,
+        "ingestion_api_bridge", STATUS_BLOCKED if required else STATUS_WARNING,
         "CaleeMobile-Regression ingestion bridge is not available (sibling checkout/bridge action missing).",
+        not_applicable=not required,
     )
 
 
-def check_selector_ci_evidence_availability(*, env: "dict | None" = None, required: bool = False) -> PreflightCheck:
+def check_selector_ci_evidence_availability(
+    *, env: "dict | None" = None, required: bool = False,
+    workflow_run_id: "str | None" = None, artifact_id: "str | None" = None,
+    expected_regression_sha: "str | None" = None, expected_tested_sha: "str | None" = None,
+    expected_version: "str | None" = None,
+) -> PreflightCheck:
+    """Priority 6 (this session): a resolvable GitHub API credential alone is
+    NOT evidence -- it only proves a request COULD be made, not that a real
+    selector-contract artifact for this release was ever produced or
+    verified. When a workflow run id + artifact id are supplied, this runs
+    the SAME authenticated artifact chain the release-gating
+    ``selector-contract`` command itself uses
+    (:func:`github_artifact.acquire_github_artifact`) -- repository/workflow-
+    path/run-success/artifact-ownership/digest verification, extracted
+    identity checked against the expected CaleeMobile-Regression SHA and
+    CaleeMobile tested SHA/version -- so a preflight READY here means a real
+    artifact was independently authenticated, never merely that credentials
+    exist."""
     from . import github_artifact as ga_mod
 
     token = ga_mod.resolve_token(env=env)
@@ -518,8 +602,35 @@ def check_selector_ci_evidence_availability(*, env: "dict | None" = None, requir
             "selector_ci_evidence_availability", STATUS_BLOCKED if required else STATUS_WARNING,
             f"No GitHub API credential resolvable from {list(ga_mod.TOKEN_ENV_VARS)}.",
             hint="A production release requires a CI-authenticated selector artifact -- set REGRESSION_API_TOKEN/GITHUB_TOKEN/GH_TOKEN.",
+            not_applicable=not required,
         )
-    return _check("selector_ci_evidence_availability", STATUS_READY, "A GitHub API credential is resolvable (value not shown).")
+    if not (workflow_run_id and artifact_id):
+        return _check(
+            "selector_ci_evidence_availability", STATUS_BLOCKED if required else STATUS_WARNING,
+            "A GitHub API credential is resolvable, but no --selector-workflow-run-id/--selector-artifact-id "
+            "was given -- credential PRESENCE is never treated as evidence; authenticated selector-artifact "
+            "verification was skipped.",
+            hint="Supply --selector-workflow-run-id/--selector-artifact-id to authenticate a real "
+                 "selector-contract-result artifact via the GitHub API.",
+            not_applicable=not required,
+        )
+    try:
+        chain = ga_mod.acquire_github_artifact(
+            run_id=workflow_run_id, artifact_id=artifact_id,
+            expected_regression_sha=expected_regression_sha, expected_tested_sha=expected_tested_sha,
+            expected_version=expected_version, env=env,
+        )
+    except ga_mod.GithubArtifactError as exc:
+        return _check("selector_ci_evidence_availability", STATUS_BLOCKED, str(exc))
+    if not chain.ok:
+        return _check(
+            "selector_ci_evidence_availability", STATUS_BLOCKED,
+            f"Authenticated selector-contract artifact rejected: {'; '.join(chain.problems)}",
+        )
+    return _check(
+        "selector_ci_evidence_availability", STATUS_READY,
+        f"Authenticated selector-contract artifact verified (run {workflow_run_id}, artifact {artifact_id}).",
+    )
 
 
 def check_distributed_build_evidence_availability(
@@ -527,37 +638,66 @@ def check_distributed_build_evidence_availability(
     expected_release_id: "str | None" = None, expected_git_sha: "str | None" = None,
     expected_version: "str | None" = None,
 ) -> PreflightCheck:
-    from . import distributed_build_provenance as dbp
+    """Priority 7 (this session): re-verify the run-scoped distributed-build-
+    acceptance REPORT -- the exact ``results.json``
+    ``record-distributed-build-acceptance`` writes -- through the SAME
+    independent re-verification consolidation itself relies on
+    (:func:`consolidated_report.component_from_distributed_build_acceptance_
+    report`). The previous version of this check ran ``validate_distributed_
+    evidence`` -- a FORMAT-only check -- directly over whatever JSON was at
+    ``source_path``; a hand-typed file with plausible-looking fields (a
+    fabricated provider/channel/build id, no authenticated provenance at
+    all) passed every one of those rules. Re-using the consolidation
+    function means a report missing its authenticated ``provenance`` block,
+    whose envelope/raw-byte digest doesn't match the adjacent evidence
+    bundle, or whose ``evidenceTier`` isn't one of ``provider_evidence.
+    AUTHENTICATED_TIERS``, BLOCKS here exactly as it would at consolidation
+    -- closing the "arbitrary --source JSON passes every offline format
+    check" hole for the preflight path too."""
+    from . import consolidated_report as cr_mod
 
     if not source_path:
         return _check(
             "distributed_build_evidence_availability", STATUS_BLOCKED if required else STATUS_WARNING,
-            "No --distributed-build-evidence path given to check.",
+            "No --distributed-build-evidence path given to check.", not_applicable=not required,
         )
-    if not Path(source_path).is_file():
+    source_path = Path(source_path)
+    if not source_path.is_file():
         return _check("distributed_build_evidence_availability", STATUS_BLOCKED, f"{source_path} does not exist.")
     try:
-        evidence = json.loads(Path(source_path).read_text(encoding="utf-8"))
+        report = json.loads(source_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return _check("distributed_build_evidence_availability", STATUS_BLOCKED, f"{source_path} is not valid JSON: {exc}")
-    if not isinstance(evidence, dict):
+    if not isinstance(report, dict):
         return _check("distributed_build_evidence_availability", STATUS_BLOCKED, f"{source_path}: not a JSON object.")
-    # Priority 7 requirement 13: validated against the RELEASE's own
-    # id/SHA/version when supplied, not merely "is this file well-formed".
-    problems = dbp.validate_distributed_evidence(
-        evidence, expected_release_id=expected_release_id, expected_git_sha=expected_git_sha,
-        expected_version=expected_version,
+
+    result = cr_mod.component_from_distributed_build_acceptance_report(
+        "distributed_build_evidence_availability", report, mandatory=required,
+        expected_git_sha=expected_git_sha, expected_version=expected_version,
+        expected_release_id=expected_release_id, component_dir=source_path.parent,
     )
-    if problems:
-        return _check("distributed_build_evidence_availability", STATUS_BLOCKED, f"Evidence at {source_path} has problem(s): {'; '.join(problems)}")
-    return _check("distributed_build_evidence_availability", STATUS_READY, f"Distributed-build evidence at {source_path} is well-formed and matches the release identity.")
+    if result.status == cr_mod.STATUS_PASS:
+        return _check(
+            "distributed_build_evidence_availability", STATUS_READY,
+            "; ".join(result.detail) or f"Distributed-build acceptance evidence at {source_path} is authenticated and matches the release identity.",
+        )
+    if result.status == cr_mod.STATUS_NOT_RUN:
+        return _check(
+            "distributed_build_evidence_availability", STATUS_BLOCKED if required else STATUS_WARNING,
+            "; ".join(result.detail) or f"No distributed-build acceptance evidence at {source_path}.",
+            not_applicable=not required,
+        )
+    return _check(
+        "distributed_build_evidence_availability", STATUS_BLOCKED,
+        f"{source_path}: " + ("; ".join(result.detail) or "distributed-build acceptance evidence rejected."),
+    )
 
 
 def check_frozen_candidate_ability(bundle_path: "Path | None", *, verification: "Any | None" = None) -> PreflightCheck:
     from . import release_installer
 
     if not bundle_path:
-        return _check("frozen_candidate_ability", STATUS_WARNING, "No --bundle given to check.")
+        return _check("frozen_candidate_ability", STATUS_WARNING, "No --bundle given to check.", not_applicable=True)
     if verification is None:
         verification = release_installer.verify_release_bundle(bundle_path)
     if not verification.ok:
@@ -580,7 +720,10 @@ def check_main_ci_evidence(
     from . import main_ci_evidence as mce_mod
 
     if not summary_path:
-        return _check("main_ci_evidence", STATUS_BLOCKED if required else STATUS_WARNING, "No --main-ci-evidence path given to check.")
+        return _check(
+            "main_ci_evidence", STATUS_BLOCKED if required else STATUS_WARNING, "No --main-ci-evidence path given to check.",
+            not_applicable=not required,
+        )
     try:
         summary, _raw = mce_mod.load_summary(summary_path)
     except mce_mod.MainCiEvidenceError as exc:
@@ -601,34 +744,48 @@ def check_main_ci_evidence(
 
 
 def check_main_ci_artifact_authenticated(
-    *, repository: "str | None", workflow_run_id: "str | None", artifact_id: "str | None",
+    *, check_name: str = "main_ci_artifact_authenticated", repository: "str | None",
+    workflow_run_id: "str | None", artifact_id: "str | None",
     expected_merge_sha: "str | None", required: bool = False, env: "dict | None" = None,
+    run_id_flag: str = "--main-ci-workflow-run-id", artifact_id_flag: str = "--main-ci-artifact-id",
+    sha_flag: str = "--expected-merge-sha",
 ) -> PreflightCheck:
-    """Priority 7 requirement 15 (authenticated half): when a workflow run
-    id + artifact id are supplied, verify main-CI evidence via the
-    AUTHENTICATED GitHub-API chain (Priority 6) instead of the offline,
-    structural-only check. Read-only: performs GET requests only, never a
-    write."""
+    """Priority 8 (this session): verify ONE repository's merged-main CI via
+    the AUTHENTICATED GitHub-API chain instead of the offline, structural-
+    only check. Read-only: performs GET requests only, never a write.
+
+    ``repository``/``expected_merge_sha`` identify exactly which repository
+    and commit this call is authenticating -- callers MUST pass the
+    repository's OWN expected SHA (see :func:`run_qualification_preflight`,
+    which calls this once per regression repository with its own distinct
+    ``--calee-regression-main-sha`` / ``--caleemobile-regression-main-sha``
+    input; reusing the CaleeMobile product SHA for a regression repository's
+    own main-CI check would silently compare against the wrong commit
+    entirely). ``check_name`` lets multiple independent calls (one per
+    repository) each surface as their own named check in the report rather
+    than colliding under one shared name.
+    """
     from . import main_ci_artifact as mca_mod
     from . import main_ci_evidence as mce_mod
 
     if not (workflow_run_id and artifact_id):
         return _check(
-            "main_ci_artifact_authenticated", STATUS_WARNING,
-            "No --main-ci-workflow-run-id/--main-ci-artifact-id given -- authenticated main-CI verification skipped "
+            check_name, STATUS_BLOCKED if required else STATUS_WARNING,
+            f"No {run_id_flag}/{artifact_id_flag} given -- authenticated main-CI verification skipped "
             "(offline structural check only, see main_ci_evidence).",
+            not_applicable=not required,
         )
     if not (repository and expected_merge_sha):
         return _check(
-            "main_ci_artifact_authenticated", STATUS_BLOCKED,
-            "--main-ci-workflow-run-id/--main-ci-artifact-id were given, but --main-ci-repository/an expected "
-            "merge SHA are required to authenticate against.",
+            check_name, STATUS_BLOCKED,
+            f"{run_id_flag}/{artifact_id_flag} were given, but a repository and {sha_flag} are required to "
+            "authenticate against.",
         )
     profile = mca_mod.KNOWN_PROFILES.get(repository)
     if profile is None:
         return _check(
-            "main_ci_artifact_authenticated", STATUS_BLOCKED,
-            f"--main-ci-repository {repository!r} is not a recognised profile ({sorted(mca_mod.KNOWN_PROFILES)}).",
+            check_name, STATUS_BLOCKED,
+            f"repository {repository!r} is not a recognised profile ({sorted(mca_mod.KNOWN_PROFILES)}).",
         )
     canonical_gates = mce_mod.CALEEMOBILE_REGRESSION_REQUIRED_GATES if repository == mce_mod.CALEEMOBILE_REGRESSION_REPOSITORY else None
     try:
@@ -640,14 +797,14 @@ def check_main_ci_artifact_authenticated(
             env=env,
         )
     except mca_mod.MainCiArtifactError as exc:
-        return _check("main_ci_artifact_authenticated", STATUS_BLOCKED, str(exc))
+        return _check(check_name, STATUS_BLOCKED, str(exc))
     if not chain.ok:
         return _check(
-            "main_ci_artifact_authenticated", STATUS_BLOCKED,
+            check_name, STATUS_BLOCKED,
             f"Authenticated main-CI artifact rejected: {'; '.join(chain.problems)}",
         )
     return _check(
-        "main_ci_artifact_authenticated", STATUS_READY,
+        check_name, STATUS_READY,
         f"Authenticated merged-main CI artifact verified for {repository} (run {workflow_run_id}, commit {expected_merge_sha}).",
     )
 
@@ -670,6 +827,104 @@ def check_manual_check_definitions(path: "Path | None") -> PreflightCheck:
     return _check("manual_check_definitions", STATUS_READY, f"{len(defs)} manual check definition(s) loaded from {candidate}.")
 
 
+# Priority 11 (this session): qualification output must separate these
+# named identity/evidence/infrastructure buckets, each independently
+# reporting READY/WARNING/BLOCKED/NOT_APPLICABLE with remediation guidance
+# -- never one flat, undifferentiated check list a technical owner has to
+# mentally partition themselves. Order here is the order sections are
+# reported in.
+SECTION_RELEASE_CANDIDATE_IDENTITY = "release_candidate_identity"
+SECTION_PRODUCT_BUILD_IDENTITY = "product_build_identity"
+SECTION_REGRESSION_FRAMEWORK_IDENTITY = "regression_framework_identity"
+SECTION_SELECTOR_EVIDENCE = "selector_evidence"
+SECTION_DISTRIBUTED_BUILD_PROVIDER_EVIDENCE = "distributed_build_provider_evidence"
+SECTION_DISTRIBUTED_BUILD_PROVENANCE = "distributed_build_provenance"
+SECTION_PHYSICAL_DEVICES = "physical_devices"
+SECTION_TOOLCHAINS = "toolchains"
+SECTION_SUBSCRIBED_CALENDAR_INFRASTRUCTURE = "subscribed_calendar_infrastructure"
+SECTION_CREDENTIALS = "credentials"
+
+SECTION_TITLES = {
+    SECTION_RELEASE_CANDIDATE_IDENTITY: "Release Candidate Identity",
+    SECTION_PRODUCT_BUILD_IDENTITY: "Product Build Identity (CaleeMobile)",
+    SECTION_REGRESSION_FRAMEWORK_IDENTITY: "Regression Framework Identity (calee-regression + CaleeMobile-Regression)",
+    SECTION_SELECTOR_EVIDENCE: "Selector Evidence",
+    SECTION_DISTRIBUTED_BUILD_PROVIDER_EVIDENCE: "Distributed Build Provider Evidence",
+    SECTION_DISTRIBUTED_BUILD_PROVENANCE: "Distributed Build Provenance",
+    SECTION_PHYSICAL_DEVICES: "Physical Devices",
+    SECTION_TOOLCHAINS: "Toolchains",
+    SECTION_SUBSCRIBED_CALENDAR_INFRASTRUCTURE: "Subscribed-Calendar Infrastructure",
+    SECTION_CREDENTIALS: "Credentials",
+}
+
+# Every check name this module ever produces is mapped to exactly one
+# section, EXCEPT distributed_build_evidence_availability, which maps to
+# BOTH distributed-build sections: this codebase verifies the provider-
+# observation and build-provenance halves of the identity chain together,
+# as one joined, authenticated record (see build_provenance.
+# join_provider_and_build_provenance) -- there is no separate standalone
+# check for either half alone. release_scope_conflict:<axis> (a dynamic
+# per-conflict name) is matched by prefix in _sections_for_check below, not
+# listed here.
+_SECTION_BY_CHECK_NAME = {
+    "machine_config": SECTION_RELEASE_CANDIDATE_IDENTITY,
+    "report_root": SECTION_RELEASE_CANDIDATE_IDENTITY,
+    "frozen_candidate_ability": SECTION_RELEASE_CANDIDATE_IDENTITY,
+    "manual_check_definitions": SECTION_RELEASE_CANDIDATE_IDENTITY,
+    "caleemobile_checkout": SECTION_PRODUCT_BUILD_IDENTITY,
+    "caleemobile_checkout_sha": SECTION_PRODUCT_BUILD_IDENTITY,
+    "caleemobile_regression_checkout": SECTION_REGRESSION_FRAMEWORK_IDENTITY,
+    "caleemobile_regression_checkout_sha": SECTION_REGRESSION_FRAMEWORK_IDENTITY,
+    "main_ci_evidence": SECTION_REGRESSION_FRAMEWORK_IDENTITY,
+    "calee_regression_main_ci_authenticated": SECTION_REGRESSION_FRAMEWORK_IDENTITY,
+    "caleemobile_regression_main_ci_authenticated": SECTION_REGRESSION_FRAMEWORK_IDENTITY,
+    "selector_ci_evidence_availability": SECTION_SELECTOR_EVIDENCE,
+    "distributed_build_evidence_availability": (
+        SECTION_DISTRIBUTED_BUILD_PROVIDER_EVIDENCE, SECTION_DISTRIBUTED_BUILD_PROVENANCE,
+    ),
+    "adb_device_availability": SECTION_PHYSICAL_DEVICES,
+    "expected_tablet_serial": SECTION_PHYSICAL_DEVICES,
+    "android_device_for_scope": SECTION_PHYSICAL_DEVICES,
+    "iphone_device_for_scope": SECTION_PHYSICAL_DEVICES,
+    "android_sdk_tools": SECTION_TOOLCHAINS,
+    "android_build_tools": SECTION_TOOLCHAINS,
+    "appium": SECTION_TOOLCHAINS,
+    "appium_drivers": SECTION_TOOLCHAINS,
+    "flutter": SECTION_TOOLCHAINS,
+    "external_ics_publisher": SECTION_SUBSCRIBED_CALENDAR_INFRASTRUCTURE,
+    "public_ics_url": SECTION_SUBSCRIBED_CALENDAR_INFRASTRUCTURE,
+    "ingestion_api_bridge": SECTION_SUBSCRIBED_CALENDAR_INFRASTRUCTURE,
+    "keychain_credentials": SECTION_CREDENTIALS,
+}
+
+
+def _sections_for_check(check: "PreflightCheck") -> "tuple[str, ...]":
+    if check.name.startswith("release_scope_conflict:"):
+        return (SECTION_RELEASE_CANDIDATE_IDENTITY,)
+    mapped = _SECTION_BY_CHECK_NAME.get(check.name)
+    if mapped is None:
+        return ()
+    return mapped if isinstance(mapped, tuple) else (mapped,)
+
+
+def _section_status(checks: "list[PreflightCheck]") -> str:
+    """BLOCKED beats a genuine WARNING beats READY/NOT_APPLICABLE -- mirrors
+    PreflightReport.overall's own precedence. A check tagged not_applicable
+    never counts as a genuine warning here; a section where EVERY
+    constituent check is not_applicable rolls up to NOT_APPLICABLE as a
+    whole (nothing in it pertains to this release scope); an empty section
+    (no check in this run ever mapped to it) is likewise NOT_APPLICABLE."""
+    if not checks:
+        return STATUS_NOT_APPLICABLE
+    if any(c.status == STATUS_BLOCKED for c in checks):
+        return STATUS_BLOCKED
+    if any(c.status == STATUS_WARNING and not c.not_applicable for c in checks):
+        return STATUS_WARNING
+    if all(c.not_applicable for c in checks):
+        return STATUS_NOT_APPLICABLE
+    return STATUS_READY
+
+
 @dataclass
 class PreflightReport:
     checks: "list[PreflightCheck]" = field(default_factory=list)
@@ -679,12 +934,40 @@ class PreflightReport:
         # Priority 7 requirements 16-17: BLOCKED beats WARNING beats READY --
         # any warning prevents an unqualified READY. The previous behaviour
         # (any number of WARNINGs still reported READY) was exactly the
-        # fail-open defect this closes.
+        # fail-open defect this closes. Deliberately NOT relaxed for
+        # not_applicable-tagged warnings (see Priority 11's section-level
+        # rollup for that): a release-wide READY still requires every
+        # individual check to be genuinely READY, never merely "not
+        # applicable" -- see test_overall_never_ready_while_any_warning_
+        # present_in_full_orchestration, which pins this exact invariant.
         if any(c.status == STATUS_BLOCKED for c in self.checks):
             return STATUS_BLOCKED
         if any(c.status == STATUS_WARNING for c in self.checks):
             return STATUS_WARNING
         return STATUS_READY
+
+    def sections(self) -> "list[dict]":
+        """Priority 11: the SAME checks as .checks, grouped into the named
+        buckets qualification output must separate, each independently
+        rolled up to READY/WARNING/BLOCKED/NOT_APPLICABLE with its own
+        remediation guidance (collected from the constituent checks' own
+        hints -- never a secret value, see PreflightCheck.to_dict)."""
+        by_section: "dict[str, list[PreflightCheck]]" = {key: [] for key in SECTION_TITLES}
+        for check in self.checks:
+            for section in _sections_for_check(check):
+                by_section[section].append(check)
+        result = []
+        for key, title in SECTION_TITLES.items():
+            section_checks = by_section[key]
+            remediation = [c.hint for c in section_checks if c.hint and c.status != STATUS_READY]
+            result.append({
+                "section": key,
+                "title": title,
+                "status": _section_status(section_checks).upper(),
+                "checks": [c.name for c in section_checks],
+                "remediation": remediation,
+            })
+        return result
 
     def to_dict(self) -> dict:
         # Priority 7 requirement 18: explain exactly which required
@@ -695,6 +978,7 @@ class PreflightReport:
             "overall": self.overall.upper(),
             "blockedCapabilities": blocked,
             "warnedCapabilities": warned,
+            "sections": self.sections(),
             "checks": [c.to_dict() for c in self.checks],
         }
 
@@ -763,10 +1047,16 @@ def run_qualification_preflight(
     manual_checks_path: "Path | None" = None,
     main_ci_evidence_path: "Path | None" = None,
     main_ci_repository: "str | None" = None,
-    main_ci_workflow_run_id: "str | None" = None,
-    main_ci_artifact_id: "str | None" = None,
     expected_caleemobile_sha: "str | None" = None,
     expected_caleemobile_regression_sha: "str | None" = None,
+    selector_workflow_run_id: "str | None" = None,
+    selector_artifact_id: "str | None" = None,
+    calee_regression_main_sha: "str | None" = None,
+    calee_regression_main_workflow_run_id: "str | None" = None,
+    calee_regression_main_artifact_id: "str | None" = None,
+    caleemobile_regression_main_sha: "str | None" = None,
+    caleemobile_regression_main_workflow_run_id: "str | None" = None,
+    caleemobile_regression_main_artifact_id: "str | None" = None,
     adb_runner=None,
     which: WhichFn = shutil.which,
     http_opener=None,
@@ -783,6 +1073,17 @@ def run_qualification_preflight(
     derived from THAT -- not from the machine's own declared capability
     scope. A machine.local.yaml under-declaring what the release actually
     needs no longer silently narrows what gets checked.
+
+    Priority 8 (this session): calee-regression's and CaleeMobile-
+    Regression's own merged-main CI are each authenticated SEPARATELY, with
+    their OWN distinct workflow-run/artifact/expected-SHA inputs -- never
+    the CaleeMobile product SHA (``expected_caleemobile_sha``, which is used
+    ONLY for the CaleeMobile sibling-checkout-SHA check below). The previous
+    single generic ``--main-ci-workflow-run-id``/``--main-ci-artifact-id``
+    pair could only ever target one of these two regression repositories at
+    a time yet was verified against the CaleeMobile product's own expected
+    SHA regardless of which repository was named -- a meaningless
+    comparison for a regression-framework repository's own main-CI run.
     """
     from . import machine_config as mc
     from . import release_installer as ri_mod
@@ -848,9 +1149,15 @@ def run_qualification_preflight(
         profile = None
         expected_identities = {}
 
+    # Priority 9 (this session): any mobile platform in scope at all -- the
+    # one condition shared by Appium (reachability + drivers) and the
+    # Flutter toolchain, since CaleeMobile's Flutter codebase and its
+    # Appium-driven UI automation underlie tablet/android/ios alike.
+    any_mobile_platform_in_scope = bool({"tablet", "android", "ios"} & set(enabled_platforms))
+
     checks.append(check_android_build_tools(which=which, required=bool({"tablet", "android"} & set(enabled_platforms))))
 
-    checks.append(check_appium(_load_appium_url(repo_root), opener=http_opener))
+    checks.append(check_appium(_load_appium_url(repo_root), opener=http_opener, required=any_mobile_platform_in_scope))
     required_drivers = []
     if {"tablet", "android"} & set(enabled_platforms):
         required_drivers.append("uiautomator2")
@@ -858,7 +1165,7 @@ def run_qualification_preflight(
         required_drivers.append("xcuitest")
     checks.append(check_appium_drivers(required_drivers=required_drivers, which=which, runner=subprocess_runner))
 
-    checks.append(check_flutter(which=which, runner=subprocess_runner))
+    checks.append(check_flutter(which=which, runner=subprocess_runner, required=any_mobile_platform_in_scope))
 
     iphone_connected_udids = (
         check_iphone_connected_udids(which=which, runner=subprocess_runner) if "ios" in enabled_platforms else None
@@ -899,19 +1206,26 @@ def run_qualification_preflight(
     calendar_required = "google_calendar" in enabled_features
     checks.append(check_ics_publisher_config(section, required=calendar_required))
     checks.append(check_public_ics_url(section.get("public_url"), opener=http_opener, required=calendar_required))
-    checks.append(check_ingestion_bridge(repo_root))
+    checks.append(check_ingestion_bridge(repo_root, required=calendar_required))
 
     from . import release_config as rc_mod
+
+    caleemobile_identity = expected_identities.get("caleeMobile", {}) or {}
 
     selector_required = bool(rc_mod.resolve_selector_evidence_required(
         profile=profile, enabled_platforms=enabled_platforms,
         schema_version=effective.schema_version if effective is not None else None,
-        manifest_required=expected_identities.get("caleeMobile", {}).get("selectorEvidenceRequired"),
+        manifest_required=caleemobile_identity.get("selectorEvidenceRequired"),
     ))
-    checks.append(check_selector_ci_evidence_availability(env=environ, required=selector_required))
+    checks.append(check_selector_ci_evidence_availability(
+        env=environ, required=selector_required,
+        workflow_run_id=selector_workflow_run_id, artifact_id=selector_artifact_id,
+        expected_regression_sha=expected_caleemobile_regression_sha,
+        expected_tested_sha=caleemobile_identity.get("gitSha"),
+        expected_version=caleemobile_identity.get("buildVersion"),
+    ))
 
-    distributed_required = bool(expected_identities.get("caleeMobile", {}).get("distributedBuildAcceptanceRequired"))
-    caleemobile_identity = expected_identities.get("caleeMobile", {}) or {}
+    distributed_required = bool(caleemobile_identity.get("distributedBuildAcceptanceRequired"))
     checks.append(check_distributed_build_evidence_availability(
         distributed_build_evidence_path, required=distributed_required,
         expected_release_id=effective.release_id if effective is not None else None,
@@ -922,9 +1236,33 @@ def run_qualification_preflight(
     checks.append(check_main_ci_evidence(
         main_ci_evidence_path, expected_repository=main_ci_repository, required=bool(main_ci_evidence_path),
     ))
+    # Priority 8: calee-regression's and CaleeMobile-Regression's own
+    # merged-main CI, each authenticated SEPARATELY against its OWN expected
+    # SHA -- never the CaleeMobile product SHA (caleemobile_identity above).
+    from . import main_ci_evidence as mce_mod_for_profiles
+
+    # required=bool(...-main-sha) mirrors check_main_ci_evidence's own
+    # required=bool(main_ci_evidence_path) convention: supplying the SHA
+    # signals the operator wants this repository's main CI authenticated,
+    # so a run-id/artifact-id left out at that point is an incomplete
+    # configuration that BLOCKS rather than merely warns -- offline test 22
+    # ("missing either regression main-CI artifact blocks") pins this.
     checks.append(check_main_ci_artifact_authenticated(
-        repository=main_ci_repository, workflow_run_id=main_ci_workflow_run_id, artifact_id=main_ci_artifact_id,
-        expected_merge_sha=caleemobile_identity.get("gitSha"), env=environ,
+        check_name="calee_regression_main_ci_authenticated",
+        repository="CaleeAdmin/calee-regression",
+        workflow_run_id=calee_regression_main_workflow_run_id, artifact_id=calee_regression_main_artifact_id,
+        expected_merge_sha=calee_regression_main_sha, required=bool(calee_regression_main_sha), env=environ,
+        run_id_flag="--calee-regression-main-workflow-run-id", artifact_id_flag="--calee-regression-main-artifact-id",
+        sha_flag="--calee-regression-main-sha",
+    ))
+    checks.append(check_main_ci_artifact_authenticated(
+        check_name="caleemobile_regression_main_ci_authenticated",
+        repository=mce_mod_for_profiles.CALEEMOBILE_REGRESSION_REPOSITORY,
+        workflow_run_id=caleemobile_regression_main_workflow_run_id, artifact_id=caleemobile_regression_main_artifact_id,
+        expected_merge_sha=caleemobile_regression_main_sha, required=bool(caleemobile_regression_main_sha), env=environ,
+        run_id_flag="--caleemobile-regression-main-workflow-run-id",
+        artifact_id_flag="--caleemobile-regression-main-artifact-id",
+        sha_flag="--caleemobile-regression-main-sha",
     ))
 
     checks.append(check_manual_check_definitions(manual_checks_path))

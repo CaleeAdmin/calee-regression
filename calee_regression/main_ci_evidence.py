@@ -47,6 +47,7 @@ duplicated-schema pattern already used for selector evidence.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -86,11 +87,68 @@ CALEEMOBILE_REGRESSION_REQUIRED_GATES = (
     "releaseCertificationGuard",
 )
 
+# Priority 10 (this session): the closed set of values a GitHub Actions
+# `needs.<job>.result`/conclusion can ever legitimately hold. A gate value
+# outside this set is not "a failure" -- it's a malformed/tampered field, and
+# is reported as such rather than lumped in with a genuine failure.
+GATE_CONCLUSIONS = frozenset({
+    "success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral",
+})
+
 
 class MainCiEvidenceError(Exception):
     """The evidence file is missing, unreadable, or not a JSON object -- a
     framework/pipeline fault, never a verdict (a real problem with the
     evidence's CONTENT is returned as a problem list, not raised)."""
+
+
+# --- Priority 10 (this session): strict schema type predicates --------------
+# Every predicate below is total (never raises) so a wildly-malformed field
+# of any JSON type (a list, a dict, a bool where a string is expected, ...)
+# is reported as a problem, never an uncaught exception.
+
+
+def _is_nonempty_str(value: "Any") -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_full_git_sha(value: "Any") -> bool:
+    return isinstance(value, str) and len(value) == 40 and all(c in "0123456789abcdefABCDEF" for c in value)
+
+
+def _is_positive_integer_or_numeric_string(value: "Any") -> bool:
+    """runAttempt must be a positive integer -- either a real JSON integer,
+    or (matching how both repos' workflow heredocs actually emit it, via
+    ``os.environ.get("GITHUB_RUN_ATTEMPT", "")``) a canonical positive
+    numeric string like ``"1"``. Rejects bools (bool is an int subclass in
+    Python), floats, zero/negative values, and non-canonical strings
+    (leading zeros, signs, decimals, whitespace)."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value > 0
+    if isinstance(value, str):
+        if not value or not value.isdigit():
+            return False
+        if value != str(int(value)):
+            return False  # rejects leading zeros such as "01"
+        return int(value) > 0
+    return False
+
+
+def _parse_utc_iso8601(value: "Any") -> "datetime.datetime | None":
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() != datetime.timedelta(0):
+        return None
+    return parsed
 
 
 def load_summary(path: "Path | str") -> "tuple[dict, bytes]":
@@ -142,6 +200,20 @@ def verify_main_ci_evidence(
     produced zero gate-related problems simply because the caller passed no
     ``--required-gate``: with a non-empty canonical set, every one of its
     gates is looked up and reported missing.
+
+    Priority 10 (this session): ``schemaVersion``/``repository``/
+    ``workflow``/``workflowFile``/``ref``/``event``/``runId``/``commitSha``/
+    ``runAttempt``/``isMainPush``/``isMergeGroup``/``generatedAt`` are all
+    independently required and type-checked (true for BOTH the simple and
+    rich evidence shapes -- both real emitters populate every one of these).
+    ``gates``/``skipClassification``, by contrast, are type-checked only WHEN
+    PRESENT: calee-regression's own single-job evidence genuinely carries
+    neither key at all, so their absence there is not itself a problem --
+    only the effective-required-gates logic below (driven by
+    ``canonical_required_gates``/``required_gates``) decides whether a
+    *missing* gates breakdown blocks. A malformed field of ANY type is
+    reported as a problem and never raises, and no field is ever coerced
+    (e.g. no ``bool(...)`` truthiness cast).
     """
     problems: "list[str]" = []
 
@@ -158,6 +230,47 @@ def verify_main_ci_evidence(
             f"evidence schemaVersion {schema_version!r} is not supported (this verifier supports "
             f"{sorted(SUPPORTED_SCHEMA_VERSIONS)}) -- refusing to read evidence produced by an "
             f"unknown emitter version."
+        )
+
+    # --- Priority 10: strict schema -- required, type-checked independent of
+    # any --expected-* comparison target (see the docstring note above for
+    # why gates/skipClassification are handled separately, further below).
+    for _field in ("repository", "workflow", "workflowFile", "ref", "event", "runId"):
+        if not _is_nonempty_str(summary.get(_field)):
+            problems.append(f"evidence {_field} must be a nonempty string (got {summary.get(_field)!r}).")
+    if not _is_positive_integer_or_numeric_string(summary.get("runAttempt")):
+        problems.append(
+            f"evidence runAttempt must be a positive integer or canonical numeric string "
+            f"(got {summary.get('runAttempt')!r})."
+        )
+    if _parse_utc_iso8601(summary.get("generatedAt")) is None:
+        problems.append(f"evidence generatedAt must be a valid UTC ISO-8601 timestamp (got {summary.get('generatedAt')!r}).")
+    if "commitSha" in summary and summary.get("commitSha") is not None and not _is_full_git_sha(summary.get("commitSha")):
+        problems.append(f"evidence commitSha must be a full 40-character hex SHA (got {summary.get('commitSha')!r}).")
+    for _bool_field in ("isMainPush", "isMergeGroup"):
+        _value = summary.get(_bool_field)
+        if _bool_field not in summary:
+            problems.append(f"evidence has no {_bool_field} recorded.")
+        elif not isinstance(_value, bool):
+            problems.append(
+                f"evidence {_bool_field} must be a JSON boolean (got {_value!r}) -- not coerced by truthiness."
+            )
+    if "gates" in summary and summary.get("gates") is not None and not isinstance(summary.get("gates"), dict):
+        problems.append(f"evidence gates must be a JSON object (got {summary.get('gates')!r}).")
+    elif isinstance(summary.get("gates"), dict):
+        for _gate_name, _gate_result in summary["gates"].items():
+            if _gate_result not in GATE_CONCLUSIONS:
+                problems.append(
+                    f"gate {_gate_name!r} has an unrecognised result {_gate_result!r} (expected one of "
+                    f"{sorted(GATE_CONCLUSIONS)})."
+                )
+    if (
+        "skipClassification" in summary
+        and summary.get("skipClassification") is not None
+        and not isinstance(summary.get("skipClassification"), dict)
+    ):
+        problems.append(
+            f"evidence skipClassification must be a JSON object (got {summary.get('skipClassification')!r})."
         )
 
     if expected_repository is not None:
@@ -199,22 +312,32 @@ def verify_main_ci_evidence(
             f"evidence event {event!r} (ref {ref!r}) is neither a push to {MAIN_REF!r} nor a "
             f"{MAIN_EVENT_MERGE_GROUP!r} run -- not merged-main evidence."
         )
-    # Cross-check the evidence's OWN boolean flags (when present) agree with
-    # its event/ref -- a tampered or hand-edited summary claiming isMainPush
-    # while the ref/event say otherwise (or vice versa) is caught here too.
-    if "isMainPush" in summary and bool(summary.get("isMainPush")) != is_main_push:
+    # Cross-check the evidence's OWN boolean flags (when present, and only
+    # when actually JSON booleans -- a non-bool value was already reported
+    # above by the strict-schema pass, and is never coerced by truthiness
+    # here either) agree with its event/ref -- a tampered or hand-edited
+    # summary claiming isMainPush while the ref/event say otherwise (or vice
+    # versa) is caught here too.
+    if isinstance(summary.get("isMainPush"), bool) and summary.get("isMainPush") != is_main_push:
         problems.append(
             f"evidence isMainPush={summary.get('isMainPush')!r} disagrees with its own event/ref "
             f"(event={event!r}, ref={ref!r})."
         )
-    if "isMergeGroup" in summary and bool(summary.get("isMergeGroup")) != is_merge_group:
+    if isinstance(summary.get("isMergeGroup"), bool) and summary.get("isMergeGroup") != is_merge_group:
         problems.append(
             f"evidence isMergeGroup={summary.get('isMergeGroup')!r} disagrees with its own event "
             f"({event!r})."
         )
 
     gates = summary.get("gates")
-    skip_classification = summary.get("skipClassification") or {}
+    # Priority 10: a non-dict skipClassification (a list, a string, ...) is
+    # already reported as a problem by the strict-schema pass above; fall
+    # back to an empty mapping here so a "skipped" gate below can never
+    # crash with AttributeError on a malformed field -- a BLOCKED verdict,
+    # not an uncaught exception, is the only acceptable outcome for bad input.
+    skip_classification = summary.get("skipClassification")
+    if not isinstance(skip_classification, dict):
+        skip_classification = {}
     # Priority 5: the EFFECTIVE required-gate set is the union of whatever the
     # caller explicitly asked for (--required-gate, repeatable) and the
     # verifier's OWN canonical set (when the caller identified a consumer --

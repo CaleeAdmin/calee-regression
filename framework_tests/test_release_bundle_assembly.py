@@ -477,8 +477,12 @@ def test_write_release_bundle_failure_partway_through_leaves_prior_bundle_untouc
     # No STALE temp/backup directory left behind -- only the permanent
     # versions store remains, holding exactly release #1's version (the
     # failed release #2 build was cleaned up before it was ever renamed in).
+    # Priority 5 (this session): the lock file is now a STABLE, permanent
+    # fixture (fcntl.flock-based mutual exclusion never deletes/renames it,
+    # on release or otherwise) -- so it is expected to persist alongside the
+    # permanent .versions store, unlike a transient .tmp-*/journal artifact.
     siblings = [p.name for p in out_dir.parent.iterdir() if p != out_dir]
-    assert siblings == [f".{out_dir.name}.versions"], siblings
+    assert sorted(siblings) == sorted([f".{out_dir.name}.versions", f".{out_dir.name}.lock"]), siblings
     versions_dir = out_dir.parent / f".{out_dir.name}.versions"
     version_entries = [p.name for p in versions_dir.iterdir()]
     assert len(version_entries) == 1, version_entries
@@ -504,8 +508,12 @@ def test_write_release_bundle_leaves_no_temp_dir_on_success(tmp_path):
     # permanent (not a leftover) ".out.versions" directory alongside the
     # out_dir pointer -- but no transient .tmp-*/lock/journal artifact may
     # survive a successful publish.
+    # Priority 5 (this session): the lock file is now a STABLE, permanent
+    # fixture (fcntl.flock-based mutual exclusion never deletes/renames it,
+    # on release or otherwise) -- so it is expected to persist alongside the
+    # permanent .versions store, unlike a transient .tmp-*/journal artifact.
     siblings = [p.name for p in out_dir.parent.iterdir() if p != out_dir]
-    assert siblings == [f".{out_dir.name}.versions"], siblings
+    assert sorted(siblings) == sorted([f".{out_dir.name}.versions", f".{out_dir.name}.lock"]), siblings
     versions_dir = out_dir.parent / f".{out_dir.name}.versions"
     version_entries = [p.name for p in versions_dir.iterdir()]
     assert len(version_entries) == 1, version_entries

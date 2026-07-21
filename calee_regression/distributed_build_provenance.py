@@ -82,12 +82,22 @@ DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT = "caleemobile-distributed-build-acceptan
 
 # How the underlying source evidence was actually produced -- the load-bearing
 # anti-fabrication field, exactly analogous to selector_provenance.py's
-# generatedBy ("ci"/"local"), but distinguishing the THREE authentic sources
-# Priority 3 accepts.
+# generatedBy ("ci"/"local"), but distinguishing the authentic sources this
+# module accepts.
 GENERATED_BY_PROVIDER_API = "provider-api"
 GENERATED_BY_SIGNED_EXPORT = "signed-export"
 GENERATED_BY_CI_ARTIFACT = "ci-artifact"
-VALID_GENERATED_BY = frozenset({GENERATED_BY_PROVIDER_API, GENERATED_BY_SIGNED_EXPORT, GENERATED_BY_CI_ARTIFACT})
+# Priority 1 (this session): the distributed-build IDENTITY CHAIN join --
+# stamped only by build_provenance.join_provider_and_build_provenance, once
+# BOTH an independently-authenticated provider observation AND an
+# independently-authenticated build-provenance record have named the SAME
+# immutable platform build. This is the ONLY generatedBy value whose
+# testedGitSha/testedVersion are proven by an authenticated SOURCE (never the
+# provider) -- see that function's docstring.
+GENERATED_BY_PROVIDER_BUILD_JOIN = "provider-build-provenance-join"
+VALID_GENERATED_BY = frozenset({
+    GENERATED_BY_PROVIDER_API, GENERATED_BY_SIGNED_EXPORT, GENERATED_BY_CI_ARTIFACT, GENERATED_BY_PROVIDER_BUILD_JOIN,
+})
 # Explicitly-named rejected sources, so a rejection message is precise rather
 # than a generic "not recognised" -- mirrors distributed_build_acceptance.py's
 # REJECTED_VERIFIED_VIA (kept in sync so both the legacy and provenance paths
@@ -256,6 +266,26 @@ def validate_distributed_evidence(
                 )
         if generated_by == GENERATED_BY_CI_ARTIFACT and not provider_record_id:
             problems.append("generatedBy 'ci-artifact' requires providerRecordId to name the retained CI run/artifact.")
+        if generated_by == GENERATED_BY_PROVIDER_BUILD_JOIN:
+            # Priority 1: a self-declared join label alone is never enough --
+            # both halves of the chain must actually be present and shaped
+            # like what build_provenance.join_provider_and_build_provenance
+            # produces (full re-verification of each half's own authenticity
+            # is the CALLER's responsibility -- e.g. consolidated_report.py
+            # only ever trusts evidenceTier, never this label; this is a
+            # structural presence check only).
+            provider_observation = evidence.get("providerObservation")
+            build_provenance = evidence.get("buildProvenance")
+            if not isinstance(provider_observation, dict) or not provider_observation:
+                problems.append(
+                    "generatedBy 'provider-build-provenance-join' requires a non-empty providerObservation "
+                    "object -- a join label with no provider-side record attached proves nothing."
+                )
+            if not isinstance(build_provenance, dict) or not build_provenance:
+                problems.append(
+                    "generatedBy 'provider-build-provenance-join' requires a non-empty buildProvenance "
+                    "object -- a join label with no build-provenance-side record attached proves nothing."
+                )
 
     tested_git_sha = _norm(evidence.get("testedGitSha"))
     if not tested_git_sha:

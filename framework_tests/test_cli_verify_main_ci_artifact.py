@@ -52,7 +52,7 @@ def _install_fake_acquisition(monkeypatch, zb, *, run_overrides=None, artifact_o
     def _fake_acquire(**kwargs):
         run_data = {
             "id": int(RUN_ID), "repository": {"full_name": REPO}, "path": WORKFLOW_PATH,
-            "name": "ci", "event": "push", "head_sha": MERGE_SHA,
+            "name": "ci", "event": "push", "head_sha": MERGE_SHA, "head_branch": "main",
             "status": "completed", "conclusion": "success",
         }
         run_data.update(run_overrides)

@@ -85,6 +85,18 @@ report_dir: "."
 # customer device). Default false: a tester machine never opts in by accident.
 allow_caleeshell_technical: false
 
+# ── signed-export trust root (Priority 4) ────────────────────────────────
+# The PINNED SHA-256 fingerprint (64 lowercase/uppercase hex characters, no
+# "sha256:" prefix) of the trusted public key that authenticates a
+# distributed-build/build-provenance signed-export. This is NOT a secret (a
+# fingerprint of a PUBLIC key) so it lives here, not in credentials.py -- but
+# the actual key PEM is still resolved only from CALEE_SIGNED_EXPORT_PUBLIC_KEY
+# (environment/Keychain), never from this file. A release-gating PASS
+# requires the resolved key's OWN computed fingerprint to match this pinned
+# value; a mismatch -- or an ad-hoc --trusted-public-key-file override --
+# can never produce a PASS. Omit while no signed-export path is in use.
+# trusted_signed_export_public_key_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+
 # ── subscribed-calendar fixture (Priority 5/6/7) ─────────────────────────
 # How the today-relative subscribed-calendar ICS is made available to the
 # regression account's subscription. Three explicit modes -- `prepare-

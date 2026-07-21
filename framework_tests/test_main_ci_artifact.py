@@ -64,7 +64,7 @@ def _valid_zip(**overrides) -> bytes:
 def _run(**overrides) -> ga.WorkflowRunMetadata:
     base = dict(
         run_id=RUN_ID, repo_full_name=REPO, workflow_path=WORKFLOW_PATH, workflow_name="ci",
-        event="push", head_sha=MERGE_SHA, status="completed", conclusion="success",
+        event="push", head_sha=MERGE_SHA, head_branch="main", status="completed", conclusion="success",
     )
     base.update(overrides)
     return ga.WorkflowRunMetadata(**base)
@@ -107,6 +107,35 @@ def test_valid_chain_accepted_on_push_to_main():
 def test_valid_chain_accepted_on_merge_group():
     zb = _valid_zip(event="merge_group", ref="refs/heads/main", isMainPush=False, isMergeGroup=True)
     chain = _verify(zb, run=_run(event="merge_group"))
+    assert chain.ok, chain.problems
+
+
+# --- Priority 10: authenticated head_branch cross-check ---------------------
+
+
+def test_push_run_with_wrong_head_branch_rejected():
+    """The run's OWN authenticated head_branch (from GitHub's run resource,
+    independent of the extracted evidence's self-reported ref) must agree
+    with it being a main-branch push."""
+    zb = _valid_zip()
+    chain = _verify(zb, run=_run(head_branch="some-other-branch"))
+    assert not chain.ok
+    assert any("head_branch" in p and "!= expected" in p for p in chain.problems)
+
+
+def test_push_run_with_missing_head_branch_rejected():
+    zb = _valid_zip()
+    chain = _verify(zb, run=_run(head_branch=None))
+    assert not chain.ok
+    assert any("no head_branch recorded" in p for p in chain.problems)
+
+
+def test_merge_group_run_does_not_require_head_branch_to_equal_main():
+    """A merge_group run's head_branch names GitHub's synthetic merge-queue
+    ref, never plain 'main' -- this must not be exact-matched against
+    'main', unlike a push."""
+    zb = _valid_zip(event="merge_group", ref="refs/heads/main", isMainPush=False, isMergeGroup=True)
+    chain = _verify(zb, run=_run(event="merge_group", head_branch="gh-readonly-queue/main/pr-1-abc"))
     assert chain.ok, chain.problems
 
 
@@ -317,7 +346,7 @@ def test_acquire_never_contacts_real_network_uses_injected_fetchers_end_to_end()
         if url.endswith(f"/runs/{RUN_ID}"):
             return {
                 "id": int(RUN_ID), "repository": {"full_name": REPO}, "path": WORKFLOW_PATH,
-                "name": "ci", "event": "push", "head_sha": MERGE_SHA,
+                "name": "ci", "event": "push", "head_sha": MERGE_SHA, "head_branch": "main",
                 "status": "completed", "conclusion": "success",
             }
         if url.endswith(f"/artifacts/{ARTIFACT_ID}"):
@@ -354,7 +383,7 @@ def test_acquire_with_local_zip_path_still_authenticates_metadata(tmp_path):
         if url.endswith(f"/runs/{RUN_ID}"):
             return {
                 "id": int(RUN_ID), "repository": {"full_name": REPO}, "path": WORKFLOW_PATH,
-                "name": "ci", "event": "push", "head_sha": MERGE_SHA,
+                "name": "ci", "event": "push", "head_sha": MERGE_SHA, "head_branch": "main",
                 "status": "completed", "conclusion": "success",
             }
         if url.endswith(f"/artifacts/{ARTIFACT_ID}"):

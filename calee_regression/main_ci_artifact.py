@@ -162,6 +162,24 @@ def verify_main_ci_artifact_chain(
         problems.append(f"workflow run has not completed (status={run.status!r}).")
     if (run.conclusion or "").strip().lower() != "success":
         problems.append(f"workflow run conclusion {run.conclusion!r} != 'success'.")
+    # Priority 10 (this session): cross-check GitHub's OWN authenticated
+    # head_branch against the target branch, for a push event -- an
+    # independent signal beyond head_sha/event alone. A merge_group run's
+    # head_branch names GitHub's synthetic merge-queue ref (e.g.
+    # "gh-readonly-queue/main/pr-123-<sha>"), not "main" itself, so this
+    # exact-match is only meaningful (and only enforced) for a push.
+    if (run.event or "").strip() == mce.MAIN_EVENT_PUSH:
+        expected_branch = mce.MAIN_REF.rsplit("/", 1)[-1]
+        if not (run.head_branch or "").strip():
+            problems.append(
+                "workflow run has no head_branch recorded -- cannot independently confirm this push "
+                "actually targeted the main branch."
+            )
+        elif run.head_branch.strip() != expected_branch:
+            problems.append(
+                f"workflow run head_branch {run.head_branch!r} != expected {expected_branch!r} -- this "
+                f"push run's OWN branch metadata disagrees with it being a main-branch push."
+            )
     if not (run.head_sha or "").strip():
         problems.append("workflow run has no head_sha -- cannot tie this run to a commit.")
     elif run.head_sha.strip().lower() != (expected_merge_sha or "").strip().lower():

@@ -112,29 +112,79 @@ def _asc_fake_fetcher(status, body: dict):
     return _fetch
 
 
+def _asc_body_with_included(build_id="BUILD-999", build_number="24", bundle_id="com.viso.caleemobile", marketing_version="0.0.24"):
+    return {
+        "data": [{
+            "id": build_id,
+            "attributes": {"version": build_number, "processingState": "VALID", "uploadedDate": "2026-07-20T00:00:00.000+0000"},
+            "relationships": {
+                "app": {"data": {"id": "APP-1", "type": "apps"}},
+                "preReleaseVersion": {"data": {"id": "PRV-1", "type": "preReleaseVersions"}},
+            },
+        }],
+        "included": [
+            {"id": "APP-1", "type": "apps", "attributes": {"bundleId": bundle_id}},
+            {"id": "PRV-1", "type": "preReleaseVersions", "attributes": {"version": marketing_version}},
+        ],
+    }
+
+
 def test_collect_app_store_connect_evidence_happy_path(ec_keypair):
+    """Priority 1/2: the collector records ONLY provider-owned facts. It
+    must NEVER populate a Git SHA from the requested/expected value -- the
+    exact defect this session closes."""
     _key, pem = ec_keypair
     client = pe.AppStoreConnectClient(
         key_id="KID1", issuer_id="ISS1", private_key_pem=pem,
-        fetcher=_asc_fake_fetcher(200, {"data": [{"id": "BUILD-999", "attributes": {"version": "0.0.24+24"}}]}),
+        fetcher=_asc_fake_fetcher(200, _asc_body_with_included()),
     )
     record = pe.collect_app_store_connect_evidence(
         app_id="APPID1", build_version="24", requested_git_sha="a" * 40, requested_version="0.0.24+24",
         release_id="r1", client=client, collection_run_id="run-1",
     )
     assert record.provider == pe.PROVIDER_APP_STORE_CONNECT
+    assert record.platform == pe.PLATFORM_IOS
     assert record.provider_record_id == "BUILD-999"
     assert record.http_status == 200
-    assert record.tested_git_sha == "a" * 40
-    assert record.tested_version == "0.0.24+24"
     assert record.collection_run_id == "run-1"
     assert record.credential_source_name == "CALEE_ASC_KEY_ID"
+    # Provider-owned facts, pulled from the SAME authenticated response.
+    assert record.bundle_id == "com.viso.caleemobile"
+    assert record.marketing_version == "0.0.24"
+    assert record.build_number == "24"
+    assert record.processing_state == "VALID"
+    # Audit-only -- never proof, never surfaced as tested*.
+    assert record.requested_git_sha == "a" * 40
+    assert record.requested_version == "0.0.24+24"
+    assert not hasattr(record, "tested_git_sha")
+    assert not hasattr(record, "tested_version")
 
-    evidence = record.to_evidence_dict()
+    evidence = record.to_provider_observation_dict()
     assert evidence["generatedBy"] == "provider-api"
     assert evidence["provider"] == "app_store_connect"
-    problems = dbp.validate_distributed_evidence(evidence, expected_git_sha="a" * 40, expected_version="0.0.24+24", expected_release_id="r1")
+    assert "testedGitSha" not in evidence
+    assert "testedVersion" not in evidence
+    problems = pe.validate_provider_observation(evidence, expected_release_id="r1")
     assert problems == [], problems
+    # A provider observation ALONE can never satisfy the full
+    # distributed-build-evidence schema (Priority 1's core requirement) --
+    # it's missing testedGitSha/testedVersion by design.
+    full_problems = dbp.validate_distributed_evidence(evidence, expected_git_sha="a" * 40, expected_version="0.0.24+24")
+    assert any("testedGitSha" in p or "schemaVersion" in p for p in full_problems)
+
+
+def test_collect_app_store_connect_evidence_without_included_leaves_fields_absent(ec_keypair):
+    """When the response has no `included` array at all, bundleId/marketing
+    version must remain None -- never guessed, never backfilled."""
+    _key, pem = ec_keypair
+    client = pe.AppStoreConnectClient(
+        key_id="K", issuer_id="I", private_key_pem=pem,
+        fetcher=_asc_fake_fetcher(200, {"data": [{"id": "B1", "attributes": {"version": "1"}}]}),
+    )
+    record = pe.collect_app_store_connect_evidence(app_id="A", build_version="1", client=client, collection_run_id="run-1")
+    assert record.bundle_id is None
+    assert record.marketing_version is None
+    assert record.build_number == "1"
 
 
 def test_collect_app_store_connect_evidence_non_200_blocks(ec_keypair):
@@ -178,62 +228,212 @@ def test_collect_app_store_connect_evidence_never_leaks_private_key_in_raw_respo
 # --- Play Console collector ------------------------------------------------
 
 
-def _play_fake_fetcher(track_status, track_body, *, edit_status=200, edit_body=None):
-    calls = {"n": 0}
+def _play_fake_fetcher(track_status, track_body, *, edit_status=200, edit_body=None, delete_status=204, calls=None):
+    """Priority 3: a fake transport that also RECORDS every call's method
+    (and, for the token/edit endpoints, its body) so tests can assert on the
+    actual HTTP-method contract -- not just on the resulting evidence."""
+    calls = calls if calls is not None else []
 
-    def _fetch(url, headers):
-        calls["n"] += 1
-        assert "Authorization" in headers and headers["Authorization"].startswith("Bearer ")
-        if "/edits" in url and "/tracks/" not in url:
+    def _fetch(url, headers, *, method="GET", body=None, timeout=30):
+        calls.append({"url": url, "method": method, "body": body})
+        if url.startswith(pe.PlayConsoleClient.TOKEN_URI):
+            assert method == "POST", "OAuth token exchange must be a real POST"
+            assert headers.get("Content-Type") == "application/x-www-form-urlencoded"
+            assert body is not None and b"grant_type=" in body and b"assertion=" in body
+            return 200, json.dumps({"access_token": "exchanged-token"}).encode(), {}
+        if url.endswith("/edits") and method == "POST":
             return edit_status, json.dumps(edit_body or {"id": "EDIT-1"}).encode(), {}
+        if "/edits/" in url and "/tracks/" not in url and method == "DELETE":
+            return delete_status, b"", {}
+        assert "Authorization" in headers and headers["Authorization"].startswith("Bearer ")
+        assert method == "GET", "track retrieval must be a real GET"
         return track_status, json.dumps(track_body).encode(), {}
     return _fetch
 
 
 def test_collect_play_console_evidence_happy_path_with_access_token():
+    """Priority 1/2: same defect closed for Play -- the collector must never
+    populate a Git SHA from the requested/expected value. Uses an explicitly
+    supplied edit id (Priority 3's safe default), so no edit is created."""
+    calls = []
     client = pe.PlayConsoleClient(
         access_token="fake-access-token",
-        fetcher=_play_fake_fetcher(200, {"releases": [{"name": "0.0.24+24", "versionCodes": ["24"]}]}),
+        fetcher=_play_fake_fetcher(
+            200, {"releases": [{"name": "0.0.24+24", "versionCodes": ["24"], "status": "completed"}]}, calls=calls,
+        ),
     )
     record = pe.collect_play_console_evidence(
         package_name="com.viso.calee", track="internal", requested_git_sha="a" * 40,
         requested_version="0.0.24+24", release_id="r1", client=client, collection_run_id="run-1",
+        edit_id="EDIT-EXISTING",
     )
     assert record.provider == pe.PROVIDER_PLAY_CONSOLE
+    assert record.platform == pe.PLATFORM_ANDROID
     assert record.provider_record_id == "24"
     assert record.channel == "play_console_internal"
-    evidence = record.to_evidence_dict()
-    problems = dbp.validate_distributed_evidence(evidence, expected_git_sha="a" * 40, expected_version="0.0.24+24", expected_release_id="r1")
+    # Provider-owned facts.
+    assert record.bundle_id == "com.viso.calee"
+    assert record.marketing_version == "0.0.24+24"
+    assert record.build_number == "24"
+    assert record.track == "internal"
+    assert record.release_status == "completed"
+    assert not hasattr(record, "tested_git_sha")
+    # An explicitly supplied edit id is read-only: never created, never deleted.
+    assert record.edit_session_source == "explicit"
+    assert record.edit_session_cleanup == "not-applicable"
+    assert all(c["method"] != "POST" or not c["url"].endswith("/edits") for c in calls)
+    assert all(c["method"] != "DELETE" for c in calls)
+    assert any(c["method"] == "GET" and "/edits/EDIT-EXISTING/tracks/internal" in c["url"] for c in calls)
+
+    evidence = record.to_provider_observation_dict()
+    assert "testedGitSha" not in evidence
+    problems = pe.validate_provider_observation(evidence, expected_release_id="r1")
     assert problems == [], problems
+    full_problems = dbp.validate_distributed_evidence(evidence, expected_git_sha="a" * 40, expected_version="0.0.24+24")
+    assert any("testedGitSha" in p or "schemaVersion" in p for p in full_problems)
+
+
+def test_collect_play_console_evidence_release_status_and_track_recorded():
+    client = pe.PlayConsoleClient(
+        access_token="t",
+        fetcher=_play_fake_fetcher(200, {"releases": [{"versionCodes": ["7"], "status": "inProgress"}]}),
+    )
+    record = pe.collect_play_console_evidence(
+        package_name="p", track="beta", client=client, collection_run_id="run-1", edit_id="EDIT-1",
+    )
+    assert record.track == "beta"
+    assert record.release_status == "inProgress"
+    # versionName is absent from the release entirely -- must stay None,
+    # never guessed from the version code.
+    assert record.marketing_version is None
 
 
 def test_collect_play_console_evidence_via_service_account_jwt_exchange(rsa_keypair):
     _key, private_pem, _public_pem = rsa_keypair
     service_account = {"client_email": "svc@proj.iam.gserviceaccount.com", "private_key": private_pem}
+    calls = []
 
-    def fetcher(url, headers):
+    def fetcher(url, headers, *, method="GET", body=None, timeout=30):
+        calls.append({"url": url, "method": method, "body": body})
         if url.startswith(pe.PlayConsoleClient.TOKEN_URI):
+            assert method == "POST"
             return 200, json.dumps({"access_token": "exchanged-token"}).encode(), {}
-        if "/edits" in url and "/tracks/" not in url:
-            return 200, json.dumps({"id": "EDIT-1"}).encode(), {}
         assert headers["Authorization"] == "Bearer exchanged-token"
+        assert method == "GET"
         return 200, json.dumps({"releases": [{"name": "0.0.24+24", "versionCodes": ["24"]}]}).encode(), {}
 
     client = pe.PlayConsoleClient(service_account=service_account, fetcher=fetcher)
-    record = pe.collect_play_console_evidence(package_name="com.viso.calee", track="internal", client=client, collection_run_id="run-1")
+    record = pe.collect_play_console_evidence(
+        package_name="com.viso.calee", track="internal", client=client, collection_run_id="run-1", edit_id="EDIT-1",
+    )
     assert record.provider_record_id == "24"
+    assert any(c["method"] == "POST" and c["url"].startswith(pe.PlayConsoleClient.TOKEN_URI) for c in calls)
 
 
 def test_collect_play_console_evidence_no_releases_blocks():
     client = pe.PlayConsoleClient(access_token="t", fetcher=_play_fake_fetcher(200, {"releases": []}))
     with pytest.raises(pe.ProviderEvidenceError, match="no releases"):
-        pe.collect_play_console_evidence(package_name="p", track="internal", client=client, collection_run_id="run-1")
+        pe.collect_play_console_evidence(
+            package_name="p", track="internal", client=client, collection_run_id="run-1", edit_id="EDIT-1",
+        )
 
 
 def test_collect_play_console_evidence_blocks_without_credentials():
     resolver = credentials_mod.CredentialResolver([credentials_mod.EnvironmentProvider({})])
     with pytest.raises(pe.ProviderEvidenceError, match="CALEE_PLAY"):
-        pe.collect_play_console_evidence(package_name="p", track="internal", resolver=resolver, collection_run_id="run-1")
+        pe.collect_play_console_evidence(
+            package_name="p", track="internal", resolver=resolver, collection_run_id="run-1", edit_id="EDIT-1",
+        )
+
+
+# --- Play Console edit-session safety policy (Priority 3) -------------------
+#
+# The Play Developer API only exposes track state through an edit session --
+# there is no edit-free read. Creating an edit can invalidate another edit
+# already open, so collect_play_console_evidence must never do so silently.
+
+
+def test_collect_play_console_evidence_without_edit_id_or_allow_create_blocks():
+    """The safe default: neither an explicit edit id nor
+    --allow-create-play-edit-session was supplied -- BLOCKS rather than
+    silently creating an edit session."""
+    client = pe.PlayConsoleClient(access_token="t", fetcher=_play_fake_fetcher(200, {"releases": []}))
+    with pytest.raises(pe.ProviderEvidenceError, match="edit session"):
+        pe.collect_play_console_evidence(package_name="p", track="internal", client=client, collection_run_id="run-1")
+
+
+def test_collect_play_console_evidence_explicit_edit_id_never_creates_or_deletes():
+    calls = []
+    client = pe.PlayConsoleClient(
+        access_token="t",
+        fetcher=_play_fake_fetcher(200, {"releases": [{"versionCodes": ["9"]}]}, calls=calls),
+    )
+    record = pe.collect_play_console_evidence(
+        package_name="p", track="internal", client=client, collection_run_id="run-1", edit_id="EDIT-PROVIDED",
+    )
+    assert record.edit_session_source == "explicit"
+    assert record.edit_session_cleanup == "not-applicable"
+    assert not any(c["method"] == "POST" and c["url"].endswith("/edits") for c in calls)
+    assert not any(c["method"] == "DELETE" for c in calls)
+
+
+def test_collect_play_console_evidence_allow_create_edit_session_creates_and_cleans_up(capsys):
+    """Explicit --allow-create-play-edit-session opt-in: a real POST creates
+    a temporary edit, it's used for a real GET, and a real DELETE cleans it
+    up -- with an unmissable warning printed before the create."""
+    calls = []
+    client = pe.PlayConsoleClient(
+        access_token="t",
+        fetcher=_play_fake_fetcher(
+            200, {"releases": [{"versionCodes": ["9"]}]}, edit_body={"id": "EDIT-TEMP"}, calls=calls,
+        ),
+    )
+    record = pe.collect_play_console_evidence(
+        package_name="p", track="internal", client=client, collection_run_id="run-1",
+        allow_create_edit_session=True,
+    )
+    assert record.edit_session_source == "created"
+    assert record.edit_session_cleanup == "succeeded"
+    assert any(c["method"] == "POST" and c["url"].endswith("/edits") for c in calls)
+    assert any(c["method"] == "GET" and "/edits/EDIT-TEMP/tracks/internal" in c["url"] for c in calls)
+    assert any(c["method"] == "DELETE" and c["url"].endswith("/edits/EDIT-TEMP") for c in calls)
+    warning = capsys.readouterr().err
+    assert "WARNING" in warning and "TEMPORARY" in warning
+
+
+def test_collect_play_console_evidence_cleanup_failure_is_surfaced(capsys):
+    """A cleanup DELETE failure must never be silently swallowed -- the
+    record carries edit_session_cleanup == 'failed' and a loud warning is
+    printed, since a leaked edit can block other tooling/humans."""
+    client = pe.PlayConsoleClient(
+        access_token="t",
+        fetcher=_play_fake_fetcher(200, {"releases": [{"versionCodes": ["9"]}]}, delete_status=500),
+    )
+    record = pe.collect_play_console_evidence(
+        package_name="p", track="internal", client=client, collection_run_id="run-1",
+        allow_create_edit_session=True,
+    )
+    assert record.edit_session_cleanup == "failed"
+    warning = capsys.readouterr().err
+    assert "FAILED" in warning
+
+
+def test_collect_play_console_evidence_cleanup_runs_even_if_the_read_fails(capsys):
+    """Cleanup of a created edit must happen in a finally -- even when the
+    track read itself errors out (e.g. no releases) -- never leaking a
+    temporary edit just because the read failed."""
+    client = pe.PlayConsoleClient(
+        access_token="t",
+        fetcher=_play_fake_fetcher(200, {"releases": []}),
+    )
+    with pytest.raises(pe.ProviderEvidenceError, match="no releases"):
+        pe.collect_play_console_evidence(
+            package_name="p", track="internal", client=client, collection_run_id="run-1",
+            allow_create_edit_session=True,
+        )
+    warning = capsys.readouterr().err
+    assert "TEMPORARY" in warning
+    assert "FAILED" not in warning
 
 
 def test_provider_evidence_dicts_never_contain_key_material(ec_keypair, rsa_keypair):
@@ -250,23 +450,24 @@ def test_provider_evidence_dicts_never_contain_key_material(ec_keypair, rsa_keyp
         fetcher=_asc_fake_fetcher(200, {"data": [{"id": "B1", "attributes": {"version": "1"}}]}),
     )
     asc_record = pe.collect_app_store_connect_evidence(app_id="A", build_version="1", client=asc_client, collection_run_id="run-1")
-    asc_serialized = json.dumps(asc_record.to_evidence_dict())
+    asc_serialized = json.dumps(asc_record.to_provider_observation_dict())
     assert asc_pem not in asc_serialized
     assert "BEGIN" not in asc_serialized
     assert asc_record.credential_source_name == credentials_mod.APP_STORE_CONNECT_KEY_ID.env_var
 
     service_account = {"client_email": "svc@proj.iam.gserviceaccount.com", "private_key": play_private_pem}
 
-    def _service_account_fetcher(url, headers):
+    def _service_account_fetcher(url, headers, *, method="GET", body=None, timeout=30):
         if url.startswith(pe.PlayConsoleClient.TOKEN_URI):
             return 200, json.dumps({"access_token": "exchanged-token"}).encode(), {}
-        if "/edits" in url and "/tracks/" not in url:
-            return 200, json.dumps({"id": "EDIT-1"}).encode(), {}
         return 200, json.dumps({"releases": [{"name": "0.0.24+24", "versionCodes": ["24"]}]}).encode(), {}
 
     play_client = pe.PlayConsoleClient(service_account=service_account, fetcher=_service_account_fetcher)
-    play_record = pe.collect_play_console_evidence(package_name="com.viso.calee", track="internal", client=play_client, collection_run_id="run-1")
-    play_serialized = json.dumps(play_record.to_evidence_dict())
+    play_record = pe.collect_play_console_evidence(
+        package_name="com.viso.calee", track="internal", client=play_client, collection_run_id="run-1",
+        edit_id="EDIT-1",
+    )
+    play_serialized = json.dumps(play_record.to_provider_observation_dict())
     assert play_private_pem not in play_serialized
     assert "BEGIN" not in play_serialized
 
@@ -329,6 +530,100 @@ def test_verify_signed_export_rejects_malformed_public_key():
     assert problems and "not a valid" in problems[0]
 
 
+# --- Priority 4 (this session): pinned signed-export trust roots -----------
+
+
+def test_compute_public_key_sha256_fingerprint_is_stable_and_format_independent(rsa_keypair):
+    _key, _private_pem, public_pem = rsa_keypair
+    fingerprint = pe.compute_public_key_sha256_fingerprint(public_pem)
+    assert len(fingerprint) == 64
+    assert all(c in "0123456789abcdef" for c in fingerprint)
+    # Re-wrapping the SAME key's PEM text at a different line width must not
+    # change the fingerprint -- it's computed over the canonical DER SPKI,
+    # never the raw PEM text.
+    rewrapped = public_pem.replace("\n", "").replace(
+        "-----BEGIN PUBLIC KEY-----", "-----BEGIN PUBLIC KEY-----\n"
+    ).replace("-----END PUBLIC KEY-----", "\n-----END PUBLIC KEY-----\n")
+    assert pe.compute_public_key_sha256_fingerprint(rewrapped) == fingerprint
+
+
+def test_compute_public_key_sha256_fingerprint_differs_for_different_keys(rsa_keypair):
+    _key, _private_pem, public_pem = rsa_keypair
+    other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    other_public_pem = other_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    assert pe.compute_public_key_sha256_fingerprint(public_pem) != pe.compute_public_key_sha256_fingerprint(other_public_pem)
+
+
+def test_compute_public_key_sha256_fingerprint_rejects_malformed_key():
+    with pytest.raises(pe.ProviderEvidenceError):
+        pe.compute_public_key_sha256_fingerprint("not a key")
+
+
+def test_resolve_pinned_trusted_public_key_requires_a_pinned_fingerprint(rsa_keypair):
+    _key, _private_pem, public_pem = rsa_keypair
+    resolver = credentials_mod.CredentialResolver([credentials_mod.InjectedProvider({"signed_export_trusted_public_key": public_pem})])
+    with pytest.raises(pe.ProviderEvidenceError, match="no trusted signed-export public-key fingerprint is pinned"):
+        pe.resolve_pinned_trusted_public_key(pinned_fingerprint=None, resolver=resolver)
+    with pytest.raises(pe.ProviderEvidenceError, match="no trusted signed-export public-key fingerprint is pinned"):
+        pe.resolve_pinned_trusted_public_key(pinned_fingerprint="", resolver=resolver)
+
+
+def test_resolve_pinned_trusted_public_key_blocks_without_credential():
+    resolver = credentials_mod.CredentialResolver([credentials_mod.EnvironmentProvider({})])
+    with pytest.raises(pe.ProviderEvidenceError, match="CALEE_SIGNED_EXPORT_PUBLIC_KEY"):
+        pe.resolve_pinned_trusted_public_key(pinned_fingerprint="a" * 64, resolver=resolver)
+
+
+def test_resolve_pinned_trusted_public_key_accepts_matching_fingerprint(rsa_keypair):
+    _key, _private_pem, public_pem = rsa_keypair
+    expected_fingerprint = pe.compute_public_key_sha256_fingerprint(public_pem)
+    resolver = credentials_mod.CredentialResolver([credentials_mod.InjectedProvider({"signed_export_trusted_public_key": public_pem})])
+    pem, fingerprint = pe.resolve_pinned_trusted_public_key(pinned_fingerprint=expected_fingerprint, resolver=resolver)
+    assert pem == public_pem
+    assert fingerprint == expected_fingerprint
+
+
+def test_resolve_pinned_trusted_public_key_rejects_fingerprint_mismatch(rsa_keypair):
+    """The exact Priority 4 requirement: a wrong pinned-key fingerprint
+    BLOCKS, even though the resolved key itself parses/verifies fine."""
+    _key, _private_pem, public_pem = rsa_keypair
+    resolver = credentials_mod.CredentialResolver([credentials_mod.InjectedProvider({"signed_export_trusted_public_key": public_pem})])
+    with pytest.raises(pe.ProviderEvidenceError, match="does not match"):
+        pe.resolve_pinned_trusted_public_key(pinned_fingerprint="0" * 64, resolver=resolver)
+
+
+def test_a_newly_generated_self_signed_key_cannot_pass_release_qualification(rsa_keypair):
+    """Priority 4's explicit required test: a brand-new, never-configured
+    key pair -- signature verifies genuinely against ITSELF, but since its
+    fingerprint was never pinned in machine configuration, resolving the
+    PINNED key path must BLOCK rather than accept this self-signed key as a
+    substitute trust root."""
+    attacker_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    attacker_public_pem = attacker_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    payload = {"testedGitSha": "a" * 40}
+    signature = attacker_key.sign(_canonical(payload), padding.PKCS1v15(), hashes.SHA256())
+    # The signature verifies genuinely against the attacker's OWN key --
+    # proving this is a real cryptography check, not merely "any key fails".
+    assert pe.verify_signed_export(
+        payload_bytes=_canonical(payload), signature_bytes=signature, trusted_public_key_pem=attacker_public_pem,
+    ) == []
+
+    # But resolving it through the PINNED path (the only path that may ever
+    # produce a release-gating PASS) BLOCKS: nothing pins this key's
+    # fingerprint anywhere, and a resolver that happens to hand back this
+    # exact key must not silently be treated as sufficient.
+    legitimate_fingerprint = "1" * 64  # some OTHER, actually-pinned key's fingerprint
+    resolver = credentials_mod.CredentialResolver(
+        [credentials_mod.InjectedProvider({"signed_export_trusted_public_key": attacker_public_pem})]
+    )
+    with pytest.raises(pe.ProviderEvidenceError, match="does not match"):
+        pe.resolve_pinned_trusted_public_key(pinned_fingerprint=legitimate_fingerprint, resolver=resolver)
+
+
 def test_build_signed_export_evidence_end_to_end(rsa_keypair):
     private_key, _private_pem, public_pem = rsa_keypair
     payload = {
@@ -346,7 +641,12 @@ def test_build_signed_export_evidence_end_to_end(rsa_keypair):
     assert problems == []
     assert evidence["generatedBy"] == "signed-export"
     assert isinstance(evidence["signatureOrArtifactProvenance"], dict)
-    assert evidence["signatureOrArtifactProvenance"]["signerFingerprint"] == "AA:BB:CC"
+    # Priority 4: signerFingerprint is ALWAYS derived from the verified key
+    # itself, never the caller-supplied label -- the operator's label is
+    # merely recorded alongside it, under a separate, clearly-non-authoritative
+    # key.
+    assert evidence["signatureOrArtifactProvenance"]["signerFingerprint"] == pe.compute_public_key_sha256_fingerprint(public_pem)
+    assert evidence["signatureOrArtifactProvenance"]["operatorDeclaredSignerLabel"] == "AA:BB:CC"
     validate_problems = dbp.validate_distributed_evidence(evidence, expected_release_id="r1")
     assert validate_problems == [], validate_problems
 
@@ -373,10 +673,9 @@ def test_build_signed_export_evidence_altered_payload_after_signing_blocks(rsa_k
 
 def test_verify_nested_provider_evidence_accepts_well_formed_provider_api_claim():
     evidence = {
-        "schemaVersion": 2, "component": "caleemobile-distributed-build-acceptance",
-        "provider": "app_store_connect", "channel": "testflight", "distributedBuildId": "TF-1",
-        "releaseId": "r1", "testedGitSha": "a" * 40, "testedVersion": "0.0.24+24",
-        "providerAccountOrProject": "acct", "providerRecordId": "rec-1",
+        "schemaVersion": 1, "component": "caleemobile-provider-observation",
+        "provider": "app_store_connect", "platform": "ios", "channel": "testflight",
+        "releaseId": "r1", "providerAccountOrProject": "acct", "providerRecordId": "rec-1",
         "providerObservedAt": "2026-07-21T00:00:00Z", "generatedBy": "provider-api",
         "sourceDigest": "sha256:" + "1" * 64, "timestamp": "2026-07-21T00:00:00Z",
     }
@@ -384,19 +683,31 @@ def test_verify_nested_provider_evidence_accepts_well_formed_provider_api_claim(
 
 
 def test_verify_nested_provider_evidence_rejects_manual_claim_even_inside_real_artifact():
-    """The core Priority 3 requirement: an authenticated CI artifact
+    """The core Priority 1/3 requirement: an authenticated CI artifact
     carrying a hand-typed manual claim (never touched a provider) must
     still be rejected -- the ARTIFACT's authenticity doesn't launder the
     CONTENT's lack of provenance."""
     evidence = {
-        "schemaVersion": 2, "provider": "app_store_connect", "channel": "testflight",
-        "distributedBuildId": "TF-1", "releaseId": "r1", "testedGitSha": "a" * 40,
-        "testedVersion": "0.0.24+24", "providerAccountOrProject": "acct", "providerRecordId": "rec-1",
+        "schemaVersion": 1, "component": "caleemobile-provider-observation",
+        "provider": "app_store_connect", "platform": "ios", "channel": "testflight",
+        "releaseId": "r1", "providerAccountOrProject": "acct", "providerRecordId": "rec-1",
         "providerObservedAt": "2026-07-21T00:00:00Z", "generatedBy": "manual_claim",
         "sourceDigest": "sha256:" + "1" * 64, "timestamp": "2026-07-21T00:00:00Z",
     }
     problems = pe.verify_nested_provider_evidence(evidence)
-    assert problems and any("manual_claim" in p or "rejected" in p for p in problems)
+    assert problems and any("manual_claim" in p or "not 'provider-api'" in p for p in problems)
+
+
+def test_verify_nested_provider_evidence_rejects_missing_platform():
+    evidence = {
+        "schemaVersion": 1, "component": "caleemobile-provider-observation",
+        "provider": "app_store_connect", "channel": "testflight",
+        "releaseId": "r1", "providerAccountOrProject": "acct", "providerRecordId": "rec-1",
+        "providerObservedAt": "2026-07-21T00:00:00Z", "generatedBy": "provider-api",
+        "sourceDigest": "sha256:" + "1" * 64, "timestamp": "2026-07-21T00:00:00Z",
+    }
+    problems = pe.verify_nested_provider_evidence(evidence)
+    assert any("platform" in p for p in problems)
 
 
 # --- CI-artifact chain (authenticate the ARTIFACT, then the nested content) -
@@ -411,10 +722,9 @@ CI_RESULT_FILENAME = "distributed-build-evidence.json"
 
 def _nested_evidence(**overrides) -> dict:
     data = {
-        "schemaVersion": 2, "component": "caleemobile-distributed-build-acceptance",
-        "provider": "app_store_connect", "channel": "testflight", "distributedBuildId": "TF-1",
-        "releaseId": "r1", "testedGitSha": "a" * 40, "testedVersion": "0.0.24+24",
-        "providerAccountOrProject": "acct", "providerRecordId": "rec-1",
+        "schemaVersion": 1, "component": "caleemobile-provider-observation",
+        "provider": "app_store_connect", "platform": "ios", "channel": "testflight",
+        "releaseId": "r1", "providerAccountOrProject": "acct", "providerRecordId": "rec-1",
         "providerObservedAt": "2026-07-21T00:00:00Z", "generatedBy": "provider-api",
         "sourceDigest": "sha256:" + "1" * 64, "timestamp": "2026-07-21T00:00:00Z",
     }
@@ -465,7 +775,7 @@ def test_verify_provider_ci_artifact_chain_accepts_well_formed():
     zb = _ci_zip()
     chain = _verify_ci_chain(zb)
     assert chain.ok, chain.problems
-    assert chain.result["distributedBuildId"] == "TF-1"
+    assert chain.result["providerRecordId"] == "rec-1"
 
 
 def test_verify_provider_ci_artifact_chain_rejects_wrong_repository():
@@ -527,7 +837,7 @@ def test_verify_provider_ci_artifact_chain_enforces_expected_release_id():
 def test_verify_provider_ci_artifact_chain_summary_mentions_build_id_or_rejection():
     zb = _ci_zip()
     ok_chain = _verify_ci_chain(zb)
-    assert "TF-1" in ok_chain.summary()
+    assert "rec-1" in ok_chain.summary()
     bad_chain = _verify_ci_chain(zb, run=_ci_run(conclusion="failure"))
     assert "REJECTED" in bad_chain.summary()
 
@@ -587,4 +897,4 @@ def test_acquire_provider_ci_artifact_never_contacts_real_network_uses_injected_
         json_fetcher=json_fetcher, bytes_fetcher=bytes_fetcher, token="fake",
     )
     assert chain.ok, chain.problems
-    assert chain.result["distributedBuildId"] == "TF-1"
+    assert chain.result["providerRecordId"] == "rec-1"

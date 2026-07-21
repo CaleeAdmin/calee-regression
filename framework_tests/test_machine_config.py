@@ -123,3 +123,33 @@ def test_shipped_example_is_valid_and_secret_free():
     raw = yaml.safe_load(example.read_text(encoding="utf-8"))
     errors = validate_machine_config(raw)
     assert errors == [], errors
+
+
+# --- Priority 4 (this session): pinned signed-export trust-key fingerprint -
+
+
+def test_valid_trusted_signed_export_fingerprint_loads(tmp_path):
+    cfg = load_machine_config(_write(tmp_path, dict(_VALID, trusted_signed_export_public_key_sha256="a" * 64)))
+    assert cfg.trusted_signed_export_public_key_sha256 == "a" * 64
+
+
+def test_trusted_signed_export_fingerprint_absent_by_default(tmp_path):
+    cfg = load_machine_config(_write(tmp_path, _VALID))
+    assert cfg.trusted_signed_export_public_key_sha256 is None
+
+
+def test_trusted_signed_export_fingerprint_wrong_length_rejected():
+    errors = validate_machine_config(dict(_VALID, trusted_signed_export_public_key_sha256="abc123"))
+    assert any("trusted_signed_export_public_key_sha256" in e for e in errors)
+
+
+def test_trusted_signed_export_fingerprint_non_hex_rejected():
+    errors = validate_machine_config(
+        dict(_VALID, trusted_signed_export_public_key_sha256="g" * 64)
+    )
+    assert any("trusted_signed_export_public_key_sha256" in e for e in errors)
+
+
+def test_trusted_signed_export_fingerprint_is_lowercased_on_load(tmp_path):
+    cfg = load_machine_config(_write(tmp_path, dict(_VALID, trusted_signed_export_public_key_sha256="A" * 64)))
+    assert cfg.trusted_signed_export_public_key_sha256 == "a" * 64

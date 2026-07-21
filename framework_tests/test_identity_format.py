@@ -10,7 +10,7 @@ never be safely matched, so it must be rejected up front rather than silently
 from __future__ import annotations
 
 from calee_regression import release_platforms
-from calee_regression.identity_format import is_full_git_sha, is_wellformed_version
+from calee_regression.identity_format import is_full_git_sha, is_wellformed_version, split_marketing_version_and_build_number
 from calee_regression.release_platforms import ExpectedBuildIdentity
 
 FULL_SHA = "a" * 40
@@ -40,6 +40,28 @@ def test_is_wellformed_version_accepts_real_calee_versions():
 def test_is_wellformed_version_rejects_malformed():
     for bad in ("", "   ", None, "latest", "0.3", "v1.2.3", "1.2.3.4", "0.0.22+", "founder-v0.3", "abc"):
         assert not is_wellformed_version(bad), bad
+
+
+# --- split_marketing_version_and_build_number (Priority 2, this session) ----
+
+
+def test_split_marketing_version_and_build_number_splits_caleemobile_shape():
+    assert split_marketing_version_and_build_number("0.0.24+24") == ("0.0.24", "24")
+
+
+def test_split_marketing_version_and_build_number_rejects_no_build_number():
+    # A bare "0.3.24" is a WELL-FORMED version (is_wellformed_version accepts
+    # it) but has no build number to split off -- ambiguous, never a guess.
+    assert split_marketing_version_and_build_number("0.3.24") is None
+
+
+def test_split_marketing_version_and_build_number_rejects_multiple_plus_signs():
+    assert split_marketing_version_and_build_number("0.0.24+24+7") is None
+
+
+def test_split_marketing_version_and_build_number_rejects_malformed_version():
+    for bad in ("", "   ", None, "latest", "0.0.22+", "abc"):
+        assert split_marketing_version_and_build_number(bad) is None, bad
 
 
 # --- validate_expected_build_identity (config-level, Workstream 2) -----------
