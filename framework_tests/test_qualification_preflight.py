@@ -74,13 +74,23 @@ def test_check_report_root_filesystem_root_is_blocked():
 
 
 def test_check_android_sdk_found_via_which():
-    result = qp.check_android_sdk(which=lambda name: "/usr/bin/adb" if name == "adb" else None)
+    result = qp.check_android_sdk(which=lambda name: "/usr/bin/adb" if name == "adb" else None, env={})
     assert result.status == qp.STATUS_READY
 
 
 def test_check_android_sdk_not_found_is_blocked():
-    result = qp.check_android_sdk(which=lambda name: None)
+    # env={} makes this hermetic -- without it, a CI runner with a real
+    # ANDROID_HOME/platform-tools/adb on disk would pass via the env-var
+    # branch regardless of the faked `which`, exactly as happened in CI.
+    result = qp.check_android_sdk(which=lambda name: None, env={})
     assert result.status == qp.STATUS_BLOCKED
+
+
+def test_check_android_sdk_found_via_android_home_env(tmp_path):
+    (tmp_path / "platform-tools").mkdir()
+    (tmp_path / "platform-tools" / "adb").write_text("")
+    result = qp.check_android_sdk(which=lambda name: None, env={"ANDROID_HOME": str(tmp_path)})
+    assert result.status == qp.STATUS_READY
 
 
 def test_check_adb_devices_none_connected_is_blocked():

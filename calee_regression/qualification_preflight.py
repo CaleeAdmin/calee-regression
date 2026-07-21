@@ -96,9 +96,10 @@ def check_report_root(machine_report_dir: "str | None", env: "dict | None" = Non
     return _check("report_root", STATUS_READY, f"Report root {path} exists and is writable.")
 
 
-def check_android_sdk(which: WhichFn = shutil.which) -> PreflightCheck:
-    home = os.environ.get("ANDROID_HOME")
-    sdk_root = os.environ.get("ANDROID_SDK_ROOT")
+def check_android_sdk(which: WhichFn = shutil.which, *, env: "dict | None" = None) -> PreflightCheck:
+    environ = env if env is not None else os.environ
+    home = environ.get("ANDROID_HOME")
+    sdk_root = environ.get("ANDROID_SDK_ROOT")
     for env_value in (home, sdk_root):
         if env_value and (Path(env_value) / "platform-tools" / "adb").exists():
             return _check("android_sdk_tools", STATUS_READY, f"Android SDK found at {env_value}.")
@@ -396,7 +397,7 @@ def run_qualification_preflight(
             cfg = None
 
     checks.append(check_report_root(cfg.report_dir if cfg else None, env=environ))
-    checks.append(check_android_sdk(which=which))
+    checks.append(check_android_sdk(which=which, env=environ))
 
     availability, serial_check, connected_serials = check_adb_devices(
         cfg.tablet_serial if cfg else None, adb_runner=adb_runner,
