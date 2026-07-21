@@ -36,16 +36,16 @@ docstring):
 
 from __future__ import annotations
 
+import hashlib
 import json
-import os
 import re
 import shutil
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import apk_inspect
+from . import atomic_publish
 from .identity_format import is_full_git_sha, is_wellformed_version
 from .release_installer import (
     CALEE_PACKAGE_ID,
@@ -352,61 +352,35 @@ def assemble_release_bundle(
     return assembly
 
 
-def _atomic_replace_dir(tmp_dir: Path, dest_dir: Path) -> None:
-    """Atomically make ``tmp_dir`` become ``dest_dir``. POSIX ``rename``
-    cannot replace a non-empty existing directory in one call, so an existing
-    ``dest_dir`` is first renamed aside, ``tmp_dir`` is renamed into place,
-    and only then is the old directory removed -- a failure partway through
-    the swap still leaves a valid directory at ``dest_dir`` (either the old
-    one, restored, or the new one). Mirrors release_candidate.py's identical
-    helper (Priority 4/9) -- kept as its own copy here rather than a cross-
-    import, matching this module's existing style of not depending on
-    release_candidate.py."""
-    backup_dir = None
-    if dest_dir.exists():
-        backup_dir = dest_dir.with_name(f".{dest_dir.name}.bak-{os.getpid()}")
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir, ignore_errors=True)
-        dest_dir.rename(backup_dir)
-    try:
-        tmp_dir.rename(dest_dir)
-    except Exception:
-        if backup_dir is not None:
-            backup_dir.rename(dest_dir)
-        raise
-    if backup_dir is not None:
-        shutil.rmtree(backup_dir, ignore_errors=True)
-
-
 def write_release_bundle(assembly: BundleAssembly, out_dir: "Path | str") -> Path:
     """Writes the assembled, schema-v2 bundle to ``out_dir``: copies each
     included APK, generates ``checksums.sha256`` and ``release-manifest.json``.
     Raises AssemblyError if ``assembly`` did not succeed -- never writes a
     partial/invalid bundle.
 
-    Writes ATOMICALLY (Priority 9): everything is built in a fresh temporary
-    sibling directory first, then swapped into place with one directory
-    rename (``_atomic_replace_dir``, mirroring ``release_candidate.py``'s
-    identical snapshot-swap pattern). A process killed/crashing partway
-    through a write leaves ``out_dir`` exactly as it was before this call --
-    never a torn state where, say, a freshly-copied APK sits alongside a
-    STALE ``release-manifest.json`` still describing a previous release's
-    identity (or vice versa). That specific torn state is dangerous, not
-    just untidy: if ``--out`` is reused across releases with a filename that
-    happens to coincide, a half-written bundle could otherwise still
-    successfully verify -- just as the WRONG release. Because the swap
-    replaces the whole directory, ``out_dir`` is always exactly the
-    single bundle this call produced -- an ``--out`` reused across releases
-    never accumulates stale APKs/manifests left over from an earlier,
-    differently-named release. A destination used for anything besides a
-    release bundle should not be pointed at by ``--out``."""
+    Publication (Priority 4/9) goes through ``atomic_publish.publish_version``:
+    everything is built once in a fresh, content-addressed, immutable version
+    directory, verified, and only then does ``out_dir`` (a symlink pointer)
+    get atomically repointed at it -- never a multi-step backup/rename dance
+    that a killed process could interrupt halfway. A process killed/crashing
+    at ANY point leaves ``out_dir`` exactly as it was before this call (or,
+    for the very first publish, simply absent) -- never a torn state where,
+    say, a freshly-copied APK sits alongside a STALE ``release-manifest.json``
+    still describing a previous release's identity (or vice versa). That
+    specific torn state is dangerous, not just untidy: if ``--out`` is reused
+    across releases with a filename that happens to coincide, a half-written
+    bundle could otherwise still successfully verify -- just as the WRONG
+    release. Because each publish is a whole-directory version swap, ``out_dir``
+    is always exactly the single bundle this call produced -- an ``--out``
+    reused across releases never accumulates stale APKs/manifests left over
+    from an earlier, differently-named release. A destination used for
+    anything besides a release bundle should not be pointed at by ``--out``."""
     if not assembly.ok or assembly.manifest is None:
         raise AssemblyError("Cannot write a bundle from a failed/incomplete assembly.")
     out = Path(out_dir)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix=f".{out.name}.tmp-", dir=str(out.parent)))
-    try:
+    def _build(tmp_dir: Path) -> None:
         checksum_lines: "list[str]" = []
         for result in (assembly.calee, assembly.caleeshell):
             if result is None or not result.install_artifact:
@@ -419,8 +393,26 @@ def write_release_bundle(assembly: BundleAssembly, out_dir: "Path | str") -> Pat
             "\n".join(checksum_lines) + ("\n" if checksum_lines else ""), encoding="utf-8",
         )
         (tmp_dir / MANIFEST_NAME).write_text(json.dumps(assembly.manifest, indent=2) + "\n", encoding="utf-8")
-        _atomic_replace_dir(tmp_dir, out)
-    except Exception:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
+
+    def _verify(tmp_dir: Path) -> "list[str]":
+        problems: "list[str]" = []
+        if not (tmp_dir / MANIFEST_NAME).is_file():
+            problems.append(f"{MANIFEST_NAME} missing from the newly built bundle version.")
+        if not (tmp_dir / CHECKSUMS_NAME).is_file():
+            problems.append(f"{CHECKSUMS_NAME} missing from the newly built bundle version.")
+        for result in (assembly.calee, assembly.caleeshell):
+            if result is None or not result.install_artifact:
+                continue
+            dest = tmp_dir / result.apk_filename
+            if not dest.is_file():
+                problems.append(f"{result.apk_filename} missing from the newly built bundle version.")
+                continue
+            actual = hashlib.sha256(dest.read_bytes()).hexdigest()
+            if actual != result.apk_sha256:
+                problems.append(
+                    f"{result.apk_filename} digest mismatch after copy: expected {result.apk_sha256}, got {actual}."
+                )
+        return problems
+
+    atomic_publish.publish_version(out, _build, verify_fn=_verify)
     return out

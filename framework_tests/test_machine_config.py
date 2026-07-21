@@ -78,6 +78,22 @@ def test_invalid_mobile_platform_is_rejected(tmp_path):
     assert "blackberry" in str(exc.value)
 
 
+@pytest.mark.parametrize("bad_url", [
+    "http://hub-dev.calee.com.au",
+    "hub-dev.calee.com.au",
+    "https://user:pass@hub-dev.calee.com.au",
+    "https://real.calee.com.au@evil.example/",
+    "https://hub-dev.calee.com.au#frag",
+    "https://hub-dev.calee.com.au:99999",
+    " https://hub-dev.calee.com.au",
+])
+def test_backend_url_structural_problems_are_rejected(tmp_path, bad_url):
+    data = dict(_VALID, backend_url=bad_url)
+    with pytest.raises(MachineConfigError) as exc:
+        load_machine_config(_write(tmp_path, data))
+    assert "backend_url" in str(exc.value)
+
+
 def test_inline_password_is_rejected():
     errors = validate_machine_config(dict(_VALID, regression_password="hunter2"))
     assert any("must not contain secrets" in e for e in errors)

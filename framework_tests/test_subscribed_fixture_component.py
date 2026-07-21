@@ -22,7 +22,7 @@ from calee_regression.consolidated_report import (
     STATUS_PASS,
     component_from_subscribed_fixture_report,
 )
-from calee_regression.models import EXIT_SUCCESS
+from calee_regression.models import EXIT_BLOCKED, EXIT_SUCCESS
 
 
 def test_subscribed_fixture_is_a_registered_component():
@@ -409,6 +409,142 @@ def test_cli_prepare_subscribed_fixture_records_generated_at(tmp_path, monkeypat
     ws = run_context.RunWorkspace(tmp_path, RUN_ID)
     data = json.loads(ws.component_report_path("subscribed-fixture").read_text(encoding="utf-8"))
     assert data["generatedAt"], data
+
+
+# ── Priority 6 (this session): explicit --gate/--non-gating execution policy ──
+
+
+def _blocked_published_run(tmp_path, monkeypatch, *, extra_args=()):
+    """published mode with no publisher configured at all -- BLOCKS honestly
+    (build_publisher_from_config returns (None, None, None))."""
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    return CliRunner().invoke(
+        cli.main, ["prepare-subscribed-fixture", "--run-id", RUN_ID, "--mode", "published", *extra_args],
+    )
+
+
+def test_gate_flag_exits_blocked_on_a_failed_published_attempt(tmp_path, monkeypatch):
+    result = _blocked_published_run(tmp_path, monkeypatch, extra_args=["--gate"])
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    assert "BLOCKED" in result.output
+    ws = run_context.RunWorkspace(tmp_path, RUN_ID)
+    data = json.loads(ws.component_report_path("subscribed-fixture").read_text(encoding="utf-8"))
+    assert data["status"] != "ok"
+
+
+def test_non_gating_flag_still_exits_success_on_a_failed_published_attempt(tmp_path, monkeypatch):
+    result = _blocked_published_run(tmp_path, monkeypatch, extra_args=["--non-gating"])
+    assert result.exit_code == EXIT_SUCCESS, result.output
+    ws = run_context.RunWorkspace(tmp_path, RUN_ID)
+    data = json.loads(ws.component_report_path("subscribed-fixture").read_text(encoding="utf-8"))
+    assert data["status"] != "ok"  # the failure is still fully recorded
+
+
+def test_default_gate_is_derived_from_scenario_promotion_state_not_promoted(tmp_path, monkeypatch):
+    # No promotion file at all (or draft) -- default is non-gating, matching
+    # the exact derivation 'consolidate' uses for this component's
+    # mandatory-ness.
+    result = _blocked_published_run(tmp_path, monkeypatch)
+    assert result.exit_code == EXIT_SUCCESS, result.output
+
+
+_PROMOTED_SUBSCRIBED_CALENDAR_YAML = (
+    "scenario: subscribed_calendar\n"
+    "scenarioFile: scenarios/subscribed_calendar.yaml\n"
+    "sourceConfirmed: true\n"
+    'sourceSha: "' + "a" * 40 + '"\n'
+    "offlineTestsPassed: true\n"
+    "physicalConfirmation:\n"
+    "  status: passed\n"
+    "  requiredDevice: physical_tablet\n"
+    "  evidenceRequired: [runId]\n"
+    "  evidence:\n"
+    "    runId: some-run\n"
+    "releaseSuiteEligible: true\n"
+)
+
+
+def test_default_gate_follows_promotion_once_scenario_is_promoted(tmp_path, monkeypatch):
+    import calee_regression.promotion as promotion_mod
+
+    promoted_dir = tmp_path / "promotion"
+    promoted_dir.mkdir(parents=True)
+    (promoted_dir / "subscribed_calendar.yaml").write_text(_PROMOTED_SUBSCRIBED_CALENDAR_YAML)
+    monkeypatch.setattr(promotion_mod, "PROMOTION_DIR", promoted_dir)
+    result = _blocked_published_run(tmp_path, monkeypatch)
+    assert result.exit_code == EXIT_BLOCKED, result.output
+
+
+def test_explicit_gate_flag_overrides_promotion_derived_default(tmp_path, monkeypatch):
+    import calee_regression.promotion as promotion_mod
+
+    promoted_dir = tmp_path / "promotion"
+    promoted_dir.mkdir(parents=True)
+    (promoted_dir / "subscribed_calendar.yaml").write_text(_PROMOTED_SUBSCRIBED_CALENDAR_YAML)
+    monkeypatch.setattr(promotion_mod, "PROMOTION_DIR", promoted_dir)
+    result = _blocked_published_run(tmp_path, monkeypatch, extra_args=["--non-gating"])
+    assert result.exit_code == EXIT_SUCCESS, result.output
+
+
+def test_gate_flag_with_a_passing_result_still_exits_success(tmp_path, monkeypatch):
+    # offline-only mode with --gate: nothing to block on, gate never fires
+    # against a genuinely passing result.
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    result = CliRunner().invoke(cli.main, ["prepare-subscribed-fixture", "--run-id", RUN_ID, "--gate"])
+    assert result.exit_code == EXIT_SUCCESS, result.output
+
+
+# ── Priority 6 (this session): safe_scenario_variables_from_report guard ────
+
+
+def test_safe_scenario_variables_returns_none_for_non_published_mode():
+    from calee_regression import subscribed_publisher as sp
+
+    report = {"mode": "offline-only", "status": "ok", "generatedTitles": {"REG_SUB_TIMED_TITLE": "x"}}
+    assert sp.safe_scenario_variables_from_report(report) is None
+
+
+def test_safe_scenario_variables_returns_none_when_any_phase_not_ok():
+    from calee_regression import subscribed_publisher as sp
+
+    base = {
+        "mode": "published", "status": "ok", "generatedTitles": {"REG_SUB_TIMED_TITLE": "x"},
+        "publicationStatus": "ok", "publicReadVerificationStatus": "ok", "ingestionStatus": "ok",
+    }
+    assert sp.safe_scenario_variables_from_report(dict(base, publicationStatus="blocked")) is None
+    assert sp.safe_scenario_variables_from_report(dict(base, publicReadVerificationStatus="blocked-mismatch")) is None
+    assert sp.safe_scenario_variables_from_report(dict(base, ingestionStatus="blocked")) is None
+
+
+def test_safe_scenario_variables_returns_titles_when_fully_verified():
+    from calee_regression import subscribed_publisher as sp
+
+    report = {
+        "mode": "published", "status": "ok", "runId": "r1", "releaseId": "rel1",
+        "generatedTitles": {"REG_SUB_TIMED_TITLE": "x", "REG_SUB_ALLDAY_TITLE": "y", "REG_SUB_DATE": "2026-01-01"},
+        "publicationStatus": "ok", "publicReadVerificationStatus": "ok", "ingestionStatus": "ok",
+    }
+    assert sp.safe_scenario_variables_from_report(report, expected_run_id="r1", expected_release_id="rel1") == report["generatedTitles"]
+
+
+def test_safe_scenario_variables_rejects_wrong_run_or_release():
+    from calee_regression import subscribed_publisher as sp
+
+    report = {
+        "mode": "published", "status": "ok", "runId": "r1", "releaseId": "rel1",
+        "generatedTitles": {"REG_SUB_TIMED_TITLE": "x"},
+        "publicationStatus": "ok", "publicReadVerificationStatus": "ok", "ingestionStatus": "ok",
+    }
+    assert sp.safe_scenario_variables_from_report(report, expected_run_id="different-run") is None
+    assert sp.safe_scenario_variables_from_report(report, expected_release_id="different-release") is None
+
+
+def test_safe_scenario_variables_returns_none_for_missing_or_non_dict_report():
+    from calee_regression import subscribed_publisher as sp
+
+    assert sp.safe_scenario_variables_from_report(None) is None
+    assert sp.safe_scenario_variables_from_report({}) is None
+    assert sp.safe_scenario_variables_from_report("not-a-dict") is None
 
 
 # ── #24: no secret in commands/output/JSON, through the REAL CLI command ───

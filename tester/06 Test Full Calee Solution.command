@@ -161,12 +161,44 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     # S3-CLI/local adapter -- no calee-hub-core endpoint involved) and polls
     # until the run-specific event is visible; "fixed-date" uses the existing
     # static fixture at its own known date. Records first-class subscribed-
-    # fixture evidence under this run and makes the generated event titles
-    # available to the tablet scenario as ${REG_SUB_*} variables. Optional
-    # while the subscribed-calendar scenario stays draft-unverified --
-    # automatically mandatory once it is promoted (see consolidate's
-    # --subscribed-fixture-mandatory/--subscribed-fixture-optional).
-    python -m calee_regression prepare-subscribed-fixture --run-id "$CALEE_RUN_ID"
+    # fixture evidence under this run. Scenario variables are consumable ONLY
+    # via subscribed_publisher.safe_scenario_variables_from_report (Priority 6)
+    # -- a blocked/partial published attempt can never supply them.
+    #
+    # Priority 6 (this session): --gate/--non-gating is this launcher's own
+    # explicit execution policy for THIS STEP's exit code, derived (in order)
+    # from: (1) an explicit technical-owner override
+    # (CALEE_SUBSCRIBED_FIXTURE_GATE=true/false), (2) this release's OWN
+    # feature scope ($RELEASE_FEATURE_GOOGLE_CALENDAR -- not in scope means
+    # non-gating, there is nothing subscribed-calendar-related to verify),
+    # else (3) omitted entirely so `prepare-subscribed-fixture` derives its
+    # own default from the scenario's promotion state -- the SAME derivation
+    # `consolidate` below uses for whether this component is mandatory, so
+    # the two can never disagree. A gated BLOCKED result does not abort this
+    # launcher (the tablet suite continues; the scenario itself stays
+    # draft-unverified/excluded from the general suite while unpromoted) --
+    # it is `consolidate`'s independent re-derivation that is the final,
+    # authoritative release gate.
+    SUBSCRIBED_GATE_ARGS=()
+    if [ "${CALEE_SUBSCRIBED_FIXTURE_GATE:-}" = "true" ] || [ "${CALEE_SUBSCRIBED_FIXTURE_GATE:-}" = "1" ]; then
+        SUBSCRIBED_GATE_ARGS+=(--gate)
+    elif [ "${CALEE_SUBSCRIBED_FIXTURE_GATE:-}" = "false" ] || [ "${CALEE_SUBSCRIBED_FIXTURE_GATE:-}" = "0" ]; then
+        SUBSCRIBED_GATE_ARGS+=(--non-gating)
+    elif [ "${RELEASE_FEATURE_GOOGLE_CALENDAR:-true}" = "false" ]; then
+        SUBSCRIBED_GATE_ARGS+=(--non-gating)
+    fi
+    python -m calee_regression prepare-subscribed-fixture --run-id "$CALEE_RUN_ID" "${SUBSCRIBED_GATE_ARGS[@]}"
+    SUBSCRIBED_FIXTURE_STATUS=$?
+    if [ "$SUBSCRIBED_FIXTURE_STATUS" -ne 0 ]; then
+        # Priority 6, requirement 7: a technical owner must never be able to
+        # overlook a blocked, GATING published fixture -- an unmissable banner,
+        # not just a line buried in the step's own output above.
+        echo ""
+        echo "=== WARNING: the subscribed-calendar fixture is BLOCKED and GATING (status $SUBSCRIBED_FIXTURE_STATUS) ==="
+        echo "See $CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/subscribed-fixture/results.json for the exact"
+        echo "publication/public-read/ingestion failure. No scenario variables from this run are safe to use."
+        echo "This WILL block the release once/if this scenario is promoted -- see docs/SUBSCRIBED_CALENDAR_REGRESSION.md."
+    fi
 
     echo ""
     echo "--- Step 2: Calee Tablet ---"
@@ -179,18 +211,54 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     # UI, or cross-device sync run, obtain (or generate) machine-readable selector
     # evidence for the EXACT release SHA+version, validate it against the hardened
     # schema, and record it at $CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/selector-contract/
-    # results.json. The gate BLOCKS (exit 3) when evidence is missing, unreadable,
-    # malformed, stale, for another SHA/version, produced with the wrong Flutter
-    # version, not PASS, or reporting any missing selector -- and then the mobile
-    # functional legs below are SKIPPED, so the consolidated bundle can never read
-    # as a PASS without valid selector evidence for the build being released.
+    # results.json.
     #
-    # The expected identity falls back to config/release-platforms.yaml and then
-    # the detected CaleeMobile checkout; a technical owner can pin it via
-    # CALEEMOBILE_EXPECTED_GIT_SHA/CALEEMOBILE_EXPECTED_BUILD_VERSION, or supply a
-    # downloaded CI artifact via CALEEMOBILE_SELECTOR_EVIDENCE (else it generates
-    # locally from the sibling CaleeMobile-Regression + CaleeMobile checkouts).
-    SELECTOR_ARGS=(--run-id "$CALEE_RUN_ID" --mandatory)
+    # Priority 2 (this session) -- documented mandatory/optional policy, ONE
+    # already-resolved decision this launcher reads and acts on rather than
+    # re-deriving itself: $RELEASE_SELECTOR_EVIDENCE_REQUIRED (emitted above by
+    # "release-config", or by "release-platforms" when no machine config exists --
+    # see calee_regression/release_config.py's resolve_selector_evidence_required)
+    # is true when:
+    #   * this is a PRODUCTION release with a mobile platform in scope
+    #     (UNCONDITIONALLY, regardless of the manifest's own opinion), or
+    #   * a non-production schema-v2 release's own bundle manifest states
+    #     caleeMobile.selectorEvidenceRequired: true, or
+    #   * a schema-v1 release (or a v2 manifest with no stated opinion) has a
+    #     mobile platform in scope (the legacy default).
+    # When mandatory, evidence missing/unreadable/malformed/stale/for another
+    # SHA-version/wrong-Flutter/not-PASS/missing-any-selector BLOCKS (exit 3) and
+    # EVERY mobile functional leg below is skipped -- the consolidated bundle can
+    # never read as a PASS without valid selector evidence for the build being
+    # released. When optional, the gate still runs (never silently skipped) and
+    # is recorded as an explicit optional component either way, but a failure
+    # there only skips the selector-DEPENDENT UI/sync legs (see below) -- the
+    # device-independent Client API check may still proceed. Either way,
+    # "consolidate" further down re-validates the SAME evidence independently and
+    # is passed the matching --selector-contract-mandatory/-optional flag, so the
+    # two gates can never disagree. A production release never permits LOCAL
+    # selector generation regardless of this flag -- enforced inside the
+    # selector-contract command itself.
+    #
+    # The expected CaleeMobile identity is read from THIS RUN'S OWN release-config
+    # composition ($RELEASE_EXPECTED_CALEEMOBILE_GIT_SHA / $RELEASE_EXPECTED_
+    # CALEEMOBILE_VERSION -- the schema-v2 bundle manifest's caleeMobile identity
+    # block, or config/release-platforms.yaml for schema v1/a bare run), which a
+    # technical owner may still override per-run via CALEEMOBILE_EXPECTED_GIT_SHA/
+    # CALEEMOBILE_EXPECTED_BUILD_VERSION; a downloaded CI artifact may be supplied
+    # via CALEEMOBILE_SELECTOR_EVIDENCE (else it generates locally from the
+    # sibling CaleeMobile-Regression + CaleeMobile checkouts -- a development-only
+    # fallback the command itself refuses in production).
+    CALEEMOBILE_EXPECTED_GIT_SHA="${CALEEMOBILE_EXPECTED_GIT_SHA:-${RELEASE_EXPECTED_CALEEMOBILE_GIT_SHA:-}}"
+    CALEEMOBILE_EXPECTED_BUILD_VERSION="${CALEEMOBILE_EXPECTED_BUILD_VERSION:-${RELEASE_EXPECTED_CALEEMOBILE_VERSION:-}}"
+
+    SELECTOR_ARGS=(--run-id "$CALEE_RUN_ID")
+    if [ "${RELEASE_SELECTOR_EVIDENCE_REQUIRED:-true}" = "false" ]; then
+        SELECTOR_ARGS+=(--optional)
+        SELECTOR_MANDATORY=false
+    else
+        SELECTOR_ARGS+=(--mandatory)
+        SELECTOR_MANDATORY=true
+    fi
     [ -n "${CALEEMOBILE_EXPECTED_GIT_SHA:-}" ] && SELECTOR_ARGS+=(--expected-sha "$CALEEMOBILE_EXPECTED_GIT_SHA")
     [ -n "${CALEEMOBILE_EXPECTED_BUILD_VERSION:-}" ] && SELECTOR_ARGS+=(--expected-version "$CALEEMOBILE_EXPECTED_BUILD_VERSION")
     [ -n "${CALEEMOBILE_SELECTOR_EVIDENCE:-}" ] && SELECTOR_ARGS+=(--source "$CALEEMOBILE_SELECTOR_EVIDENCE")
@@ -261,6 +329,28 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
         SYNC_ARGS+=(--mandatory)
     fi
     python -m calee_regression sync-smoke "${SYNC_ARGS[@]}"
+    elif [ "$SELECTOR_MANDATORY" = "false" ]; then
+        # Priority 2: selector evidence was OPTIONAL for this release and did
+        # NOT pass. Never silently omitted -- the selector-contract report
+        # above is preserved and consolidated as an explicit optional
+        # BLOCKED component. Because the selectors were not verified for
+        # this exact build, every selector-DEPENDENT leg (the mobile UI, and
+        # cross-device sync, which drives that same UI) is still skipped --
+        # an unverified selector must never back a real UI test, mandatory
+        # or not. The device-independent Client API check does not depend
+        # on selectors at all, so it may still proceed.
+        echo ""
+        echo "=== CaleeMobile selector contract is OPTIONAL for this release and did not pass (status $SELECTOR_GATE_STATUS) ==="
+        echo "  - CaleeMobile Client API:       proceeding (device-independent, does not use selectors)"
+        echo "  - CaleeMobile Android UI:       SKIPPED (selector evidence optional and not verified)"
+        echo "  - CaleeMobile iPhone UI:        SKIPPED (selector evidence optional and not verified)"
+        echo "  - Cross-device synchronization: SKIPPED (drives mobile UI; selector evidence optional and not verified)"
+        echo "The selector-contract report Step 2.5 wrote is preserved and consolidated as an"
+        echo "explicit optional component -- it does not block this release by itself."
+
+        echo ""
+        echo "--- Step 3: CaleeMobile Client API (device-independent — run once) ---"
+        python3 -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh api-only
     else
         echo ""
         echo "=== CaleeMobile selector contract did not pass (status $SELECTOR_GATE_STATUS) — mobile functional tests SKIPPED ==="
@@ -393,12 +483,21 @@ if [ "$RELEASE_FEATURE_SYNCHRONIZATION" = "false" ]; then
 else
     CONSOLIDATE_ARGS+=(--sync-mandatory)
 fi
-# CaleeMobile selector contract (Priority 1) is UNCONDITIONALLY release-gating
-# for a full Calee solution: a release can never PASS without valid selector
-# evidence for the exact CaleeMobile build. Step 2.5 recorded it under this run;
-# consolidate re-validates the embedded evidence independently and BLOCKS on any
-# problem (missing/malformed/wrong-build/not-PASS/stale), exactly like the gate.
-CONSOLIDATE_ARGS+=(--selector-contract-mandatory)
+# CaleeMobile selector contract: release-gating exactly per the SAME resolved
+# $RELEASE_SELECTOR_EVIDENCE_REQUIRED decision Step 2.5 already acted on above
+# (Priority 2, this session) -- never unconditional, so the launcher-level gate
+# and consolidate's own independent re-validation can never disagree. Step 2.5
+# recorded the evidence under this run; consolidate re-validates it independently
+# and, when mandatory, BLOCKS on any problem (missing/malformed/wrong-build/
+# not-PASS/stale) exactly like the gate. consolidate itself is the final,
+# authoritative word (it re-derives this same policy from the release-config
+# composition, a named waiver, and its own explicit flags), so this flag is a
+# consistent DEFAULT for this launcher, never the only enforcement point.
+if [ "${RELEASE_SELECTOR_EVIDENCE_REQUIRED:-true}" = "false" ]; then
+    CONSOLIDATE_ARGS+=(--selector-contract-optional)
+else
+    CONSOLIDATE_ARGS+=(--selector-contract-mandatory)
+fi
 # Machine-config snapshot (Priority 4) and tablet release installation
 # (Priority 5/6). When the one-button launcher ("00") created this run and
 # recorded them under it, they are release-gating consolidated components: a

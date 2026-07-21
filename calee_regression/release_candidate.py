@@ -1,4 +1,5 @@
-"""Release-candidate fingerprint + immutable snapshot (Priority 4).
+"""Release-candidate fingerprint + immutable snapshot (Priority 4 legacy;
+Priorities 4/5 this session).
 
 Closes the time-of-check/time-of-use (TOCTOU) gap between ``release-config``
 composing its evidence from an already-verified release bundle and
@@ -21,22 +22,43 @@ same-run snapshot exists -- and re-verifies the snapshot's CURRENT bytes
 against the recorded fingerprint immediately before building the install
 plan, so tampering after the snapshot was taken is caught too.
 
-Mirrors ``selector_provenance.py``'s raw-byte digest + envelope-digest
-pattern, already proven and tamper-tested in this codebase for a different
-(selector-contract) evidence stream, and ``release_bundle_assembly.py``'s
-temp-dir + atomic-replace pattern for the snapshot write itself.
+Publication itself (this session's Priority 4) goes through
+``atomic_publish.publish_version`` -- an immutable, content-addressed version
+directory plus a symlink pointer swapped only after verification -- so a
+process killed mid-publish can never leave ``snapshot_dir`` pointing at a
+partial/missing directory; a previously valid candidate stays discoverable
+and installable.
+
+The fingerprint (this session's Priority 5) additionally binds:
+
+  * ``candidateId`` -- a content-addressed identifier for the ENTIRE
+    published directory tree (``atomic_publish.directory_content_id``),
+    independent of any machine-local absolute path;
+  * ``runId`` -- the run this candidate was frozen for, so a candidate
+    directory copied wholesale into a different run's workspace is rejected
+    (its embedded ``runId`` will disagree with the run trying to install it);
+  * ``releaseConfigDigest`` -- a digest of the release-config selections
+    (profile/scope/expected identities) that approved this exact candidate,
+    so ``install-tablet-release`` can independently recompute the same
+    digest from the same-run release-config report and refuse to install if
+    they disagree;
+  * ``createdAt`` -- when the candidate was frozen.
+
+``bundleRoot`` remains a machine-local, mutable diagnostic path and is
+deliberately EXCLUDED from the envelope digest -- see the module docstring
+in ``atomic_publish.py``.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import os
-import shutil
-import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from . import atomic_publish
 
 FINGERPRINT_FILENAME = "release-candidate-fingerprint.json"
 MANIFEST_NAME = "release-manifest.json"
@@ -57,12 +79,18 @@ def _sha256_file(path: Path) -> str:
     return _sha256_bytes(path.read_bytes())
 
 
+def _utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 @dataclass
 class CandidateFingerprint:
     """A content-addressed fingerprint of one run's approved release
     candidate: the resolved snapshot root, the release ID + schema version it
-    was approved for, and a raw-byte SHA-256 for the manifest, the checksums
-    file, and every included app's APK."""
+    was approved for, a raw-byte SHA-256 for the manifest/checksums/every
+    included app's APK, and (Priority 5) the run it belongs to, the digest of
+    the release-config that approved it, its whole-directory content id, and
+    its creation time."""
 
     bundle_root: "str | None" = None
     release_id: "str | None" = None
@@ -71,6 +99,11 @@ class CandidateFingerprint:
     checksums_sha256: "str | None" = None
     # app key ("calee"/"caleeShell") -> {"filename": ..., "sha256": ...}
     apk_sha256: "dict[str, dict[str, str]]" = field(default_factory=dict)
+    # Priority 5 fields -- all bound into the envelope digest below.
+    run_id: "str | None" = None
+    candidate_id: "str | None" = None
+    release_config_digest: "str | None" = None
+    created_at: "str | None" = None
     envelope_digest: "str | None" = None
 
     def to_dict(self) -> dict:
@@ -81,15 +114,24 @@ class CandidateFingerprint:
             "manifestSha256": self.manifest_sha256,
             "checksumsSha256": self.checksums_sha256,
             "apkSha256": {k: dict(v) for k, v in self.apk_sha256.items()},
+            "runId": self.run_id,
+            "candidateId": self.candidate_id,
+            "releaseConfigDigest": self.release_config_digest,
+            "createdAt": self.created_at,
             "envelopeDigest": self.envelope_digest,
         }
 
 
 def _envelope_digest(fp: CandidateFingerprint) -> str:
-    """A digest over every OTHER field, so the fingerprint record itself
-    cannot be edited (e.g. a problem file's digest silently replaced) without
-    also invalidating this envelope -- mirrors selector_provenance.py's
-    envelope_digest construction."""
+    """A digest over every OTHER cryptographically-bound field, so the
+    fingerprint record itself cannot be edited (e.g. a problem file's digest
+    silently replaced, or the candidate re-pointed at another run/root)
+    without also invalidating this envelope -- mirrors
+    ``selector_provenance.py``'s ``envelope_digest`` construction.
+
+    ``bundle_root`` is deliberately NOT included -- it is a machine-local,
+    mutable diagnostic path, not part of the candidate's cryptographic
+    identity (see module docstring)."""
     payload = json.dumps(
         {
             "releaseId": fp.release_id,
@@ -97,6 +139,10 @@ def _envelope_digest(fp: CandidateFingerprint) -> str:
             "manifestSha256": fp.manifest_sha256,
             "checksumsSha256": fp.checksums_sha256,
             "apkSha256": {k: dict(sorted(v.items())) for k, v in sorted(fp.apk_sha256.items())},
+            "runId": fp.run_id,
+            "candidateId": fp.candidate_id,
+            "releaseConfigDigest": fp.release_config_digest,
+            "createdAt": fp.created_at,
         },
         sort_keys=True,
     )
@@ -109,6 +155,9 @@ def snapshot_release_candidate(
     *,
     release_id: "str | None",
     schema_version: "int | None",
+    run_id: "str | None" = None,
+    release_config_digest: "str | None" = None,
+    created_at: "str | None" = None,
 ) -> CandidateFingerprint:
     """Copy a verified release bundle's manifest, checksums file, and every
     verified app's ACTUAL apk bytes into ``snapshot_dir``, and return a
@@ -121,13 +170,14 @@ def snapshot_release_candidate(
 
     Every source file's bytes are hashed both immediately BEFORE and AFTER
     the copy; a mismatch (the source changed mid-copy) raises rather than
-    silently snapshotting a torn read. The whole snapshot is built into a
-    fresh temp sibling directory and atomically swapped into place on
-    success, so a failed/partial snapshot never leaves a stale or half-
-    written candidate at ``snapshot_dir`` (mirrors release_bundle_assembly.
-    write_release_bundle's atomic-replace pattern) -- and a pre-existing
-    (e.g. run-workspace-initialised empty) directory at that path is safely
-    replaced, never merged into.
+    silently snapshotting a torn read.
+
+    Publication goes through ``atomic_publish.publish_version`` (Priority 4):
+    the new content is built in a fresh, content-addressed version
+    directory, verified, and only then atomically pointed to by
+    ``snapshot_dir`` (a symlink) -- a process killed at any point during this
+    leaves either the previous valid candidate (if any) or nothing, never a
+    partially-written one, discoverable at ``snapshot_dir``.
     """
     bundle_root = Path(verification.bundle_root)
     manifest_src = bundle_root / MANIFEST_NAME
@@ -135,8 +185,9 @@ def snapshot_release_candidate(
     snapshot_dir = Path(snapshot_dir)
     snapshot_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    tmp_dir = Path(tempfile.mkdtemp(dir=snapshot_dir.parent, prefix=f".{snapshot_dir.name}.tmp-"))
-    try:
+    fingerprint_holder: "dict[str, CandidateFingerprint]" = {}
+
+    def _build(tmp_dir: Path) -> None:
         def _copy_hashed(src: Path, dst: Path) -> str:
             if not src.is_file():
                 raise CandidateFingerprintError(f"{src} is missing -- cannot snapshot the release candidate.")
@@ -169,40 +220,34 @@ def snapshot_release_candidate(
             manifest_sha256=manifest_sha256,
             checksums_sha256=checksums_sha256,
             apk_sha256=apk_sha256,
+            run_id=run_id,
+            release_config_digest=release_config_digest,
+            created_at=created_at or _utc_now_iso(),
         )
+        # The whole-directory content id is computed from what's ACTUALLY in
+        # tmp_dir (the same bytes that will be published), excluding the
+        # fingerprint file itself (which doesn't exist yet at this point, and
+        # must never depend on its own id) -- so it always agrees with a
+        # later `directory_content_id(snapshot_dir, exclude=...)` recompute.
+        fingerprint.candidate_id = atomic_publish.directory_content_id(tmp_dir, exclude={FINGERPRINT_FILENAME})
         fingerprint.envelope_digest = _envelope_digest(fingerprint)
         (tmp_dir / FINGERPRINT_FILENAME).write_text(
             json.dumps(fingerprint.to_dict(), indent=2) + "\n", encoding="utf-8"
         )
+        fingerprint_holder["fingerprint"] = fingerprint
 
-        _atomic_replace_dir(tmp_dir, snapshot_dir)
-    except Exception:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
-    return fingerprint
+    def _verify(tmp_dir: Path) -> "list[str]":
+        # Re-read what was just written and prove it round-trips before it is
+        # ever published (Priority 4 requirement: verify before the pointer
+        # moves).
+        try:
+            fp = load_candidate_fingerprint(tmp_dir / FINGERPRINT_FILENAME)
+        except CandidateFingerprintError as exc:
+            return [f"newly-built candidate fingerprint did not round-trip: {exc}"]
+        return verify_candidate_fingerprint(tmp_dir, fp)
 
-
-def _atomic_replace_dir(tmp_dir: Path, dest_dir: Path) -> None:
-    """Atomically make ``tmp_dir`` become ``dest_dir``. POSIX ``rename``
-    cannot replace a non-empty existing directory in one call, so an existing
-    ``dest_dir`` is first renamed aside, ``tmp_dir`` is renamed into place,
-    and only then is the old directory removed -- a failure partway through
-    the swap still leaves a valid directory at ``dest_dir`` (either the old
-    one, restored, or the new one)."""
-    backup_dir = None
-    if dest_dir.exists():
-        backup_dir = dest_dir.with_name(f".{dest_dir.name}.bak-{os.getpid()}")
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir, ignore_errors=True)
-        dest_dir.rename(backup_dir)
-    try:
-        tmp_dir.rename(dest_dir)
-    except Exception:
-        if backup_dir is not None:
-            backup_dir.rename(dest_dir)
-        raise
-    if backup_dir is not None:
-        shutil.rmtree(backup_dir, ignore_errors=True)
+    atomic_publish.publish_version(snapshot_dir, _build, verify_fn=_verify)
+    return fingerprint_holder["fingerprint"]
 
 
 def load_candidate_fingerprint(path: "Path | str") -> CandidateFingerprint:
@@ -232,17 +277,37 @@ def load_candidate_fingerprint(path: "Path | str") -> CandidateFingerprint:
         manifest_sha256=data.get("manifestSha256"),
         checksums_sha256=data.get("checksumsSha256"),
         apk_sha256=apk_sha256,
+        run_id=data.get("runId"),
+        candidate_id=data.get("candidateId"),
+        release_config_digest=data.get("releaseConfigDigest"),
+        created_at=data.get("createdAt"),
         envelope_digest=data.get("envelopeDigest"),
     )
 
 
-def verify_candidate_fingerprint(snapshot_dir: "Path | str", fingerprint: CandidateFingerprint) -> "list[str]":
+def verify_candidate_fingerprint(
+    snapshot_dir: "Path | str",
+    fingerprint: CandidateFingerprint,
+    *,
+    expected_run_id: "str | None" = None,
+    expected_release_id: "str | None" = None,
+    expected_schema_version: "int | None" = None,
+    expected_release_config_digest: "str | None" = None,
+) -> "list[str]":
     """Recompute every digest from the snapshot directory's CURRENT bytes and
     compare against the recorded fingerprint. Returns a list of problems
     (empty means the snapshot is byte-for-byte unchanged since it was
-    recorded). Any changed manifest, checksums file, or APK -- including one
-    substituted via a re-pointed symlink, since the bytes actually present at
-    the path are what gets hashed -- is caught here."""
+    recorded, and matches every ``expected_*`` binding supplied). Any changed
+    manifest, checksums file, or APK -- including one substituted via a
+    re-pointed symlink, since the bytes actually present at the path are what
+    gets hashed -- is caught here.
+
+    Priority 5: ``expected_run_id``/``expected_release_id``/
+    ``expected_schema_version``/``expected_release_config_digest``, when
+    given, bind this verification to a SPECIFIC run/release/config -- a
+    candidate directory copied wholesale from another run, or a fingerprint
+    silently approved under a different release-config, is rejected here
+    even though its own internal envelope digest is self-consistent."""
     problems: "list[str]" = []
     snapshot_dir = Path(snapshot_dir)
 
@@ -279,5 +344,49 @@ def verify_candidate_fingerprint(snapshot_dir: "Path | str", fingerprint: Candid
             problems.append(f"fingerprint has no recorded APK filename for app {app_key!r}.")
             continue
         _check(f"{app_key} APK ({filename})", expected_sha, snapshot_dir / filename)
+
+    # Priority 5: the immutable whole-directory candidate id must match what
+    # is ACTUALLY on disk right now -- catches a fingerprint that names a
+    # candidateId belonging to a different (e.g. substituted-in-full)
+    # directory tree, even one whose individual per-file digests were also
+    # consistently forged.
+    if snapshot_dir.is_dir():
+        if not fingerprint.candidate_id:
+            problems.append("fingerprint has no recorded candidateId -- the candidate is not identity-bound.")
+        else:
+            try:
+                actual_candidate_id = atomic_publish.directory_content_id(
+                    snapshot_dir, exclude={FINGERPRINT_FILENAME}
+                )
+            except OSError as exc:
+                problems.append(f"could not recompute the candidate directory's content id: {exc}")
+            else:
+                if actual_candidate_id != fingerprint.candidate_id:
+                    problems.append(
+                        f"candidateId mismatch: fingerprint says {fingerprint.candidate_id}, the snapshot "
+                        f"directory's current content id is {actual_candidate_id} -- this is not the exact "
+                        f"candidate directory the fingerprint was recorded for."
+                    )
+
+    if expected_run_id is not None and fingerprint.run_id != expected_run_id:
+        problems.append(
+            f"candidate fingerprint runId {fingerprint.run_id!r} != this run {expected_run_id!r} -- this "
+            f"candidate belongs to a DIFFERENT run and must not be installed here."
+        )
+    if expected_release_id is not None and fingerprint.release_id != expected_release_id:
+        problems.append(
+            f"candidate fingerprint releaseId {fingerprint.release_id!r} != expected {expected_release_id!r}."
+        )
+    if expected_schema_version is not None and fingerprint.schema_version != expected_schema_version:
+        problems.append(
+            f"candidate fingerprint schemaVersion {fingerprint.schema_version!r} != expected "
+            f"{expected_schema_version!r}."
+        )
+    if expected_release_config_digest is not None and fingerprint.release_config_digest != expected_release_config_digest:
+        problems.append(
+            f"candidate fingerprint releaseConfigDigest {fingerprint.release_config_digest!r} != the same-run "
+            f"release-config's digest {expected_release_config_digest!r} -- this candidate was not approved by "
+            f"the release-config evidence for this run."
+        )
 
     return problems

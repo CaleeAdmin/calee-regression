@@ -653,8 +653,15 @@ def test_full_solution_runs_client_api_once_and_ui_only_per_platform():
     # runs it EXACTLY ONCE (api-only) and then the per-platform UI ONLY
     # (--ui-only). This is what stops an Android and an iOS run from each
     # re-running and overwriting the one mobile-api/results.json (Phase 3).
+    #
+    # Priority 2 (this session): two MUTUALLY EXCLUSIVE branches now exist --
+    # the selector-contract PASS branch, and the selector-OPTIONAL-and-failed
+    # branch (device-independent API may still proceed there; see the
+    # selector-contract gate step) -- so the literal text contains api-only
+    # twice, but any single actual run takes exactly one of these branches and
+    # so still runs api-only exactly once.
     text = FULL_SOLUTION_SCRIPT.read_text(encoding="utf-8")
-    assert text.count("test_caleemobile.sh api-only") == 1
+    assert text.count("test_caleemobile.sh api-only") == 2
     assert "test_caleemobile.sh android --ui-only" in text
     assert "test_caleemobile.sh ios --ui-only" in text
     # The old "run the whole thing (incl. API) per platform" calls are gone.

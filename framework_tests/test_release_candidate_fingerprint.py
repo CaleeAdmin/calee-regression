@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from calee_regression import release_candidate as rcand
@@ -193,6 +195,118 @@ def test_tampered_fingerprint_file_itself_is_detected(tmp_path):
     assert any("envelope digest mismatch" in p for p in problems)
 
 
+# ── Priority 5: complete fingerprint binding ────────────────────────────
+
+
+def test_fingerprint_binds_run_id_release_config_digest_and_created_at(tmp_path):
+    bundle = _write_bundle(tmp_path)
+    verification = ri.verify_release_bundle(bundle)
+    snapshot_dir = tmp_path / "snapshot"
+    fp = rcand.snapshot_release_candidate(
+        verification, snapshot_dir, release_id="r1", schema_version=2,
+        run_id="release-20260720-000000-abc123", release_config_digest="sha256:" + "1" * 64,
+    )
+    assert fp.run_id == "release-20260720-000000-abc123"
+    assert fp.release_config_digest == "sha256:" + "1" * 64
+    assert fp.candidate_id
+    assert fp.created_at
+    assert rcand.verify_candidate_fingerprint(snapshot_dir, fp) == []
+
+
+@pytest.mark.parametrize("field_name", ["run_id", "candidate_id", "release_config_digest", "created_at"])
+def test_tampering_any_priority5_field_without_recompute_is_detected(tmp_path, field_name):
+    bundle = _write_bundle(tmp_path)
+    verification = ri.verify_release_bundle(bundle)
+    snapshot_dir = tmp_path / "snapshot"
+    fp = rcand.snapshot_release_candidate(
+        verification, snapshot_dir, release_id="r1", schema_version=2,
+        run_id="run-a", release_config_digest="sha256:" + "2" * 64,
+    )
+    setattr(fp, field_name, "tampered-value")
+    problems = rcand.verify_candidate_fingerprint(snapshot_dir, fp)
+    assert any("envelope digest mismatch" in p for p in problems), (field_name, problems)
+
+
+def test_candidate_copied_from_another_run_is_rejected_by_expected_run_id(tmp_path):
+    bundle = _write_bundle(tmp_path)
+    verification = ri.verify_release_bundle(bundle)
+    snapshot_dir = tmp_path / "snapshot"
+    fp = rcand.snapshot_release_candidate(
+        verification, snapshot_dir, release_id="r1", schema_version=2, run_id="run-a",
+    )
+    # The fingerprint is internally self-consistent (envelope digest matches,
+    # every byte on disk matches) -- it is simply NOT for the run trying to
+    # install it (as if the whole directory had been copied wholesale from
+    # run-a's workspace into run-b's).
+    problems = rcand.verify_candidate_fingerprint(snapshot_dir, fp, expected_run_id="run-b")
+    assert any("belongs to a DIFFERENT run" in p for p in problems)
+    assert rcand.verify_candidate_fingerprint(snapshot_dir, fp, expected_run_id="run-a") == []
+
+
+def test_fingerprint_edited_to_name_another_release_or_schema_is_rejected(tmp_path):
+    bundle = _write_bundle(tmp_path)
+    verification = ri.verify_release_bundle(bundle)
+    snapshot_dir = tmp_path / "snapshot"
+    fp = rcand.snapshot_release_candidate(verification, snapshot_dir, release_id="r1", schema_version=2, run_id="run-a")
+    assert any(
+        "releaseId" in p for p in rcand.verify_candidate_fingerprint(snapshot_dir, fp, expected_release_id="r2")
+    )
+    assert any(
+        "schemaVersion" in p
+        for p in rcand.verify_candidate_fingerprint(snapshot_dir, fp, expected_schema_version=1)
+    )
+
+
+def test_release_config_report_fingerprint_digest_mismatch_is_rejected(tmp_path):
+    bundle = _write_bundle(tmp_path)
+    verification = ri.verify_release_bundle(bundle)
+    snapshot_dir = tmp_path / "snapshot"
+    fp = rcand.snapshot_release_candidate(
+        verification, snapshot_dir, release_id="r1", schema_version=2, run_id="run-a",
+        release_config_digest="sha256:" + "3" * 64,
+    )
+    # The release-config report that "approved" this candidate recorded a
+    # DIFFERENT digest than what the candidate's own fingerprint carries --
+    # e.g. release-config was re-run (or tampered) after the candidate was
+    # frozen against a different composition.
+    problems = rcand.verify_candidate_fingerprint(
+        snapshot_dir, fp, expected_release_config_digest="sha256:" + "4" * 64,
+    )
+    assert any("releaseConfigDigest" in p for p in problems)
+    assert rcand.verify_candidate_fingerprint(
+        snapshot_dir, fp, expected_release_config_digest="sha256:" + "3" * 64,
+    ) == []
+
+
+def test_candidate_id_mismatch_detects_extra_file_dropped_into_snapshot(tmp_path):
+    """An extra file smuggled into the snapshot after freezing isn't
+    referenced by any of the per-file digest checks (which only look at the
+    manifest/checksums/APK filenames the fingerprint already knows about) --
+    the whole-directory candidateId is what catches it."""
+    bundle = _write_bundle(tmp_path)
+    verification = ri.verify_release_bundle(bundle)
+    snapshot_dir = tmp_path / "snapshot"
+    fp = rcand.snapshot_release_candidate(verification, snapshot_dir, release_id="r1", schema_version=2, run_id="run-a")
+    assert rcand.verify_candidate_fingerprint(snapshot_dir, fp) == []
+
+    (snapshot_dir / "smuggled-extra-file.apk").write_bytes(b"not part of the approved candidate")
+    problems = rcand.verify_candidate_fingerprint(snapshot_dir, fp)
+    assert any("candidateId mismatch" in p for p in problems)
+
+
+def test_candidate_root_is_excluded_from_envelope_digest_but_recorded(tmp_path):
+    """bundleRoot is a machine-local, mutable diagnostic path -- editing it
+    alone must NOT trip the envelope digest (it is deliberately excluded),
+    unlike every other Priority 5 field."""
+    bundle = _write_bundle(tmp_path)
+    verification = ri.verify_release_bundle(bundle)
+    snapshot_dir = tmp_path / "snapshot"
+    fp = rcand.snapshot_release_candidate(verification, snapshot_dir, release_id="r1", schema_version=2, run_id="run-a")
+    assert fp.bundle_root
+    fp.bundle_root = "/some/other/machine/path"
+    assert rcand.verify_candidate_fingerprint(snapshot_dir, fp) == []
+
+
 def test_snapshot_reused_dir_leaves_no_stale_files(tmp_path):
     bundle = _write_bundle(tmp_path)
     verification = ri.verify_release_bundle(bundle)
@@ -258,8 +372,14 @@ def test_install_uses_snapshot_path_not_original_bundle(tmp_path, monkeypatch):
     argvs = [a for step in payload["plan"]["steps"] for a in step["argv"]]
     apk_args = [a for a in argvs if a.endswith(".apk")]
     assert apk_args
+    # snapshot_dir is a symlink pointer (Priority 4 crash-recoverable
+    # publication -- see atomic_publish.py) into a content-addressed version
+    # directory; every consumer that just opens/reads it (verify_release_bundle
+    # included) is unaffected, but the RESOLVED APK path -- which is what
+    # actually reaches an install command -- lives under the pointer's real
+    # target rather than repeating the pointer path textually.
     for a in apk_args:
-        assert str(snapshot_dir) in a
+        assert Path(a).is_relative_to(snapshot_dir.resolve())
         assert str(bundle) not in a
 
 
