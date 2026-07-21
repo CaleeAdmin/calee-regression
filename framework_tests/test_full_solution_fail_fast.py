@@ -50,6 +50,19 @@ def _copy_repo(tmp_path: Path) -> Path:
         dest,
         ignore=shutil.ignore_patterns(".git", "reports", ".venv", "__pycache__"),
     )
+
+    # Operator-local configuration must never leak into an isolated launcher
+    # test. These files may exist on the real qualification Mac and would
+    # otherwise alter the release-config path exercised by this test copy.
+    for local_config in (
+        "config/machine.local.yaml",
+        "config/tester.local.yaml",
+        "config/manual-checks.json",
+    ):
+        local_path = dest / local_config
+        if local_path.exists():
+            local_path.unlink()
+
     (dest / "reports").mkdir(exist_ok=True)
     venv_bin = dest / ".venv" / "bin"
     venv_bin.mkdir(parents=True, exist_ok=True)

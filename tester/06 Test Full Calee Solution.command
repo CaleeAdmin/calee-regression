@@ -179,15 +179,23 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     # draft-unverified/excluded from the general suite while unpromoted) --
     # it is `consolidate`'s independent re-derivation that is the final,
     # authoritative release gate.
-    SUBSCRIBED_GATE_ARGS=()
+    SUBSCRIBED_GATE_ARG=""
     if [ "${CALEE_SUBSCRIBED_FIXTURE_GATE:-}" = "true" ] || [ "${CALEE_SUBSCRIBED_FIXTURE_GATE:-}" = "1" ]; then
-        SUBSCRIBED_GATE_ARGS+=(--gate)
+        SUBSCRIBED_GATE_ARG="--gate"
     elif [ "${CALEE_SUBSCRIBED_FIXTURE_GATE:-}" = "false" ] || [ "${CALEE_SUBSCRIBED_FIXTURE_GATE:-}" = "0" ]; then
-        SUBSCRIBED_GATE_ARGS+=(--non-gating)
+        SUBSCRIBED_GATE_ARG="--non-gating"
     elif [ "${RELEASE_FEATURE_GOOGLE_CALENDAR:-true}" = "false" ]; then
-        SUBSCRIBED_GATE_ARGS+=(--non-gating)
+        SUBSCRIBED_GATE_ARG="--non-gating"
     fi
-    python -m calee_regression prepare-subscribed-fixture --run-id "$CALEE_RUN_ID" "${SUBSCRIBED_GATE_ARGS[@]}"
+
+    if [ -n "$SUBSCRIBED_GATE_ARG" ]; then
+        python -m calee_regression prepare-subscribed-fixture \
+            --run-id "$CALEE_RUN_ID" \
+            "$SUBSCRIBED_GATE_ARG"
+    else
+        python -m calee_regression prepare-subscribed-fixture \
+            --run-id "$CALEE_RUN_ID"
+    fi
     SUBSCRIBED_FIXTURE_STATUS=$?
     if [ "$SUBSCRIBED_FIXTURE_STATUS" -ne 0 ]; then
         # Priority 6, requirement 7: a technical owner must never be able to
