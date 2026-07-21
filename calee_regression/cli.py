@@ -41,8 +41,10 @@ from .consolidated_report import (
     component_from_identity_stability,
     component_from_release_intent,
     decide_status,
+    verify_distributed_evidence_report,
     write_release_bundle,
 )
+from . import consolidated_report as consolidated_report_mod
 from .fixture_bridge import FixtureBridgeError, run_fixture_action
 from .models import EXIT_BLOCKED, EXIT_INVALID_CONFIG, EXIT_REGRESSION, EXIT_SUCCESS
 from .runner import ScenarioRunner
@@ -1967,23 +1969,15 @@ def record_distributed_build_acceptance_cmd(
         )
         raise SystemExit(EXIT_INVALID_CONFIG)
 
-    _UNSET = object()
-
     def _record_authenticated(
-        evidence: dict, *, raw_bytes: bytes, evidence_tier: str, source_label: str, verify_version=_UNSET,
+        evidence: dict, *, raw_bytes: bytes, evidence_tier: str, source_label: str,
     ) -> None:
-        # Priority 1/2: the distributed-build identity JOIN's testedVersion
-        # is the MARKETING-only part (build_provenance.application_version)
-        # -- --expected-version is the CaleeMobile FULL "marketing+build"
-        # form, and the join already verified both parts separately (via
-        # identity_format.split_marketing_version_and_build_number). Re-
-        # checking the full form against the marketing-only value here would
-        # spuriously fail a join that already passed, so the join call site
-        # passes ``verify_version=None`` to skip this redundant (and, for
-        # that shape, incorrect) re-check; every other tier's evidence still
-        # carries the version in the SAME full form --expected-version uses,
-        # so they keep the default (this closure's own expected_version).
-        version_to_verify = expected_version if verify_version is _UNSET else verify_version
+        # Priority 1 (this session): NO version bypass any more. The joined
+        # evidence now carries the ONE canonical full version identity
+        # (testedVersion == marketing "+" build number, composed by
+        # build_provenance.join_provider_and_build_provenance), so
+        # recording, preflight and consolidation all apply the same exact
+        # comparison against --expected-version.
         adopted_by_label = adopted_by or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
         record = dbp_mod.build_provenance_record(
             evidence, release_run_id=run_id_opt, adopted_at=timestamp, adopted_by=adopted_by_label,
@@ -1991,7 +1985,7 @@ def record_distributed_build_acceptance_cmd(
         )
         problems = dbp_mod.verify_provenance_record(
             record, source_bytes=raw_bytes, expected_release_run_id=run_id_opt,
-            expected_git_sha=expected_git_sha, expected_version=version_to_verify,
+            expected_git_sha=expected_git_sha, expected_version=expected_version,
             expected_release_id=expected_release_id,
         )
         if evidence_tier not in pe_mod.AUTHENTICATED_TIERS:
@@ -2016,6 +2010,23 @@ def record_distributed_build_acceptance_cmd(
         report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         component_dir = workspace.component_dir("distributed-build-acceptance")
         dbp_mod.write_evidence_bundle(component_dir, record, source_bytes=raw_bytes)
+
+        # Priority 9: recording's FINAL validation runs the SAME shared
+        # distributed-evidence entrypoint preflight and consolidation use --
+        # a report that passes here passes both of those without
+        # modification, and a disagreement can only ever tighten (never
+        # loosen) this command's own verdict.
+        final = verify_distributed_evidence_report(
+            report, mandatory=True, run_id=run_id_opt, release_id=expected_release_id,
+            product_git_sha=expected_git_sha, full_version=expected_version,
+            component_dir=component_dir,
+        )
+        if final.status != STATUS_PASS and status == "passed":
+            status = "blocked"
+            problems = list(problems) + list(final.detail)
+            report["status"] = status
+            report["problems"] = list(problems)
+            report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         for problem in problems:
             click.echo(f"  - {problem}", err=status != "passed")
         if status == "passed":
@@ -2088,7 +2099,12 @@ def record_distributed_build_acceptance_cmd(
             for problem in chain.problems:
                 click.echo(f"  - {problem}", err=True)
             raise SystemExit(EXIT_BLOCKED)
-        return chain.result, chain.result_bytes, f"github-artifact:{github_repository}#run={github_run_id}&artifact={github_artifact_id}"
+        # Schema v2 (Priority 4): the RAW provider response retained in the
+        # artifact -- not the observation JSON -- is the provider-side raw
+        # source bundle, matching the live-collection path exactly.
+        return chain.result, (chain.raw_response_bytes or chain.result_bytes), (
+            f"github-artifact:{github_repository}#run={github_run_id}&artifact={github_artifact_id}"
+        )
 
     def _collect_build_provenance_side():
         """Priority 1: acquire the BUILD PROVENANCE half of the identity
@@ -2299,6 +2315,9 @@ def record_distributed_build_acceptance_cmd(
             provider_evidence, build_record,
             expected_release_config_git_sha=expected_git_sha, expected_release_config_version=expected_version,
             expected_release_id=expected_release_id,
+            release_run_id=run_id_opt,
+            provider_raw_sha256=dbp_mod.raw_sha256(provider_raw_bytes),
+            build_raw_sha256=dbp_mod.raw_sha256(build_raw_bytes or b""),
         )
         if not verdict.ok:
             click.echo("Distributed-build acceptance BLOCKED -- identity chain join rejected:", err=True)
@@ -2306,21 +2325,39 @@ def record_distributed_build_acceptance_cmd(
                 click.echo(f"  - {problem}", err=True)
             raise SystemExit(EXIT_BLOCKED)
 
-        # Priority 1.9: both source bundles (provider + build provenance),
-        # not just the merged/joined view, are retained in the component
-        # directory -- and so end up in the release evidence ZIP alongside
-        # everything else write_evidence_bundle below writes.
+        # Priority 6: BOTH raw source bundles, their .sha256 sidecars, each
+        # side's authentication metadata, and the joined evidence with its
+        # own sidecar are retained in the standardised component layout --
+        # and so end up in the release evidence ZIP alongside everything
+        # write_evidence_bundle writes. Consolidation re-requires and
+        # re-digests every one of these files.
         component_dir = workspace.component_dir("distributed-build-acceptance")
-        component_dir.mkdir(parents=True, exist_ok=True)
-        (component_dir / "provider-observation-raw.bin").write_bytes(provider_raw_bytes)
-        (component_dir / "build-provenance-raw.bin").write_bytes(build_raw_bytes or b"")
-
         joined_raw_bytes = json.dumps(
             verdict.evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
+        dbp_mod.write_joined_source_bundle(
+            component_dir,
+            provider_observation=provider_evidence,
+            provider_raw_bytes=provider_raw_bytes,
+            provider_authentication={
+                "sourceLabel": provider_source_label,
+                "recordedAt": timestamp,
+                "runId": run_id_opt,
+            },
+            build_provenance=build_record.to_dict(),
+            build_raw_bytes=build_raw_bytes or b"",
+            build_authentication={
+                "sourceLabel": build_source_label,
+                "recordedAt": timestamp,
+                "runId": run_id_opt,
+                "authenticatedRun": build_record.authenticated_run,
+                "buildArtifactTrust": build_record.build_artifact_trust,
+            },
+            joined_evidence_bytes=joined_raw_bytes,
+        )
         _record_authenticated(
             verdict.evidence, raw_bytes=joined_raw_bytes, evidence_tier=pe_mod.TIER_PROVIDER_BUILD_PROVENANCE_JOIN,
-            source_label=f"joined:{provider_source_label}+{build_source_label}", verify_version=None,
+            source_label=f"joined:{provider_source_label}+{build_source_label}",
         )
         return
 
@@ -3253,13 +3290,16 @@ def consolidate(
     # (distributed_build_gating is not None) so ad-hoc/legacy consolidation
     # that never had a release-config composed for it is unaffected.
     if distributed_build_gating is not None:
-        distributed_build_component = component_from_distributed_build_acceptance_report(
-            DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT_NAME, distributed_build_acceptance_report,
+        # Priority 9: consolidation goes through the SAME shared
+        # distributed-evidence entrypoint recording and preflight use.
+        distributed_build_component = consolidated_report_mod.verify_distributed_evidence_report(
+            distributed_build_acceptance_report,
+            component_name=DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT_NAME,
             mandatory=distributed_build_gating,
-            expected_git_sha=eff_expected_caleemobile_sha,
-            expected_version=eff_expected_caleemobile_build,
-            expected_release_id=expected_release_id_for_selector,
-            expected_release_run_id=run_id_opt,
+            run_id=run_id_opt,
+            release_id=expected_release_id_for_selector,
+            product_git_sha=eff_expected_caleemobile_sha,
+            full_version=eff_expected_caleemobile_build,
             component_dir=(
                 workspace.component_dir("distributed-build-acceptance")
                 if distributed_build_acceptance_report is not None else None

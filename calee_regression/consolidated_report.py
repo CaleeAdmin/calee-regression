@@ -1104,12 +1104,27 @@ def component_from_distributed_build_acceptance_report(
                 f"can never reach PASS, however well-formed it looks."
             )
         evidence = dbp.source_evidence_of(provenance) or {}
+        # Priority 6: a JOINED record's standardised raw-source bundle --
+        # both source files, every sidecar digest, and the run/release/
+        # product binding -- is re-verified here, recomputing every digest.
+        if evidence.get("generatedBy") == dbp.GENERATED_BY_PROVIDER_BUILD_JOIN and component_dir is not None:
+            from pathlib import Path as _Path
+
+            problems.extend(dbp.verify_joined_source_bundle(
+                _Path(component_dir), evidence,
+                expected_release_run_id=expected_release_run_id,
+                expected_release_id=expected_release_id,
+                expected_git_sha=expected_git_sha,
+            ))
         evidence_summary = {
             "provider": evidence.get("provider"),
             "channel": evidence.get("channel"),
             "distributedBuildId": evidence.get("distributedBuildId"),
             "testedGitSha": evidence.get("testedGitSha"),
             "testedVersion": evidence.get("testedVersion"),
+            "marketingVersion": evidence.get("marketingVersion"),
+            "platformBuildNumber": evidence.get("platformBuildNumber"),
+            "providerMarketingVersionConfirmation": evidence.get("providerMarketingVersionConfirmation"),
             "generatedBy": evidence.get("generatedBy"),
             "evidenceTier": evidence_tier,
             "releaseId": evidence.get("releaseId"),
@@ -1172,6 +1187,35 @@ def component_from_distributed_build_acceptance_report(
     return ComponentResult(
         name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
         detail=[deprecation_notice] + list(verdict.problems), evidence=evidence_summary,
+    )
+
+
+def verify_distributed_evidence_report(
+    report_dict: "dict[str, Any] | None",
+    *,
+    component_name: str = "caleemobile_distributed_build_acceptance",
+    mandatory: bool = True,
+    run_id: "str | None" = None,
+    release_id: "str | None" = None,
+    product_git_sha: "str | None" = None,
+    full_version: "str | None" = None,
+    component_dir: "Any | None" = None,
+    trusted_envelope_digest: "str | None" = None,
+    now: "Any | None" = None,
+) -> ComponentResult:
+    """Priority 9: THE single shared distributed-evidence verification
+    entrypoint. Recording's final validation, qualification preflight, and
+    final consolidation all call this same function with the same identity
+    inputs (run ID, release ID, product Git SHA, full canonical version,
+    component directory, trusted envelope digest when available) -- there is
+    exactly one set of version/source-digest rules, so a report that passes
+    one path passes all three without modification."""
+    return component_from_distributed_build_acceptance_report(
+        component_name, report_dict, mandatory=mandatory,
+        expected_git_sha=product_git_sha, expected_version=full_version,
+        expected_release_id=release_id, expected_release_run_id=run_id,
+        component_dir=component_dir, expected_envelope_digest=trusted_envelope_digest,
+        now=now,
     )
 
 

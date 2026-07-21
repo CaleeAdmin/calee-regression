@@ -84,3 +84,33 @@ def split_marketing_version_and_build_number(value: "Any | None") -> "tuple[str,
     if not marketing or not build:
         return None
     return marketing, build
+
+
+def compose_full_version(marketing: "Any | None", build_number: "Any | None") -> "str | None":
+    """The canonical composition helper paired with
+    :func:`split_marketing_version_and_build_number` (Priority 1): compose a
+    CaleeMobile marketing version (``0.0.24``) and platform build number
+    (``24``) into the ONE canonical full-version identity ``0.0.24+24``.
+
+    Returns ``None`` -- never a guess -- for anything ambiguous or
+    noncanonical: a missing/empty half, a marketing value that is not a bare
+    ``X.Y.Z`` (a stage-prefixed or already-``+``-carrying value cannot be a
+    CaleeMobile marketing version), or a build number that is not a plain
+    positive decimal integer literal. The result always round-trips:
+    ``split_marketing_version_and_build_number(compose_full_version(m, b))
+    == (m, b)``.
+    """
+    if marketing is None or build_number is None:
+        return None
+    marketing_text = str(marketing).strip()
+    build_text = str(build_number).strip()
+    if not marketing_text or not build_text:
+        return None
+    if not re.fullmatch(r"\d+\.\d+\.\d+", marketing_text):
+        return None
+    if not re.fullmatch(r"\d+", build_text):
+        return None
+    composed = f"{marketing_text}+{build_text}"
+    if split_marketing_version_and_build_number(composed) != (marketing_text, build_text):
+        return None
+    return composed

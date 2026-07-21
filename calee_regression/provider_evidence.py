@@ -1012,6 +1012,249 @@ def _valid_utc_timestamp(value: "Any") -> bool:
     return parsed.tzinfo is not None and parsed.utcoffset() == datetime.timedelta(0)
 
 
+# --- provider-observation CI artifact schema version 2 (Priority 4) --------
+#
+# A GitHub artifact whose nested JSON simply declares
+# ``{"generatedBy": "provider-api"}`` proves nothing about whether a
+# collector ever actually made the provider request. Schema v2 requires the
+# artifact to RETAIN the raw provider response and a collector attestation
+# that binds the collection to the authenticated workflow run itself.
+
+PROVIDER_CI_ARTIFACT_SCHEMA_VERSION = 2
+
+CI_MEMBER_OBSERVATION = "provider-observation.json"
+CI_MEMBER_RESPONSE_BIN = "provider-response.bin"
+CI_MEMBER_RESPONSE_SHA = "provider-response.sha256"
+CI_MEMBER_ATTESTATION = "collector-attestation.json"
+CI_REQUIRED_MEMBERS = frozenset({
+    CI_MEMBER_OBSERVATION, CI_MEMBER_RESPONSE_BIN, CI_MEMBER_RESPONSE_SHA, CI_MEMBER_ATTESTATION,
+})
+
+# The official provider API hosts a genuine collector must have talked to.
+OFFICIAL_PROVIDER_HOSTS = {
+    PROVIDER_APP_STORE_CONNECT: "api.appstoreconnect.apple.com",
+    PROVIDER_PLAY_CONSOLE: "androidpublisher.googleapis.com",
+}
+
+# Priority 4 requirement 3/12: the EXPLICIT approved collector profile --
+# (repository, workflow path) pairs whose runs are trusted to have performed
+# a real provider collection. DELIBERATELY EMPTY today: no approved
+# provider-collector workflow exists yet in any product repository, so the
+# artifact-import path for provider observations remains BLOCKED (with a
+# precise reason) rather than pretending to be available. A technical owner
+# extends this set (or passes ``approved_collectors``) only once a real,
+# reviewed collector workflow exists. Direct live-provider collection
+# (``--provider``) remains the preferred qualification path throughout.
+APPROVED_PROVIDER_COLLECTORS: "frozenset[tuple[str, str]]" = frozenset()
+
+_ATTESTATION_REQUIRED_FIELDS = (
+    "repository", "workflowRunId", "workflowFile", "provider", "providerEndpoint",
+    "collectionRunId", "collectorVersion", "observationTimestamp", "rawResponseDigest",
+)
+
+
+def _extract_ci_artifact_members(zip_bytes: bytes) -> "dict[str, bytes]":
+    """Safely extract every member of a provider CI artifact ZIP. Mirrors
+    ``github_artifact.extract_single_result``'s safety rules (path-safety,
+    duplicate, member-size caps) but returns ALL members, since schema v2
+    artifacts are multi-file by construction. Raises ProviderEvidenceError
+    for a malformed/unsafe ZIP."""
+    import io
+    import zipfile
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except zipfile.BadZipFile as exc:
+        raise ProviderEvidenceError(f"provider CI artifact is not a valid ZIP archive: {exc}") from exc
+    members: "dict[str, bytes]" = {}
+    with zf:
+        for info in zf.infolist():
+            name = info.filename
+            if not ga._member_is_safe(name):
+                raise ProviderEvidenceError(
+                    f"provider CI artifact ZIP member {name!r} is unsafe (path traversal, directory, or "
+                    f"absolute path) -- refusing to extract."
+                )
+            if name in members:
+                raise ProviderEvidenceError(f"provider CI artifact ZIP contains duplicate member {name!r}.")
+            if info.file_size > ga.MAX_EXTRACTED_MEMBER_BYTES:
+                raise ProviderEvidenceError(
+                    f"provider CI artifact ZIP member {name!r} is {info.file_size} bytes, over the "
+                    f"{ga.MAX_EXTRACTED_MEMBER_BYTES}-byte limit."
+                )
+            members[name] = zf.read(info)
+    return members
+
+
+def _endpoint_host(endpoint: "Any") -> "str | None":
+    from urllib.parse import urlparse
+
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        return None
+    try:
+        parsed = urlparse(endpoint.strip())
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or not parsed.hostname:
+        return None
+    return parsed.hostname.lower()
+
+
+def _reparse_provider_owned_fields(
+    provider: "str | None", raw_bytes: bytes, observation: "dict[str, Any]",
+) -> "list[str]":
+    """Priority 4 requirement 6: re-derive the provider-owned identity fields
+    from the RAW retained response and compare them with what the
+    observation claims -- an observation whose claims the raw response does
+    not actually support is rejected. Best-effort where the raw shape is
+    recognised; an unparseable raw response is itself a problem (the raw
+    response is the whole point of schema v2)."""
+    problems: "list[str]" = []
+    try:
+        parsed = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return [f"retained raw provider response is not parseable JSON: {exc}"]
+    if not isinstance(parsed, dict):
+        return ["retained raw provider response is not a JSON object."]
+
+    claimed_record_id = _opt_str(observation.get("providerRecordId"))
+    claimed_build_number = _opt_str(observation.get("buildNumber"))
+    if provider == PROVIDER_APP_STORE_CONNECT:
+        builds = parsed.get("data")
+        first = builds[0] if isinstance(builds, list) and builds and isinstance(builds[0], dict) else None
+        if first is None:
+            problems.append("raw App Store Connect response contains no build record to support the observation.")
+        else:
+            raw_id = _opt_str(first.get("id"))
+            attrs = first.get("attributes") if isinstance(first.get("attributes"), dict) else {}
+            raw_build_number = _opt_str(attrs.get("version"))
+            if claimed_record_id and raw_id and claimed_record_id != raw_id:
+                problems.append(
+                    f"observation providerRecordId {claimed_record_id!r} != raw response build id {raw_id!r}."
+                )
+            if claimed_build_number and raw_build_number and claimed_build_number != raw_build_number:
+                problems.append(
+                    f"observation buildNumber {claimed_build_number!r} != raw response build number "
+                    f"{raw_build_number!r}."
+                )
+    elif provider == PROVIDER_PLAY_CONSOLE:
+        releases = parsed.get("releases")
+        first = releases[0] if isinstance(releases, list) and releases and isinstance(releases[0], dict) else None
+        if first is None:
+            problems.append("raw Play Console response contains no release record to support the observation.")
+        else:
+            version_codes = first.get("versionCodes")
+            codes = [str(c) for c in version_codes] if isinstance(version_codes, list) else []
+            if claimed_record_id and codes and claimed_record_id not in codes:
+                problems.append(
+                    f"observation providerRecordId {claimed_record_id!r} is not among the raw response's "
+                    f"versionCodes {codes}."
+                )
+    return problems
+
+
+def verify_collector_attestation(
+    attestation: "Any",
+    *,
+    run: "Any",
+    observation: "dict[str, Any]",
+    raw_response_bytes: bytes,
+    approved_collectors: "frozenset[tuple[str, str]] | set[tuple[str, str]] | None" = None,
+) -> "list[str]":
+    """Priority 4: verify the collector attestation that binds a retained
+    provider observation to the authenticated GitHub workflow run that
+    actually collected it. Returns a problem list (empty == accepted)."""
+    approved = APPROVED_PROVIDER_COLLECTORS if approved_collectors is None else frozenset(approved_collectors)
+    problems: "list[str]" = []
+    if not isinstance(attestation, dict):
+        return ["collector-attestation.json must contain a JSON object."]
+
+    for field_name in _ATTESTATION_REQUIRED_FIELDS:
+        if not _opt_str(attestation.get(field_name)):
+            problems.append(f"collector attestation has no {field_name} recorded.")
+
+    att_repo = _opt_str(attestation.get("repository"))
+    att_workflow = _opt_str(attestation.get("workflowFile"))
+    att_run_id = _opt_str(attestation.get("workflowRunId"))
+    att_collection_run = _opt_str(attestation.get("collectionRunId"))
+
+    run_id = getattr(run, "run_id", None)
+    if att_collection_run and run_id is not None and str(att_collection_run) != str(run_id):
+        problems.append(
+            f"collector attestation collectionRunId {att_collection_run!r} != authenticated GitHub "
+            f"workflow run id {run_id!r} -- the collection was not performed by the run that uploaded "
+            f"this artifact."
+        )
+    if att_run_id and run_id is not None and str(att_run_id) != str(run_id):
+        problems.append(
+            f"collector attestation workflowRunId {att_run_id!r} != authenticated run id {run_id!r}."
+        )
+    repo_full = getattr(run, "repo_full_name", None)
+    if att_repo and repo_full and att_repo != repo_full.strip():
+        problems.append(
+            f"collector attestation repository {att_repo!r} != authenticated run repository {repo_full!r}."
+        )
+    workflow_path = getattr(run, "workflow_path", None)
+    if att_workflow and workflow_path and att_workflow != workflow_path.strip():
+        problems.append(
+            f"collector attestation workflowFile {att_workflow!r} != authenticated workflow path "
+            f"{workflow_path!r}."
+        )
+
+    if att_repo and att_workflow and (att_repo, att_workflow) not in approved:
+        if not approved:
+            problems.append(
+                f"no approved provider-collector workflow profile is configured -- the provider CI "
+                f"artifact-import path is BLOCKED until a technical owner approves an explicit "
+                f"(repository, workflow) collector profile. Collector claimed: ({att_repo!r}, "
+                f"{att_workflow!r}). Direct live-provider collection (--provider) remains the preferred "
+                f"qualification path."
+            )
+        else:
+            problems.append(
+                f"collector ({att_repo!r}, {att_workflow!r}) is not in the approved provider-collector "
+                f"profile {sorted(approved)} -- an unapproved collector workflow is rejected."
+            )
+
+    att_provider = _opt_str(attestation.get("provider"))
+    obs_provider = _opt_str(observation.get("provider"))
+    if att_provider and obs_provider and att_provider != obs_provider:
+        problems.append(f"collector attestation provider {att_provider!r} != observation provider {obs_provider!r}.")
+    expected_host = OFFICIAL_PROVIDER_HOSTS.get(obs_provider or att_provider or "")
+    att_host = _endpoint_host(attestation.get("providerEndpoint"))
+    obs_host = _endpoint_host(observation.get("providerEndpoint"))
+    if expected_host is None:
+        problems.append(f"no official provider host is known for provider {obs_provider!r}.")
+    else:
+        if att_host != expected_host:
+            problems.append(
+                f"collector attestation providerEndpoint host {att_host!r} != official {obs_provider!r} "
+                f"host {expected_host!r}."
+            )
+        if obs_host is not None and obs_host != expected_host:
+            problems.append(
+                f"observation providerEndpoint host {obs_host!r} != official {obs_provider!r} host "
+                f"{expected_host!r}."
+            )
+
+    actual_raw_digest = "sha256:" + hashlib.sha256(raw_response_bytes).hexdigest()
+    att_digest = _opt_str(attestation.get("rawResponseDigest"))
+    if att_digest and att_digest != actual_raw_digest:
+        problems.append(
+            f"collector attestation rawResponseDigest {att_digest!r} != recomputed digest "
+            f"{actual_raw_digest} of the retained raw provider response."
+        )
+    obs_digest = _opt_str(observation.get("sourceDigest"))
+    if obs_digest and obs_digest != actual_raw_digest:
+        problems.append(
+            f"observation sourceDigest {obs_digest!r} != recomputed digest {actual_raw_digest} of the "
+            f"retained raw provider response -- the observation does not describe these raw bytes."
+        )
+
+    problems.extend(_reparse_provider_owned_fields(obs_provider, raw_response_bytes, observation))
+    return problems
+
+
 # --- GitHub CI artifact: the CONTAINED provider evidence must itself be
 #     authentic (never merely a raw claim smuggled through a real artifact) -
 
@@ -1068,6 +1311,10 @@ class ProviderCiArtifactChain:
     result_bytes: "bytes | None" = None
     result_sha256: "str | None" = None
     result: "dict[str, Any] | None" = None
+    # Schema v2 (Priority 4): the retained RAW provider response bytes and
+    # the collector attestation extracted from the artifact.
+    raw_response_bytes: "bytes | None" = None
+    attestation: "dict[str, Any] | None" = None
 
     def summary(self) -> str:
         if self.ok:
@@ -1088,6 +1335,7 @@ def verify_provider_ci_artifact_chain(
     expected_run_id: "str | None" = None,
     expected_artifact_id: "str | None" = None,
     max_zip_bytes: "int | None" = None,
+    approved_collectors: "frozenset[tuple[str, str]] | set[tuple[str, str]] | None" = None,
     **validate_kwargs: Any,
 ) -> ProviderCiArtifactChain:
     """Authenticate that ``zip_bytes`` genuinely is the named artifact from
@@ -1151,22 +1399,76 @@ def verify_provider_ci_artifact_chain(
             f"the bytes do not match what GitHub stored."
         )
 
+    # Priority 4: schema v2 provider CI artifacts are MULTI-FILE -- the
+    # observation JSON alone (however well-formed, whatever generatedBy it
+    # declares) is never accepted; the raw provider response, its digest
+    # sidecar, and the collector attestation are all required.
     result_bytes: "bytes | None" = None
     result: "dict[str, Any] | None" = None
     result_sha: "str | None" = None
+    raw_response_bytes: "bytes | None" = None
+    attestation: "dict[str, Any] | None" = None
     try:
-        result_bytes, result = ga.extract_single_result(zip_bytes, expected_name=expected_result_filename)
-        result_sha = ga.sha256_hex(result_bytes)
-    except ga.GithubArtifactError as exc:
+        members = _extract_ci_artifact_members(zip_bytes)
+    except ProviderEvidenceError as exc:
         problems.append(str(exc))
+        members = {}
+
+    if members:
+        missing_members = sorted(CI_REQUIRED_MEMBERS - set(members))
+        if missing_members:
+            problems.append(
+                f"provider CI artifact is missing required schema-v2 member(s) {missing_members} -- a "
+                f"nested observation JSON with no retained raw provider response and no collector "
+                f"attestation proves nothing (a self-declared 'provider-api' label is never accepted "
+                f"on its own)."
+            )
+        result_bytes = members.get(CI_MEMBER_OBSERVATION)
+        raw_response_bytes = members.get(CI_MEMBER_RESPONSE_BIN)
+        if result_bytes is not None:
+            result_sha = ga.sha256_hex(result_bytes)
+            try:
+                parsed_obs = json.loads(result_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                problems.append(f"{CI_MEMBER_OBSERVATION} is not valid JSON: {exc}")
+                parsed_obs = None
+            if parsed_obs is not None and not isinstance(parsed_obs, dict):
+                problems.append(f"{CI_MEMBER_OBSERVATION} must contain a JSON object.")
+                parsed_obs = None
+            result = parsed_obs
+        sha_sidecar = members.get(CI_MEMBER_RESPONSE_SHA)
+        if raw_response_bytes is not None and sha_sidecar is not None:
+            recorded = sha_sidecar.decode("utf-8", errors="replace").split()
+            actual = "sha256:" + hashlib.sha256(raw_response_bytes).hexdigest()
+            if not recorded or recorded[0] not in (actual, actual[len("sha256:"):]):
+                problems.append(
+                    f"{CI_MEMBER_RESPONSE_SHA} sidecar digest {(recorded[0] if recorded else '<empty>')!r} "
+                    f"!= recomputed digest {actual} of {CI_MEMBER_RESPONSE_BIN}."
+                )
+        attestation_bytes = members.get(CI_MEMBER_ATTESTATION)
+        if attestation_bytes is not None:
+            try:
+                parsed_att = json.loads(attestation_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                problems.append(f"{CI_MEMBER_ATTESTATION} is not valid JSON: {exc}")
+                parsed_att = None
+            attestation = parsed_att if isinstance(parsed_att, dict) else None
+            if parsed_att is not None and attestation is None:
+                problems.append(f"{CI_MEMBER_ATTESTATION} must contain a JSON object.")
 
     if result is not None:
         problems.extend(verify_nested_provider_evidence(result, **validate_kwargs))
+    if result is not None and raw_response_bytes is not None and attestation is not None:
+        problems.extend(verify_collector_attestation(
+            attestation, run=run, observation=result, raw_response_bytes=raw_response_bytes,
+            approved_collectors=approved_collectors,
+        ))
 
     return ProviderCiArtifactChain(
         ok=not problems, problems=problems, run=run, artifact=artifact,
         zip_bytes=zip_bytes, zip_sha256=zip_sha, result_bytes=result_bytes,
         result_sha256=result_sha, result=result,
+        raw_response_bytes=raw_response_bytes, attestation=attestation,
     )
 
 
@@ -1183,6 +1485,7 @@ def acquire_provider_ci_artifact(
     bytes_fetcher: "ga.BytesFetcher | None" = None,
     token: "str | None" = None,
     env: "dict[str, str] | None" = None,
+    approved_collectors: "frozenset[tuple[str, str]] | set[tuple[str, str]] | None" = None,
     **validate_kwargs: Any,
 ) -> ProviderCiArtifactChain:
     """Acquire and verify an authenticated CI-artifact distributed-build
@@ -1240,5 +1543,6 @@ def acquire_provider_ci_artifact(
         expected_repository=repository, expected_workflow_path=workflow_path,
         expected_artifact_name=expected_artifact_name, expected_result_filename=expected_result_filename,
         expected_run_id=run_id, expected_artifact_id=artifact_id,
+        approved_collectors=approved_collectors,
         **validate_kwargs,
     )

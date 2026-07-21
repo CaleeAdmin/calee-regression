@@ -21,14 +21,29 @@ from calee_regression import provider_evidence as pe
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
 
+BP_REPO = "CaleeAdmin/CaleeMobile"
+BP_WORKFLOW_PATH = ".github/workflows/build-ios.yml"
+BP_RUN_ID = "42424242"
+BP_ARTIFACT_ID = "77777777"
+BP_ARTIFACT_NAME = "build-provenance"
+BP_RESULT_FILENAME = "build-provenance.json"
+BUILD_ARTIFACT_ID = "88888888"
+BUILD_ARTIFACT_NAME = "CaleeMobile-ios-ipa"
+BUILD_ARTIFACT_SHA = "c" * 64
+
 
 def _bp_dict(**overrides) -> dict:
     data = dict(
-        schemaVersion=1, component="caleemobile-build-provenance",
-        repository="CaleeAdmin/CaleeMobile", workflowRunId="42", workflowFile=".github/workflows/build-ios.yml",
+        schemaVersion=2, component="caleemobile-build-provenance",
+        repository=BP_REPO, workflowRunId=BP_RUN_ID, workflowFile=BP_WORKFLOW_PATH,
         sourceGitSha=SHA, sourceRef="refs/heads/main", applicationVersion="0.0.24",
         platform="ios", bundleId="com.viso.caleemobile", platformBuildNumber="24",
-        artifactId="777", artifactDigest="sha256:" + "9" * 64, buildTimestamp="2026-07-21T00:00:00Z",
+        provenanceArtifact={"id": BP_ARTIFACT_ID, "name": BP_ARTIFACT_NAME},
+        buildArtifact={
+            "id": BUILD_ARTIFACT_ID, "name": BUILD_ARTIFACT_NAME,
+            "sha256": BUILD_ARTIFACT_SHA, "platform": "ios",
+        },
+        buildTimestamp="2026-07-21T00:00:00Z",
         generatedBy="github-actions-artifact",
     )
     data.update(overrides)
@@ -104,13 +119,6 @@ def test_validate_build_provenance_rejects_generated_by_outside_allowlist():
 
 # --- authenticated origin 1: GitHub Actions artifact -------------------------
 
-BP_REPO = "CaleeAdmin/CaleeMobile"
-BP_WORKFLOW_PATH = ".github/workflows/build-ios.yml"
-BP_RUN_ID = "42424242"
-BP_ARTIFACT_ID = "77777777"
-BP_ARTIFACT_NAME = "build-provenance"
-BP_RESULT_FILENAME = "build-provenance.json"
-
 
 def _bp_zip(**overrides) -> bytes:
     body = json.dumps(_bp_dict(**overrides)).encode("utf-8")
@@ -139,11 +147,22 @@ def _bp_artifact(zip_bytes: bytes, **overrides) -> ga.ArtifactMetadata:
     return ga.ArtifactMetadata(**base)
 
 
+def _build_artifact_meta(**overrides) -> ga.ArtifactMetadata:
+    base = dict(
+        artifact_id=BUILD_ARTIFACT_ID, name=BUILD_ARTIFACT_NAME, expired=False, size_in_bytes=123456,
+        digest="sha256:" + BUILD_ARTIFACT_SHA, workflow_run_id=BP_RUN_ID,
+        archive_download_url="https://api.github.com/y/zip",
+    )
+    base.update(overrides)
+    return ga.ArtifactMetadata(**base)
+
+
 def _verify_bp_chain(zb, run=None, artifact=None, **kwargs):
     kwargs.setdefault("expected_repository", BP_REPO)
     kwargs.setdefault("expected_workflow_path", BP_WORKFLOW_PATH)
     kwargs.setdefault("expected_artifact_name", BP_ARTIFACT_NAME)
     kwargs.setdefault("expected_result_filename", BP_RESULT_FILENAME)
+    kwargs.setdefault("build_artifact_metadata", _build_artifact_meta())
     return bp.verify_build_provenance_artifact_chain(
         run if run is not None else _bp_run(), artifact if artifact is not None else _bp_artifact(zb), zb, **kwargs,
     )
@@ -217,6 +236,12 @@ def test_acquire_build_provenance_artifact_end_to_end_with_injected_fetchers():
                 "id": int(BP_ARTIFACT_ID), "name": BP_ARTIFACT_NAME, "expired": False,
                 "size_in_bytes": len(zb), "digest": "sha256:" + ga.sha256_hex(zb),
                 "workflow_run": {"id": int(BP_RUN_ID)}, "archive_download_url": "https://api.github.com/x/zip",
+            }
+        if url.endswith(f"/artifacts/{BUILD_ARTIFACT_ID}"):
+            return {
+                "id": int(BUILD_ARTIFACT_ID), "name": BUILD_ARTIFACT_NAME, "expired": False,
+                "size_in_bytes": 123456, "digest": "sha256:" + BUILD_ARTIFACT_SHA,
+                "workflow_run": {"id": int(BP_RUN_ID)}, "archive_download_url": "https://api.github.com/y/zip",
             }
         raise AssertionError(f"unexpected url {url}")
 
@@ -293,7 +318,9 @@ def test_join_provider_and_build_provenance_matching_passes():
     )
     assert verdict.ok, verdict.problems
     assert verdict.evidence["testedGitSha"] == SHA
-    assert verdict.evidence["testedVersion"] == "0.0.24"
+    assert verdict.evidence["testedVersion"] == "0.0.24+24"
+    assert verdict.evidence["marketingVersion"] == "0.0.24"
+    assert verdict.evidence["platformBuildNumber"] == "24"
     assert verdict.evidence["generatedBy"] == "provider-build-provenance-join"
     assert verdict.evidence["providerObservation"]["providerRecordId"] == "build-1"
     assert verdict.evidence["buildProvenance"]["sourceGitSha"] == SHA

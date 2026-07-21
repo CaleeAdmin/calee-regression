@@ -450,15 +450,16 @@ def test_provider_and_build_provenance_join_end_to_end_never_leaks_private_key(t
     assert report["status"] == "passed"
     assert report["evidenceTier"] == pe.TIER_PROVIDER_BUILD_PROVENANCE_JOIN
     assert report["provenance"]["sourceEvidence"]["testedGitSha"] == SHA_RELEASE
-    assert report["provenance"]["sourceEvidence"]["testedVersion"] == "0.0.24"
+    assert report["provenance"]["sourceEvidence"]["testedVersion"] == "0.0.24+24"
+    assert report["provenance"]["sourceEvidence"]["marketingVersion"] == "0.0.24"
+    assert report["provenance"]["sourceEvidence"]["platformBuildNumber"] == "24"
     report_text = json.dumps(report)
     assert pem not in report_text
     assert "BEGIN" not in report_text
 
     component_dir = workspace.component_dir("distributed-build-acceptance")
-    for name in (
-        dbp.BUNDLE_SOURCE_JSON, dbp.BUNDLE_SOURCE_SHA, dbp.BUNDLE_PROVENANCE,
-        "provider-observation-raw.bin", "build-provenance-raw.bin",
+    for name in (dbp.BUNDLE_SOURCE_JSON, dbp.BUNDLE_SOURCE_SHA, dbp.BUNDLE_PROVENANCE) + tuple(
+        n for n in dbp.JOINED_MANDATORY_FILES if n != dbp.BUNDLE_PROVENANCE
     ):
         text = (component_dir / name).read_text()
         assert pem not in text

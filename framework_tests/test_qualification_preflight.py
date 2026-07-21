@@ -135,7 +135,7 @@ def test_check_adb_devices_adb_not_runnable_is_blocked():
 
 
 def test_check_appium_no_url_is_warning():
-    assert qp.check_appium(None).status == qp.STATUS_WARNING
+    assert qp.check_appium(None).status == qp.STATUS_NOT_APPLICABLE
 
 
 def test_check_appium_reachable_is_ready():
@@ -190,7 +190,7 @@ def test_check_flutter_missing_is_only_a_warning_when_not_required():
     enabled at all is never blocked merely because Flutter isn't installed
     on this machine."""
     result = qp.check_flutter(which=lambda name: None, required=False)
-    assert result.status == qp.STATUS_WARNING
+    assert result.status == qp.STATUS_NOT_APPLICABLE
 
 
 def test_check_appium_no_url_blocks_when_required():
@@ -213,7 +213,7 @@ def test_check_appium_unreachable_is_blocked_even_when_not_required():
 
 def test_check_ingestion_bridge_unavailable_is_only_a_warning_by_default(tmp_path):
     result = qp.check_ingestion_bridge(tmp_path)
-    assert result.status == qp.STATUS_WARNING
+    assert result.status == qp.STATUS_NOT_APPLICABLE
 
 
 def test_check_ingestion_bridge_unavailable_blocks_when_calendar_required(tmp_path):
@@ -239,8 +239,8 @@ def test_run_qualification_preflight_no_mobile_platform_never_blocks_on_flutter_
         env={},
     )
     names_to_status = {c.name: c.status for c in report.checks}
-    assert names_to_status["flutter"] == qp.STATUS_WARNING
-    assert names_to_status["appium"] == qp.STATUS_WARNING
+    assert names_to_status["flutter"] == qp.STATUS_NOT_APPLICABLE
+    assert names_to_status["appium"] == qp.STATUS_NOT_APPLICABLE
 
 
 def test_check_mobile_devices_for_scope_android_required_and_present():
@@ -309,11 +309,11 @@ def test_check_keychain_credentials_missing_is_blocked():
 
 
 def test_check_ics_publisher_config_no_section_is_warning():
-    assert qp.check_ics_publisher_config(None).status == qp.STATUS_WARNING
+    assert qp.check_ics_publisher_config(None).status == qp.STATUS_NOT_APPLICABLE
 
 
 def test_check_ics_publisher_config_offline_only_is_warning():
-    assert qp.check_ics_publisher_config({"mode": "offline-only"}).status == qp.STATUS_WARNING
+    assert qp.check_ics_publisher_config({"mode": "offline-only"}).status == qp.STATUS_NOT_APPLICABLE
 
 
 def test_check_ics_publisher_config_published_valid_is_ready():
@@ -348,7 +348,7 @@ def test_check_public_ics_url_unreachable_is_blocked():
 
 def test_check_selector_ci_evidence_availability_no_token_is_warning_by_default():
     result = qp.check_selector_ci_evidence_availability(env={})
-    assert result.status == qp.STATUS_WARNING
+    assert result.status == qp.STATUS_NOT_APPLICABLE
 
 
 def test_check_selector_ci_evidence_availability_no_token_blocks_when_required():
@@ -362,7 +362,7 @@ def test_check_selector_ci_evidence_availability_token_alone_is_not_evidence():
     previous defect this closes was exactly 'credential presence -> READY'
     with no artifact ever actually authenticated."""
     result = qp.check_selector_ci_evidence_availability(env={"GITHUB_TOKEN": "tok"})
-    assert result.status == qp.STATUS_WARNING
+    assert result.status == qp.STATUS_NOT_APPLICABLE
 
 
 def test_check_selector_ci_evidence_availability_token_alone_blocks_when_required():
@@ -406,7 +406,7 @@ def test_check_selector_ci_evidence_availability_rejected_artifact_blocks(monkey
 
 
 def test_check_distributed_build_evidence_availability_none_given_is_warning():
-    assert qp.check_distributed_build_evidence_availability(None).status == qp.STATUS_WARNING
+    assert qp.check_distributed_build_evidence_availability(None).status == qp.STATUS_NOT_APPLICABLE
 
 
 def _write_run_scoped_distributed_build_report(tmp_path, *, run_id="run-1", evidence_tier=None, **overrides):
@@ -515,7 +515,7 @@ def test_check_distributed_build_evidence_availability_wrong_identity_blocks(tmp
 
 
 def test_check_frozen_candidate_ability_none_given_is_warning():
-    assert qp.check_frozen_candidate_ability(None).status == qp.STATUS_WARNING
+    assert qp.check_frozen_candidate_ability(None).status == qp.STATUS_NOT_APPLICABLE
 
 
 def test_check_frozen_candidate_ability_valid_bundle(tmp_path):
@@ -563,7 +563,7 @@ def test_check_main_ci_artifact_authenticated_no_run_or_artifact_id_is_warning_b
         repository="CaleeAdmin/calee-regression", workflow_run_id=None, artifact_id=None,
         expected_merge_sha="a" * 40,
     )
-    assert result.status == qp.STATUS_WARNING
+    assert result.status == qp.STATUS_NOT_APPLICABLE
 
 
 def test_check_main_ci_artifact_authenticated_no_run_or_artifact_id_blocks_when_required():
@@ -778,8 +778,8 @@ def test_sections_empty_section_is_not_applicable():
 
 def test_sections_all_not_applicable_checks_roll_up_to_not_applicable():
     report = qp.PreflightReport(checks=[
-        qp.PreflightCheck("appium", qp.STATUS_WARNING, "not configured", not_applicable=True),
-        qp.PreflightCheck("flutter", qp.STATUS_WARNING, "not on PATH", not_applicable=True),
+        qp.PreflightCheck("appium", qp.STATUS_NOT_APPLICABLE, "not configured", not_applicable=True),
+        qp.PreflightCheck("flutter", qp.STATUS_NOT_APPLICABLE, "not on PATH", not_applicable=True),
     ])
     by_key = {s["section"]: s for s in report.sections()}
     assert by_key[qp.SECTION_TOOLCHAINS]["status"] == "NOT_APPLICABLE"
@@ -787,7 +787,7 @@ def test_sections_all_not_applicable_checks_roll_up_to_not_applicable():
 
 def test_sections_mixed_ready_and_not_applicable_is_ready():
     report = qp.PreflightReport(checks=[
-        qp.PreflightCheck("appium", qp.STATUS_WARNING, "not configured", not_applicable=True),
+        qp.PreflightCheck("appium", qp.STATUS_NOT_APPLICABLE, "not configured", not_applicable=True),
         qp.PreflightCheck("flutter", qp.STATUS_READY, "found"),
     ])
     by_key = {s["section"]: s for s in report.sections()}
@@ -804,7 +804,7 @@ def test_sections_genuine_warning_is_not_not_applicable():
 
 def test_sections_blocked_beats_everything():
     report = qp.PreflightReport(checks=[
-        qp.PreflightCheck("appium", qp.STATUS_WARNING, "not configured", not_applicable=True),
+        qp.PreflightCheck("appium", qp.STATUS_NOT_APPLICABLE, "not configured", not_applicable=True),
         qp.PreflightCheck("flutter", qp.STATUS_BLOCKED, "wrong version"),
     ])
     by_key = {s["section"]: s for s in report.sections()}

@@ -52,15 +52,13 @@ from typing import Any, Callable, Optional
 STATUS_READY = "ready"
 STATUS_BLOCKED = "blocked"
 STATUS_WARNING = "warning"
-# Priority 11 (this session): a SECTION-level status (see PreflightReport.
-# sections) meaning "nothing in this release scope needs this capability at
-# all" -- distinct from STATUS_WARNING, which still means "this might matter
-# and its state is unresolved/ambiguous". Never returned as an individual
-# PreflightCheck.status (existing callers/tests keep seeing WARNING there
-# unchanged); a check instead sets PreflightCheck.not_applicable=True
-# alongside its existing WARNING status, and section rollup (below) is what
-# turns "every check in this section is READY or not_applicable" into an
-# overall NOT_APPLICABLE for that section.
+# Priority 8 (this session): a REAL check status -- "nothing in this release
+# scope needs this capability at all" -- distinct from STATUS_WARNING, which
+# still means "this might matter and its state is unresolved/ambiguous". An
+# out-of-scope check records NOT_APPLICABLE (not WARNING) and never prevents
+# an overall READY; a genuine unresolved optional concern remains WARNING
+# and DOES prevent READY. Sections and the overall status use the same
+# precedence: BLOCKED > WARNING > READY, with NOT_APPLICABLE ignored.
 STATUS_NOT_APPLICABLE = "not_applicable"
 
 WhichFn = Callable[[str], "Optional[str]"]
@@ -95,6 +93,11 @@ class PreflightCheck:
 
 
 def _check(name: str, status: str, detail: str, hint: "str | None" = None, not_applicable: bool = False) -> PreflightCheck:
+    # Priority 8: an out-of-scope check is a REAL NOT_APPLICABLE, never a
+    # warning that would (wrongly) keep the whole report at WARNING. A
+    # BLOCKED status is never downgraded, even if tagged not_applicable.
+    if not_applicable and status == STATUS_WARNING:
+        status = STATUS_NOT_APPLICABLE
     return PreflightCheck(name=name, status=status, detail=detail, hint=hint, not_applicable=not_applicable)
 
 
@@ -636,7 +639,7 @@ def check_selector_ci_evidence_availability(
 def check_distributed_build_evidence_availability(
     source_path: "Path | None", *, required: bool = False,
     expected_release_id: "str | None" = None, expected_git_sha: "str | None" = None,
-    expected_version: "str | None" = None,
+    expected_version: "str | None" = None, expected_release_run_id: "str | None" = None,
 ) -> PreflightCheck:
     """Priority 7 (this session): re-verify the run-scoped distributed-build-
     acceptance REPORT -- the exact ``results.json``
@@ -671,10 +674,13 @@ def check_distributed_build_evidence_availability(
     if not isinstance(report, dict):
         return _check("distributed_build_evidence_availability", STATUS_BLOCKED, f"{source_path}: not a JSON object.")
 
-    result = cr_mod.component_from_distributed_build_acceptance_report(
-        "distributed_build_evidence_availability", report, mandatory=required,
-        expected_git_sha=expected_git_sha, expected_version=expected_version,
-        expected_release_id=expected_release_id, component_dir=source_path.parent,
+    # Priority 9: the SAME shared distributed-evidence entrypoint recording
+    # and consolidation use -- one set of version/source-digest rules.
+    result = cr_mod.verify_distributed_evidence_report(
+        report, component_name="distributed_build_evidence_availability", mandatory=required,
+        run_id=expected_release_run_id, release_id=expected_release_id,
+        product_git_sha=expected_git_sha, full_version=expected_version,
+        component_dir=source_path.parent,
     )
     if result.status == cr_mod.STATUS_PASS:
         return _check(
@@ -876,6 +882,7 @@ _SECTION_BY_CHECK_NAME = {
     "caleemobile_regression_checkout": SECTION_REGRESSION_FRAMEWORK_IDENTITY,
     "caleemobile_regression_checkout_sha": SECTION_REGRESSION_FRAMEWORK_IDENTITY,
     "main_ci_evidence": SECTION_REGRESSION_FRAMEWORK_IDENTITY,
+    "release_scope_derivation": SECTION_RELEASE_CANDIDATE_IDENTITY,
     "calee_regression_main_ci_authenticated": SECTION_REGRESSION_FRAMEWORK_IDENTITY,
     "caleemobile_regression_main_ci_authenticated": SECTION_REGRESSION_FRAMEWORK_IDENTITY,
     "selector_ci_evidence_availability": SECTION_SELECTOR_EVIDENCE,
@@ -918,9 +925,9 @@ def _section_status(checks: "list[PreflightCheck]") -> str:
         return STATUS_NOT_APPLICABLE
     if any(c.status == STATUS_BLOCKED for c in checks):
         return STATUS_BLOCKED
-    if any(c.status == STATUS_WARNING and not c.not_applicable for c in checks):
+    if any(c.status == STATUS_WARNING for c in checks):
         return STATUS_WARNING
-    if all(c.not_applicable for c in checks):
+    if all(c.status == STATUS_NOT_APPLICABLE for c in checks):
         return STATUS_NOT_APPLICABLE
     return STATUS_READY
 
@@ -928,18 +935,16 @@ def _section_status(checks: "list[PreflightCheck]") -> str:
 @dataclass
 class PreflightReport:
     checks: "list[PreflightCheck]" = field(default_factory=list)
+    # Priority 7 requirement 7: a preflight with no valid release bundle is
+    # DIAGNOSTIC-ONLY -- it can still report BLOCKED/WARNING/READY over what
+    # it did check, but it can never claim release-qualified readiness.
+    diagnostic_only: bool = False
 
     @property
     def overall(self) -> str:
-        # Priority 7 requirements 16-17: BLOCKED beats WARNING beats READY --
-        # any warning prevents an unqualified READY. The previous behaviour
-        # (any number of WARNINGs still reported READY) was exactly the
-        # fail-open defect this closes. Deliberately NOT relaxed for
-        # not_applicable-tagged warnings (see Priority 11's section-level
-        # rollup for that): a release-wide READY still requires every
-        # individual check to be genuinely READY, never merely "not
-        # applicable" -- see test_overall_never_ready_while_any_warning_
-        # present_in_full_orchestration, which pins this exact invariant.
+        # Priority 8: BLOCKED beats a genuine WARNING beats READY -- any
+        # genuine warning or block prevents READY, while a NOT_APPLICABLE
+        # check (out of the release's scope) never does.
         if any(c.status == STATUS_BLOCKED for c in self.checks):
             return STATUS_BLOCKED
         if any(c.status == STATUS_WARNING for c in self.checks):
@@ -974,10 +979,16 @@ class PreflightReport:
         # capability is missing, not just an aggregate status.
         blocked = [c.name for c in self.checks if c.status == STATUS_BLOCKED]
         warned = [c.name for c in self.checks if c.status == STATUS_WARNING]
+        not_applicable = [c.name for c in self.checks if c.status == STATUS_NOT_APPLICABLE]
         return {
             "overall": self.overall.upper(),
+            # Priority 7 requirement 7: READY from a diagnostic-only run
+            # (no verified release bundle) is never release-qualified.
+            "releaseQualified": self.overall == STATUS_READY and not self.diagnostic_only,
+            "diagnosticOnly": self.diagnostic_only,
             "blockedCapabilities": blocked,
             "warnedCapabilities": warned,
+            "notApplicableCapabilities": not_applicable,
             "sections": self.sections(),
             "checks": [c.to_dict() for c in self.checks],
         }
@@ -1103,16 +1114,12 @@ def run_qualification_preflight(
             cfg = None
 
     checks.append(check_report_root(cfg.report_dir if cfg else None, env=environ))
-    checks.append(check_android_sdk(which=which, env=environ))
 
-    availability, serial_check, connected_serials = check_adb_devices(
-        cfg.tablet_serial if cfg else None, adb_runner=adb_runner,
-    )
-    checks.append(availability)
-    checks.append(serial_check)
-
-    # Priority 7 requirement 1: the release bundle is verified FIRST, before
-    # any requirement derivation below depends on it.
+    # Priority 7: machine configuration is loaded, the release bundle is
+    # verified, and the effective release configuration is composed BEFORE
+    # any platform-specific check executes -- the dependency matrix below is
+    # derived from the release scope, and out-of-scope checks never run
+    # external commands at all.
     verification = None
     if bundle_path:
         verification = ri_mod.verify_release_bundle(bundle_path)
@@ -1148,27 +1155,102 @@ def run_qualification_preflight(
         enabled_features = []
         profile = None
         expected_identities = {}
+        # Priority 7 requirement 7: with no valid release bundle there is
+        # nothing release-authoritative to derive from -- this run is
+        # DIAGNOSTIC-ONLY and can never be release-qualified READY.
+        checks.append(_check(
+            "release_scope_derivation", STATUS_WARNING,
+            "No verified release bundle/effective release configuration -- this preflight is "
+            "diagnostic-only (falling back to the machine's own declared scope) and cannot report "
+            "release-qualified readiness.",
+            hint="Pass --bundle with a verifiable release bundle to derive the release-authoritative scope.",
+        ))
 
-    # Priority 9 (this session): any mobile platform in scope at all -- the
-    # one condition shared by Appium (reachability + drivers) and the
-    # Flutter toolchain, since CaleeMobile's Flutter codebase and its
-    # Appium-driven UI automation underlie tablet/android/ios alike.
-    any_mobile_platform_in_scope = bool({"tablet", "android", "ios"} & set(enabled_platforms))
+    # ── Priority 7: the explicit platform dependency matrix, derived from
+    # the composed release scope (confirmed against the actual launchers:
+    # the tablet launcher drives the native Calee tablet app via Appium/
+    # uiautomator2 and never touches Flutter or the CaleeMobile checkout;
+    # only the CaleeMobile Android/iPhone launchers need those):
+    #
+    #   tablet         -> Android SDK, adb, configured tablet serial,
+    #                     Appium, uiautomator2, Android build tools
+    #   android mobile -> Android SDK, adb, a configured Android phone
+    #                     DISTINCT from the tablet, Flutter, CaleeMobile +
+    #                     CaleeMobile-Regression checkouts, Appium,
+    #                     uiautomator2
+    #   ios mobile     -> configured iPhone UDID, Flutter, CaleeMobile +
+    #                     CaleeMobile-Regression checkouts, Appium, xcuitest
+    #
+    # An out-of-scope check records NOT_APPLICABLE (Priority 8) and never
+    # executes external commands.
+    scope = set(enabled_platforms)
+    tablet_in_scope = "tablet" in scope
+    android_in_scope = "android" in scope
+    ios_in_scope = "ios" in scope
+    adb_needed = tablet_in_scope or android_in_scope
+    caleemobile_needed = android_in_scope or ios_in_scope
+    any_mobile_platform_in_scope = tablet_in_scope or android_in_scope or ios_in_scope
+    scope_note = f"release scope platforms: {sorted(scope) or 'none'}"
 
-    checks.append(check_android_build_tools(which=which, required=bool({"tablet", "android"} & set(enabled_platforms))))
+    if adb_needed:
+        checks.append(check_android_sdk(which=which, env=environ))
+        availability, serial_check, connected_serials = check_adb_devices(
+            cfg.tablet_serial if cfg else None, adb_runner=adb_runner,
+        )
+        checks.append(availability)
+        # The tablet serial requirement only applies when the tablet itself
+        # is in scope -- an Android-mobile-only release needs an Android
+        # phone (checked below, distinct from the tablet), not the tablet.
+        if tablet_in_scope:
+            checks.append(serial_check)
+        else:
+            checks.append(_check(
+                "expected_tablet_serial", STATUS_WARNING,
+                f"Not applicable: the tablet is not in this release's scope ({scope_note}).",
+                not_applicable=True,
+            ))
+        checks.append(check_android_build_tools(which=which, required=True))
+    else:
+        connected_serials = []
+        for name in ("android_sdk_tools", "adb_device_availability", "expected_tablet_serial", "android_build_tools"):
+            checks.append(_check(
+                name, STATUS_WARNING,
+                f"Not applicable: no Android-side platform (tablet/android) is in this release's scope "
+                f"({scope_note}); the check was not executed.",
+                not_applicable=True,
+            ))
 
-    checks.append(check_appium(_load_appium_url(repo_root), opener=http_opener, required=any_mobile_platform_in_scope))
-    required_drivers = []
-    if {"tablet", "android"} & set(enabled_platforms):
-        required_drivers.append("uiautomator2")
-    if "ios" in enabled_platforms:
-        required_drivers.append("xcuitest")
-    checks.append(check_appium_drivers(required_drivers=required_drivers, which=which, runner=subprocess_runner))
+    if any_mobile_platform_in_scope:
+        checks.append(check_appium(_load_appium_url(repo_root), opener=http_opener, required=True))
+        required_drivers = []
+        if tablet_in_scope or android_in_scope:
+            required_drivers.append("uiautomator2")
+        if ios_in_scope:
+            required_drivers.append("xcuitest")
+        checks.append(check_appium_drivers(required_drivers=required_drivers, which=which, runner=subprocess_runner))
+    else:
+        for name in ("appium", "appium_drivers"):
+            checks.append(_check(
+                name, STATUS_WARNING,
+                f"Not applicable: no mobile platform is in this release's scope ({scope_note}); the check "
+                f"was not executed.",
+                not_applicable=True,
+            ))
 
-    checks.append(check_flutter(which=which, runner=subprocess_runner, required=any_mobile_platform_in_scope))
+    # Flutter/the CaleeMobile checkouts underlie only the CaleeMobile
+    # (android/ios) launchers -- a tablet-only release never requires them.
+    if caleemobile_needed:
+        checks.append(check_flutter(which=which, runner=subprocess_runner, required=True))
+    else:
+        checks.append(_check(
+            "flutter", STATUS_WARNING,
+            f"Not applicable: no CaleeMobile platform (android/ios) is in this release's scope "
+            f"({scope_note}); the check was not executed.",
+            not_applicable=True,
+        ))
 
     iphone_connected_udids = (
-        check_iphone_connected_udids(which=which, runner=subprocess_runner) if "ios" in enabled_platforms else None
+        check_iphone_connected_udids(which=which, runner=subprocess_runner) if ios_in_scope else None
     )
     checks.extend(check_mobile_device_scope(
         enabled_platforms=enabled_platforms,
@@ -1179,18 +1261,30 @@ def run_qualification_preflight(
         iphone_connected_udids=iphone_connected_udids,
     ))
 
-    checks.append(check_sibling_checkout("caleemobile_checkout", repo_root.parent / "CaleeMobile"))
-    checks.append(check_sibling_checkout("caleemobile_regression_checkout", repo_root.parent / "CaleeMobile-Regression"))
     caleemobile_expected_sha = expected_caleemobile_sha or expected_identities.get("caleeMobile", {}).get("gitSha")
-    checks.append(check_sibling_checkout_sha(
-        "caleemobile_checkout", repo_root.parent / "CaleeMobile", expected_sha=caleemobile_expected_sha,
-        required=bool(caleemobile_expected_sha), runner=subprocess_runner,
-    ))
-    checks.append(check_sibling_checkout_sha(
-        "caleemobile_regression_checkout", repo_root.parent / "CaleeMobile-Regression",
-        expected_sha=expected_caleemobile_regression_sha, required=bool(expected_caleemobile_regression_sha),
-        runner=subprocess_runner,
-    ))
+    if caleemobile_needed:
+        checks.append(check_sibling_checkout("caleemobile_checkout", repo_root.parent / "CaleeMobile"))
+        checks.append(check_sibling_checkout("caleemobile_regression_checkout", repo_root.parent / "CaleeMobile-Regression"))
+        checks.append(check_sibling_checkout_sha(
+            "caleemobile_checkout", repo_root.parent / "CaleeMobile", expected_sha=caleemobile_expected_sha,
+            required=bool(caleemobile_expected_sha), runner=subprocess_runner,
+        ))
+        checks.append(check_sibling_checkout_sha(
+            "caleemobile_regression_checkout", repo_root.parent / "CaleeMobile-Regression",
+            expected_sha=expected_caleemobile_regression_sha, required=bool(expected_caleemobile_regression_sha),
+            runner=subprocess_runner,
+        ))
+    else:
+        for name in (
+            "caleemobile_checkout", "caleemobile_regression_checkout",
+            "caleemobile_checkout_sha", "caleemobile_regression_checkout_sha",
+        ):
+            checks.append(_check(
+                name, STATUS_WARNING,
+                f"Not applicable: no CaleeMobile platform (android/ios) is in this release's scope "
+                f"({scope_note}); the check was not executed.",
+                not_applicable=True,
+            ))
 
     checks.append(check_keychain_credentials())
 
@@ -1267,4 +1361,4 @@ def run_qualification_preflight(
 
     checks.append(check_manual_check_definitions(manual_checks_path))
 
-    return PreflightReport(checks=checks)
+    return PreflightReport(checks=checks, diagnostic_only=effective is None)

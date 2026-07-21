@@ -720,23 +720,65 @@ CI_ARTIFACT_NAME = "distributed-build-evidence"
 CI_RESULT_FILENAME = "distributed-build-evidence.json"
 
 
+CI_ENDPOINT = "https://api.appstoreconnect.apple.com/v1/builds?filter[app]=acct&filter[version]=24"
+# The retained RAW provider response the collector actually received.
+CI_RAW_RESPONSE = json.dumps({
+    "data": [{"type": "builds", "id": "rec-1", "attributes": {"version": "24", "processingState": "VALID"}}],
+}).encode("utf-8")
+
+
+def _raw_digest(raw: bytes) -> str:
+    import hashlib as _hashlib
+
+    return "sha256:" + _hashlib.sha256(raw).hexdigest()
+
+
 def _nested_evidence(**overrides) -> dict:
     data = {
         "schemaVersion": 1, "component": "caleemobile-provider-observation",
         "provider": "app_store_connect", "platform": "ios", "channel": "testflight",
         "releaseId": "r1", "providerAccountOrProject": "acct", "providerRecordId": "rec-1",
         "providerObservedAt": "2026-07-21T00:00:00Z", "generatedBy": "provider-api",
-        "sourceDigest": "sha256:" + "1" * 64, "timestamp": "2026-07-21T00:00:00Z",
+        "providerEndpoint": CI_ENDPOINT, "buildNumber": "24",
+        "sourceDigest": _raw_digest(CI_RAW_RESPONSE), "timestamp": "2026-07-21T00:00:00Z",
     }
     data.update(overrides)
     return data
 
 
-def _ci_zip(**overrides) -> bytes:
-    body = json.dumps(_nested_evidence(**overrides)).encode("utf-8")
+def _attestation(**overrides) -> dict:
+    data = {
+        "repository": CI_REPO, "workflowRunId": CI_RUN_ID, "workflowFile": CI_WORKFLOW_PATH,
+        "provider": "app_store_connect", "providerEndpoint": CI_ENDPOINT,
+        "collectionRunId": CI_RUN_ID, "collectorVersion": "1.0.0",
+        "observationTimestamp": "2026-07-21T00:00:00Z", "rawResponseDigest": _raw_digest(CI_RAW_RESPONSE),
+    }
+    data.update(overrides)
+    return data
+
+
+def _ci_zip(raw_response: "bytes | None" = None, attestation: "dict | None" = None,
+            members: "dict | None" = None, **overrides) -> bytes:
+    """Schema-v2 provider CI artifact: observation + raw response + digest
+    sidecar + collector attestation. ``members`` overrides/removes files
+    entirely (a None value removes the member)."""
+    raw = CI_RAW_RESPONSE if raw_response is None else raw_response
+    files = {
+        pe.CI_MEMBER_OBSERVATION: json.dumps(_nested_evidence(**overrides)).encode("utf-8"),
+        pe.CI_MEMBER_RESPONSE_BIN: raw,
+        pe.CI_MEMBER_RESPONSE_SHA: (_raw_digest(raw) + "  provider-response.bin\n").encode("utf-8"),
+        pe.CI_MEMBER_ATTESTATION: json.dumps(attestation if attestation is not None else _attestation()).encode("utf-8"),
+    }
+    if members:
+        for name, content in members.items():
+            if content is None:
+                files.pop(name, None)
+            else:
+                files[name] = content
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(CI_RESULT_FILENAME, body)
+        for name, content in files.items():
+            zf.writestr(name, content)
     return buf.getvalue()
 
 
@@ -764,6 +806,7 @@ def _verify_ci_chain(zb, run=None, artifact=None, **kwargs):
     kwargs.setdefault("expected_workflow_path", CI_WORKFLOW_PATH)
     kwargs.setdefault("expected_artifact_name", CI_ARTIFACT_NAME)
     kwargs.setdefault("expected_result_filename", CI_RESULT_FILENAME)
+    kwargs.setdefault("approved_collectors", frozenset({(CI_REPO, CI_WORKFLOW_PATH)}))
     return pe.verify_provider_ci_artifact_chain(
         run if run is not None else _ci_run(),
         artifact if artifact is not None else _ci_artifact(zb),
@@ -895,6 +938,7 @@ def test_acquire_provider_ci_artifact_never_contacts_real_network_uses_injected_
         repository=CI_REPO, workflow_path=CI_WORKFLOW_PATH, run_id=CI_RUN_ID, artifact_id=CI_ARTIFACT_ID,
         expected_artifact_name=CI_ARTIFACT_NAME, expected_result_filename=CI_RESULT_FILENAME,
         json_fetcher=json_fetcher, bytes_fetcher=bytes_fetcher, token="fake",
+        approved_collectors=frozenset({(CI_REPO, CI_WORKFLOW_PATH)}),
     )
     assert chain.ok, chain.problems
     assert chain.result["providerRecordId"] == "rec-1"

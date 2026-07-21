@@ -24,7 +24,7 @@ def test_runs_read_only_and_never_crashes(tmp_path):
     assert payload["overall"] in ("READY", "WARNING", "BLOCKED")
     assert isinstance(payload["checks"], list) and payload["checks"]
     for check in payload["checks"]:
-        assert check["status"] in ("ready", "warning", "blocked")
+        assert check["status"] in ("ready", "warning", "blocked", "not_applicable")
     assert isinstance(payload["blockedCapabilities"], list)
     assert isinstance(payload["warnedCapabilities"], list)
 

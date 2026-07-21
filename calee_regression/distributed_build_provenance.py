@@ -114,6 +114,35 @@ BUNDLE_SOURCE_JSON = "distributed-build-source.json"
 BUNDLE_SOURCE_SHA = "distributed-build-source.sha256"
 BUNDLE_PROVENANCE = "distributed-build-provenance.json"
 
+# Priority 6: the standardised joined-evidence component layout. Every file
+# here is MANDATORY for a joined (provider + build-provenance) record; its
+# digest is recomputed at preflight/consolidation, and a missing or altered
+# file BLOCKS.
+JOINED_PROVIDER_OBSERVATION = "provider-observation.json"
+JOINED_PROVIDER_RESPONSE_BIN = "provider-response.bin"
+JOINED_PROVIDER_RESPONSE_SHA = "provider-response.sha256"
+JOINED_PROVIDER_AUTHENTICATION = "provider-authentication.json"
+JOINED_BUILD_PROVENANCE = "build-provenance.json"
+JOINED_BUILD_SOURCE_BIN = "build-provenance-source.bin"
+JOINED_BUILD_SOURCE_SHA = "build-provenance-source.sha256"
+JOINED_BUILD_AUTHENTICATION = "build-provenance-authentication.json"
+JOINED_EVIDENCE_JSON = "joined-evidence.json"
+JOINED_EVIDENCE_SHA = "joined-evidence.sha256"
+
+JOINED_MANDATORY_FILES = (
+    JOINED_PROVIDER_OBSERVATION,
+    JOINED_PROVIDER_RESPONSE_BIN,
+    JOINED_PROVIDER_RESPONSE_SHA,
+    JOINED_PROVIDER_AUTHENTICATION,
+    JOINED_BUILD_PROVENANCE,
+    JOINED_BUILD_SOURCE_BIN,
+    JOINED_BUILD_SOURCE_SHA,
+    JOINED_BUILD_AUTHENTICATION,
+    JOINED_EVIDENCE_JSON,
+    JOINED_EVIDENCE_SHA,
+    BUNDLE_PROVENANCE,
+)
+
 
 class DistributedProvenanceError(Exception):
     """A provenance record is structurally unusable (no sourceEvidence, an
@@ -286,6 +315,46 @@ def validate_distributed_evidence(
                     "generatedBy 'provider-build-provenance-join' requires a non-empty buildProvenance "
                     "object -- a join label with no build-provenance-side record attached proves nothing."
                 )
+            # Priority 1: joined evidence must carry the ONE canonical full
+            # version identity -- explicit marketingVersion +
+            # platformBuildNumber fields whose canonical composition equals
+            # testedVersion exactly. A legacy joined record that recorded
+            # only the marketing version BLOCKS with a migration message; it
+            # is never silently reinterpreted.
+            from .identity_format import compose_full_version, split_marketing_version_and_build_number
+
+            joined_marketing = _norm(evidence.get("marketingVersion"))
+            joined_build_number = _norm(evidence.get("platformBuildNumber"))
+            joined_tested = _norm(evidence.get("testedVersion"))
+            if not joined_marketing or not joined_build_number:
+                problems.append(
+                    "legacy joined evidence: no explicit marketingVersion/platformBuildNumber recorded -- "
+                    "this record predates the canonical joined-version identity (Priority 1). MIGRATION "
+                    "REQUIRED: re-record the distributed-build acceptance with the current framework so "
+                    "the joined evidence carries marketingVersion, platformBuildNumber, and the canonical "
+                    "full testedVersion (e.g. '0.0.24+24')."
+                )
+            elif joined_tested:
+                canonical = compose_full_version(joined_marketing, joined_build_number)
+                if canonical is None:
+                    problems.append(
+                        f"joined evidence marketingVersion {joined_marketing!r} + platformBuildNumber "
+                        f"{joined_build_number!r} cannot be composed into a canonical full version -- "
+                        f"ambiguous/noncanonical version forms are rejected."
+                    )
+                elif joined_tested != canonical:
+                    if split_marketing_version_and_build_number(joined_tested) is None:
+                        problems.append(
+                            f"joined evidence testedVersion {joined_tested!r} is not the canonical full "
+                            f"'marketing+buildNumber' form (expected {canonical!r}). A marketing-only "
+                            f"joined testedVersion is a legacy record -- MIGRATION REQUIRED: re-record "
+                            f"with the current framework version."
+                        )
+                    else:
+                        problems.append(
+                            f"joined evidence testedVersion {joined_tested!r} != canonical composition "
+                            f"{canonical!r} of its own marketingVersion/platformBuildNumber fields."
+                        )
 
     tested_git_sha = _norm(evidence.get("testedGitSha"))
     if not tested_git_sha:
@@ -494,6 +563,166 @@ def write_evidence_bundle(
     (directory / BUNDLE_PROVENANCE).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     written.append(BUNDLE_PROVENANCE)
     return written
+
+
+def write_joined_source_bundle(
+    directory: "Path | str",
+    *,
+    provider_observation: "dict[str, Any]",
+    provider_raw_bytes: bytes,
+    provider_authentication: "dict[str, Any]",
+    build_provenance: "dict[str, Any]",
+    build_raw_bytes: bytes,
+    build_authentication: "dict[str, Any]",
+    joined_evidence_bytes: bytes,
+) -> "list[str]":
+    """Write the Priority 6 standardised joined-evidence layout: BOTH raw
+    source bundles (provider response + build-provenance source), their
+    ``.sha256`` sidecars, the authentication metadata for each side, and the
+    joined evidence with its own sidecar. The raw bytes are written verbatim
+    (never reserialised)."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    def _sidecar(name: str, content: bytes, sha_name: str) -> None:
+        (directory / name).write_bytes(content)
+        (directory / sha_name).write_text(raw_sha256(content) + "  " + name + "\n", encoding="utf-8")
+
+    (directory / JOINED_PROVIDER_OBSERVATION).write_text(
+        json.dumps(provider_observation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _sidecar(JOINED_PROVIDER_RESPONSE_BIN, provider_raw_bytes, JOINED_PROVIDER_RESPONSE_SHA)
+    (directory / JOINED_PROVIDER_AUTHENTICATION).write_text(
+        json.dumps(provider_authentication, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (directory / JOINED_BUILD_PROVENANCE).write_text(
+        json.dumps(build_provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _sidecar(JOINED_BUILD_SOURCE_BIN, build_raw_bytes, JOINED_BUILD_SOURCE_SHA)
+    (directory / JOINED_BUILD_AUTHENTICATION).write_text(
+        json.dumps(build_authentication, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _sidecar(JOINED_EVIDENCE_JSON, joined_evidence_bytes, JOINED_EVIDENCE_SHA)
+    return [
+        JOINED_PROVIDER_OBSERVATION, JOINED_PROVIDER_RESPONSE_BIN, JOINED_PROVIDER_RESPONSE_SHA,
+        JOINED_PROVIDER_AUTHENTICATION, JOINED_BUILD_PROVENANCE, JOINED_BUILD_SOURCE_BIN,
+        JOINED_BUILD_SOURCE_SHA, JOINED_BUILD_AUTHENTICATION, JOINED_EVIDENCE_JSON, JOINED_EVIDENCE_SHA,
+    ]
+
+
+def verify_joined_source_bundle(
+    directory: "Path | str",
+    evidence: "dict[str, Any]",
+    *,
+    expected_release_run_id: "str | None" = None,
+    expected_release_id: "str | None" = None,
+    expected_git_sha: "str | None" = None,
+) -> "list[str]":
+    """Priority 6: re-verify the joined-evidence source-bundle layout at
+    preflight/consolidation. Requires every mandatory file, RECOMPUTES every
+    digest (raw bytes vs the joined evidence's own ``sourceFiles`` map and
+    vs each ``.sha256`` sidecar), and checks the evidence's ``binding``
+    block against the current run/release/product identity -- so missing
+    raw bytes, altered bytes, and source files swapped in from another
+    release run all BLOCK. Returns a problem list (empty == intact)."""
+    directory = Path(directory)
+    problems: "list[str]" = []
+
+    for name in JOINED_MANDATORY_FILES:
+        if not (directory / name).is_file():
+            problems.append(
+                f"mandatory joined-evidence source file {name!r} is missing from {directory} -- "
+                f"every retained raw source file is required; a joined record without its raw "
+                f"source bundles BLOCKS."
+            )
+    if problems:
+        return problems
+
+    source_files = evidence.get("sourceFiles")
+    if not isinstance(source_files, dict) or not source_files:
+        problems.append(
+            "joined evidence records no sourceFiles digest map -- each retained raw source file "
+            "must be digest-bound in the joined evidence itself."
+        )
+        source_files = {}
+
+    def _check_bin(name: str, sha_name: str) -> None:
+        try:
+            content = (directory / name).read_bytes()
+        except OSError as exc:
+            problems.append(f"could not read {name}: {exc}")
+            return
+        actual = raw_sha256(content)
+        recorded = _norm(source_files.get(name)) if isinstance(source_files, dict) else None
+        if recorded is None:
+            problems.append(f"joined evidence sourceFiles has no digest for {name!r}.")
+        elif recorded != actual:
+            problems.append(
+                f"{name} raw-byte digest mismatch: joined evidence records {recorded}, actual {actual} "
+                f"-- the preserved raw source bytes were altered or substituted after recording."
+            )
+        sidecar = (directory / sha_name).read_text(encoding="utf-8").split()
+        if not sidecar or sidecar[0] != actual:
+            problems.append(
+                f"{sha_name} sidecar digest {(sidecar[0] if sidecar else '<empty>')!r} != recomputed "
+                f"{actual} for {name}."
+            )
+
+    _check_bin(JOINED_PROVIDER_RESPONSE_BIN, JOINED_PROVIDER_RESPONSE_SHA)
+    _check_bin(JOINED_BUILD_SOURCE_BIN, JOINED_BUILD_SOURCE_SHA)
+
+    try:
+        joined_bytes = (directory / JOINED_EVIDENCE_JSON).read_bytes()
+    except OSError as exc:
+        problems.append(f"could not read {JOINED_EVIDENCE_JSON}: {exc}")
+        joined_bytes = None
+    if joined_bytes is not None:
+        actual_joined = raw_sha256(joined_bytes)
+        sidecar = (directory / JOINED_EVIDENCE_SHA).read_text(encoding="utf-8").split()
+        if not sidecar or sidecar[0] != actual_joined:
+            problems.append(
+                f"{JOINED_EVIDENCE_SHA} sidecar digest != recomputed digest of {JOINED_EVIDENCE_JSON} "
+                f"-- the joined evidence file was altered after recording."
+            )
+        try:
+            reloaded = json.loads(joined_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            problems.append(f"{JOINED_EVIDENCE_JSON} is not valid JSON: {exc}")
+            reloaded = None
+        if reloaded is not None and reloaded != evidence:
+            problems.append(
+                f"{JOINED_EVIDENCE_JSON} does not equal the provenance record's own sourceEvidence -- "
+                f"the retained joined evidence and the adopted record disagree."
+            )
+
+    binding = evidence.get("binding")
+    if not isinstance(binding, dict):
+        problems.append(
+            "joined evidence has no binding block -- it is not bound to a release run/release/product "
+            "identity."
+        )
+    else:
+        def _bind(field_name: str, expected: "str | None", label: str) -> None:
+            if expected is None:
+                return
+            actual = _norm(binding.get(field_name))
+            if actual is None:
+                problems.append(f"joined evidence binding has no {field_name} -- cannot confirm it belongs to this {label}.")
+            elif actual != str(expected).strip():
+                problems.append(
+                    f"joined evidence binding {field_name} {actual!r} != current {label} "
+                    f"{str(expected).strip()!r} -- evidence from another release run is rejected."
+                )
+
+        _bind("runId", expected_release_run_id, "release run")
+        _bind("releaseId", expected_release_id, "release")
+        if expected_git_sha is not None:
+            actual_sha = _norm(binding.get("productGitSha"))
+            if actual_sha is None:
+                problems.append("joined evidence binding has no productGitSha.")
+            elif actual_sha.lower() != expected_git_sha.strip().lower():
+                problems.append(
+                    f"joined evidence binding productGitSha {actual_sha!r} != expected product SHA "
+                    f"{expected_git_sha!r}."
+                )
+
+    return problems
 
 
 def source_evidence_of(record: "dict[str, Any] | None") -> "dict[str, Any] | None":

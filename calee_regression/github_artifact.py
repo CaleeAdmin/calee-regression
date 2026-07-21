@@ -135,6 +135,11 @@ class WorkflowRunMetadata:
     head_branch: "str | None" = None
     status: "str | None" = None
     conclusion: "str | None" = None
+    # The run attempt number GitHub's own API reports (``run_attempt``) --
+    # preserved so authenticated-run metadata recorded alongside adopted
+    # provenance names the exact attempt, not just the run. ``None`` only
+    # when the API response itself omits it.
+    run_attempt: "str | None" = None
 
     @classmethod
     def from_api(cls, data: "dict[str, Any]") -> "WorkflowRunMetadata":
@@ -154,6 +159,7 @@ class WorkflowRunMetadata:
             head_branch=_opt_str(data.get("head_branch")),
             status=_opt_str(data.get("status")),
             conclusion=_opt_str(data.get("conclusion")),
+            run_attempt=_opt_str(data.get("run_attempt")),
         )
 
 
