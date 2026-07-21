@@ -1016,6 +1016,7 @@ def build_install_plan(
             purpose="Reboot so HOME re-resolution and any first-run migration settle cleanly.",
             argv=_adb_base(serial) + ["reboot"],
             expectation="Device reboots and reconnects (adb wait-for-device below).",
+            kind="verify",
         )
     )
     plan.steps.append(
@@ -1323,6 +1324,17 @@ def _classify_verify_step(step, result, calee, caleeshell, execution) -> "tuple[
         return OUTCOME_ADB_UNAVAILABLE, _BLOCKING_DETAIL[OUTCOME_ADB_UNAVAILABLE]
     if any(m.lower() in combined for m in _DEVICE_UNAVAILABLE_MARKERS):
         return OUTCOME_DEVICE_UNAVAILABLE, _BLOCKING_DETAIL[OUTCOME_DEVICE_UNAVAILABLE]
+
+    # CALEE_REBOOT_CLASSIFICATION_FIX
+    # `adb reboot` succeeds with return code 0 and normally prints no
+    # "Success" token. It is a device-control command, not an APK install.
+    if step.label == "reboot":
+        if result.returncode == 0:
+            return OUTCOME_OK, ""
+        return (
+            OUTCOME_INSTALL_FAILED,
+            (result.stderr or result.stdout or "adb reboot failed").strip(),
+        )
 
     if step.label == "wait-for-device":
         return (OUTCOME_OK, "") if result.returncode == 0 else (OUTCOME_DEVICE_UNAVAILABLE, _BLOCKING_DETAIL[OUTCOME_DEVICE_UNAVAILABLE])
