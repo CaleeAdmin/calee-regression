@@ -50,6 +50,7 @@ import base64
 import datetime
 import hashlib
 import json
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -67,21 +68,40 @@ TIER_PROVIDER_API_LIVE = "provider-api-live"
 TIER_GITHUB_AUTHENTICATED_ARTIFACT = "github-authenticated-artifact"
 TIER_VERIFIED_SIGNED_EXPORT = "verified-signed-export"
 TIER_MANUAL_UNVERIFIED = "manual-unverified"
+# Priority 4 (this session): a signature that verified genuinely, but only
+# against an operator-supplied --trusted-public-key-file rather than the
+# pinned machine-config key -- real cryptography, but NOT anchored to a
+# preconfigured trust root, so it can NEVER be treated as equivalent to
+# TIER_VERIFIED_SIGNED_EXPORT. Kept distinct from TIER_MANUAL_UNVERIFIED
+# (which has no cryptography behind it at all) purely for an honest audit
+# trail; both are, identically, never in AUTHENTICATED_TIERS.
+TIER_DIAGNOSTIC_UNPINNED_KEY = "diagnostic-unpinned-key"
+# Priority 1 (this session): the distributed-build identity chain's join --
+# an independently-authenticated provider observation AND an independently-
+# authenticated build provenance record NAME THE SAME immutable platform
+# build (see build_provenance.join_provider_and_build_provenance). Neither
+# side alone is ever sufficient; this tier is stamped only once BOTH sides
+# authenticated AND every chain requirement in that function passed.
+TIER_PROVIDER_BUILD_PROVENANCE_JOIN = "provider-build-provenance-join"
 KNOWN_TIERS = frozenset({
     TIER_PROVIDER_API_LIVE, TIER_GITHUB_AUTHENTICATED_ARTIFACT, TIER_VERIFIED_SIGNED_EXPORT, TIER_MANUAL_UNVERIFIED,
+    TIER_DIAGNOSTIC_UNPINNED_KEY, TIER_PROVIDER_BUILD_PROVENANCE_JOIN,
 })
 # The tiers that can ever justify a PASS -- everything else (missing,
-# TIER_MANUAL_UNVERIFIED, or any unrecognised string) is, at best, an
-# explicit blocked-unverified record. Consulted both by cli.py (the
-# command's own immediate verdict) and consolidated_report.py (re-derived
-# independently at consolidation, never trusting a report's recorded
-# ``status`` on faith -- see component_from_distributed_build_acceptance_
-# report). Deliberately a property of the RECORD's ``evidenceTier`` field
-# (set by this process's own control flow, inside the envelope-digest-
-# protected provenance record -- see distributed_build_provenance.
-# build_provenance_record's ``evidence_tier`` parameter), never read from
-# operator-supplied evidence content itself.
-AUTHENTICATED_TIERS = frozenset({TIER_PROVIDER_API_LIVE, TIER_GITHUB_AUTHENTICATED_ARTIFACT, TIER_VERIFIED_SIGNED_EXPORT})
+# TIER_MANUAL_UNVERIFIED, TIER_DIAGNOSTIC_UNPINNED_KEY, or any unrecognised
+# string) is, at best, an explicit blocked-unverified record. Consulted both
+# by cli.py (the command's own immediate verdict) and consolidated_report.py
+# (re-derived independently at consolidation, never trusting a report's
+# recorded ``status`` on faith -- see component_from_distributed_build_
+# acceptance_report). Deliberately a property of the RECORD's
+# ``evidenceTier`` field (set by this process's own control flow, inside the
+# envelope-digest-protected provenance record -- see
+# distributed_build_provenance.build_provenance_record's ``evidence_tier``
+# parameter), never read from operator-supplied evidence content itself.
+AUTHENTICATED_TIERS = frozenset({
+    TIER_PROVIDER_API_LIVE, TIER_GITHUB_AUTHENTICATED_ARTIFACT, TIER_VERIFIED_SIGNED_EXPORT,
+    TIER_PROVIDER_BUILD_PROVENANCE_JOIN,
+})
 
 
 class ProviderEvidenceError(Exception):
@@ -95,21 +115,30 @@ class ProviderEvidenceError(Exception):
 
 # --- HTTP seams (injected; the only place real network I/O happens) --------
 
-# A "fetcher" performs one authenticated HTTPS GET and returns
+# A "fetcher" performs one authenticated HTTPS request and returns
 # (status_code, raw_response_bytes, response_headers). Injected so the
 # collection flow is fully testable with a fake and so the live
 # implementation (which needs real credentials/network) is the only part
 # that ever touches a socket.
-HttpFetcher = Callable[[str, "dict[str, str]"], "tuple[int, bytes, dict[str, str]]"]
+#
+# Priority 3 (this session): the seam supports method/body/timeout, not just
+# a bare GET -- ``method``/``body``/``timeout`` are keyword-only with GET-
+# compatible defaults, so App Store Connect's existing GET-only calls (and
+# any test fake written before this session, taking just ``(url, headers)``)
+# keep working unchanged; only Play Console's OAuth token exchange/edit-
+# session calls actually pass a non-default ``method``/``body``.
+HttpFetcher = Callable[..., "tuple[int, bytes, dict[str, str]]"]
 
 
-def _default_https_fetcher(url: str, headers: "dict[str, str]") -> "tuple[int, bytes, dict[str, str]]":
+def _default_https_fetcher(
+    url: str, headers: "dict[str, str]", *, method: str = "GET", body: "bytes | None" = None, timeout: float = 30,
+) -> "tuple[int, bytes, dict[str, str]]":
     import urllib.error
     import urllib.request
 
-    req = urllib.request.Request(url, headers=headers, method="GET")
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 - provider API hosts only
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - provider API hosts only
             return resp.status, resp.read(), dict(resp.headers)
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read(), dict(exc.headers or {})
@@ -195,65 +224,159 @@ def build_play_console_assertion_jwt(*, service_account_email: str, private_key_
 
 # --- evidence record ---------------------------------------------------------
 
+PLATFORM_IOS = "ios"
+PLATFORM_ANDROID = "android"
+
+PROVIDER_OBSERVATION_SCHEMA_VERSION = 1
+PROVIDER_OBSERVATION_COMPONENT = "caleemobile-provider-observation"
+
 
 @dataclass
 class ProviderEvidenceRecord:
-    """Everything Priority 3 requires be recorded about an authenticated
-    provider collection. Every field here is populated by the collector
-    ITSELF from the actual authenticated response -- never by the operator."""
+    """Priority 1/2 (this session): the PROVIDER OBSERVATION half of the
+    distributed-build identity chain. Every field here is populated by the
+    collector ITSELF from the actual authenticated response -- never by the
+    operator, and -- the defect this closes -- never backfilled from
+    ``requested_git_sha``/``requested_version``. A provider observation
+    proves only provider-owned facts (the store build record and platform
+    build identifier); it can NEVER prove source Git identity, so this
+    record carries no ``tested_git_sha``/``tested_version`` field at all.
+    Source Git SHA/version proof comes exclusively from an independently-
+    authenticated :class:`build_provenance.BuildProvenanceRecord`, joined
+    against this observation by
+    :func:`build_provenance.join_provider_and_build_provenance` -- see that
+    function for the two-source chain.
+
+    ``requested_git_sha``/``requested_version`` ARE still recorded here, but
+    strictly as an audit trail of what the caller asked to check for --
+    :meth:`to_provider_observation_dict` never surfaces them as
+    ``testedGitSha``/``testedVersion``, and no verifier ever treats them as
+    proof of anything.
+    """
 
     provider: str
+    platform: str  # PLATFORM_IOS | PLATFORM_ANDROID -- derived from provider, never the response
     provider_account_or_project: str
     provider_endpoint: str
-    provider_record_id: str
+    provider_record_id: str  # "providerBuildId": ASC Build.id / Play versionCode
     http_status: int
     observed_at: str
     raw_response_bytes: bytes
-    requested_git_sha: "str | None"
-    requested_version: "str | None"
-    tested_git_sha: "str | None"
-    tested_version: "str | None"
-    distributed_build_id: "str | None"
     credential_source_name: str
     collector_version: str
     collection_run_id: str
     release_id: "str | None" = None
     channel: "str | None" = None
+    # --- provider-owned facts (Priority 1/2) -- absent when the provider
+    # itself doesn't supply them; NEVER populated from requested_git_sha/
+    # requested_version below. ------------------------------------------
+    bundle_id: "str | None" = None  # app/package identifier
+    marketing_version: "str | None" = None  # ASC preReleaseVersion.version / Play release name
+    build_number: "str | None" = None  # the PLATFORM BUILD NUMBER: iOS CFBundleVersion / Android versionCode
+    processing_state: "str | None" = None  # ASC only
+    uploaded_date: "str | None" = None  # ASC only
+    track: "str | None" = None  # Play only
+    release_status: "str | None" = None  # Play only
+    # --- Play edit-session diagnostics (Priority 3) -- absent for App Store
+    # Connect, which has no edit-session concept. ``edit_session_source`` is
+    # "explicit" (caller supplied an existing edit id to read from) or
+    # "created" (a temporary edit was created under
+    # ``--allow-create-play-edit-session`` and must be cleaned up).
+    # ``edit_session_cleanup`` is "not-applicable" (no temporary edit was
+    # created), "succeeded", or "failed" -- see
+    # :func:`collect_play_console_evidence`.
+    edit_session_source: "str | None" = None
+    edit_session_cleanup: "str | None" = None
+    # --- audit trail ONLY: never proof, never surfaced as tested*Sha/Version.
+    requested_git_sha: "str | None" = None
+    requested_version: "str | None" = None
 
     def raw_response_sha256(self) -> str:
         return "sha256:" + hashlib.sha256(self.raw_response_bytes).hexdigest()
 
-    def to_evidence_dict(self) -> "dict[str, Any]":
-        """The distributed_build_provenance.py-shaped evidence envelope this
-        record authenticates -- schemaVersion 2, generatedBy provider-api,
-        every field validate_distributed_evidence requires."""
+    def to_provider_observation_dict(self) -> "dict[str, Any]":
+        """Priority 1: the provider-observation evidence envelope -- proves
+        ONLY provider-owned facts (the store build record and platform build
+        identifier). Deliberately carries NO testedGitSha/testedVersion: a
+        provider response alone must never prove source Git identity. This
+        dict alone can never satisfy
+        ``distributed_build_provenance.validate_distributed_evidence`` (which
+        requires testedGitSha/testedVersion) -- by design, it can only ever
+        be one half of the chain; see
+        ``build_provenance.join_provider_and_build_provenance`` for the
+        other half and the join."""
         return {
-            "schemaVersion": 2,
-            "component": "caleemobile-distributed-build-acceptance",
+            "schemaVersion": PROVIDER_OBSERVATION_SCHEMA_VERSION,
+            "component": PROVIDER_OBSERVATION_COMPONENT,
             "provider": self.provider,
+            "platform": self.platform,
             "channel": self.channel or ("testflight" if self.provider == PROVIDER_APP_STORE_CONNECT else "play_console_internal"),
-            "distributedBuildId": self.distributed_build_id,
             "releaseId": self.release_id,
-            "testedGitSha": self.tested_git_sha,
-            "testedVersion": self.tested_version,
             "providerAccountOrProject": self.provider_account_or_project,
             "providerRecordId": self.provider_record_id,
             "providerObservedAt": self.observed_at,
+            "bundleId": self.bundle_id,
+            "marketingVersion": self.marketing_version,
+            "buildNumber": self.build_number,
+            "processingState": self.processing_state,
+            "uploadedDate": self.uploaded_date,
+            "track": self.track,
+            "releaseStatus": self.release_status,
+            "editSessionSource": self.edit_session_source,
+            "editSessionCleanup": self.edit_session_cleanup,
             "generatedBy": "provider-api",
             "sourceDigest": self.raw_response_sha256(),
             "timestamp": self.observed_at,
-            # Priority 3: the full authenticated-collection audit trail,
-            # preserved alongside the minimum distributed_build_provenance
-            # schema so a later verifier/human can see exactly how this
-            # evidence was obtained without re-deriving it.
+            # The full authenticated-collection audit trail, preserved
+            # alongside the fields above so a later verifier/human can see
+            # exactly how this observation was obtained without re-deriving
+            # it. requestedGitSha/requestedVersion are audit-only -- what the
+            # CALLER asked to check for, never proof of anything.
             "providerEndpoint": self.provider_endpoint,
             "httpStatus": self.http_status,
-            "requestedGitSha": self.requested_git_sha,
-            "requestedVersion": self.requested_version,
             "credentialSourceName": self.credential_source_name,
             "collectorVersion": self.collector_version,
             "collectionRunId": self.collection_run_id,
+            "requestedGitSha": self.requested_git_sha,
+            "requestedVersion": self.requested_version,
         }
+
+
+def _opt_str(value: "Any | None") -> "str | None":
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _find_included_attribute(
+    parsed: "dict[str, Any]", *, resource_type: str, relationships: "dict[str, Any]",
+    relationship_name: str, attribute: str,
+) -> "str | None":
+    """Look up ``attribute`` on the JSON:API ``included`` resource of
+    ``resource_type`` that ``relationships[relationship_name]`` points to.
+    Used to pull the App Store Connect App/PreReleaseVersion resources
+    Priority 2 needs (bundleId, marketing version) out of a single
+    ``include=...``-augmented response -- returns ``None`` (never a guess)
+    when the relationship or the included resource isn't present."""
+    if not isinstance(parsed, dict):
+        return None
+    included = parsed.get("included")
+    if not isinstance(included, list):
+        return None
+    relationship = relationships.get(relationship_name) if isinstance(relationships, dict) else None
+    related_data = relationship.get("data") if isinstance(relationship, dict) else None
+    related_id = related_data.get("id") if isinstance(related_data, dict) else None
+    if related_id is None:
+        return None
+    for item in included:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == resource_type and str(item.get("id")) == str(related_id):
+            attrs = item.get("attributes")
+            if isinstance(attrs, dict):
+                return _opt_str(attrs.get(attribute))
+    return None
 
 
 # --- App Store Connect / TestFlight collector -------------------------------
@@ -274,9 +397,21 @@ class AppStoreConnectClient:
 
     def get_build(self, *, app_id: str, build_version: str) -> "tuple[int, bytes, str]":
         """GET the build matching ``app_id``+``build_version`` (the TestFlight
-        build/version number). Returns (status, raw_bytes, endpoint_url)."""
+        build/version number). Returns (status, raw_bytes, endpoint_url).
+
+        Priority 2: requests ``include=app,preReleaseVersion`` in the SAME
+        authenticated call, so the response's ``included`` array carries the
+        App resource's ``bundleId`` and the PreReleaseVersion resource's
+        ``version`` (the actual MARKETING version -- Build.attributes.version
+        is the build number/CFBundleVersion, never the marketing version;
+        see the module docstring and Priority 2's requirement not to treat
+        Build.attributes.version as the complete semantic version). No extra
+        round trip: one request, two related resources inlined."""
         token = build_app_store_connect_jwt(key_id=self._key_id, issuer_id=self._issuer_id, private_key_pem=self._private_key_pem)
-        endpoint = f"{self.API_BASE}/builds?filter[app]={app_id}&filter[version]={build_version}"
+        endpoint = (
+            f"{self.API_BASE}/builds?filter[app]={app_id}&filter[version]={build_version}"
+            f"&include=app,preReleaseVersion&fields[apps]=bundleId&fields[preReleaseVersions]=version"
+        )
         status, raw, _headers = self._fetcher(endpoint, {"Authorization": f"Bearer {token}", "Accept": "application/json"})
         return status, raw, endpoint
 
@@ -336,24 +471,47 @@ def collect_app_store_connect_evidence(
     attributes = attributes if isinstance(attributes, dict) else {}
     observed_at = (now() if now is not None else _utc_now_iso())
 
+    # Priority 2: Build.attributes.version is the BUILD NUMBER (CFBundleVersion)
+    # -- never the complete marketing/semantic version. The marketing version
+    # (CFBundleShortVersionString equivalent) comes from the related
+    # PreReleaseVersion resource, inlined via `include=preReleaseVersion`
+    # above; the bundle id comes from the related App resource, inlined via
+    # `include=app`. Both are looked up from the response's own `included`
+    # array (never guessed, never defaulted from `build_version`/`app_id`).
+    build_number = _opt_str(attributes.get("version"))
+    processing_state = _opt_str(attributes.get("processingState"))
+    uploaded_date = _opt_str(attributes.get("uploadedDate"))
+    relationships = build.get("relationships") if isinstance(build, dict) else {}
+    relationships = relationships if isinstance(relationships, dict) else {}
+    bundle_id = _find_included_attribute(
+        parsed, resource_type="apps", relationships=relationships, relationship_name="app", attribute="bundleId",
+    )
+    marketing_version = _find_included_attribute(
+        parsed, resource_type="preReleaseVersions", relationships=relationships,
+        relationship_name="preReleaseVersion", attribute="version",
+    )
+
     return ProviderEvidenceRecord(
         provider=PROVIDER_APP_STORE_CONNECT,
+        platform=PLATFORM_IOS,
         provider_account_or_project=app_id,
         provider_endpoint=endpoint,
         provider_record_id=build_id,
         http_status=status,
         observed_at=observed_at,
         raw_response_bytes=raw,
-        requested_git_sha=requested_git_sha,
-        requested_version=requested_version,
-        tested_git_sha=requested_git_sha,
-        tested_version=str(attributes.get("version") or build_version),
-        distributed_build_id=build_id,
+        bundle_id=bundle_id,
+        marketing_version=marketing_version,
+        build_number=build_number,
+        processing_state=processing_state,
+        uploaded_date=uploaded_date,
         credential_source_name=credentials_mod.APP_STORE_CONNECT_KEY_ID.env_var,
         collector_version=COLLECTOR_VERSION,
         collection_run_id=collection_run_id,
         release_id=release_id,
         channel="testflight",
+        requested_git_sha=requested_git_sha,
+        requested_version=requested_version,
     )
 
 
@@ -385,8 +543,14 @@ class PlayConsoleClient:
             service_account_email=sa["client_email"], private_key_pem=sa["private_key"],
             scope=self.SCOPE, token_uri=self.TOKEN_URI,
         )
+        # Priority 3: a REAL POST with a form-encoded body (grant_type,
+        # assertion) -- not a GET with the body smuggled into the query
+        # string, which is what this used to do.
         body = f"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={assertion}"
-        status, raw, _headers = self._fetcher(f"{self.TOKEN_URI}?{body}", {"Accept": "application/json"})
+        status, raw, _headers = self._fetcher(
+            self.TOKEN_URI, {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            method="POST", body=body.encode("ascii"),
+        )
         if status != 200:
             raise ProviderEvidenceError(f"Google OAuth2 token exchange returned HTTP {status}: {raw[:500]!r}")
         try:
@@ -399,20 +563,28 @@ class PlayConsoleClient:
         return token
 
     def get_track(self, *, package_name: str, edit_id: str, track: str) -> "tuple[int, bytes, str]":
-        """GET the named release track within a (caller-managed, read-only-in-
-        intent) edit session. Returns (status, raw_bytes, endpoint_url)."""
+        """GET the named release track within a (caller-supplied or
+        caller-created, see :func:`collect_play_console_evidence`) edit
+        session. Returns (status, raw_bytes, endpoint_url)."""
         token = self._bearer_token()
         endpoint = f"{self.API_BASE}/applications/{package_name}/edits/{edit_id}/tracks/{track}"
-        status, raw, _headers = self._fetcher(endpoint, {"Authorization": f"Bearer {token}", "Accept": "application/json"})
+        status, raw, _headers = self._fetcher(
+            endpoint, {"Authorization": f"Bearer {token}", "Accept": "application/json"}, method="GET",
+        )
         return status, raw, endpoint
 
     def create_edit(self, *, package_name: str) -> str:
-        """POST a new edit session (required by the API to read tracks) and
-        return its id. A technical owner's collector run never publishes
-        this edit -- Google auto-expires an unused one."""
+        """A REAL POST (Priority 3 -- not an `X-HTTP-Method-Override` header
+        pretending a GET is a POST) creating a new edit session, and return
+        its id. Because creating an edit can invalidate another open edit,
+        this must only ever be called under the caller's explicit
+        ``--allow-create-play-edit-session`` opt-in -- see
+        :func:`collect_play_console_evidence`, never unconditionally."""
         token = self._bearer_token()
         endpoint = f"{self.API_BASE}/applications/{package_name}/edits"
-        status, raw, _headers = self._fetcher(endpoint, {"Authorization": f"Bearer {token}", "Accept": "application/json", "X-HTTP-Method-Override": "POST"})
+        status, raw, _headers = self._fetcher(
+            endpoint, {"Authorization": f"Bearer {token}", "Accept": "application/json"}, method="POST", body=b"",
+        )
         if status not in (200, 201):
             raise ProviderEvidenceError(f"Play Console edit-session creation returned HTTP {status}: {raw[:500]!r}")
         try:
@@ -423,6 +595,25 @@ class PlayConsoleClient:
         if not edit_id:
             raise ProviderEvidenceError("Play Console edit-session response has no id.")
         return str(edit_id)
+
+    def delete_edit(self, *, package_name: str, edit_id: str) -> bool:
+        """A REAL DELETE (Priority 3) of a temporary edit session THIS
+        process created. Returns True on a successful cleanup (HTTP
+        200/204), False otherwise -- never raises, so a cleanup failure can
+        never mask (or crash past) an already-successful collection; the
+        caller is responsible for surfacing a False return prominently."""
+        try:
+            token = self._bearer_token()
+        except ProviderEvidenceError:
+            return False
+        endpoint = f"{self.API_BASE}/applications/{package_name}/edits/{edit_id}"
+        try:
+            status, _raw, _headers = self._fetcher(
+                endpoint, {"Authorization": f"Bearer {token}", "Accept": "application/json"}, method="DELETE", body=b"",
+            )
+        except Exception:
+            return False
+        return status in (200, 204)
 
 
 def collect_play_console_evidence(
@@ -436,10 +627,34 @@ def collect_play_console_evidence(
     client: "PlayConsoleClient | None" = None,
     collection_run_id: str,
     now: "Callable[[], str] | None" = None,
+    edit_id: "str | None" = None,
+    allow_create_edit_session: bool = False,
 ) -> ProviderEvidenceRecord:
     """Perform the authenticated Play Console request and build the evidence
     record. BLOCKS with the exact missing credential name if neither a
-    service-account JSON nor an access token is resolvable."""
+    service-account JSON nor an access token is resolvable.
+
+    Priority 3 (this session): the Play Developer API only exposes track
+    state through an edit session (``edits.tracks.get``) -- there is no
+    edit-free read for a track. Silently calling ``edits.insert`` on every
+    collection is unsafe: creating an edit can invalidate another edit
+    already open (e.g. one a human is mid-way through in the Play Console
+    UI), so this function never does that unconditionally. Instead:
+
+      * ``edit_id`` -- an edit session the CALLER already controls (e.g. one
+        created and tracked outside this process). Used strictly read-only;
+        never deleted by this function, since this process didn't create it.
+      * ``allow_create_edit_session=True`` -- explicit opt-in (wired to the
+        CLI's ``--allow-create-play-edit-session``) to create a TEMPORARY
+        edit for this single read, with an unmissable stderr warning, and
+        guaranteed cleanup in a ``finally`` -- a cleanup failure is also
+        surfaced prominently on stderr, since a leaked edit can block other
+        tooling/humans from editing the app until it expires or is deleted
+        manually.
+      * Neither supplied -- BLOCKS. Refusing to silently create an edit
+        session is the safe default; this is never treated as a product
+        failure.
+    """
     resolver = resolver or credentials_mod.default_resolver()
     credential_source_name = credentials_mod.PLAY_CONSOLE_ACCESS_TOKEN.env_var
     if client is None:
@@ -461,26 +676,69 @@ def collect_play_console_evidence(
             )
         client = PlayConsoleClient(access_token=access_token, service_account=service_account)
 
-    edit_id = client.create_edit(package_name=package_name)
-    status, raw, endpoint = client.get_track(package_name=package_name, edit_id=edit_id, track=track)
-    if status != 200:
-        raise ProviderEvidenceError(
-            f"Play Console request to {endpoint} returned HTTP {status} -- cannot authenticate "
-            f"distributed-build evidence: {raw[:500]!r}"
+    edit_id = _opt_str(edit_id)
+    created_edit_id: "str | None" = None
+    if edit_id:
+        active_edit_id = edit_id
+        edit_session_source = "explicit"
+        edit_session_cleanup = "not-applicable"
+    elif allow_create_edit_session:
+        print(
+            "WARNING: --allow-create-play-edit-session is set. Creating a "
+            f"TEMPORARY Play Console edit session to read track {track!r} for "
+            f"{package_name!r}. Creating an edit can invalidate another edit "
+            "session already open for this app (e.g. one in progress in the "
+            "Play Console UI). This temporary edit will be deleted "
+            "immediately after this read.",
+            file=sys.stderr,
         )
-    try:
-        parsed = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ProviderEvidenceError(f"Play Console response from {endpoint} is not valid JSON: {exc}") from exc
+        active_edit_id = client.create_edit(package_name=package_name)
+        created_edit_id = active_edit_id
+        edit_session_source = "created"
+        edit_session_cleanup = "failed"  # overwritten in the finally block below
+    else:
+        raise ProviderEvidenceError(
+            "Play Console live collection requires either an existing edit session "
+            "id (--play-edit-id, read strictly read-only) or explicit approval to "
+            "create a temporary one (--allow-create-play-edit-session). Refusing to "
+            "silently create an edit session, since doing so can invalidate another "
+            "edit already open for this app. This BLOCKS distributed-build evidence "
+            "collection -- it is never treated as a product failure."
+        )
 
-    releases = parsed.get("releases") if isinstance(parsed, dict) else None
-    if not isinstance(releases, list) or not releases:
-        raise ProviderEvidenceError(f"Play Console track {track!r} for {package_name!r} has no releases.")
-    release = releases[0]
-    version_codes = release.get("versionCodes") if isinstance(release, dict) else None
-    version_code = str(version_codes[0]) if isinstance(version_codes, list) and version_codes else None
-    if not version_code:
-        raise ProviderEvidenceError("Play Console release has no versionCodes.")
+    try:
+        status, raw, endpoint = client.get_track(package_name=package_name, edit_id=active_edit_id, track=track)
+        if status != 200:
+            raise ProviderEvidenceError(
+                f"Play Console request to {endpoint} returned HTTP {status} -- cannot authenticate "
+                f"distributed-build evidence: {raw[:500]!r}"
+            )
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProviderEvidenceError(f"Play Console response from {endpoint} is not valid JSON: {exc}") from exc
+
+        releases = parsed.get("releases") if isinstance(parsed, dict) else None
+        if not isinstance(releases, list) or not releases:
+            raise ProviderEvidenceError(f"Play Console track {track!r} for {package_name!r} has no releases.")
+        release = releases[0]
+        version_codes = release.get("versionCodes") if isinstance(release, dict) else None
+        version_code = str(version_codes[0]) if isinstance(version_codes, list) and version_codes else None
+        if not version_code:
+            raise ProviderEvidenceError("Play Console release has no versionCodes.")
+    finally:
+        if created_edit_id is not None:
+            cleanup_ok = client.delete_edit(package_name=package_name, edit_id=created_edit_id)
+            edit_session_cleanup = "succeeded" if cleanup_ok else "failed"
+            if not cleanup_ok:
+                print(
+                    f"WARNING: cleanup of the temporary Play Console edit {created_edit_id!r} "
+                    f"for {package_name!r} FAILED. This edit may still exist server-side and "
+                    "could block other edits until it expires or is deleted manually via the "
+                    "Play Console UI or API.",
+                    file=sys.stderr,
+                )
+
     observed_at = (now() if now is not None else _utc_now_iso())
 
     # distributed_build_provenance.VALID_CHANNELS only defines one Play
@@ -491,24 +749,34 @@ def collect_play_console_evidence(
     # today's schema, so it is recorded under the same value.
     channel = "play_console_internal"
 
+    # Priority 1/2: provider-owned facts only. `release.get("name")` is Play's
+    # own "versionName where independently available" (the release's own
+    # display version -- absent, never guessed, when Play doesn't set one);
+    # `release.get("status")` is the real Play Developer API TrackRelease
+    # field ("completed"/"inProgress"/"halted"/"draft").
     return ProviderEvidenceRecord(
         provider=PROVIDER_PLAY_CONSOLE,
+        platform=PLATFORM_ANDROID,
         provider_account_or_project=package_name,
         provider_endpoint=endpoint,
         provider_record_id=version_code,
         http_status=status,
         observed_at=observed_at,
         raw_response_bytes=raw,
-        requested_git_sha=requested_git_sha,
-        requested_version=requested_version,
-        tested_git_sha=requested_git_sha,
-        tested_version=str(release.get("name") or requested_version or version_code),
-        distributed_build_id=version_code,
+        bundle_id=package_name,
+        marketing_version=_opt_str(release.get("name")),
+        build_number=version_code,
+        track=track,
+        release_status=_opt_str(release.get("status")),
+        edit_session_source=edit_session_source,
+        edit_session_cleanup=edit_session_cleanup,
         credential_source_name=credential_source_name,
         collector_version=COLLECTOR_VERSION,
         collection_run_id=collection_run_id,
         release_id=release_id,
         channel=channel,
+        requested_git_sha=requested_git_sha,
+        requested_version=requested_version,
     )
 
 
@@ -556,32 +824,192 @@ def verify_signed_export(
     return []
 
 
+def compute_public_key_sha256_fingerprint(trusted_public_key_pem: str) -> str:
+    """SHA-256 fingerprint of the ACTUAL key (Priority 4): computed over the
+    DER-encoded SubjectPublicKeyInfo, which is canonical regardless of how
+    the PEM text happens to be wrapped/whitespaced -- unlike hashing the raw
+    PEM text, two byte-different PEM encodings of the identical key always
+    produce the SAME fingerprint here. Returns lowercase 64-character hex, no
+    ``sha256:`` prefix (matching ``machine_config.py``'s pinned-fingerprint
+    format and ``release_installer.py``'s existing ``signerSha256``
+    precedent). Raises :class:`ProviderEvidenceError` for a key that doesn't
+    even parse as a PEM public key."""
+    from cryptography.exceptions import UnsupportedAlgorithm
+    from cryptography.hazmat.primitives import serialization
+
+    try:
+        public_key = serialization.load_pem_public_key(trusted_public_key_pem.encode("utf-8"))
+    except (ValueError, UnsupportedAlgorithm) as exc:
+        raise ProviderEvidenceError(f"configured trusted public key is not a valid PEM public key: {exc}") from exc
+    der = public_key.public_bytes(
+        encoding=serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return hashlib.sha256(der).hexdigest()
+
+
+def resolve_pinned_trusted_public_key(
+    *,
+    pinned_fingerprint: "str | None",
+    resolver: "credentials_mod.CredentialResolver | None" = None,
+) -> "tuple[str, str]":
+    """Priority 4: resolve the trusted signed-export public key EXCLUSIVELY
+    from preconfigured machine security configuration/Keychain (via
+    ``credentials.SIGNED_EXPORT_TRUSTED_PUBLIC_KEY`` -- environment/Keychain
+    -- never a per-command ``--trusted-public-key-file`` override), and
+    require its computed SHA-256 fingerprint to match ``pinned_fingerprint``
+    (a technical owner's non-secret ``machine_config.MachineConfig.
+    trusted_signed_export_public_key_sha256``). Returns ``(pem,
+    verified_fingerprint)`` -- ``verified_fingerprint`` is the ONLY signer
+    identity a release-gating PASS may ever be derived from; it is computed
+    HERE, from the resolved key itself, never accepted as an operator-typed
+    label (see :func:`build_signed_export_evidence`).
+
+    Raises :class:`ProviderEvidenceError` (BLOCKED) when no fingerprint is
+    pinned, the key can't be resolved, or the fingerprints disagree -- a
+    mismatch NEVER falls back to trusting the resolved key anyway; this is
+    the one function a release-gating PASS must go through, and it fails
+    closed on every ambiguity."""
+    if not (pinned_fingerprint or "").strip():
+        raise ProviderEvidenceError(
+            "no trusted signed-export public-key fingerprint is pinned in machine configuration "
+            "(trusted_signed_export_public_key_sha256) -- a release-gating signed-export PASS requires "
+            "a pinned fingerprint configured in advance, never an ad-hoc/per-command key."
+        )
+    resolver = resolver or credentials_mod.default_resolver()
+    try:
+        pem = resolver.require(credentials_mod.SIGNED_EXPORT_TRUSTED_PUBLIC_KEY)
+    except credentials_mod.CredentialError as exc:
+        raise ProviderEvidenceError(str(exc)) from exc
+
+    actual_fingerprint = compute_public_key_sha256_fingerprint(pem)
+    if actual_fingerprint.strip().lower() != pinned_fingerprint.strip().lower():
+        raise ProviderEvidenceError(
+            f"the resolved trusted public key's fingerprint {actual_fingerprint} does not match the "
+            f"fingerprint {pinned_fingerprint.strip().lower()} pinned in machine configuration -- "
+            f"refusing to trust it. This BLOCKS the signed-export path; it is never treated as a "
+            f"reason to fall back to trusting the resolved key anyway."
+        )
+    return pem, actual_fingerprint
+
+
 def build_signed_export_evidence(
     *,
     payload: "dict[str, Any]",
     signature_bytes: bytes,
     trusted_public_key_pem: str,
-    signer_fingerprint: str,
+    signer_fingerprint: "str | None" = None,
 ) -> "tuple[dict[str, Any], list[str]]":
     """Verify a signed-export payload and, if the signature is genuine,
     return the evidence dict (schemaVersion 2, generatedBy signed-export)
     ready for ``distributed_build_provenance.validate_distributed_evidence``.
     Returns (evidence_or_empty_dict, problems) -- an empty dict with a
     non-empty problems list on signature failure, never a half-trusted
-    result."""
+    result.
+
+    Priority 4: the recorded ``signerFingerprint`` is ALWAYS the verified
+    key's OWN computed SHA-256 fingerprint (:func:`compute_public_key_sha256_
+    fingerprint`) -- never the caller-supplied ``signer_fingerprint``, which
+    (when given) is recorded separately as ``operatorDeclaredSignerLabel``,
+    purely for human cross-reference, and is never consulted by any
+    verifier or consolidator to determine a PASS."""
     payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     problems = verify_signed_export(payload_bytes=payload_bytes, signature_bytes=signature_bytes, trusted_public_key_pem=trusted_public_key_pem)
     if problems:
         return {}, problems
 
+    verified_fingerprint = compute_public_key_sha256_fingerprint(trusted_public_key_pem)
     evidence = dict(payload)
     evidence["generatedBy"] = "signed-export"
     evidence["signatureOrArtifactProvenance"] = {
-        "signerFingerprint": signer_fingerprint,
+        "signerFingerprint": verified_fingerprint,
         "signatureSha256": "sha256:" + hashlib.sha256(signature_bytes).hexdigest(),
         "verifiedAt": _utc_now_iso(),
     }
+    if signer_fingerprint:
+        evidence["signatureOrArtifactProvenance"]["operatorDeclaredSignerLabel"] = signer_fingerprint
     return evidence, []
+
+
+def validate_provider_observation(
+    evidence: "dict[str, Any]", *, expected_release_id: "str | None" = None,
+) -> "list[str]":
+    """Priority 1 (this session): format/consistency validation for a
+    :meth:`ProviderEvidenceRecord.to_provider_observation_dict`-shaped
+    envelope -- schemaVersion 1, component ``caleemobile-provider-
+    observation``. Deliberately does NOT require ``testedGitSha``/
+    ``testedVersion`` (a provider observation never carries them -- see the
+    module docstring); a provider observation that passes this is still,
+    BY ITSELF, never sufficient for a PASS -- only
+    ``build_provenance.join_provider_and_build_provenance`` can combine it
+    with an independently-authenticated build-provenance record to reach
+    one. Returns a problem list (empty == well-formed)."""
+    from . import distributed_build_acceptance as dba
+
+    problems: "list[str]" = []
+    if not isinstance(evidence, dict):
+        return ["provider observation must be a JSON object."]
+
+    schema_version = evidence.get("schemaVersion")
+    if schema_version != PROVIDER_OBSERVATION_SCHEMA_VERSION:
+        problems.append(
+            f"provider observation schemaVersion {schema_version!r} != expected "
+            f"{PROVIDER_OBSERVATION_SCHEMA_VERSION!r}."
+        )
+    component = evidence.get("component")
+    if component != PROVIDER_OBSERVATION_COMPONENT:
+        problems.append(f"provider observation component {component!r} != expected {PROVIDER_OBSERVATION_COMPONENT!r}.")
+
+    provider = evidence.get("provider")
+    if provider not in (PROVIDER_APP_STORE_CONNECT, PROVIDER_PLAY_CONSOLE):
+        problems.append(f"provider observation has no recognised provider (got {provider!r}).")
+
+    platform = evidence.get("platform")
+    if platform not in (PLATFORM_IOS, PLATFORM_ANDROID):
+        problems.append(f"provider observation has no recognised platform (got {platform!r}).")
+
+    channel = evidence.get("channel")
+    if not channel or channel not in dba.VALID_CHANNELS:
+        problems.append(f"provider observation channel {channel!r} is not a recognised distribution channel.")
+
+    if not _opt_str(evidence.get("providerAccountOrProject")):
+        problems.append("provider observation has no providerAccountOrProject recorded.")
+    if not _opt_str(evidence.get("providerRecordId")):
+        problems.append("provider observation has no providerRecordId recorded.")
+
+    observed_at = evidence.get("providerObservedAt")
+    if not observed_at or _valid_utc_timestamp(observed_at) is False:
+        problems.append(f"provider observation has no valid providerObservedAt timestamp (got {observed_at!r}).")
+
+    if not _opt_str(evidence.get("sourceDigest")):
+        problems.append("provider observation has no sourceDigest recorded.")
+
+    timestamp = evidence.get("timestamp")
+    if not timestamp or _valid_utc_timestamp(timestamp) is False:
+        problems.append(f"provider observation has no valid timestamp (got {timestamp!r}).")
+
+    if expected_release_id is not None:
+        release_id = evidence.get("releaseId")
+        if not release_id:
+            problems.append("provider observation has no releaseId recorded -- it is not bound to this release.")
+        elif str(release_id).strip() != str(expected_release_id).strip():
+            problems.append(
+                f"provider observation releaseId {release_id!r} != expected release {expected_release_id!r}."
+            )
+
+    return problems
+
+
+def _valid_utc_timestamp(value: "Any") -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == datetime.timedelta(0)
 
 
 # --- GitHub CI artifact: the CONTAINED provider evidence must itself be
@@ -589,26 +1017,24 @@ def build_signed_export_evidence(
 
 
 def verify_nested_provider_evidence(extracted: "dict[str, Any]", **validate_kwargs: Any) -> "list[str]":
-    """Priority 3 requirement: "verify that the contained provider evidence
+    """Priority 1 requirement: "verify that the contained provider evidence
     is itself authentic" -- a GitHub artifact whose payload is just a
     hand-typed ``generatedBy: provider-api`` claim (with nothing backing it)
     must not pass merely because the ARTIFACT was authenticated. This
-    re-runs the full distributed-build evidence validation (schema,
-    provider/channel allow-lists, generatedBy-specific proof requirements,
-    and -- via ``validate_kwargs`` -- the expected SHA/version/release-id
-    binding) over the artifact's contained payload, PLUS an additional
-    restriction beyond what a bare ``--source`` file must satisfy: the
-    nested evidence's own ``generatedBy`` must be exactly ``"provider-api"``
-    (i.e. produced by :func:`collect_app_store_connect_evidence` /
+    re-runs :func:`validate_provider_observation` (schema, provider/
+    platform/channel allow-lists, and -- via ``validate_kwargs`` -- the
+    expected release-id binding) over the artifact's contained payload, PLUS
+    an additional restriction: the nested evidence's own ``generatedBy``
+    must be exactly ``"provider-api"`` (i.e. produced by
+    :func:`collect_app_store_connect_evidence` /
     :func:`collect_play_console_evidence` during that CI run). A nested
     ``signed-export`` or another ``ci-artifact`` claim is not accepted here
     -- the artifact chain proves WHERE the bytes came from; this proves WHAT
     they claim is both well-formed AND was itself live-collected, not a
     fabricated or merely-recursive claim laundered through a real artifact
-    upload."""
-    from . import distributed_build_provenance as dbp
-
-    problems = list(dbp.validate_distributed_evidence(extracted, **validate_kwargs))
+    upload. A provider observation that passes this is still only ONE half
+    of the identity chain -- see :func:`validate_provider_observation`."""
+    problems = list(validate_provider_observation(extracted, **validate_kwargs))
     if isinstance(extracted, dict) and extracted.get("generatedBy") != "provider-api":
         problems.append(
             f"nested evidence generatedBy {extracted.get('generatedBy')!r} is not 'provider-api' -- a CI "
@@ -645,9 +1071,9 @@ class ProviderCiArtifactChain:
 
     def summary(self) -> str:
         if self.ok:
-            build = (self.result or {}).get("distributedBuildId", "?")
-            return f"Authenticated CI-artifact distributed-build evidence verified (build {build})."
-        return "Authenticated CI-artifact distributed-build evidence REJECTED: " + "; ".join(self.problems)
+            build = (self.result or {}).get("providerRecordId", "?")
+            return f"Authenticated CI-artifact provider observation verified (build {build})."
+        return "Authenticated CI-artifact provider observation REJECTED: " + "; ".join(self.problems)
 
 
 def verify_provider_ci_artifact_chain(

@@ -127,6 +127,12 @@ class WorkflowRunMetadata:
     workflow_name: "str | None" = None
     event: "str | None" = None
     head_sha: "str | None" = None
+    # The run's actual branch, as GitHub's own "get a workflow run" API
+    # response exposes it (``head_branch``) -- an authenticated signal
+    # independent of (and cross-checked against) the caller-supplied
+    # ``event``/expected-ref assumptions. ``None`` only when the API response
+    # itself omits it (never guessed/defaulted).
+    head_branch: "str | None" = None
     status: "str | None" = None
     conclusion: "str | None" = None
 
@@ -145,6 +151,7 @@ class WorkflowRunMetadata:
             workflow_name=_opt_str(data.get("name")),
             event=_opt_str(data.get("event")),
             head_sha=_opt_str(data.get("head_sha")),
+            head_branch=_opt_str(data.get("head_branch")),
             status=_opt_str(data.get("status")),
             conclusion=_opt_str(data.get("conclusion")),
         )

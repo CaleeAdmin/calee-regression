@@ -60,3 +60,27 @@ def is_wellformed_version(value: "Any | None") -> bool:
     components), and ``0.0.22+`` (empty build number).
     """
     return bool(value) and bool(_VERSION_RE.match(str(value).strip()))
+
+
+def split_marketing_version_and_build_number(value: "Any | None") -> "tuple[str, str] | None":
+    """Split a CaleeMobile pubspec-style ``MARKETING+BUILD`` version (e.g.
+    ``0.0.24+24``) into ``(marketing, build)`` (Priority 2). Returns
+    ``None`` -- never a guess -- for anything ambiguous: not a well-formed
+    version at all (:func:`is_wellformed_version`), no ``+`` present (no
+    build number to split off, e.g. a bare ``0.3.24``), more than one
+    ``+``, or an empty half on either side. This is the one place a
+    CaleeMobile release identity is decomposed into its marketing-version
+    and build-number parts -- callers that need the full identity but no
+    split (e.g. an equality check against another full version string)
+    should keep using the whole string and :func:`is_wellformed_version`
+    instead of calling this.
+    """
+    if not is_wellformed_version(value):
+        return None
+    text = str(value).strip()
+    if text.count("+") != 1:
+        return None
+    marketing, _sep, build = text.partition("+")
+    if not marketing or not build:
+        return None
+    return marketing, build

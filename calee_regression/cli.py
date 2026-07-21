@@ -14,6 +14,7 @@ import click
 
 from . import appium_lifecycle
 from . import build_identity as build_identity_mod
+from . import build_provenance as build_provenance_mod
 from . import config as config_mod
 from . import credentials as credentials_mod
 from . import distributed_build_acceptance as distributed_build_acceptance_mod
@@ -1767,6 +1768,20 @@ def selector_contract_cmd(
 @click.option("--package-name", default=None, help="Play Console package name (--provider play_console).")
 @click.option("--track", "play_track", default=None, help="Play Console release track, e.g. 'internal' (--provider play_console).")
 @click.option(
+    "--play-edit-id", "play_edit_id", default=None,
+    help="Priority 3: an existing Play Console edit session id, used strictly read-only (never created "
+         "or deleted by this process). The Play Developer API only exposes track state through an edit "
+         "session; supplying one you already control is the safe way to read it without risking another "
+         "open edit. Mutually exclusive with --allow-create-play-edit-session.",
+)
+@click.option(
+    "--allow-create-play-edit-session", "allow_create_play_edit_session", is_flag=True, default=False,
+    help="Priority 3: explicit opt-in to create a TEMPORARY Play Console edit session for this read and "
+         "delete it immediately afterward. Creating an edit can invalidate another edit already open for "
+         "this app -- without --play-edit-id or this flag, Play live collection BLOCKS rather than "
+         "silently creating one.",
+)
+@click.option(
     "--signed-export", "signed_export_payload_path", default=None, type=click.Path(exists=True, dir_okay=False),
     help="Priority 3: path to a signed-export evidence PAYLOAD JSON (the unsigned canonical claim). "
          "Requires --export-signature. Produces tier verified-signed-export ONLY if the detached "
@@ -1777,10 +1792,19 @@ def selector_contract_cmd(
     "--export-signature", "signed_export_signature_path", default=None, type=click.Path(exists=True, dir_okay=False),
     help="Path to the raw detached signature bytes over --signed-export's exact canonical payload bytes.",
 )
-@click.option("--signer-fingerprint", default=None, help="Human-readable identifier of the signer key, recorded alongside the verified signature (not itself verified).")
+@click.option("--signer-fingerprint", default=None, help="Human-readable operator label for the signer key, recorded alongside the VERIFIED key's own computed fingerprint for cross-reference only -- never itself trusted as the signer identity.")
 @click.option(
     "--trusted-public-key-file", default=None, type=click.Path(exists=True, dir_okay=False),
-    help="Override the configured CALEE_SIGNED_EXPORT_PUBLIC_KEY credential with a PEM public key file.",
+    help="Priority 4: DIAGNOSTIC-ONLY per-command override of the trusted public key. Its result is "
+         "ALWAYS recorded as blocked-unverified (tier diagnostic-unpinned-key), never a release-gating "
+         "PASS, however genuine the signature verification against it turns out to be -- use this only "
+         "to troubleshoot a signature offline. A real PASS requires the key pinned in machine "
+         "configuration (see --config) and resolved from CALEE_SIGNED_EXPORT_PUBLIC_KEY.",
+)
+@click.option(
+    "--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(),
+    help="Path to machine.local.yaml (defaults to config/machine.local.yaml) -- read for the pinned "
+         "trusted_signed_export_public_key_sha256 fingerprint (--signed-export path only).",
 )
 @click.option(
     "--github-run-id", default=None,
@@ -1800,6 +1824,36 @@ def selector_contract_cmd(
     "--github-artifact-zip", "github_artifact_zip_path", default=None, type=click.Path(exists=True, dir_okay=False),
     help="An already-downloaded artifact ZIP -- metadata (run/artifact ownership, digest) is still "
          "authenticated live via the GitHub API; an operator-supplied ZIP alone is never sufficient.",
+)
+@click.option(
+    "--build-provenance-github-run-id", "bp_github_run_id", default=None,
+    help="Priority 1: GitHub Actions workflow run id (in the CaleeMobile PRODUCT repository, not this "
+         "one) that produced a retained build-provenance artifact proving the source Git SHA/version/"
+         "platform build number a specific CI build produced. Combine with --provider/--github-run-id "
+         "above to JOIN a provider observation with this build provenance -- neither side alone can ever "
+         "PASS. Requires --build-provenance-github-artifact-id/-repository/-workflow-file/-artifact-name/"
+         "-result-filename.",
+)
+@click.option("--build-provenance-github-artifact-id", "bp_github_artifact_id", default=None, help="GitHub Actions artifact id within --build-provenance-github-run-id.")
+@click.option("--build-provenance-github-repository", "bp_github_repository", default=None, help="owner/repo the build-provenance run/artifact belong to (e.g. CaleeAdmin/CaleeMobile).")
+@click.option("--build-provenance-github-workflow-file", "bp_github_workflow_file", default=None, help="Expected build-provenance workflow file path.")
+@click.option("--build-provenance-github-artifact-name", "bp_github_artifact_name", default=None, help="Expected build-provenance artifact name.")
+@click.option("--build-provenance-github-result-filename", "bp_github_result_filename", default=None, help="Expected JSON filename inside the build-provenance artifact ZIP.")
+@click.option(
+    "--build-provenance-github-artifact-zip", "bp_github_artifact_zip_path", default=None, type=click.Path(exists=True, dir_okay=False),
+    help="An already-downloaded build-provenance artifact ZIP -- metadata is still authenticated live "
+         "via the GitHub API.",
+)
+@click.option(
+    "--build-provenance-signed-export", "bp_signed_export_payload_path", default=None, type=click.Path(exists=True, dir_okay=False),
+    help="Priority 1: path to a signed BUILD-PROVENANCE payload JSON (source Git SHA/version/platform "
+         "build number). Requires --build-provenance-signature. Verified against the PINNED trust root "
+         "(see --config), never a per-command key. Combine with --provider/--github-run-id above to JOIN.",
+)
+@click.option(
+    "--build-provenance-signature", "bp_signature_path", default=None, type=click.Path(exists=True, dir_okay=False),
+    help="Path to the raw detached signature bytes over --build-provenance-signed-export's exact "
+         "canonical payload bytes.",
 )
 @click.option(
     "--source", "source_path", default=None, type=click.Path(exists=True, dir_okay=False),
@@ -1833,9 +1887,14 @@ def selector_contract_cmd(
 @click.option("--expected-release-id", "expected_release_id", default=None, help="Expected release ID; defaults to this run's own release-config releaseId.")
 def record_distributed_build_acceptance_cmd(
     run_id_opt, live_provider, app_id, asc_build_version, package_name, play_track,
+    play_edit_id, allow_create_play_edit_session,
     signed_export_payload_path, signed_export_signature_path, signer_fingerprint, trusted_public_key_file,
+    config_path,
     github_run_id, github_artifact_id, github_repository, github_workflow_file, github_artifact_name,
     github_result_filename, github_artifact_zip_path,
+    bp_github_run_id, bp_github_artifact_id, bp_github_repository, bp_github_workflow_file,
+    bp_github_artifact_name, bp_github_result_filename, bp_github_artifact_zip_path,
+    bp_signed_export_payload_path, bp_signature_path,
     source_path, adopted_by, channel, distributed_build_id, tested_git_sha, tested_version,
     verified_via, release_id_opt, expected_git_sha, expected_version, expected_release_id,
 ):
@@ -1870,18 +1929,61 @@ def record_distributed_build_acceptance_cmd(
 
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    live_modes = [
+    provider_side_modes = [
         name for name, given in (
-            ("--provider", live_provider is not None),
-            ("--signed-export", signed_export_payload_path is not None),
-            ("--github-run-id", github_run_id is not None),
+            ("--provider", live_provider is not None), ("--github-run-id", github_run_id is not None),
         ) if given
     ]
-    if len(live_modes) > 1:
-        click.echo(f"Only one of --provider / --signed-export / --github-run-id may be used at a time; got {live_modes}.", err=True)
+    if len(provider_side_modes) > 1:
+        click.echo(f"Only one of --provider / --github-run-id (the provider side) may be used at a time; got {provider_side_modes}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    build_side_modes = [
+        name for name, given in (
+            ("--build-provenance-github-run-id", bp_github_run_id is not None),
+            ("--build-provenance-signed-export", bp_signed_export_payload_path is not None),
+        ) if given
+    ]
+    if len(build_side_modes) > 1:
+        click.echo(
+            f"Only one of --build-provenance-github-run-id / --build-provenance-signed-export (the "
+            f"build-provenance side) may be used at a time; got {build_side_modes}.", err=True,
+        )
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    provider_side_requested = bool(provider_side_modes)
+    build_side_requested = bool(build_side_modes)
+    if signed_export_payload_path is not None and (provider_side_requested or build_side_requested):
+        click.echo(
+            "Only one of --signed-export (a complete, independently-signed distributed-build claim) or "
+            "--provider/--github-run-id/--build-provenance-* (which build a JOINED identity chain from "
+            "two separately-authenticated sides) may be used at a time.",
+            err=True,
+        )
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    if play_edit_id is not None and allow_create_play_edit_session:
+        click.echo(
+            "Only one of --play-edit-id (read-only against an edit you already control) or "
+            "--allow-create-play-edit-session (creates and deletes a temporary one) may be used at a time.",
+            err=True,
+        )
         raise SystemExit(EXIT_INVALID_CONFIG)
 
-    def _record_authenticated(evidence: dict, *, raw_bytes: bytes, evidence_tier: str, source_label: str) -> None:
+    _UNSET = object()
+
+    def _record_authenticated(
+        evidence: dict, *, raw_bytes: bytes, evidence_tier: str, source_label: str, verify_version=_UNSET,
+    ) -> None:
+        # Priority 1/2: the distributed-build identity JOIN's testedVersion
+        # is the MARKETING-only part (build_provenance.application_version)
+        # -- --expected-version is the CaleeMobile FULL "marketing+build"
+        # form, and the join already verified both parts separately (via
+        # identity_format.split_marketing_version_and_build_number). Re-
+        # checking the full form against the marketing-only value here would
+        # spuriously fail a join that already passed, so the join call site
+        # passes ``verify_version=None`` to skip this redundant (and, for
+        # that shape, incorrect) re-check; every other tier's evidence still
+        # carries the version in the SAME full form --expected-version uses,
+        # so they keep the default (this closure's own expected_version).
+        version_to_verify = expected_version if verify_version is _UNSET else verify_version
         adopted_by_label = adopted_by or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
         record = dbp_mod.build_provenance_record(
             evidence, release_run_id=run_id_opt, adopted_at=timestamp, adopted_by=adopted_by_label,
@@ -1889,7 +1991,7 @@ def record_distributed_build_acceptance_cmd(
         )
         problems = dbp_mod.verify_provenance_record(
             record, source_bytes=raw_bytes, expected_release_run_id=run_id_opt,
-            expected_git_sha=expected_git_sha, expected_version=expected_version,
+            expected_git_sha=expected_git_sha, expected_version=version_to_verify,
             expected_release_id=expected_release_id,
         )
         if evidence_tier not in pe_mod.AUTHENTICATED_TIERS:
@@ -1928,83 +2030,40 @@ def record_distributed_build_acceptance_cmd(
         click.echo(f"Recorded: {report_path}")
         raise SystemExit(EXIT_SUCCESS if status == "passed" else EXIT_BLOCKED)
 
-    if live_provider is not None:
-        # Priority 3, tier provider-api-live: THIS process makes the
-        # authenticated HTTPS request itself, right now.
-        try:
-            if live_provider == pe_mod.PROVIDER_APP_STORE_CONNECT:
-                if not app_id or not asc_build_version:
-                    click.echo("--provider app_store_connect requires --app-id and --build-version.", err=True)
-                    raise SystemExit(EXIT_INVALID_CONFIG)
-                record = pe_mod.collect_app_store_connect_evidence(
-                    app_id=app_id, build_version=asc_build_version, requested_git_sha=expected_git_sha,
-                    requested_version=expected_version, release_id=expected_release_id,
-                    collection_run_id=run_id_opt,
-                )
-            else:
-                if not package_name or not play_track:
-                    click.echo("--provider play_console requires --package-name and --track.", err=True)
-                    raise SystemExit(EXIT_INVALID_CONFIG)
-                record = pe_mod.collect_play_console_evidence(
-                    package_name=package_name, track=play_track, requested_git_sha=expected_git_sha,
-                    requested_version=expected_version, release_id=expected_release_id,
-                    collection_run_id=run_id_opt,
-                )
-        except pe_mod.ProviderEvidenceError as exc:
-            click.echo(f"Distributed-build acceptance BLOCKED: {exc}", err=True)
-            raise SystemExit(EXIT_BLOCKED)
-        evidence = record.to_evidence_dict()
-        _record_authenticated(
-            evidence, raw_bytes=record.raw_response_bytes, evidence_tier=pe_mod.TIER_PROVIDER_API_LIVE,
-            source_label=f"live:{live_provider}",
-        )
-        return
-
-    if signed_export_payload_path is not None:
-        # Priority 3, tier verified-signed-export: a real detached signature
-        # cryptographically verified against a configured trusted public key.
-        if signed_export_signature_path is None:
-            click.echo("--signed-export requires --export-signature.", err=True)
-            raise SystemExit(EXIT_INVALID_CONFIG)
-        try:
-            payload = json.loads(Path(signed_export_payload_path).read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            click.echo(f"--signed-export {signed_export_payload_path!r} is not valid JSON: {exc}", err=True)
-            raise SystemExit(EXIT_INVALID_CONFIG)
-        if not isinstance(payload, dict):
-            click.echo(f"--signed-export {signed_export_payload_path!r} must contain a JSON object.", err=True)
-            raise SystemExit(EXIT_INVALID_CONFIG)
-        signature_bytes = Path(signed_export_signature_path).read_bytes()
-        if trusted_public_key_file:
-            trusted_public_key_pem = Path(trusted_public_key_file).read_text(encoding="utf-8")
-        else:
-            resolver = credentials_mod.default_resolver()
+    def _collect_provider_side() -> "tuple[dict, bytes, str]":
+        """Priority 1: acquire the PROVIDER OBSERVATION half of the identity
+        chain, from whichever of --provider (live collection) /
+        --github-run-id (CI artifact) was requested. Returns (evidence,
+        raw_bytes, source_label); exits directly (INVALID_CONFIG/BLOCKED) on
+        failure, matching every other collection path in this command."""
+        if live_provider is not None:
             try:
-                trusted_public_key_pem = resolver.require(credentials_mod.SIGNED_EXPORT_TRUSTED_PUBLIC_KEY)
-            except credentials_mod.CredentialError as exc:
+                if live_provider == pe_mod.PROVIDER_APP_STORE_CONNECT:
+                    if not app_id or not asc_build_version:
+                        click.echo("--provider app_store_connect requires --app-id and --build-version.", err=True)
+                        raise SystemExit(EXIT_INVALID_CONFIG)
+                    record = pe_mod.collect_app_store_connect_evidence(
+                        app_id=app_id, build_version=asc_build_version, requested_git_sha=expected_git_sha,
+                        requested_version=expected_version, release_id=expected_release_id,
+                        collection_run_id=run_id_opt,
+                    )
+                else:
+                    if not package_name or not play_track:
+                        click.echo("--provider play_console requires --package-name and --track.", err=True)
+                        raise SystemExit(EXIT_INVALID_CONFIG)
+                    record = pe_mod.collect_play_console_evidence(
+                        package_name=package_name, track=play_track, requested_git_sha=expected_git_sha,
+                        requested_version=expected_version, release_id=expected_release_id,
+                        collection_run_id=run_id_opt,
+                        edit_id=play_edit_id, allow_create_edit_session=allow_create_play_edit_session,
+                    )
+            except pe_mod.ProviderEvidenceError as exc:
                 click.echo(f"Distributed-build acceptance BLOCKED: {exc}", err=True)
                 raise SystemExit(EXIT_BLOCKED)
-        evidence, sig_problems = pe_mod.build_signed_export_evidence(
-            payload=payload, signature_bytes=signature_bytes, trusted_public_key_pem=trusted_public_key_pem,
-            signer_fingerprint=signer_fingerprint or "unspecified",
-        )
-        if sig_problems:
-            click.echo("Distributed-build acceptance BLOCKED -- signed-export signature verification failed:", err=True)
-            for problem in sig_problems:
-                click.echo(f"  - {problem}", err=True)
-            raise SystemExit(EXIT_BLOCKED)
-        raw_bytes = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        _record_authenticated(
-            evidence, raw_bytes=raw_bytes, evidence_tier=pe_mod.TIER_VERIFIED_SIGNED_EXPORT,
-            source_label=f"signed-export:{signed_export_payload_path}",
-        )
-        return
+            return record.to_provider_observation_dict(), record.raw_response_bytes, f"live:{live_provider}"
 
-    if github_run_id is not None:
-        # Priority 3, tier github-authenticated-artifact: an authenticated
-        # GitHub CI artifact whose contained result is itself a
-        # ProviderEvidenceRecord (generatedBy provider-api) -- never a
-        # hand-typed claim smuggled through an otherwise-real artifact.
+        # --github-run-id: an authenticated CI artifact whose contained
+        # result is itself a provider observation.
         required = {
             "--github-artifact-id": github_artifact_id, "--github-repository": github_repository,
             "--github-workflow-file": github_workflow_file, "--github-artifact-name": github_artifact_name,
@@ -2019,22 +2078,266 @@ def record_distributed_build_acceptance_cmd(
                 repository=github_repository, workflow_path=github_workflow_file, run_id=github_run_id,
                 artifact_id=github_artifact_id, expected_artifact_name=github_artifact_name,
                 expected_result_filename=github_result_filename, local_zip_path=github_artifact_zip_path,
-                expected_git_sha=expected_git_sha, expected_version=expected_version,
                 expected_release_id=expected_release_id,
             )
         except pe_mod.ProviderEvidenceError as exc:
             click.echo(f"Distributed-build acceptance BLOCKED: {exc}", err=True)
             raise SystemExit(EXIT_BLOCKED)
         if not chain.ok:
-            click.echo("Distributed-build acceptance BLOCKED -- CI artifact chain rejected:", err=True)
+            click.echo("Distributed-build acceptance BLOCKED -- provider CI artifact chain rejected:", err=True)
             for problem in chain.problems:
                 click.echo(f"  - {problem}", err=True)
             raise SystemExit(EXIT_BLOCKED)
+        return chain.result, chain.result_bytes, f"github-artifact:{github_repository}#run={github_run_id}&artifact={github_artifact_id}"
+
+    def _collect_build_provenance_side():
+        """Priority 1: acquire the BUILD PROVENANCE half of the identity
+        chain, from whichever of --build-provenance-github-run-id /
+        --build-provenance-signed-export was requested. Returns
+        (BuildProvenanceRecord, raw_bytes, source_label); exits directly on
+        failure."""
+        if bp_github_run_id is not None:
+            required = {
+                "--build-provenance-github-artifact-id": bp_github_artifact_id,
+                "--build-provenance-github-repository": bp_github_repository,
+                "--build-provenance-github-workflow-file": bp_github_workflow_file,
+                "--build-provenance-github-artifact-name": bp_github_artifact_name,
+                "--build-provenance-github-result-filename": bp_github_result_filename,
+            }
+            missing_bp = [name for name, value in required.items() if not value]
+            if missing_bp:
+                click.echo(f"--build-provenance-github-run-id requires {sorted(required)}. Missing: {missing_bp}.", err=True)
+                raise SystemExit(EXIT_INVALID_CONFIG)
+            try:
+                chain = build_provenance_mod.acquire_build_provenance_artifact(
+                    repository=bp_github_repository, workflow_path=bp_github_workflow_file, run_id=bp_github_run_id,
+                    artifact_id=bp_github_artifact_id, expected_artifact_name=bp_github_artifact_name,
+                    expected_result_filename=bp_github_result_filename, local_zip_path=bp_github_artifact_zip_path,
+                )
+            except build_provenance_mod.BuildProvenanceError as exc:
+                click.echo(f"Distributed-build acceptance BLOCKED: {exc}", err=True)
+                raise SystemExit(EXIT_BLOCKED)
+            if not chain.ok:
+                click.echo("Distributed-build acceptance BLOCKED -- build-provenance CI artifact chain rejected:", err=True)
+                for problem in chain.problems:
+                    click.echo(f"  - {problem}", err=True)
+                raise SystemExit(EXIT_BLOCKED)
+            return chain.record, chain.record.raw_bytes, f"build-provenance-github-artifact:{bp_github_repository}#run={bp_github_run_id}&artifact={bp_github_artifact_id}"
+
+        # --build-provenance-signed-export
+        if bp_signature_path is None:
+            click.echo("--build-provenance-signed-export requires --build-provenance-signature.", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        try:
+            bp_payload = json.loads(Path(bp_signed_export_payload_path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            click.echo(f"--build-provenance-signed-export {bp_signed_export_payload_path!r} is not valid JSON: {exc}", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        if not isinstance(bp_payload, dict):
+            click.echo(f"--build-provenance-signed-export {bp_signed_export_payload_path!r} must contain a JSON object.", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        bp_signature_bytes = Path(bp_signature_path).read_bytes()
+        # Priority 4: the SAME pinned trust root as the complete --signed-export
+        # path -- never a per-command key.
+        default_machine_config_path = REPO_ROOT / "config" / "machine.local.yaml"
+        machine_config_file = Path(config_path) if config_path else default_machine_config_path
+        pinned_fingerprint = None
+        if machine_config_file.is_file():
+            from . import machine_config as machine_config_mod
+
+            try:
+                pinned_fingerprint = machine_config_mod.load_machine_config(
+                    machine_config_file
+                ).trusted_signed_export_public_key_sha256
+            except machine_config_mod.MachineConfigError as exc:
+                click.echo(f"Distributed-build acceptance BLOCKED: could not load machine config: {exc}", err=True)
+                raise SystemExit(EXIT_BLOCKED)
+        try:
+            trusted_public_key_pem, _fingerprint = pe_mod.resolve_pinned_trusted_public_key(pinned_fingerprint=pinned_fingerprint)
+        except pe_mod.ProviderEvidenceError as exc:
+            click.echo(f"Distributed-build acceptance BLOCKED: {exc}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        record, sig_problems = build_provenance_mod.build_signed_build_provenance(
+            payload=bp_payload, signature_bytes=bp_signature_bytes, trusted_public_key_pem=trusted_public_key_pem,
+        )
+        if sig_problems:
+            click.echo("Distributed-build acceptance BLOCKED -- build-provenance signed-export signature verification failed:", err=True)
+            for problem in sig_problems:
+                click.echo(f"  - {problem}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        return record, record.raw_bytes, f"build-provenance-signed-export:{bp_signed_export_payload_path}"
+
+    if signed_export_payload_path is not None:
+        # Priority 3/4: a real detached signature cryptographically verified
+        # against a trust root. The trust root MUST be the machine-config-
+        # pinned key (tier verified-signed-export -- the only path that can
+        # PASS); --trusted-public-key-file is diagnostic-only (handled
+        # first, below, and always ends in blocked-unverified).
+        if signed_export_signature_path is None:
+            click.echo("--signed-export requires --export-signature.", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        try:
+            payload = json.loads(Path(signed_export_payload_path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            click.echo(f"--signed-export {signed_export_payload_path!r} is not valid JSON: {exc}", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        if not isinstance(payload, dict):
+            click.echo(f"--signed-export {signed_export_payload_path!r} must contain a JSON object.", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        signature_bytes = Path(signed_export_signature_path).read_bytes()
+
+        if trusted_public_key_file:
+            # Priority 4: an explicit per-command public-key override is
+            # DIAGNOSTIC ONLY -- it can NEVER produce a release-gating PASS,
+            # however genuine the signature verification against it turns
+            # out to be, and it never consults (or affects) the pinned trust
+            # root below.
+            click.echo(
+                click.style(
+                    "WARNING: --trusted-public-key-file is a DIAGNOSTIC override of the trust root for "
+                    "this run only. Its result is ALWAYS recorded as blocked-unverified, never a "
+                    "release-gating PASS, regardless of whether the signature verifies.",
+                    fg="yellow",
+                ),
+                err=True,
+            )
+            diagnostic_pem = Path(trusted_public_key_file).read_text(encoding="utf-8")
+            evidence, sig_problems = pe_mod.build_signed_export_evidence(
+                payload=payload, signature_bytes=signature_bytes, trusted_public_key_pem=diagnostic_pem,
+                signer_fingerprint=signer_fingerprint,
+            )
+            recorded_payload = evidence or dict(payload, generatedBy="signed-export")
+            raw_bytes = json.dumps(recorded_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            adopted_by_label = adopted_by or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+            record = dbp_mod.build_provenance_record(
+                recorded_payload, release_run_id=run_id_opt, adopted_at=timestamp, adopted_by=adopted_by_label,
+                source_path=f"signed-export-diagnostic-unpinned-key:{signed_export_payload_path}",
+                raw_source_bytes=raw_bytes, evidence_tier=pe_mod.TIER_DIAGNOSTIC_UNPINNED_KEY,
+            )
+            diagnostic_notice = (
+                "--trusted-public-key-file is a diagnostic override -- its result can never be a "
+                "release-gating PASS. Configure trusted_signed_export_public_key_sha256 in machine "
+                "config and CALEE_SIGNED_EXPORT_PUBLIC_KEY to reach verified-signed-export."
+            )
+            report = {
+                "runId": run_id_opt,
+                "component": dbp_mod.DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT,
+                "status": "blocked-unverified",
+                "evidenceTier": pe_mod.TIER_DIAGNOSTIC_UNPINNED_KEY,
+                "provenance": record,
+                "problems": [diagnostic_notice] + list(sig_problems),
+                "generatedAt": timestamp,
+            }
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+            component_dir = workspace.component_dir("distributed-build-acceptance")
+            dbp_mod.write_evidence_bundle(component_dir, record, source_bytes=raw_bytes)
+            click.echo(diagnostic_notice, err=True)
+            for problem in sig_problems:
+                click.echo(f"  - {problem}", err=True)
+            click.echo(f"Recorded (blocked-unverified): {report_path}")
+            raise SystemExit(EXIT_BLOCKED)
+
+        # Priority 4: the ONLY path that may ever reach verified-signed-export
+        # -- the trust key is resolved EXCLUSIVELY from credentials.py
+        # (environment/Keychain), gated on machine config's PINNED SHA-256
+        # fingerprint (never a per-command override).
+        default_machine_config_path = REPO_ROOT / "config" / "machine.local.yaml"
+        machine_config_file = Path(config_path) if config_path else default_machine_config_path
+        pinned_fingerprint = None
+        if machine_config_file.is_file():
+            from . import machine_config as machine_config_mod
+
+            try:
+                pinned_fingerprint = machine_config_mod.load_machine_config(
+                    machine_config_file
+                ).trusted_signed_export_public_key_sha256
+            except machine_config_mod.MachineConfigError as exc:
+                click.echo(f"Distributed-build acceptance BLOCKED: could not load machine config: {exc}", err=True)
+                raise SystemExit(EXIT_BLOCKED)
+        try:
+            trusted_public_key_pem, _verified_fingerprint = pe_mod.resolve_pinned_trusted_public_key(
+                pinned_fingerprint=pinned_fingerprint,
+            )
+        except pe_mod.ProviderEvidenceError as exc:
+            click.echo(f"Distributed-build acceptance BLOCKED: {exc}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        evidence, sig_problems = pe_mod.build_signed_export_evidence(
+            payload=payload, signature_bytes=signature_bytes, trusted_public_key_pem=trusted_public_key_pem,
+            signer_fingerprint=signer_fingerprint,
+        )
+        if sig_problems:
+            click.echo("Distributed-build acceptance BLOCKED -- signed-export signature verification failed:", err=True)
+            for problem in sig_problems:
+                click.echo(f"  - {problem}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        raw_bytes = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         _record_authenticated(
-            chain.result, raw_bytes=chain.result_bytes, evidence_tier=pe_mod.TIER_GITHUB_AUTHENTICATED_ARTIFACT,
-            source_label=f"github-artifact:{github_repository}#run={github_run_id}&artifact={github_artifact_id}",
+            evidence, raw_bytes=raw_bytes, evidence_tier=pe_mod.TIER_VERIFIED_SIGNED_EXPORT,
+            source_label=f"signed-export:{signed_export_payload_path}",
         )
         return
+
+    if provider_side_requested:
+        # Priority 1: collect/authenticate the provider side FIRST -- flag
+        # validation and credential/chain BLOCKED reasons take priority over
+        # the "other side is missing" message below, exactly like every
+        # other collection path in this command reports ITS OWN problem
+        # before anything else.
+        provider_evidence, provider_raw_bytes, provider_source_label = _collect_provider_side()
+        if not build_side_requested:
+            click.echo(
+                "Distributed-build acceptance BLOCKED: build provenance unavailable -- a provider "
+                "observation alone can never prove source Git identity (Priority 1). Supply "
+                "--build-provenance-github-run-id (+ related flags) or --build-provenance-signed-export "
+                "(+ --build-provenance-signature) to complete the identity chain.",
+                err=True,
+            )
+            raise SystemExit(EXIT_BLOCKED)
+        build_record, build_raw_bytes, build_source_label = _collect_build_provenance_side()
+        verdict = build_provenance_mod.join_provider_and_build_provenance(
+            provider_evidence, build_record,
+            expected_release_config_git_sha=expected_git_sha, expected_release_config_version=expected_version,
+            expected_release_id=expected_release_id,
+        )
+        if not verdict.ok:
+            click.echo("Distributed-build acceptance BLOCKED -- identity chain join rejected:", err=True)
+            for problem in verdict.problems:
+                click.echo(f"  - {problem}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+
+        # Priority 1.9: both source bundles (provider + build provenance),
+        # not just the merged/joined view, are retained in the component
+        # directory -- and so end up in the release evidence ZIP alongside
+        # everything else write_evidence_bundle below writes.
+        component_dir = workspace.component_dir("distributed-build-acceptance")
+        component_dir.mkdir(parents=True, exist_ok=True)
+        (component_dir / "provider-observation-raw.bin").write_bytes(provider_raw_bytes)
+        (component_dir / "build-provenance-raw.bin").write_bytes(build_raw_bytes or b"")
+
+        joined_raw_bytes = json.dumps(
+            verdict.evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        _record_authenticated(
+            verdict.evidence, raw_bytes=joined_raw_bytes, evidence_tier=pe_mod.TIER_PROVIDER_BUILD_PROVENANCE_JOIN,
+            source_label=f"joined:{provider_source_label}+{build_source_label}", verify_version=None,
+        )
+        return
+
+    if build_side_requested:
+        # Build-provenance side given, but no provider side at all -- collect/
+        # authenticate it (so ITS OWN flag/credential/chain problems are
+        # reported first, same principle as above), then BLOCK: build
+        # provenance alone can never prove a store actually distributed this
+        # build.
+        _collect_build_provenance_side()
+        click.echo(
+            "Distributed-build acceptance BLOCKED: provider observation unavailable -- build provenance "
+            "alone can never prove a store actually distributed this build (Priority 1). Supply "
+            "--provider (+ related flags) or --github-run-id to complete the identity chain.",
+            err=True,
+        )
+        raise SystemExit(EXIT_BLOCKED)
 
     if source_path:
         # Priority 3: arbitrary operator-supplied JSON is NEVER independently
@@ -4298,32 +4601,42 @@ def verify_main_ci_artifact_cmd(
 @main.command("qualification-preflight")
 @click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
 @click.option("--bundle", "bundle_path", default=None, type=click.Path(), help="Release bundle directory. Verified FIRST; its effective release configuration is composed exactly like the real launcher and drives every required check below (Priority 7).")
-@click.option("--distributed-build-evidence", "distributed_build_evidence_path", default=None, type=click.Path(), help="Distributed-build acceptance evidence path -- checked against the release's own id/SHA/version when --bundle is also given.")
+@click.option("--distributed-build-evidence", "distributed_build_evidence_path", default=None, type=click.Path(), help="Path to the run-scoped distributed-build-acceptance report (reports/runs/<run-id>/distributed-build-acceptance/results.json, as written by record-distributed-build-acceptance) -- Priority 7: re-verified through the SAME authenticated-provenance re-verification consolidation uses, never merely a format check over an arbitrary file.")
 @click.option("--manual-checks", "manual_checks_path", default=None, type=click.Path(), help="Path to manual-checks.json (defaults to config/manual-checks.json, falling back to the .example.json).")
-@click.option("--main-ci-evidence", "main_ci_evidence_path", default=None, type=click.Path(), help="Path to a downloaded main-CI evidence summary (ci-summary-<sha>.json / framework-test-summary-<sha>.json) -- verified via the canonical schema/gate verifier (structural validation only; see --main-ci-workflow-run-id for authenticated verification).")
-@click.option("--main-ci-repository", "main_ci_repository", default=None, help="Expected 'owner/repo' for --main-ci-evidence / authenticated verification, e.g. CaleeAdmin/CaleeMobile-Regression.")
-@click.option("--main-ci-workflow-run-id", "main_ci_workflow_run_id", default=None, help="GitHub Actions workflow run ID -- with --main-ci-artifact-id, authenticates main-CI evidence via the GitHub API (Priority 6) instead of only checking a downloaded file.")
-@click.option("--main-ci-artifact-id", "main_ci_artifact_id", default=None, help="GitHub Actions artifact ID, paired with --main-ci-workflow-run-id.")
+@click.option("--main-ci-evidence", "main_ci_evidence_path", default=None, type=click.Path(), help="Path to a downloaded main-CI evidence summary (ci-summary-<sha>.json / framework-test-summary-<sha>.json) -- verified via the canonical schema/gate verifier (structural validation only; see --calee-regression-main-* / --caleemobile-regression-main-* for authenticated verification).")
+@click.option("--main-ci-repository", "main_ci_repository", default=None, help="Expected 'owner/repo' for --main-ci-evidence's structural-only check, e.g. CaleeAdmin/CaleeMobile-Regression.")
 @click.option("--expected-caleemobile-sha", "expected_caleemobile_sha", default=None, help="Expected CaleeMobile sibling-checkout HEAD SHA. Defaults from the release bundle's own expected identity when --bundle is given.")
-@click.option("--expected-caleemobile-regression-sha", "expected_caleemobile_regression_sha", default=None, help="Expected CaleeMobile-Regression sibling-checkout HEAD SHA.")
+@click.option("--expected-caleemobile-regression-sha", "expected_caleemobile_regression_sha", default=None, help="Expected CaleeMobile-Regression sibling-checkout HEAD SHA -- also the expected 'regressionSha' a selector-contract artifact must carry (see --selector-workflow-run-id).")
+@click.option("--selector-workflow-run-id", "selector_workflow_run_id", default=None, help="Priority 6: GitHub Actions workflow run ID (CaleeMobile-Regression) that produced a selector-contract-result artifact -- with --selector-artifact-id, authenticates it via the GitHub API instead of only checking that a credential is resolvable.")
+@click.option("--selector-artifact-id", "selector_artifact_id", default=None, help="GitHub Actions artifact ID of the selector-contract-result artifact, paired with --selector-workflow-run-id.")
+@click.option("--calee-regression-main-sha", "calee_regression_main_sha", default=None, help="Priority 8: expected calee-regression HEAD SHA for its OWN authenticated merged-main CI check -- never the CaleeMobile product SHA.")
+@click.option("--calee-regression-main-workflow-run-id", "calee_regression_main_workflow_run_id", default=None, help="GitHub Actions workflow run ID for calee-regression's own framework-tests.yml run, paired with --calee-regression-main-artifact-id.")
+@click.option("--calee-regression-main-artifact-id", "calee_regression_main_artifact_id", default=None, help="GitHub Actions artifact ID, paired with --calee-regression-main-workflow-run-id.")
+@click.option("--caleemobile-regression-main-sha", "caleemobile_regression_main_sha", default=None, help="Priority 8: expected CaleeMobile-Regression HEAD SHA for its OWN authenticated merged-main CI check -- never the CaleeMobile product SHA.")
+@click.option("--caleemobile-regression-main-workflow-run-id", "caleemobile_regression_main_workflow_run_id", default=None, help="GitHub Actions workflow run ID for CaleeMobile-Regression's own ci.yml run, paired with --caleemobile-regression-main-artifact-id.")
+@click.option("--caleemobile-regression-main-artifact-id", "caleemobile_regression_main_artifact_id", default=None, help="GitHub Actions artifact ID, paired with --caleemobile-regression-main-workflow-run-id.")
 @click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON result.")
 def qualification_preflight_cmd(
     config_path, bundle_path, distributed_build_evidence_path, manual_checks_path, main_ci_evidence_path,
-    main_ci_repository, main_ci_workflow_run_id, main_ci_artifact_id, expected_caleemobile_sha,
-    expected_caleemobile_regression_sha, report_path,
+    main_ci_repository, expected_caleemobile_sha,
+    expected_caleemobile_regression_sha, selector_workflow_run_id, selector_artifact_id,
+    calee_regression_main_sha, calee_regression_main_workflow_run_id, calee_regression_main_artifact_id,
+    caleemobile_regression_main_sha, caleemobile_regression_main_workflow_run_id, caleemobile_regression_main_artifact_id,
+    report_path,
 ):
-    """Priority 9 (prior session); Priority 7 (this session) -- a read-only,
-    RELEASE-AUTHORITATIVE preflight for a technical owner about to run a real
-    physical qualification. When --bundle is given, the SAME effective
-    release configuration the real launcher would compose is derived from
-    it, and every required check (tablet, Android-mobile vs. tablet
-    distinguished, iOS matched to the CONFIGURED device identifier, Android
-    SDK/build tools, exact Flutter version, Appium status + required
-    drivers, sibling-checkout SHAs, authenticated selector/distributed-build/
-    main-CI evidence, kiosk/admin authorisation) is derived from what the
-    release candidate ACTUALLY requires -- never merely from the machine's
-    own declared capability scope. A required capability whose state cannot
-    be determined BLOCKS, it is never merely a warning.
+    """Priority 9 (prior session); Priority 7-8 (this session) -- a
+    read-only, RELEASE-AUTHORITATIVE preflight for a technical owner about
+    to run a real physical qualification. When --bundle is given, the SAME
+    effective release configuration the real launcher would compose is
+    derived from it, and every required check (tablet, Android-mobile vs.
+    tablet distinguished, iOS matched to the CONFIGURED device identifier,
+    Android SDK/build tools, exact Flutter version, Appium status +
+    required drivers, sibling-checkout SHAs, authenticated selector/
+    distributed-build evidence, EACH regression repository's own
+    authenticated merged-main CI, kiosk/admin authorisation) is derived from
+    what the release candidate ACTUALLY requires -- never merely from the
+    machine's own declared capability scope. A required capability whose
+    state cannot be determined BLOCKS, it is never merely a warning.
 
     Every check is read-only: no APK is installed, no fixture is published,
     no credential value is printed, no product API is mutated, and neither
@@ -4344,10 +4657,15 @@ def qualification_preflight_cmd(
         manual_checks_path=Path(manual_checks_path) if manual_checks_path else None,
         main_ci_evidence_path=Path(main_ci_evidence_path) if main_ci_evidence_path else None,
         main_ci_repository=main_ci_repository,
-        main_ci_workflow_run_id=main_ci_workflow_run_id,
-        main_ci_artifact_id=main_ci_artifact_id,
         expected_caleemobile_sha=expected_caleemobile_sha,
         expected_caleemobile_regression_sha=expected_caleemobile_regression_sha,
+        selector_workflow_run_id=selector_workflow_run_id, selector_artifact_id=selector_artifact_id,
+        calee_regression_main_sha=calee_regression_main_sha,
+        calee_regression_main_workflow_run_id=calee_regression_main_workflow_run_id,
+        calee_regression_main_artifact_id=calee_regression_main_artifact_id,
+        caleemobile_regression_main_sha=caleemobile_regression_main_sha,
+        caleemobile_regression_main_workflow_run_id=caleemobile_regression_main_workflow_run_id,
+        caleemobile_regression_main_artifact_id=caleemobile_regression_main_artifact_id,
         repo_root=REPO_ROOT,
     )
     payload = report.to_dict()
@@ -4355,11 +4673,16 @@ def qualification_preflight_cmd(
 
     color = {"ready": "green", "warning": "yellow", "blocked": "red"}.get(report.overall, "red")
     click.echo(click.style(f"[{payload['overall']}] qualification preflight -- {len(report.checks)} check(s):", fg=color))
-    for check in report.checks:
-        marker = {"ready": "OK", "warning": "WARN", "blocked": "BLOCKED"}.get(check.status, check.status.upper())
-        click.echo(f"  [{marker}] {check.name}: {check.detail}")
-        if check.hint:
-            click.echo(f"           hint: {check.hint}")
+    section_color = {"READY": "green", "WARNING": "yellow", "BLOCKED": "red", "NOT_APPLICABLE": "cyan"}
+    for section in payload["sections"]:
+        click.echo(click.style(f"-- {section['title']} [{section['status']}]", fg=section_color.get(section["status"], "red")))
+        for check in report.checks:
+            if check.name not in section["checks"]:
+                continue
+            marker = {"ready": "OK", "warning": "WARN", "blocked": "BLOCKED"}.get(check.status, check.status.upper())
+            click.echo(f"  [{marker}] {check.name}: {check.detail}")
+            if check.hint:
+                click.echo(f"           hint: {check.hint}")
 
     if report.overall == qp_mod.STATUS_READY:
         raise SystemExit(EXIT_SUCCESS)

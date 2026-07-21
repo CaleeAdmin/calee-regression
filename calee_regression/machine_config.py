@@ -15,6 +15,7 @@ the environment or the macOS Keychain, never committed or dropped in a config.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,6 +29,12 @@ VALID_MOBILE_PLATFORMS = {"android", "ios"}
 # Keys that would indicate a secret was pasted into the machine config. Matched
 # case-insensitively as a substring of the key name.
 _SECRET_KEY_MARKERS = ("password", "passwd", "secret", "token", "api_key", "apikey", "credential")
+
+# A public-key fingerprint is NOT a secret (it's derived from a PUBLIC key),
+# so it belongs in this non-secret machine config -- never through
+# credentials.py -- matching release_installer.py's existing signerSha256
+# precedent (lowercase 64 hex characters, no "sha256:" prefix).
+_SHA256_FINGERPRINT_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 _REQUIRED_STRING_FIELDS = (
     "expected_tablet_state",
@@ -64,6 +71,14 @@ class MachineConfig:
     iphone_device: "str | None" = None
     android_device: "str | None" = None
     allow_caleeshell_technical: bool = False
+    # Priority 4 (this session): the PINNED SHA-256 fingerprint of the
+    # trusted signed-export public key, configured once per technical-owner
+    # machine. A release-gating signed-export PASS requires the key actually
+    # resolved (via credentials.py's SIGNED_EXPORT_TRUSTED_PUBLIC_KEY --
+    # environment/Keychain, never this file) to fingerprint-match this value
+    # -- never an ad-hoc, per-command --trusted-public-key-file override. See
+    # provider_evidence.resolve_pinned_trusted_public_key.
+    trusted_signed_export_public_key_sha256: "str | None" = None
     config_path: "Path | None" = None
 
     def resolved_bundle_dir(self) -> Path:
@@ -134,6 +149,13 @@ def validate_machine_config(raw: dict) -> "list[str]":
     if "allow_caleeshell_technical" in raw and not isinstance(raw["allow_caleeshell_technical"], bool):
         errors.append("allow_caleeshell_technical must be a boolean.")
 
+    fingerprint = raw.get("trusted_signed_export_public_key_sha256")
+    if fingerprint is not None and (not isinstance(fingerprint, str) or not _SHA256_FINGERPRINT_RE.match(fingerprint.strip())):
+        errors.append(
+            "trusted_signed_export_public_key_sha256 must be a 64-character lowercase/uppercase hex "
+            f"SHA-256 fingerprint (got {fingerprint!r})."
+        )
+
     return errors
 
 
@@ -169,5 +191,8 @@ def load_machine_config(path) -> MachineConfig:
         iphone_device=raw.get("iphone_device") or None,
         android_device=raw.get("android_device") or None,
         allow_caleeshell_technical=bool(raw.get("allow_caleeshell_technical", False)),
+        trusted_signed_export_public_key_sha256=(
+            (raw.get("trusted_signed_export_public_key_sha256") or "").strip().lower() or None
+        ),
         config_path=path.resolve(),
     )
