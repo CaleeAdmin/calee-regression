@@ -71,8 +71,52 @@ AI_ANALYSIS_KEY = CredentialRequest(
     keychain_service="calee-regression", keychain_account="ai-analysis-key", required=False,
 )
 
+# Priority 3 (this session): App Store Connect / TestFlight API credentials
+# (JWT bearer auth -- see provider_evidence.py). All three are required
+# together whenever the App Store Connect collector is actually invoked; each
+# is `required=False` HERE only because the collector itself decides (via
+# `.require()`) when they're actually needed -- most invocations never touch
+# these at all.
+APP_STORE_CONNECT_KEY_ID = CredentialRequest(
+    name="app_store_connect_key_id", env_var="CALEE_ASC_KEY_ID",
+    keychain_service="calee-regression", keychain_account="asc-key-id", required=False,
+)
+APP_STORE_CONNECT_ISSUER_ID = CredentialRequest(
+    name="app_store_connect_issuer_id", env_var="CALEE_ASC_ISSUER_ID",
+    keychain_service="calee-regression", keychain_account="asc-issuer-id", required=False,
+)
+APP_STORE_CONNECT_PRIVATE_KEY = CredentialRequest(
+    name="app_store_connect_private_key", env_var="CALEE_ASC_PRIVATE_KEY",
+    keychain_service="calee-regression", keychain_account="asc-private-key", required=False,
+)
+
+# Play Console (Google Play Developer API) service-account credentials --
+# either the full service-account JSON (preferred; a JWT is signed from it)
+# or a pre-obtained OAuth2 access token, whichever is available.
+PLAY_CONSOLE_SERVICE_ACCOUNT_JSON = CredentialRequest(
+    name="play_console_service_account_json", env_var="CALEE_PLAY_SERVICE_ACCOUNT_JSON",
+    keychain_service="calee-regression", keychain_account="play-service-account-json", required=False,
+)
+PLAY_CONSOLE_ACCESS_TOKEN = CredentialRequest(
+    name="play_console_access_token", env_var="CALEE_PLAY_ACCESS_TOKEN",
+    keychain_service="calee-regression", keychain_account="play-access-token", required=False,
+)
+
+# A trusted public key/certificate (PEM) to verify a signed-export evidence
+# package's detached signature against -- configured once per technical
+# owner, never a secret itself (it's a PUBLIC key) but resolved the same way
+# so it can live outside the source tree.
+SIGNED_EXPORT_TRUSTED_PUBLIC_KEY = CredentialRequest(
+    name="signed_export_trusted_public_key", env_var="CALEE_SIGNED_EXPORT_PUBLIC_KEY",
+    keychain_service="calee-regression", keychain_account="signed-export-public-key", required=False,
+)
+
 REQUIRED_SECRETS = (REGRESSION_USERNAME, REGRESSION_PASSWORD)
-OPTIONAL_SECRETS = (API_TOKEN, AI_ANALYSIS_KEY)
+OPTIONAL_SECRETS = (
+    API_TOKEN, AI_ANALYSIS_KEY, APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_ISSUER_ID,
+    APP_STORE_CONNECT_PRIVATE_KEY, PLAY_CONSOLE_SERVICE_ACCOUNT_JSON, PLAY_CONSOLE_ACCESS_TOKEN,
+    SIGNED_EXPORT_TRUSTED_PUBLIC_KEY,
+)
 
 
 class EnvironmentProvider:

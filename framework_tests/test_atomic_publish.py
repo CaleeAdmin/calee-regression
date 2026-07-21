@@ -21,7 +21,9 @@ release_candidate.py and release_bundle_assembly.py):
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
+import threading
 import time
 
 import pytest
@@ -361,25 +363,66 @@ def test_concurrent_writer_is_rejected(tmp_path):
     paths.lock_path.unlink()
 
 
-def test_lock_abandoned_by_dead_process_is_reclaimed(tmp_path):
+def test_lock_abandoned_by_dead_process_on_same_host_is_reclaimed(tmp_path):
     pub_root = tmp_path / "candidate"
     paths = ap._Paths(pub_root)
     paths.pub_root.parent.mkdir(parents=True, exist_ok=True)
     # A pid essentially guaranteed not to be alive in this test process tree.
     dead_pid = 2**30
-    paths.lock_path.write_text(json.dumps({"pid": dead_pid, "acquiredAt": time.time()}))
+    paths.lock_path.write_text(json.dumps({"host": ap._current_host(), "pid": dead_pid, "acquiredAt": time.time()}))
     ap.publish_version(pub_root, _build_with({"a.txt": b"v1"}))
     assert _read(pub_root, "a.txt") == b"v1"
 
 
-def test_lock_older_than_stale_threshold_is_reclaimed_even_if_pid_alive(tmp_path):
+def test_lock_with_live_pid_on_same_host_is_never_reclaimed_regardless_of_age(tmp_path):
+    """Priority 4 requirement 4: a lock owned by a DEMONSTRABLY LIVE PID must
+    never be reclaimed solely because it is old. This is the corrected
+    behaviour -- the previous (pre-Priority-4) implementation reclaimed any
+    lock older than _STALE_LOCK_SECONDS even when the owning PID was
+    confirmed alive; that was exactly the fail-open bug this closes."""
     pub_root = tmp_path / "candidate"
     paths = ap._Paths(pub_root)
     paths.pub_root.parent.mkdir(parents=True, exist_ok=True)
     ancient = time.time() - (ap._STALE_LOCK_SECONDS + 3600)
-    paths.lock_path.write_text(json.dumps({"pid": os.getpid(), "acquiredAt": ancient}))
+    paths.lock_path.write_text(
+        json.dumps({"host": ap._current_host(), "pid": os.getpid(), "acquiredAt": ancient, "token": "live-owner"})
+    )
+    with pytest.raises(ap.ConcurrentWriterError):
+        ap.publish_version(pub_root, _build_with({"a.txt": b"v1"}), lock_timeout=0.2)
+    # The live owner's lock file must survive completely untouched.
+    assert json.loads(paths.lock_path.read_text())["token"] == "live-owner"
+    paths.lock_path.unlink()
+
+
+def test_lock_from_different_host_old_age_is_reclaimed_even_with_a_locally_live_looking_pid(tmp_path):
+    """The documented safe reclaim rule's OTHER branch: a lock recorded for a
+    DIFFERENT host cannot be PID-checked from here at all (the shared-
+    filesystem scenario the module has always described) -- even though the
+    recorded pid happens to number-match a real, live local process, that
+    coincidence must not be trusted; only the age-based fallback applies."""
+    pub_root = tmp_path / "candidate"
+    paths = ap._Paths(pub_root)
+    paths.pub_root.parent.mkdir(parents=True, exist_ok=True)
+    ancient = time.time() - (ap._STALE_LOCK_SECONDS + 3600)
+    paths.lock_path.write_text(
+        json.dumps({"host": "some-other-machine", "pid": os.getpid(), "acquiredAt": ancient})
+    )
     ap.publish_version(pub_root, _build_with({"a.txt": b"v1"}))
     assert _read(pub_root, "a.txt") == b"v1"
+
+
+def test_lock_from_different_host_young_age_is_protected(tmp_path):
+    """The flip side: a different-host lock that is still YOUNG must be
+    protected -- the age-based fallback only reclaims once genuinely stale."""
+    pub_root = tmp_path / "candidate"
+    paths = ap._Paths(pub_root)
+    paths.pub_root.parent.mkdir(parents=True, exist_ok=True)
+    paths.lock_path.write_text(
+        json.dumps({"host": "some-other-machine", "pid": os.getpid(), "acquiredAt": time.time(), "token": "remote-owner"})
+    )
+    with pytest.raises(ap.ConcurrentWriterError):
+        ap.publish_version(pub_root, _build_with({"a.txt": b"v1"}), lock_timeout=0.2)
+    paths.lock_path.unlink()
 
 
 def test_corrupt_lock_file_is_treated_as_abandoned(tmp_path):
@@ -389,3 +432,313 @@ def test_corrupt_lock_file_is_treated_as_abandoned(tmp_path):
     paths.lock_path.write_text("not json")
     ap.publish_version(pub_root, _build_with({"a.txt": b"v1"}))
     assert _read(pub_root, "a.txt") == b"v1"
+
+
+def test_lock_file_records_host_pid_token_and_lease_timestamp(tmp_path):
+    """Priority 4 requirement 5: the lock file itself must record a host
+    identifier, process identifier, random owner token, and lease timestamp
+    -- not just a bare pid+timestamp."""
+    pub_root = tmp_path / "candidate"
+    paths = ap._Paths(pub_root)
+    seen = {}
+
+    def _build(tmp_dir):
+        # While the lock is held, inspect what was actually written.
+        seen.update(json.loads(paths.lock_path.read_text()))
+        (tmp_dir / "a.txt").write_bytes(b"v1")
+
+    ap.publish_version(pub_root, _build)
+    assert seen["host"] == ap._current_host()
+    assert seen["pid"] == os.getpid()
+    assert isinstance(seen["token"], str) and len(seen["token"]) >= 16
+    assert isinstance(seen["acquiredAt"], (int, float))
+    # Released after the publish completes.
+    assert not paths.lock_path.exists()
+
+
+def test_write_lock_file_is_never_observable_partially_written(tmp_path):
+    """Direct regression test for a real torn-write race (Priority 4
+    bugfix, this session): a concurrent reader must never observe
+    ``lock_path`` existing with empty or unparseable content -- only
+    "absent" or "one complete, valid JSON object". The original
+    implementation created the file with ``O_CREAT | O_EXCL`` and then
+    wrote its JSON content as a separate step, leaving exactly that window
+    open; ``_read_lock_file`` landing in it got a ``JSONDecodeError``,
+    which ``_lock_is_stale`` (correctly, for an actually-corrupt leftover)
+    treated as "abandoned -- reclaim it", so a live, mid-write owner could
+    have its lock stolen out from under it. This reproduced as a genuine,
+    non-rare flake in the two-real-threads concurrency tests below."""
+    lock_path = tmp_path / "candidate.lock"
+    stop = threading.Event()
+    bad_reads = []
+
+    def _hammer_read():
+        while not stop.is_set():
+            try:
+                text = lock_path.read_text()
+            except OSError:
+                continue
+            if text == "":
+                bad_reads.append("empty")
+                continue
+            try:
+                json.loads(text)
+            except ValueError:
+                bad_reads.append(text)
+
+    reader = threading.Thread(target=_hammer_read)
+    reader.start()
+    try:
+        for i in range(300):
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            ap._write_lock_file(lock_path, {"host": "h", "pid": i, "token": f"t{i}", "acquiredAt": float(i)})
+    finally:
+        stop.set()
+        reader.join(timeout=5)
+
+    assert bad_reads == []
+
+
+def test_release_does_not_delete_a_lock_reclaimed_by_someone_else(tmp_path):
+    """Compare-and-delete on release (Priority 4): if the lock file no longer
+    names OUR token when we finish (e.g. a reclaimer decided we were
+    abandoned and took over), releasing must NOT delete it -- that would
+    destroy the new owner's live lock and let a third acquirer in."""
+    pub_root = tmp_path / "candidate"
+    paths = ap._Paths(pub_root)
+    paths.pub_root.parent.mkdir(parents=True, exist_ok=True)
+
+    with ap._lock(paths, timeout=1.0):
+        # Simulate a reclaimer replacing our lock file with its own while we
+        # still (incorrectly, from the reclaimer's point of view) believe we
+        # hold it.
+        paths.lock_path.unlink()
+        paths.lock_path.write_text(json.dumps({
+            "host": ap._current_host(), "pid": os.getpid() + 1, "token": "someone-elses-token",
+            "acquiredAt": time.time(),
+        }))
+
+    # Our __exit__ must have left the other owner's lock file untouched.
+    assert json.loads(paths.lock_path.read_text())["token"] == "someone-elses-token"
+
+
+# ── real concurrency: threads/processes actually racing (Priority 4) ───────
+
+
+def test_two_concurrent_publications_are_serialized_not_corrupted(tmp_path):
+    """Two real threads calling publish_version() for the SAME pub_root at
+    the same time must serialize through the lock -- neither ever sees a
+    partially-written pub_root, and the final state is exactly one of the
+    two builds' content in full, never a mix or a crash."""
+    pub_root = tmp_path / "candidate"
+    start = threading.Barrier(2)
+    errors = []
+
+    def _publish(content):
+        start.wait(timeout=5)
+        try:
+            ap.publish_version(pub_root, _build_with({"a.txt": content}))
+        except Exception as exc:  # pragma: no cover - surfaced via errors below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_publish, args=(c,)) for c in (b"from-A", b"from-B")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, errors
+    assert not any(t.is_alive() for t in threads)
+    final = _read(pub_root, "a.txt")
+    assert final in (b"from-A", b"from-B"), f"unexpected/corrupted final content: {final!r}"
+    paths = ap._Paths(pub_root)
+    assert not paths.lock_path.exists()
+    assert not paths.journal_path.exists()
+
+
+def test_recovery_and_publication_started_simultaneously_do_not_corrupt(tmp_path):
+    """A real recover() call and a real publish_version() call for the same
+    root, started at the same time, must serialize through the same lock --
+    recover() must never observe (or race) a publish that is mid-flight."""
+    pub_root = tmp_path / "candidate"
+    ap.publish_version(pub_root, _build_with({"a.txt": b"seed"}))
+
+    start = threading.Barrier(2)
+    errors = []
+
+    def _do_recover():
+        start.wait(timeout=5)
+        try:
+            ap.recover(pub_root)
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    def _do_publish():
+        start.wait(timeout=5)
+        try:
+            ap.publish_version(pub_root, _build_with({"a.txt": b"raced-publish"}))
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_do_recover), threading.Thread(target=_do_publish)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, errors
+    assert _read(pub_root, "a.txt") in (b"seed", b"raced-publish")
+    paths = ap._Paths(pub_root)
+    assert not paths.lock_path.exists()
+    assert not paths.journal_path.exists()
+
+
+def test_recover_blocks_while_publish_holds_the_lock(tmp_path):
+    """Priority 4 requirement 3: the public recover() must acquire the SAME
+    lock publish_version uses -- demonstrated by recover() genuinely
+    blocking (not racing ahead) while another thread holds it, then
+    proceeding once it's released."""
+    pub_root = tmp_path / "candidate"
+    paths = ap._Paths(pub_root)
+    publisher_may_finish = threading.Event()
+    publisher_started = threading.Event()
+
+    def _slow_build(tmp_dir):
+        (tmp_dir / "a.txt").write_bytes(b"slow")
+        publisher_started.set()
+        assert publisher_may_finish.wait(timeout=5), "test setup error: never released"
+
+    publish_thread = threading.Thread(target=lambda: ap.publish_version(pub_root, _slow_build))
+    publish_thread.start()
+    assert publisher_started.wait(timeout=5), "publish never reached its build step"
+    assert paths.lock_path.exists(), "the lock must already be held by the time build_fn runs"
+
+    recover_result = {}
+    recover_thread = threading.Thread(
+        target=lambda: recover_result.update(actions=ap.recover(pub_root, lock_timeout=5.0))
+    )
+    recover_thread.start()
+    # recover() must still be blocked, waiting for the lock the publisher holds.
+    recover_thread.join(timeout=0.5)
+    assert recover_thread.is_alive(), "recover() proceeded without waiting for the publish lock"
+
+    publisher_may_finish.set()
+    publish_thread.join(timeout=5)
+    recover_thread.join(timeout=5)
+    assert not recover_thread.is_alive()
+    assert "actions" in recover_result
+    assert _read(pub_root, "a.txt") == b"slow"
+
+
+def _child_die_after_journal_write(pub_root_str, content):
+    """Run in a SEPARATE OS PROCESS (Priority 4 concurrency test): acquire
+    the lock and perform every step _publish_locked performs up to and
+    including the durable journal write, then hard-exit via os._exit --
+    which, unlike a normal return/exception, never runs the lock's
+    context-manager cleanup -- leaving the lock file and journal behind
+    exactly as a real `kill -9` would, with a PID that is genuinely dead by
+    the time the parent process checks it."""
+    import os as _os
+    from calee_regression import atomic_publish as _ap
+
+    pub_root = _ap.Path(pub_root_str)
+    paths = _ap._Paths(pub_root)
+    # Keep a reference to the context-manager object alive for the rest of
+    # this function: __enter__() alone returns nothing we hold onto, and an
+    # unreferenced generator-based CM gets garbage-collected almost
+    # immediately, which runs its `finally` (releasing the lock) via
+    # GeneratorExit -- exactly the cleanup a real `kill -9` must NOT get.
+    lock_cm = _ap._lock(paths, timeout=30.0)
+    lock_cm.__enter__()  # never __exit__: simulates a kill
+    paths.versions_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = _ap.Path(_ap.tempfile.mkdtemp(dir=paths.versions_dir, prefix=".tmp-"))
+    (tmp_dir / "a.txt").write_bytes(content)
+    _ap._fsync_tree(tmp_dir)
+    version_name = _ap.directory_content_id(tmp_dir)
+    _os.rename(str(tmp_dir), str(paths.versions_dir / version_name))
+    previous_version = _ap._current_version_name(paths)
+    paths.journal_path.write_bytes(_ap.json.dumps(
+        {"newVersion": version_name, "previousVersion": previous_version, "phase": "swapping"}
+    ).encode("utf-8"))
+    assert lock_cm is not None  # keep the reference reachable up to here
+    _os._exit(1)  # died here: journal durable, pointer swap never started
+
+
+def _child_die_after_pointer_swap(pub_root_str, content):
+    """Like _child_die_after_journal_write, but dies one step later: the
+    pointer swap itself completed (the new content is already live) before
+    the hard-exit, so the lock and journal are left behind even though
+    activation already succeeded."""
+    import os as _os
+    from calee_regression import atomic_publish as _ap
+
+    pub_root = _ap.Path(pub_root_str)
+    paths = _ap._Paths(pub_root)
+    lock_cm = _ap._lock(paths, timeout=30.0)
+    lock_cm.__enter__()
+    paths.versions_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = _ap.Path(_ap.tempfile.mkdtemp(dir=paths.versions_dir, prefix=".tmp-"))
+    (tmp_dir / "a.txt").write_bytes(content)
+    _ap._fsync_tree(tmp_dir)
+    version_name = _ap.directory_content_id(tmp_dir)
+    _os.rename(str(tmp_dir), str(paths.versions_dir / version_name))
+    previous_version = _ap._current_version_name(paths)
+    paths.journal_path.write_bytes(_ap.json.dumps(
+        {"newVersion": version_name, "previousVersion": previous_version, "phase": "swapping"}
+    ).encode("utf-8"))
+    _ap._swap_pointer(paths, version_name)
+    assert lock_cm is not None  # keep the reference reachable up to here
+    _os._exit(1)  # died here: already committed, only cleanup never ran
+
+
+def test_process_dies_after_journal_write_is_reclaimed_and_recovered(tmp_path):
+    pub_root = tmp_path / "candidate"
+    ap.publish_version(pub_root, _build_with({"a.txt": b"v1"}))
+
+    child = multiprocessing.Process(target=_child_die_after_journal_write, args=(str(pub_root), b"v2-crashed"))
+    child.start()
+    child.join(timeout=10)
+    assert child.exitcode == 1
+
+    paths = ap._Paths(pub_root)
+    assert paths.lock_path.exists(), "test setup: the child must leave its lock file behind"
+    held = json.loads(paths.lock_path.read_text())
+    assert not ap._pid_alive(held["pid"]), "test setup: the child pid must actually be dead by now"
+    assert paths.journal_path.exists(), "test setup: the journal must be left behind"
+    # The crash happened BEFORE the pointer swap -- v1 must still be active.
+    assert _read(pub_root, "a.txt") == b"v1"
+
+    # The next writer must reclaim the dead lock and discard the interrupted
+    # (never-activated) transaction before proceeding with its own publish.
+    ap.publish_version(pub_root, _build_with({"a.txt": b"v3"}))
+    assert _read(pub_root, "a.txt") == b"v3"
+    assert not paths.lock_path.exists()
+    assert not paths.journal_path.exists()
+
+
+def test_process_dies_after_pointer_swap_is_reclaimed_and_cleaned_up(tmp_path):
+    pub_root = tmp_path / "candidate"
+    ap.publish_version(pub_root, _build_with({"a.txt": b"v1"}))
+
+    child = multiprocessing.Process(target=_child_die_after_pointer_swap, args=(str(pub_root), b"v2-crashed"))
+    child.start()
+    child.join(timeout=10)
+    assert child.exitcode == 1
+
+    paths = ap._Paths(pub_root)
+    assert paths.lock_path.exists(), "test setup: the child must leave its lock file behind"
+    held = json.loads(paths.lock_path.read_text())
+    assert not ap._pid_alive(held["pid"]), "test setup: the child pid must actually be dead by now"
+    assert paths.journal_path.exists(), "test setup: the journal must be left behind"
+    # The swap already happened before the crash -- new content is already
+    # visible even before anything reclaims the lock or runs recovery.
+    assert _read(pub_root, "a.txt") == b"v2-crashed"
+
+    actions = ap.recover(pub_root)
+    assert any("already committed" in a for a in actions)
+    assert _read(pub_root, "a.txt") == b"v2-crashed"
+    assert not paths.lock_path.exists()
+    assert not paths.journal_path.exists()

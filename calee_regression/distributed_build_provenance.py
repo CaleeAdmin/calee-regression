@@ -20,6 +20,28 @@ original flat, unprovenanced shape) can never reach PASS any more -- see
 that module's own docstring and ``consolidated_report.
 component_from_distributed_build_acceptance_report``.
 
+IMPORTANT -- what THIS module alone can and cannot prove: ``validate_
+distributed_evidence`` below only checks that a ``sourceEvidence`` dict is
+well-FORMED (schema, provider/channel allow-lists, a ``generatedBy``-
+specific proof-shape requirement like "signed-export needs a non-empty
+signatureOrArtifactProvenance object"). A hand-typed JSON file that simply
+claims ``generatedBy: "provider-api"`` with plausible-looking fields passes
+every one of those checks -- this module has no way to know the claim
+wasn't backed by a real API call. The actual "was this ever independently
+authenticated" gate lives one layer up, in ``provider_evidence.py``: only
+its live collectors / real signature verification / authenticated-artifact
+chain may set a record's ``evidenceTier`` to one of ``provider_evidence.
+AUTHENTICATED_TIERS`` (via :func:`build_provenance_record`'s
+``evidence_tier`` parameter -- see that parameter's own docstring). ``cli.
+py``'s ``record-distributed-build-acceptance`` stamps ``manual-unverified``
+unconditionally on its ``--source`` path, never from the file's own claimed
+content, and ``consolidated_report.component_from_distributed_build_
+acceptance_report`` independently re-checks ``evidenceTier`` membership at
+consolidation -- never trusting a report's recorded ``status`` alone. Treat
+this module as the tamper-evidence + content-shape layer; treat
+``provider_evidence.py`` as the origin-authentication layer they compose
+with.
+
 Two independent digests, same distinction ``selector_provenance.py`` draws:
 
   * ``sourceContentDigest`` -- a *semantic* digest over the canonical JSON of
@@ -305,10 +327,21 @@ def build_provenance_record(
     adopted_by: str,
     source_path: str,
     raw_source_bytes: "bytes | None" = None,
+    evidence_tier: "str | None" = None,
 ) -> "dict[str, Any]":
     """Build the immutable-source + adoption provenance record (Priority
     3.4-3.6), envelope-protected. Mirrors
-    ``selector_provenance.build_provenance_record``."""
+    ``selector_provenance.build_provenance_record``.
+
+    ``evidence_tier``, when given, is stamped into the record (and so
+    covered by ``envelopeDigest`` like every other field -- tampering with
+    it after the fact is detected exactly like tampering with any other
+    field). It must be set by the CALLER's own control flow -- e.g. which
+    of ``provider_evidence.py``'s live-collection/signed-export/CI-artifact
+    paths actually ran and verified successfully -- never copied from
+    ``source_evidence`` content itself, or an operator-supplied claim could
+    simply declare its own tier. See ``provider_evidence.AUTHENTICATED_
+    TIERS`` for which tiers this can ever justify a PASS."""
     preserved = json.loads(json.dumps(source_evidence))
     record: "dict[str, Any]" = {
         "sourceEvidence": preserved,
@@ -322,6 +355,8 @@ def build_provenance_record(
     }
     if raw_source_bytes is not None:
         record["sourceRawSha256"] = raw_sha256(raw_source_bytes)
+    if evidence_tier is not None:
+        record["evidenceTier"] = evidence_tier
     record["envelopeDigest"] = envelope_digest(record)
     return record
 

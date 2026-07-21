@@ -97,11 +97,24 @@ def _write_acceptance(workspace, **overrides):
     path.write_text(json.dumps({"runId": RUN_ID, "evidence": data, "status": "passed"}))
 
 
-def _write_provenance_acceptance(workspace, run_id=RUN_ID, **overrides):
+_TIER_DEFAULT = object()  # sentinel: distinguishes "not given" from "explicitly None"
+
+
+def _write_provenance_acceptance(workspace, run_id=RUN_ID, evidence_tier=_TIER_DEFAULT, **overrides):
     """Priority 3 (this session): the authenticated provenance-backed shape --
-    the only one that can reach PASS. Mirrors exactly what
-    'record-distributed-build-acceptance --source ...' produces."""
+    the only one that can reach PASS. Mirrors what a genuine live collection
+    via 'record-distributed-build-acceptance --provider ...' produces
+    (``evidenceTier`` defaults to the live-collection tier when not given at
+    all; pass ``evidence_tier=None`` explicitly to build the record with NO
+    tier -- exactly what a hand-authored ``--source`` file produces, since
+    the CLI never lets an operator claim one -- which can never reach PASS
+    any more; see test_required_and_hand_authored_provenance_with_no_
+    evidence_tier_can_never_pass below)."""
     from calee_regression import distributed_build_provenance as dbp
+    from calee_regression import provider_evidence as pe
+
+    if evidence_tier is _TIER_DEFAULT:
+        evidence_tier = pe.TIER_PROVIDER_API_LIVE
 
     evidence = dict(
         schemaVersion=2, component="caleemobile-distributed-build-acceptance",
@@ -115,7 +128,7 @@ def _write_provenance_acceptance(workspace, run_id=RUN_ID, **overrides):
     raw_bytes = json.dumps(evidence).encode("utf-8")
     record = dbp.build_provenance_record(
         evidence, release_run_id=run_id, adopted_at=_fresh_ts(), adopted_by="technical-owner",
-        source_path="/tmp/fake-evidence.json", raw_source_bytes=raw_bytes,
+        source_path="/tmp/fake-evidence.json", raw_source_bytes=raw_bytes, evidence_tier=evidence_tier,
     )
     component_dir = workspace.component_dir("distributed-build-acceptance")
     dbp.write_evidence_bundle(component_dir, record, source_bytes=raw_bytes)
@@ -174,7 +187,57 @@ def test_required_and_legacy_manual_evidence_can_never_pass(tmp_path):
     assert result.exit_code == EXIT_BLOCKED, result.output
     component = _component(tmp_path, "Distributed-build acceptance")
     assert component["status"] == "blocked"
-    assert any("DEPRECATED" in d and "never PASS" in d for d in component["detail"])
+
+
+def test_required_and_hand_authored_provenance_with_no_evidence_tier_can_never_pass(tmp_path):
+    """The actual Priority 3 vulnerability this session closes: a
+    ``provenance`` record that is otherwise perfectly well-formed (correct
+    envelope digest, correct content digest, every field validates) but has
+    NO ``evidenceTier`` -- exactly what a hand-authored ``--source`` JSON
+    file produces, since the CLI never lets an operator claim a tier -- must
+    still BLOCK at consolidation. Before this session's fix, this exact
+    record would have PASSED (digest/format checks were the only gate)."""
+    from calee_regression import provider_evidence as pe
+
+    workspace = _seed_minimal_release(tmp_path, distributed_build_required=True)
+    _write_provenance_acceptance(workspace, evidence_tier=None)
+    result = _consolidate(tmp_path)
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    component = _component(tmp_path, "Distributed-build acceptance")
+    assert component["status"] == "blocked"
+    assert any("not an independently-authenticated tier" in d for d in component["detail"])
+    assert component["evidence"]["evidenceTier"] is None
+
+
+def test_required_and_provenance_claiming_manual_unverified_tier_can_never_pass(tmp_path):
+    """Same as above, but the record explicitly (rather than silently)
+    claims the manual-unverified tier -- e.g. exactly what
+    'record-distributed-build-acceptance --source' now stamps. Still
+    BLOCKED, never PASS, no matter how well-formed the rest is."""
+    from calee_regression import provider_evidence as pe
+
+    workspace = _seed_minimal_release(tmp_path, distributed_build_required=True)
+    _write_provenance_acceptance(workspace, evidence_tier=pe.TIER_MANUAL_UNVERIFIED)
+    result = _consolidate(tmp_path)
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    component = _component(tmp_path, "Distributed-build acceptance")
+    assert component["status"] == "blocked"
+    assert any("not an independently-authenticated tier" in d for d in component["detail"])
+
+
+@pytest.mark.parametrize("tier", [
+    "provider-api-live", "github-authenticated-artifact", "verified-signed-export",
+])
+def test_required_and_every_authenticated_tier_can_pass(tmp_path, tier):
+    """Each of the three genuinely-authenticated tiers (and only these
+    three) is sufficient on its own -- the gate checks tier MEMBERSHIP, not
+    one specific tier value."""
+    workspace = _seed_minimal_release(tmp_path, distributed_build_required=True)
+    _write_provenance_acceptance(workspace, evidence_tier=tier)
+    result = _consolidate(tmp_path)
+    assert result.exit_code == EXIT_SUCCESS, result.output
+    component = _component(tmp_path, "Distributed-build acceptance")
+    assert component["status"] == "pass"
 
 
 def test_required_but_evidence_claims_local_checkout_blocks(tmp_path):

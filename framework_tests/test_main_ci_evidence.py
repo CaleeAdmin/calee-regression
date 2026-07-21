@@ -18,8 +18,11 @@ def _simple_summary(**overrides) -> dict:
     """calee-regression's own actual evidence shape (framework-test-
     summary.json): one unconditional job, no gates breakdown."""
     data = dict(
+        schemaVersion=1, repository="CaleeAdmin/calee-regression",
+        workflowFile=".github/workflows/framework-tests.yml",
         workflow="framework-tests", event="push", ref="refs/heads/main",
         commitSha=SHA, runId="123456", runAttempt="1", isMainPush=True, isMergeGroup=False,
+        generatedAt="2026-07-21T00:00:00Z",
     )
     data.update(overrides)
     return data
@@ -29,6 +32,8 @@ def _rich_summary(**overrides) -> dict:
     """CaleeMobile-Regression's ci-summary.json shape: multiple named gates
     + skip classification."""
     data = dict(
+        schemaVersion=1, repository="CaleeAdmin/CaleeMobile-Regression",
+        workflowFile=".github/workflows/ci.yml", workflow="ci",
         commitSha=SHA, runId="999", event="push", ref="refs/heads/main",
         isMainPush=True, isMergeGroup=False, hasCaleemobileToken=True,
         gates={
@@ -37,6 +42,7 @@ def _rich_summary(**overrides) -> dict:
             "uiSuiteAnalyze": "success", "releaseCertificationGuard": "success",
         },
         skipClassification={},
+        generatedAt="2026-07-21T00:00:00Z",
     )
     data.update(overrides)
     return data
@@ -217,3 +223,106 @@ def test_load_summary_non_object_json_raises(tmp_path):
     path.write_text("[1, 2, 3]")
     with pytest.raises(mce.MainCiEvidenceError):
         mce.load_summary(path)
+
+
+# ── Priority 5 (this session): schemaVersion ────────────────────────────
+
+
+def test_missing_schema_version_blocks():
+    summary = _simple_summary()
+    del summary["schemaVersion"]
+    problems = _verify(summary)
+    assert any("no schemaVersion" in p for p in problems)
+
+
+def test_unsupported_schema_version_blocks():
+    problems = _verify(_simple_summary(schemaVersion=999))
+    assert any("schemaVersion 999" in p and "not supported" in p for p in problems)
+
+
+def test_non_integer_schema_version_blocks():
+    problems = _verify(_simple_summary(schemaVersion="1"))
+    assert any("must be a JSON integer" in p for p in problems)
+
+
+def test_boolean_schema_version_blocks():
+    problems = _verify(_simple_summary(schemaVersion=True))
+    assert any("must be a JSON integer" in p for p in problems)
+
+
+# ── Priority 5: repository / workflowFile cross-check ───────────────────
+
+
+def test_expected_repository_mismatch_blocks():
+    problems = _verify(_rich_summary(), expected_repository="CaleeAdmin/some-other-repo")
+    assert any("repository" in p and "!= expected" in p for p in problems)
+
+
+def test_expected_repository_missing_from_evidence_blocks():
+    summary = _rich_summary()
+    del summary["repository"]
+    problems = _verify(summary, expected_repository=mce.CALEEMOBILE_REGRESSION_REPOSITORY)
+    assert any("no repository recorded" in p for p in problems)
+
+
+def test_expected_workflow_file_mismatch_blocks():
+    problems = _verify(_rich_summary(), expected_workflow_file=".github/workflows/other.yml")
+    assert any("workflowFile" in p and "!= expected" in p for p in problems)
+
+
+def test_matching_repository_and_workflow_file_accepted():
+    problems = _verify(
+        _rich_summary(),
+        expected_repository=mce.CALEEMOBILE_REGRESSION_REPOSITORY,
+        expected_workflow_file=mce.CALEEMOBILE_REGRESSION_WORKFLOW_FILE,
+    )
+    assert problems == []
+
+
+# ── Priority 5: canonical required gates enforced even without
+#    --required-gate, and an empty/truncated gates object BLOCKS ───────────
+
+
+def test_canonical_gates_enforced_even_without_explicit_required_gate():
+    summary = _rich_summary()
+    del summary["gates"]["selectorContract"]
+    problems = _verify(summary, canonical_required_gates=mce.CALEEMOBILE_REGRESSION_REQUIRED_GATES)
+    assert any("selectorContract" in p and "not present" in p for p in problems)
+
+
+def test_empty_gates_object_blocks_when_canonical_gates_apply():
+    summary = _rich_summary(gates={})
+    problems = _verify(summary, canonical_required_gates=mce.CALEEMOBILE_REGRESSION_REQUIRED_GATES)
+    assert any("empty" in p for p in problems)
+
+
+def test_missing_gates_object_blocks_when_canonical_gates_apply():
+    summary = _rich_summary()
+    del summary["gates"]
+    problems = _verify(summary, canonical_required_gates=mce.CALEEMOBILE_REGRESSION_REQUIRED_GATES)
+    assert any("no 'gates' breakdown at all" in p for p in problems)
+
+
+def test_canonical_gates_all_present_and_successful_accepted():
+    problems = _verify(_rich_summary(), canonical_required_gates=mce.CALEEMOBILE_REGRESSION_REQUIRED_GATES)
+    assert problems == []
+
+
+def test_canonical_gates_union_with_explicit_required_gate():
+    """canonical_required_gates and an explicit required_gates list are a
+    UNION, not an override -- both sets are enforced."""
+    summary = _rich_summary()
+    del summary["gates"]["apiFrameworkTests"]
+    problems = _verify(
+        summary, required_gates=["apiFrameworkTests"],
+        canonical_required_gates=mce.CALEEMOBILE_REGRESSION_REQUIRED_GATES,
+    )
+    assert any("apiFrameworkTests" in p and "not present" in p for p in problems)
+
+
+def test_simple_shape_unaffected_by_absent_canonical_gates():
+    """calee-regression's own simple, gate-less shape must be unaffected when
+    no canonical_required_gates is supplied (the default, offline-verify
+    path for its own evidence) -- an absent 'gates' key must not spuriously
+    block."""
+    assert _verify(_simple_summary()) == []

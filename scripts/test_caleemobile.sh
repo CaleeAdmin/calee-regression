@@ -133,13 +133,23 @@ if [ "$RUN_UI" = true ]; then
 fi
 
 # --- Release-feature scope (Workstream 1) --------------------------------
-# The full-solution launcher ("06 Test Full Calee Solution") already exported
-# the CALEE_RELEASE_FEATURE_* profile before invoking us. A standalone
-# "03/04 Test CaleeMobile ..." run has not, so populate it here from the SAME
-# parsed config/release-platforms.yaml the consolidator uses -- via the
-# release-platforms command's exported lines, NEVER a second YAML parse in
-# bash. An omitted feature defaults to mandatory=true (see release_platforms.py
-# and the "omitted requirement must never silently become optional" rule).
+# KNOWN GAP (found during a Priority 8 documentation-drift audit, not yet
+# fixed): unlike "06"'s OWN --meals/--onboarding/--google-calendar/
+# --kiosk-admin-mandatory flags passed to `consolidate` (which correctly
+# prefer this run's schema-v2 release-config feature scope when one was
+# composed), this fallback -- reached both from a standalone "03/04 Test
+# CaleeMobile ..." run AND from "06" itself, since "06" never exports
+# CALEE_RELEASE_FEATURE_* before invoking this script -- ALWAYS reads
+# meals/onboarding/google_calendar/kiosk_admin from legacy
+# config/release-platforms.yaml (via the `release-platforms` command's
+# exported lines, never a second YAML parse in bash), even for a schema-v2
+# release whose bundle declares a different feature scope. This only affects
+# whether the Flutter UI suite treats a missing feature mid-run as a benign
+# optional skip vs. an ENVIRONMENT_BLOCKED failure; `consolidate`'s own final
+# release-gating decision for these features is unaffected (it resolves
+# separately and correctly, see above). An omitted feature defaults to
+# mandatory=true (see release_platforms.py and the "omitted requirement must
+# never silently become optional" rule).
 if [ -z "${CALEE_RELEASE_FEATURE_MEALS:-}" ]; then
     eval "$(python -m calee_regression release-platforms)"
 fi

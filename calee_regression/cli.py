@@ -18,6 +18,7 @@ from . import config as config_mod
 from . import credentials as credentials_mod
 from . import distributed_build_acceptance as distributed_build_acceptance_mod
 from . import manual_checks as manual_checks_mod
+from . import provider_evidence as provider_evidence_mod
 from . import preflight, release_platforms, reporting, suites
 from . import report_root as report_root_mod
 from . import run_context
@@ -768,9 +769,11 @@ def _write_sync_marker(
 )
 @click.option(
     "--mandatory/--optional", "mandatory_opt", default=None,
-    help="Whether cross-device synchronization is release-gating for this run. Defaults to "
-         "config/release-platforms.yaml (release_features.synchronization), or True if absent. "
-         "An excluded (optional) sync is recorded as an explicit optional component, never run.",
+    help="Whether cross-device synchronization is release-gating for this run. Defaults to this "
+         "run's own schema-v2 release-config feature scope when one was composed (never the legacy "
+         "file in that case), else config/release-platforms.yaml (release_features.synchronization), "
+         "or True if neither is available. An excluded (optional) sync is recorded as an explicit "
+         "optional component, never run.",
 )
 @click.option(
     "--task-id", default=None,
@@ -1016,9 +1019,11 @@ def _detect_disposable_tablet(serial: "str | None") -> "dict | None":
 )
 @click.option(
     "--mandatory/--optional", "mandatory_opt", default=None,
-    help="Whether CaleeShell kiosk/admin is release-gating for this run. Defaults to "
-         "config/release-platforms.yaml (release_features.kiosk_admin), or True if absent. "
-         "An excluded (optional) kiosk/admin is recorded as an explicit optional component, never run.",
+    help="Whether CaleeShell kiosk/admin is release-gating for this run. Defaults to this run's own "
+         "schema-v2 release-config feature scope when one was composed (never the legacy file in "
+         "that case), else config/release-platforms.yaml (release_features.kiosk_admin), or True if "
+         "neither is available. An excluded (optional) kiosk/admin is recorded as an explicit "
+         "optional component, never run.",
 )
 @click.option(
     "--confirm-technical", is_flag=True, default=False,
@@ -1236,9 +1241,15 @@ def verify_selector_evidence_cmd(evidence_path, expected_sha, expected_version, 
     the machine-readable selector-contract result and BLOCKS (exit 3) when the
     contract didn't PASS, the tested SHA/version is missing/malformed, or the
     tested SHA/version differs from the expected CaleeMobile release identity.
-    When --expected-sha/--expected-version are omitted they fall back to the
-    expected identity in config/release-platforms.yaml, so a release run
-    verifies against the same intended target the consolidator does.
+
+    This is a standalone spot-check utility -- it is NOT part of the
+    `consolidate`/`selector-contract` release-gating pipeline (grep the
+    codebase: nothing else calls it) and it has NO schema-v2 awareness: when
+    --expected-sha/--expected-version are omitted they fall back ONLY to
+    config/release-platforms.yaml's expected identity, even for a schema-v2
+    release whose actual expected identity comes from the release-candidate
+    bundle instead. For the identity the real release run actually enforces,
+    see `selector-contract` (which IS schema-v2-aware) and `consolidate`.
     """
     if expected_sha is None or expected_version is None:
         try:
@@ -1285,12 +1296,15 @@ def verify_selector_evidence_cmd(evidence_path, expected_sha, expected_version, 
 )
 @click.option(
     "--expected-sha", "expected_sha", default=None,
-    help="Expected full CaleeMobile release SHA. Defaults to config/release-platforms.yaml "
-         "(caleemobile_git_sha), then the detected CaleeMobile checkout HEAD.",
+    help="Expected full CaleeMobile release SHA. Defaults to this run's own schema-v2 "
+         "release-config identity when one was composed (never the legacy file in that case), else "
+         "config/release-platforms.yaml (caleemobile_git_sha), then the detected CaleeMobile "
+         "checkout HEAD.",
 )
 @click.option(
     "--expected-version", "expected_version", default=None,
-    help="Expected CaleeMobile release version. Defaults to config "
+    help="Expected CaleeMobile release version. Defaults to this run's own schema-v2 release-config "
+         "identity when one was composed (never the legacy file in that case), else config "
          "(caleemobile_build_version), then the detected checkout pubspec version.",
 )
 @click.option(
@@ -1317,7 +1331,8 @@ def verify_selector_evidence_cmd(evidence_path, expected_sha, expected_version, 
     "--production/--development", "production_opt", default=None,
     help="Production release profile (Priority 1, Problem A): production accepts ONLY "
          "a CI-produced selector artifact (--source with generatedBy=ci); local "
-         "generation is refused. Defaults to config/release-platforms.yaml.",
+         "generation is refused. Defaults to this run's own schema-v2 release-config profile when "
+         "one was composed (never the legacy file in that case), else config/release-platforms.yaml.",
 )
 @click.option(
     "--source-artifact-id", "source_artifact_id", default=None,
@@ -1740,18 +1755,64 @@ def selector_contract_cmd(
          "reports/runs/<run-id>/distributed-build-acceptance/results.json.",
 )
 @click.option(
+    "--provider", "live_provider", default=None,
+    type=click.Choice(sorted([provider_evidence_mod.PROVIDER_APP_STORE_CONNECT, provider_evidence_mod.PROVIDER_PLAY_CONSOLE])),
+    help="Priority 3: perform a LIVE authenticated collection from this provider's API right now, "
+         "using credentials resolved via credentials.py (tier provider-api-live -- the strongest "
+         "evidence tier). Requires --app-id/--build-version (app_store_connect) or "
+         "--package-name/--track (play_console).",
+)
+@click.option("--app-id", default=None, help="App Store Connect app id (--provider app_store_connect).")
+@click.option("--build-version", "asc_build_version", default=None, help="TestFlight/App Store Connect build/version number to match (--provider app_store_connect).")
+@click.option("--package-name", default=None, help="Play Console package name (--provider play_console).")
+@click.option("--track", "play_track", default=None, help="Play Console release track, e.g. 'internal' (--provider play_console).")
+@click.option(
+    "--signed-export", "signed_export_payload_path", default=None, type=click.Path(exists=True, dir_okay=False),
+    help="Priority 3: path to a signed-export evidence PAYLOAD JSON (the unsigned canonical claim). "
+         "Requires --export-signature. Produces tier verified-signed-export ONLY if the detached "
+         "signature cryptographically verifies against the configured trusted public key -- a claim "
+         "with no genuine signature is rejected outright, never recorded as a weaker pass.",
+)
+@click.option(
+    "--export-signature", "signed_export_signature_path", default=None, type=click.Path(exists=True, dir_okay=False),
+    help="Path to the raw detached signature bytes over --signed-export's exact canonical payload bytes.",
+)
+@click.option("--signer-fingerprint", default=None, help="Human-readable identifier of the signer key, recorded alongside the verified signature (not itself verified).")
+@click.option(
+    "--trusted-public-key-file", default=None, type=click.Path(exists=True, dir_okay=False),
+    help="Override the configured CALEE_SIGNED_EXPORT_PUBLIC_KEY credential with a PEM public key file.",
+)
+@click.option(
+    "--github-run-id", default=None,
+    help="Priority 3: GitHub Actions workflow run id that produced a retained distributed-build-"
+         "evidence artifact (tier github-authenticated-artifact) -- the CI run itself must have "
+         "collected the nested evidence live via one of the collectors above; a hand-typed claim "
+         "smuggled through an otherwise-real artifact is still rejected. Requires "
+         "--github-artifact-id/--github-repository/--github-workflow-file/--github-artifact-name/"
+         "--github-result-filename.",
+)
+@click.option("--github-artifact-id", default=None, help="GitHub Actions artifact id within --github-run-id.")
+@click.option("--github-repository", default=None, help="owner/repo the run/artifact belong to.")
+@click.option("--github-workflow-file", default=None, help="Expected workflow file path, e.g. .github/workflows/collect-distributed-build-evidence.yml.")
+@click.option("--github-artifact-name", default=None, help="Expected artifact name.")
+@click.option("--github-result-filename", default=None, help="Expected JSON filename inside the artifact ZIP.")
+@click.option(
+    "--github-artifact-zip", "github_artifact_zip_path", default=None, type=click.Path(exists=True, dir_okay=False),
+    help="An already-downloaded artifact ZIP -- metadata (run/artifact ownership, digest) is still "
+         "authenticated live via the GitHub API; an operator-supplied ZIP alone is never sufficient.",
+)
+@click.option(
     "--source", "source_path", default=None, type=click.Path(exists=True, dir_okay=False),
-    help="Priority 3: path to an AUTHENTICATED provenance evidence JSON file -- an App Store "
-         "Connect/TestFlight API result, a Play Console API result, a signed store-export package, "
-         "or a retained CI artifact containing authenticated provider evidence. Required for this "
-         "command to ever produce a PASS; without it, only a deprecated, always-blocked-unverified "
-         "manual record can be written (see the legacy --channel/--verified-via flags below).",
+    help="Records an operator-supplied evidence JSON file for audit purposes. This process never "
+         "independently authenticates it -- it can NEVER produce a PASS, regardless of how "
+         "well-formed/self-consistent the content looks (always recorded as blocked-unverified). Use "
+         "--provider / --signed-export / --github-run-id above to reach a PASS.",
 )
 @click.option("--adopted-by", default=None, help="Who/what is adopting this evidence (defaults to the OS user).")
 @click.option(
     "--channel", required=False, default=None,
     type=click.Choice(sorted(distributed_build_acceptance_mod.VALID_CHANNELS)),
-    help="DEPRECATED legacy path (no --source): which distribution channel this manual claim is for.",
+    help="DEPRECATED legacy path (no --source/live mode): which distribution channel this manual claim is for.",
 )
 @click.option(
     "--distributed-build-id", "distributed_build_id", default=None,
@@ -1762,29 +1823,38 @@ def selector_contract_cmd(
 @click.option(
     "--verified-via", "verified_via", default=None,
     help="DEPRECATED legacy path: an operator-typed label. This can NEVER produce a PASS any more -- "
-         "see --source. Retained only so a legacy/manual claim can still be recorded as an explicit, "
-         "clearly-labelled blocked-unverified (or informational, when not required) component, never "
-         "silently omitted.",
+         "see --provider/--signed-export/--github-run-id. Retained only so a legacy/manual claim can "
+         "still be recorded as an explicit, clearly-labelled blocked-unverified (or informational, "
+         "when not required) component, never silently omitted.",
 )
 @click.option("--release-id", "release_id_opt", envvar="CALEE_RELEASE_ID", default=None, help="The release ID this evidence is bound to.")
 @click.option("--expected-git-sha", "expected_git_sha", default=None, help="Expected CaleeMobile release SHA; a mismatch BLOCKS.")
 @click.option("--expected-version", "expected_version", default=None, help="Expected CaleeMobile release version; a mismatch BLOCKS.")
 @click.option("--expected-release-id", "expected_release_id", default=None, help="Expected release ID; defaults to this run's own release-config releaseId.")
 def record_distributed_build_acceptance_cmd(
-    run_id_opt, source_path, adopted_by, channel, distributed_build_id, tested_git_sha, tested_version,
+    run_id_opt, live_provider, app_id, asc_build_version, package_name, play_track,
+    signed_export_payload_path, signed_export_signature_path, signer_fingerprint, trusted_public_key_file,
+    github_run_id, github_artifact_id, github_repository, github_workflow_file, github_artifact_name,
+    github_result_filename, github_artifact_zip_path,
+    source_path, adopted_by, channel, distributed_build_id, tested_git_sha, tested_version,
     verified_via, release_id_opt, expected_git_sha, expected_version, expected_release_id,
 ):
     """Records distributed-build acceptance evidence for THIS release run
     (Priority 3): explicit, externally-verifiable proof that a distributed/
     TestFlight/store build's identity matches the release candidate.
 
-    A PASS is produced ONLY from an authenticated provenance evidence file
-    (``--source``) -- never from operator-typed identity flags alone (the
-    legacy ``--channel``/``--verified-via`` path below can, at best, record an
-    explicit ``blocked-unverified`` component). With no authentic evidence at
-    all, the component stays BLOCKED.
+    A PASS is produced ONLY from evidence THIS PROCESS itself independently
+    authenticated: a live provider-API collection (``--provider``), a
+    cryptographically-verified signed export (``--signed-export``), or an
+    authenticated GitHub CI artifact whose nested content was itself
+    live-collected (``--github-run-id``). Operator-supplied ``--source``
+    JSON and the legacy ``--channel``/``--verified-via`` flags can, at best,
+    record an explicit ``blocked-unverified`` component -- never a PASS, no
+    matter how well-formed the content looks. With no evidence at all, the
+    component stays BLOCKED.
     """
     from . import distributed_build_provenance as dbp_mod
+    pe_mod = provider_evidence_mod
 
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
@@ -1800,33 +1870,42 @@ def record_distributed_build_acceptance_cmd(
 
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    if source_path:
-        # Priority 3: the ONLY path that can produce a PASS.
-        raw_bytes = Path(source_path).read_bytes()
-        try:
-            evidence = json.loads(raw_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            click.echo(f"--source {source_path!r} is not valid JSON: {exc}", err=True)
-            raise SystemExit(EXIT_INVALID_CONFIG)
-        if not isinstance(evidence, dict):
-            click.echo(f"--source {source_path!r} must contain a JSON object.", err=True)
-            raise SystemExit(EXIT_INVALID_CONFIG)
+    live_modes = [
+        name for name, given in (
+            ("--provider", live_provider is not None),
+            ("--signed-export", signed_export_payload_path is not None),
+            ("--github-run-id", github_run_id is not None),
+        ) if given
+    ]
+    if len(live_modes) > 1:
+        click.echo(f"Only one of --provider / --signed-export / --github-run-id may be used at a time; got {live_modes}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
 
+    def _record_authenticated(evidence: dict, *, raw_bytes: bytes, evidence_tier: str, source_label: str) -> None:
         adopted_by_label = adopted_by or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
         record = dbp_mod.build_provenance_record(
             evidence, release_run_id=run_id_opt, adopted_at=timestamp, adopted_by=adopted_by_label,
-            source_path=str(source_path), raw_source_bytes=raw_bytes,
+            source_path=source_label, raw_source_bytes=raw_bytes, evidence_tier=evidence_tier,
         )
         problems = dbp_mod.verify_provenance_record(
             record, source_bytes=raw_bytes, expected_release_run_id=run_id_opt,
             expected_git_sha=expected_git_sha, expected_version=expected_version,
             expected_release_id=expected_release_id,
         )
+        if evidence_tier not in pe_mod.AUTHENTICATED_TIERS:
+            # Defence in depth: every call site below only ever passes an
+            # authenticated tier, but this keeps the CLI's own immediate
+            # verdict correct even if that ever changes, matching
+            # consolidated_report.py's independent re-check at consolidation.
+            problems = list(problems) + [
+                f"evidence tier {evidence_tier!r} is not an independently-authenticated tier."
+            ]
         status = "passed" if not problems else "blocked"
         report = {
             "runId": run_id_opt,
             "component": dbp_mod.DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT,
             "status": status,
+            "evidenceTier": evidence_tier,
             "provenance": record,
             "problems": list(problems),
             "generatedAt": timestamp,
@@ -1841,13 +1920,176 @@ def record_distributed_build_acceptance_cmd(
             ev = record["sourceEvidence"]
             click.echo(
                 f"Distributed-build acceptance PASS via {ev.get('provider')}/{ev.get('generatedBy')} "
-                f"({ev.get('channel')} build {ev.get('distributedBuildId')}) for CaleeMobile "
-                f"{ev.get('testedVersion')} @ {ev.get('testedGitSha')}."
+                f"[{evidence_tier}] ({ev.get('channel')} build {ev.get('distributedBuildId')}) for "
+                f"CaleeMobile {ev.get('testedVersion')} @ {ev.get('testedGitSha')}."
             )
         else:
             click.echo("Distributed-build acceptance evidence REJECTED: " + "; ".join(problems))
         click.echo(f"Recorded: {report_path}")
         raise SystemExit(EXIT_SUCCESS if status == "passed" else EXIT_BLOCKED)
+
+    if live_provider is not None:
+        # Priority 3, tier provider-api-live: THIS process makes the
+        # authenticated HTTPS request itself, right now.
+        try:
+            if live_provider == pe_mod.PROVIDER_APP_STORE_CONNECT:
+                if not app_id or not asc_build_version:
+                    click.echo("--provider app_store_connect requires --app-id and --build-version.", err=True)
+                    raise SystemExit(EXIT_INVALID_CONFIG)
+                record = pe_mod.collect_app_store_connect_evidence(
+                    app_id=app_id, build_version=asc_build_version, requested_git_sha=expected_git_sha,
+                    requested_version=expected_version, release_id=expected_release_id,
+                    collection_run_id=run_id_opt,
+                )
+            else:
+                if not package_name or not play_track:
+                    click.echo("--provider play_console requires --package-name and --track.", err=True)
+                    raise SystemExit(EXIT_INVALID_CONFIG)
+                record = pe_mod.collect_play_console_evidence(
+                    package_name=package_name, track=play_track, requested_git_sha=expected_git_sha,
+                    requested_version=expected_version, release_id=expected_release_id,
+                    collection_run_id=run_id_opt,
+                )
+        except pe_mod.ProviderEvidenceError as exc:
+            click.echo(f"Distributed-build acceptance BLOCKED: {exc}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        evidence = record.to_evidence_dict()
+        _record_authenticated(
+            evidence, raw_bytes=record.raw_response_bytes, evidence_tier=pe_mod.TIER_PROVIDER_API_LIVE,
+            source_label=f"live:{live_provider}",
+        )
+        return
+
+    if signed_export_payload_path is not None:
+        # Priority 3, tier verified-signed-export: a real detached signature
+        # cryptographically verified against a configured trusted public key.
+        if signed_export_signature_path is None:
+            click.echo("--signed-export requires --export-signature.", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        try:
+            payload = json.loads(Path(signed_export_payload_path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            click.echo(f"--signed-export {signed_export_payload_path!r} is not valid JSON: {exc}", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        if not isinstance(payload, dict):
+            click.echo(f"--signed-export {signed_export_payload_path!r} must contain a JSON object.", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        signature_bytes = Path(signed_export_signature_path).read_bytes()
+        if trusted_public_key_file:
+            trusted_public_key_pem = Path(trusted_public_key_file).read_text(encoding="utf-8")
+        else:
+            resolver = credentials_mod.default_resolver()
+            try:
+                trusted_public_key_pem = resolver.require(credentials_mod.SIGNED_EXPORT_TRUSTED_PUBLIC_KEY)
+            except credentials_mod.CredentialError as exc:
+                click.echo(f"Distributed-build acceptance BLOCKED: {exc}", err=True)
+                raise SystemExit(EXIT_BLOCKED)
+        evidence, sig_problems = pe_mod.build_signed_export_evidence(
+            payload=payload, signature_bytes=signature_bytes, trusted_public_key_pem=trusted_public_key_pem,
+            signer_fingerprint=signer_fingerprint or "unspecified",
+        )
+        if sig_problems:
+            click.echo("Distributed-build acceptance BLOCKED -- signed-export signature verification failed:", err=True)
+            for problem in sig_problems:
+                click.echo(f"  - {problem}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        raw_bytes = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        _record_authenticated(
+            evidence, raw_bytes=raw_bytes, evidence_tier=pe_mod.TIER_VERIFIED_SIGNED_EXPORT,
+            source_label=f"signed-export:{signed_export_payload_path}",
+        )
+        return
+
+    if github_run_id is not None:
+        # Priority 3, tier github-authenticated-artifact: an authenticated
+        # GitHub CI artifact whose contained result is itself a
+        # ProviderEvidenceRecord (generatedBy provider-api) -- never a
+        # hand-typed claim smuggled through an otherwise-real artifact.
+        required = {
+            "--github-artifact-id": github_artifact_id, "--github-repository": github_repository,
+            "--github-workflow-file": github_workflow_file, "--github-artifact-name": github_artifact_name,
+            "--github-result-filename": github_result_filename,
+        }
+        missing_github = [name for name, value in required.items() if not value]
+        if missing_github:
+            click.echo(f"--github-run-id requires {sorted(required)}. Missing: {missing_github}.", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        try:
+            chain = pe_mod.acquire_provider_ci_artifact(
+                repository=github_repository, workflow_path=github_workflow_file, run_id=github_run_id,
+                artifact_id=github_artifact_id, expected_artifact_name=github_artifact_name,
+                expected_result_filename=github_result_filename, local_zip_path=github_artifact_zip_path,
+                expected_git_sha=expected_git_sha, expected_version=expected_version,
+                expected_release_id=expected_release_id,
+            )
+        except pe_mod.ProviderEvidenceError as exc:
+            click.echo(f"Distributed-build acceptance BLOCKED: {exc}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        if not chain.ok:
+            click.echo("Distributed-build acceptance BLOCKED -- CI artifact chain rejected:", err=True)
+            for problem in chain.problems:
+                click.echo(f"  - {problem}", err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        _record_authenticated(
+            chain.result, raw_bytes=chain.result_bytes, evidence_tier=pe_mod.TIER_GITHUB_AUTHENTICATED_ARTIFACT,
+            source_label=f"github-artifact:{github_repository}#run={github_run_id}&artifact={github_artifact_id}",
+        )
+        return
+
+    if source_path:
+        # Priority 3: arbitrary operator-supplied JSON is NEVER independently
+        # authenticated by this process -- at best it is recorded as an
+        # explicit, clearly-labelled blocked-unverified claim, exactly like
+        # the legacy --channel/... path below. This can NEVER reach PASS,
+        # regardless of how well-formed/self-consistent the content looks
+        # (evidenceTier is hardcoded to manual-unverified here -- never read
+        # from the file's own content -- and consolidated_report.py
+        # independently re-derives the same block at consolidation, so even
+        # a hand-edited report.json claiming a stronger tier is caught).
+        raw_bytes = Path(source_path).read_bytes()
+        try:
+            claimed_evidence = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            click.echo(f"--source {source_path!r} is not valid JSON: {exc}", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        if not isinstance(claimed_evidence, dict):
+            click.echo(f"--source {source_path!r} must contain a JSON object.", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+
+        adopted_by_label = adopted_by or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+        record = dbp_mod.build_provenance_record(
+            claimed_evidence, release_run_id=run_id_opt, adopted_at=timestamp, adopted_by=adopted_by_label,
+            source_path=str(source_path), raw_source_bytes=raw_bytes, evidence_tier=pe_mod.TIER_MANUAL_UNVERIFIED,
+        )
+        content_problems = dbp_mod.verify_provenance_record(
+            record, source_bytes=raw_bytes, expected_release_run_id=run_id_opt,
+            expected_git_sha=expected_git_sha, expected_version=expected_version,
+            expected_release_id=expected_release_id,
+        )
+        unverified_notice = (
+            "Operator-supplied --source evidence is never independently authenticated by this process -- "
+            "at best it is recorded as blocked-unverified, regardless of how well-formed it looks. Use "
+            "--provider (live API), --signed-export (verified signature), or --github-run-id (authenticated "
+            "CI artifact) to reach a PASS."
+        )
+        report = {
+            "runId": run_id_opt,
+            "component": dbp_mod.DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT,
+            "status": "blocked-unverified",
+            "evidenceTier": pe_mod.TIER_MANUAL_UNVERIFIED,
+            "provenance": record,
+            "problems": [unverified_notice] + list(content_problems),
+            "generatedAt": timestamp,
+        }
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        component_dir = workspace.component_dir("distributed-build-acceptance")
+        dbp_mod.write_evidence_bundle(component_dir, record, source_bytes=raw_bytes)
+        click.echo(unverified_notice, err=True)
+        for problem in content_problems:
+            click.echo(f"  - {problem}", err=True)
+        click.echo(f"Recorded (blocked-unverified): {report_path}")
+        raise SystemExit(EXIT_BLOCKED)
 
     # Legacy manual path (DEPRECATED): can never reach PASS -- see the module
     # docstring and consolidated_report.component_from_distributed_build_
@@ -1863,8 +2105,9 @@ def record_distributed_build_acceptance_cmd(
     ]
     if missing:
         click.echo(
-            "Either --source (an authenticated provenance evidence file -- the only way to reach a "
-            f"PASS) or ALL of {['--channel', '--distributed-build-id', '--tested-git-sha', '--tested-version', '--verified-via']} "
+            "Either --provider/--signed-export/--github-run-id (a live-authenticated path -- the only "
+            "way to reach a PASS), --source (recorded but always blocked-unverified), or ALL of "
+            f"{['--channel', '--distributed-build-id', '--tested-git-sha', '--tested-version', '--verified-via']} "
             f"(the deprecated, always-blocked-unverified manual path) must be given. Missing: {missing}.",
             err=True,
         )
@@ -2175,19 +2418,22 @@ def _resolve_component(
 )
 @click.option(
     "--android-mandatory/--android-optional", "android_mandatory", default=None,
-    help="Whether the Android UI report is release-gating. Defaults to config/release-platforms.yaml "
-         "(mobile_android), or True if that file is absent.",
+    help="Whether the Android UI report is release-gating. Defaults to this run's own schema-v2 "
+         "release-config when one was composed, else config/release-platforms.yaml (mobile_android), "
+         "or True if neither is available.",
 )
 @click.option(
     "--ios-mandatory/--ios-optional", "ios_mandatory", default=None,
-    help="Whether the iPhone UI report is release-gating. Defaults to config/release-platforms.yaml "
-         "(mobile_ios), or True if that file is absent.",
+    help="Whether the iPhone UI report is release-gating. Defaults to this run's own schema-v2 "
+         "release-config when one was composed, else config/release-platforms.yaml (mobile_ios), or "
+         "True if neither is available.",
 )
 @click.option(
     "--sync-mandatory/--sync-optional", "sync_mandatory", default=None,
-    help="Whether cross-device synchronization is release-gating. Defaults to "
-         "config/release-platforms.yaml (release_features.synchronization), or True if absent. "
-         "An optional sync is still shown in the report, just never blocks a PASS.",
+    help="Whether cross-device synchronization is release-gating. Defaults to this run's own "
+         "schema-v2 release-config when one was composed, else config/release-platforms.yaml "
+         "(release_features.synchronization), or True if neither is available. An optional sync is "
+         "still shown in the report, just never blocks a PASS.",
 )
 @click.option(
     "--selector-contract-mandatory/--selector-contract-optional", "selector_contract_mandatory", default=None,
@@ -2231,18 +2477,24 @@ def _resolve_component(
          "automatically mandatory once it is promoted. A component report is still shown/recorded "
          "either way.",
 )
-# Independent release-feature gating (Workstream 3). Each defaults to the
-# release feature profile (config/release-platforms.yaml release_features.*),
-# or True if absent -- an omitted feature is mandatory. An optional feature is
-# still shown as an explicit component, just never blocks a PASS.
+# Independent release-feature gating (Workstream 3). Each defaults to this
+# run's own schema-v2 release-config's enabled-features scope when one was
+# composed, else the legacy release feature profile (config/release-
+# platforms.yaml release_features.*), or True if neither is available -- an
+# omitted feature is mandatory. An optional feature is still shown as an
+# explicit component, just never blocks a PASS.
 @click.option("--meals-mandatory/--meals-optional", "meals_mandatory", default=None,
-              help="Whether the CaleeMobile Meals feature is release-gating. Defaults to release_features.meals.")
+              help="Whether the CaleeMobile Meals feature is release-gating. Defaults to this run's "
+                   "schema-v2 release-config when composed, else release_features.meals.")
 @click.option("--onboarding-mandatory/--onboarding-optional", "onboarding_mandatory", default=None,
-              help="Whether onboarding + display/mobile handoff is release-gating. Defaults to release_features.onboarding.")
+              help="Whether onboarding + display/mobile handoff is release-gating. Defaults to this "
+                   "run's schema-v2 release-config when composed, else release_features.onboarding.")
 @click.option("--google-calendar-mandatory/--google-calendar-optional", "google_calendar_mandatory", default=None,
-              help="Whether Google Calendar connection is release-gating. Defaults to release_features.google_calendar.")
+              help="Whether Google Calendar connection is release-gating. Defaults to this run's "
+                   "schema-v2 release-config when composed, else release_features.google_calendar.")
 @click.option("--kiosk-admin-mandatory/--kiosk-admin-optional", "kiosk_admin_mandatory", default=None,
-              help="Whether CaleeShell kiosk/admin is release-gating. Defaults to release_features.kiosk_admin.")
+              help="Whether CaleeShell kiosk/admin is release-gating. Defaults to this run's schema-v2 "
+                   "release-config when composed, else release_features.kiosk_admin.")
 @click.option("--build-version", default="unknown", help="Combined/overall application build label (used for the bundle filename)")
 @click.option("--calee-build-version", default=None, help="Calee tablet app package version under test")
 @click.option("--expected-calee-build-version", default=None, help="Technical-owner-configured expected Calee build; mismatch BLOCKS")
@@ -2253,7 +2505,7 @@ def _resolve_component(
 @click.option("--expected-calee-git-sha", default=None, help="Technical-owner-configured expected Calee tablet commit; mismatch BLOCKS")
 @click.option("--caleemobile-git-sha", default=None, help="CaleeMobile commit SHA under test")
 @click.option("--expected-caleemobile-git-sha", default=None, help="Technical-owner-configured expected CaleeMobile commit; mismatch BLOCKS")
-@click.option("--production/--development", "production", default=None, help="Production release profile (Workstream 3): the expected identity below becomes REQUIRED, and a dirty tree needs a named waiver. Defaults to config/release-platforms.yaml (expected_build_identity.production).")
+@click.option("--production/--development", "production", default=None, help="Production release profile (Workstream 3): the expected identity below becomes REQUIRED, and a dirty tree needs a named waiver. Defaults to this run's schema-v2 release-config when composed, else config/release-platforms.yaml (expected_build_identity.production).")
 @click.option("--expected-calee-application-id", default=None, help="Production: expected Calee tablet application id; mismatch/missing BLOCKS")
 @click.option("--expected-calee-version-code", default=None, help="Production: expected Calee tablet installed versionCode; mismatch/missing BLOCKS")
 @click.option("--expected-caleeshell-version", default=None, help="Production: expected CaleeShell version when CaleeShell is in scope; mismatch/missing BLOCKS")
@@ -2267,7 +2519,7 @@ def _resolve_component(
 @click.option("--caleemobile-identity-available/--caleemobile-identity-unavailable", "caleemobile_identity_available", default=True, help="Whether CaleeMobile build identity could be determined")
 @click.option("--calee-identity-available/--calee-identity-unavailable", "calee_identity_available", default=True, help="Whether Calee tablet build identity could be determined")
 @click.option("--require-build-identity/--allow-unknown-build-identity", "require_build_identity", default=True, help="Whether an in-scope app's build identity must be known (default: required -- a PASS must prove which build was tested)")
-@click.option("--allow-dirty/--no-allow-dirty", "allow_dirty_opt", default=None, help="Explicitly approve testing an uncommitted build. Defaults to config/release-platforms.yaml (expected_build_identity.allow_dirty).")
+@click.option("--allow-dirty/--no-allow-dirty", "allow_dirty_opt", default=None, help="Explicitly approve testing an uncommitted build. Defaults to this run's schema-v2 release-config when composed, else config/release-platforms.yaml (expected_build_identity.allow_dirty).")
 @click.option("--android-device-id", default=None, help="Android device/emulator identifier used for the Android UI run")
 @click.option("--ios-device-id", default=None, help="iOS device/simulator identifier used for the iOS UI run")
 @click.option("--test-environment", default="", help="Target environment URL")
@@ -3848,7 +4100,21 @@ def verify_release_bundle_cmd(bundle_path, report_path):
     help="Optional: the expected raw-byte sha256 of the --summary file itself (e.g. recorded elsewhere "
          "when the artifact was retrieved) -- a mismatch means the file was altered since retrieval.",
 )
-def verify_main_ci_evidence_cmd(expected_sha, summary_path, required_gates, artifact_sha256):
+@click.option(
+    "--expected-repository", "expected_repository", default=None,
+    help="Optional: the exact 'owner/repo' the evidence's own 'repository' field must match (Priority 5). "
+         "Passing CaleeAdmin/CaleeMobile-Regression additionally applies that repository's CANONICAL "
+         "required-gate set (owned in code by main_ci_evidence.py) regardless of --required-gate, so a "
+         "missing/empty gates breakdown BLOCKS even when no --required-gate was given at all.",
+)
+@click.option(
+    "--expected-workflow-file", "expected_workflow_file", default=None,
+    help="Optional: the exact workflow file path (e.g. .github/workflows/ci.yml) the evidence's own "
+         "'workflowFile' field must match.",
+)
+def verify_main_ci_evidence_cmd(
+    expected_sha, summary_path, required_gates, artifact_sha256, expected_repository, expected_workflow_file,
+):
     """Priority 8: independently verify that a downloaded CI-evidence summary
     describes the EXACT merged-main (or merge-queue) commit, never a pull
     request's HEAD commit.
@@ -3861,11 +4127,18 @@ def verify_main_ci_evidence_cmd(expected_sha, summary_path, required_gates, arti
     here; it is proof about the PR HEAD commit only, never about what
     actually landed on main.
 
-    Exits 0 only when the evidence's commitSha exactly matches --expected-sha,
-    its event is a push to refs/heads/main or a merge_group run, and every
-    requested (or, if none requested, every evidence-listed) gate succeeded
-    or was an explicitly not-applicable skip. Otherwise exits BLOCKED with
-    every problem listed.
+    Exits 0 only when the evidence's schemaVersion is supported, its
+    commitSha exactly matches --expected-sha, its event is a push to
+    refs/heads/main or a merge_group run, its repository/workflowFile agree
+    with --expected-repository/--expected-workflow-file (when given), and
+    every requested/canonical (or, if neither applies, every evidence-listed)
+    gate succeeded or was an explicitly not-applicable skip. Otherwise exits
+    BLOCKED with every problem listed.
+
+    NOTE (Priority 6): this command only STRUCTURALLY validates a summary
+    file already on disk -- it never contacts GitHub, so it cannot prove the
+    file actually came from the workflow run it claims to. See
+    verify-main-ci-artifact for authenticated origin verification.
     """
     from . import main_ci_evidence as mce_mod
 
@@ -3875,10 +4148,22 @@ def verify_main_ci_evidence_cmd(expected_sha, summary_path, required_gates, arti
         click.echo(str(exc), err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
 
+    canonical_required_gates = None
+    if expected_repository == mce_mod.CALEEMOBILE_REGRESSION_REPOSITORY:
+        canonical_required_gates = mce_mod.CALEEMOBILE_REGRESSION_REQUIRED_GATES
+
     problems = mce_mod.verify_main_ci_evidence(
         summary, expected_sha=expected_sha, required_gates=list(required_gates) or None,
         raw_bytes=raw_bytes, expected_artifact_sha256=artifact_sha256,
+        expected_repository=expected_repository, expected_workflow_file=expected_workflow_file,
+        canonical_required_gates=canonical_required_gates,
     )
+    click.echo(click.style(
+        "STRUCTURAL VALIDATION ONLY -- ORIGIN NOT AUTHENTICATED: this checks the CONTENTS of the file at "
+        "--summary for internal consistency; it does not prove GitHub Actions produced it. Use "
+        "verify-main-ci-artifact for authenticated merged-main evidence.",
+        fg="yellow",
+    ), err=True)
     if not problems:
         click.echo(click.style(
             f"[OK] Merged-main CI evidence verified: commit {summary.get('commitSha')} "
@@ -3892,26 +4177,162 @@ def verify_main_ci_evidence_cmd(expected_sha, summary_path, required_gates, arti
     raise SystemExit(EXIT_BLOCKED)
 
 
+@main.command("verify-main-ci-artifact")
+@click.option(
+    "--repository", "repository", required=True,
+    help="The exact 'owner/repo' the workflow run must belong to, e.g. CaleeAdmin/CaleeMobile-Regression "
+         "or CaleeAdmin/calee-regression.",
+)
+@click.option("--workflow-run-id", "workflow_run_id", required=True, help="GitHub Actions workflow run ID.")
+@click.option("--artifact-id", "artifact_id", required=True, help="GitHub Actions artifact ID.")
+@click.option(
+    "--expected-merge-sha", "expected_merge_sha", required=True,
+    help="The full 40-character commit SHA of the ACTUAL merge/main commit -- retrieved AFTER the merge.",
+)
+@click.option(
+    "--workflow-file", "workflow_file", default=None,
+    help="Workflow file path (e.g. .github/workflows/ci.yml). Defaults from --repository for a known repo.",
+)
+@click.option(
+    "--artifact-name", "artifact_name", default=None,
+    help="Expected exact artifact name (embeds the merge SHA, e.g. ci-summary-<sha>). Defaults from "
+         "--repository for a known repo.",
+)
+@click.option(
+    "--result-filename", "result_filename", default=None,
+    help="Expected exact filename inside the artifact ZIP (e.g. ci-summary.json). Defaults from "
+         "--repository for a known repo.",
+)
+@click.option(
+    "--artifact-zip", "artifact_zip_path", default=None, type=click.Path(exists=True, dir_okay=False),
+    help="Optional: an already-downloaded artifact ZIP. Metadata (run/artifact ownership, digest) is still "
+         "authenticated via the GitHub API even when this is given.",
+)
+@click.option(
+    "--required-gate", "required_gates", multiple=True,
+    help="A gate name that must be present and successful (or an explicitly not-applicable skip). "
+         "Repeatable. The repository's canonical required-gate set (when known) is ALWAYS enforced too.",
+)
+def verify_main_ci_artifact_cmd(
+    repository, workflow_run_id, artifact_id, expected_merge_sha, workflow_file, artifact_name,
+    result_filename, artifact_zip_path, required_gates,
+):
+    """Priority 6: AUTHENTICATED verification that a merged-main CI artifact
+    was actually produced by GitHub Actions for the expected repository,
+    workflow, and commit -- not merely a structurally-consistent JSON file.
+
+    Unlike verify-main-ci-evidence (which only checks the CONTENTS of an
+    already-downloaded file for internal consistency), this command
+    authenticates the file's ORIGIN via the GitHub API: the workflow run
+    belongs to --repository, ran the expected workflow FILE (never just a
+    display name), was triggered by an organic push-to-main or merge_group
+    event (never workflow_dispatch/pull_request), completed with conclusion
+    success, and its head_sha equals --expected-merge-sha; the artifact
+    records that exact run as its owner, its name embeds the exact merge
+    SHA, and GitHub's own recorded digest matches the downloaded ZIP's
+    actual bytes; the ZIP contains exactly the one expected summary file
+    (hardened extraction: no path traversal, no duplicate/extra entries);
+    and finally the extracted summary itself passes the SAME canonical
+    schema/gate verifier verify-main-ci-evidence uses.
+
+    Requires GitHub API credentials (REGRESSION_API_TOKEN, GITHUB_TOKEN, or
+    GH_TOKEN in the environment/Keychain) -- without one, this BLOCKS naming
+    the exact missing secret rather than falling back to unauthenticated
+    (structural-only) verification.
+    """
+    from . import main_ci_artifact as mca_mod
+    from . import main_ci_evidence as mce_evidence_mod
+
+    profile = mca_mod.KNOWN_PROFILES.get(repository, {})
+    resolved_workflow_file = workflow_file or profile.get("workflow_path")
+    resolved_result_filename = result_filename or profile.get("result_filename")
+    resolved_artifact_name = artifact_name or (
+        f"{profile['artifact_prefix']}{expected_merge_sha}" if profile.get("artifact_prefix") else None
+    )
+    missing_flags = [
+        flag for flag, value in (
+            ("--workflow-file", resolved_workflow_file),
+            ("--artifact-name", resolved_artifact_name),
+            ("--result-filename", resolved_result_filename),
+        ) if not value
+    ]
+    if missing_flags:
+        click.echo(
+            f"--repository {repository!r} is not a recognised profile; {', '.join(missing_flags)} "
+            f"must be supplied explicitly.",
+            err=True,
+        )
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    canonical_required_gates = None
+    if repository == mce_evidence_mod.CALEEMOBILE_REGRESSION_REPOSITORY:
+        canonical_required_gates = mce_evidence_mod.CALEEMOBILE_REGRESSION_REQUIRED_GATES
+
+    try:
+        chain = mca_mod.acquire_main_ci_artifact(
+            repository=repository, workflow_path=resolved_workflow_file,
+            run_id=workflow_run_id, artifact_id=artifact_id, expected_merge_sha=expected_merge_sha,
+            expected_artifact_name=resolved_artifact_name, expected_result_filename=resolved_result_filename,
+            local_zip_path=artifact_zip_path, required_gates=list(required_gates) or None,
+            canonical_required_gates=canonical_required_gates,
+        )
+    except mca_mod.MainCiArtifactError as exc:
+        click.echo(click.style(f"[BLOCKED] {exc}", fg="red"), err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    if chain.ok:
+        click.echo(click.style(
+            f"[OK] Authenticated merged-main CI artifact verified: commit {expected_merge_sha} "
+            f"(run {workflow_run_id}, artifact {artifact_id}, repository {repository}).",
+            fg="green",
+        ))
+        raise SystemExit(EXIT_SUCCESS)
+    click.echo(click.style(
+        f"[BLOCKED] Authenticated merged-main CI artifact has {len(chain.problems)} problem(s):", fg="red",
+    ), err=True)
+    for p in chain.problems:
+        click.echo(f"  - {p}", err=True)
+    raise SystemExit(EXIT_BLOCKED)
+
+
 @main.command("qualification-preflight")
 @click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
-@click.option("--bundle", "bundle_path", default=None, type=click.Path(), help="Release bundle directory, to check frozen-candidate readiness.")
-@click.option("--distributed-build-evidence", "distributed_build_evidence_path", default=None, type=click.Path(), help="Distributed-build acceptance evidence path, to check availability.")
+@click.option("--bundle", "bundle_path", default=None, type=click.Path(), help="Release bundle directory. Verified FIRST; its effective release configuration is composed exactly like the real launcher and drives every required check below (Priority 7).")
+@click.option("--distributed-build-evidence", "distributed_build_evidence_path", default=None, type=click.Path(), help="Distributed-build acceptance evidence path -- checked against the release's own id/SHA/version when --bundle is also given.")
 @click.option("--manual-checks", "manual_checks_path", default=None, type=click.Path(), help="Path to manual-checks.json (defaults to config/manual-checks.json, falling back to the .example.json).")
+@click.option("--main-ci-evidence", "main_ci_evidence_path", default=None, type=click.Path(), help="Path to a downloaded main-CI evidence summary (ci-summary-<sha>.json / framework-test-summary-<sha>.json) -- verified via the canonical schema/gate verifier (structural validation only; see --main-ci-workflow-run-id for authenticated verification).")
+@click.option("--main-ci-repository", "main_ci_repository", default=None, help="Expected 'owner/repo' for --main-ci-evidence / authenticated verification, e.g. CaleeAdmin/CaleeMobile-Regression.")
+@click.option("--main-ci-workflow-run-id", "main_ci_workflow_run_id", default=None, help="GitHub Actions workflow run ID -- with --main-ci-artifact-id, authenticates main-CI evidence via the GitHub API (Priority 6) instead of only checking a downloaded file.")
+@click.option("--main-ci-artifact-id", "main_ci_artifact_id", default=None, help="GitHub Actions artifact ID, paired with --main-ci-workflow-run-id.")
+@click.option("--expected-caleemobile-sha", "expected_caleemobile_sha", default=None, help="Expected CaleeMobile sibling-checkout HEAD SHA. Defaults from the release bundle's own expected identity when --bundle is given.")
+@click.option("--expected-caleemobile-regression-sha", "expected_caleemobile_regression_sha", default=None, help="Expected CaleeMobile-Regression sibling-checkout HEAD SHA.")
 @click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON result.")
-def qualification_preflight_cmd(config_path, bundle_path, distributed_build_evidence_path, manual_checks_path, report_path):
-    """Priority 9: a read-only preflight for a technical owner about to run a
-    real physical qualification -- reports whether THIS machine is actually
-    ready (Android SDK, connected tablet, Appium, Flutter, sibling checkouts,
-    keychain credentials, subscribed-fixture config, CI/distributed-build
-    evidence availability, frozen-candidate ability, manual-check
-    definitions) before hardware time is spent discovering a broken step.
+def qualification_preflight_cmd(
+    config_path, bundle_path, distributed_build_evidence_path, manual_checks_path, main_ci_evidence_path,
+    main_ci_repository, main_ci_workflow_run_id, main_ci_artifact_id, expected_caleemobile_sha,
+    expected_caleemobile_regression_sha, report_path,
+):
+    """Priority 9 (prior session); Priority 7 (this session) -- a read-only,
+    RELEASE-AUTHORITATIVE preflight for a technical owner about to run a real
+    physical qualification. When --bundle is given, the SAME effective
+    release configuration the real launcher would compose is derived from
+    it, and every required check (tablet, Android-mobile vs. tablet
+    distinguished, iOS matched to the CONFIGURED device identifier, Android
+    SDK/build tools, exact Flutter version, Appium status + required
+    drivers, sibling-checkout SHAs, authenticated selector/distributed-build/
+    main-CI evidence, kiosk/admin authorisation) is derived from what the
+    release candidate ACTUALLY requires -- never merely from the machine's
+    own declared capability scope. A required capability whose state cannot
+    be determined BLOCKS, it is never merely a warning.
 
     Every check is read-only: no APK is installed, no fixture is published,
-    no credential value is printed, no product API is mutated. A check that
-    cannot be verified is reported BLOCKED or WARNING, never fabricated as
-    passing.
+    no credential value is printed, no product API is mutated, and neither
+    is any GitHub API call anything but a read.
 
-    Exits 0 (READY) only when no check is BLOCKED; exits BLOCKED otherwise,
+    `overall` is READY, WARNING, or BLOCKED -- any WARNING prevents an
+    unqualified READY. The JSON output's `blockedCapabilities`/
+    `warnedCapabilities` name exactly which checks are not READY. Exits 0
+    only when `overall` is READY; exits non-zero (BLOCKED) otherwise,
     listing every failing check.
     """
     from . import qualification_preflight as qp_mod
@@ -3921,12 +4342,18 @@ def qualification_preflight_cmd(config_path, bundle_path, distributed_build_evid
         bundle_path=Path(bundle_path) if bundle_path else None,
         distributed_build_evidence_path=Path(distributed_build_evidence_path) if distributed_build_evidence_path else None,
         manual_checks_path=Path(manual_checks_path) if manual_checks_path else None,
+        main_ci_evidence_path=Path(main_ci_evidence_path) if main_ci_evidence_path else None,
+        main_ci_repository=main_ci_repository,
+        main_ci_workflow_run_id=main_ci_workflow_run_id,
+        main_ci_artifact_id=main_ci_artifact_id,
+        expected_caleemobile_sha=expected_caleemobile_sha,
+        expected_caleemobile_regression_sha=expected_caleemobile_regression_sha,
         repo_root=REPO_ROOT,
     )
     payload = report.to_dict()
     _write_installer_report(Path(report_path) if report_path else None, payload)
 
-    color = "green" if report.overall == qp_mod.STATUS_READY else "red"
+    color = {"ready": "green", "warning": "yellow", "blocked": "red"}.get(report.overall, "red")
     click.echo(click.style(f"[{payload['overall']}] qualification preflight -- {len(report.checks)} check(s):", fg=color))
     for check in report.checks:
         marker = {"ready": "OK", "warning": "WARN", "blocked": "BLOCKED"}.get(check.status, check.status.upper())
@@ -4017,8 +4444,10 @@ def _record_installation_component(
     "--production/--development", "production_opt", default=None,
     help="Production release profile (Priority 2): trusted signer identity for BOTH Calee and "
          "CaleeShell becomes REQUIRED (a missing/malformed/unreadable/mismatching signer BLOCKS the "
-         "complete-solution verification, instead of recording 'not_compared'). Defaults to "
-         "config/release-platforms.yaml (expected_build_identity.production).",
+         "complete-solution verification, instead of recording 'not_compared'). For a schema-v2 "
+         "release candidate, the BUNDLE's own composed profile always wins (a disagreeing "
+         "--production/--development here only prints a note, never overrides it); otherwise "
+         "defaults to config/release-platforms.yaml (expected_build_identity.production).",
 )
 def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade, plan_only, report_path, retain_diagnostics, run_id_opt, production_opt):
     """Verify a release bundle, INSPECT each APK's actual contents + signer, and
@@ -4065,24 +4494,32 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     """
     from . import apk_inspect
     from . import release_candidate as release_candidate_mod
+    from . import release_config as release_config_mod
     from . import release_installer
 
     # Priority 1: resolve this run's release-config evidence (if any) FIRST,
     # before any release-policy decision is made, so schema-v2 authority is
     # established up front and release_platforms.py is never even imported
     # for that path below.
+    #
+    # _reject_release_config is hoisted out of the "report exists" branch
+    # below (rather than nested inside it, as before) because it must also
+    # handle the case where NO report exists at all but a frozen candidate
+    # does -- see the candidate-freeze gate further down, which is exactly
+    # the fail-open path this priority closes.
+    def _reject_release_config(detail: str) -> None:
+        payload = {"status": "blocked", "detail": [detail]}
+        _write_installer_report(Path(report_path) if report_path else None, payload)
+        _record_installation_component(run_id_opt, payload, EXIT_BLOCKED)
+        click.echo(click.style(f"[BLOCKED] {detail}", fg="red"), err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
     release_config_report = None
+    parsed_release_config = None
     if run_id_opt:
         probe_workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
         rc_report_path = probe_workspace.component_report_path("release-config")
         if rc_report_path.is_file():
-            def _reject_release_config(detail: str) -> None:
-                payload = {"status": "blocked", "detail": [detail]}
-                _write_installer_report(Path(report_path) if report_path else None, payload)
-                _record_installation_component(run_id_opt, payload, EXIT_BLOCKED)
-                click.echo(click.style(f"[BLOCKED] {detail}", fg="red"), err=True)
-                raise SystemExit(EXIT_BLOCKED)
-
             try:
                 raw_release_config = json.loads(rc_report_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
@@ -4114,42 +4551,25 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
                 detail.extend(str(d) for d in raw_release_config.get("detail", []))
                 _reject_release_config("\n  - ".join(detail))
 
+            # Priority 2: strictly parse+validate every field policy below
+            # actually relies on (rejecting wrong JSON types instead of
+            # silently coercing them via bool()/str()), and independently
+            # RECOMPUTE releaseConfigDigest from the parsed releaseSelections
+            # rather than trusting this report's own stored copy of it.
+            try:
+                parsed_release_config = release_config_mod.parse_release_config_report(raw_release_config)
+            except release_config_mod.ReleaseConfigReportError as exc:
+                _reject_release_config(
+                    f"This run's release-config evidence at {rc_report_path} is malformed: {exc}"
+                )
+            if not parsed_release_config.digest_matches:
+                _reject_release_config(
+                    f"This run's release-config evidence at {rc_report_path} is tampered: the stored "
+                    f"releaseConfigDigest {parsed_release_config.stored_digest!r} does not match the digest "
+                    f"recomputed from its own releaseSelections ({parsed_release_config.recomputed_digest!r})."
+                )
+
             release_config_report = raw_release_config
-
-    if release_config_report is not None and release_config_report.get("schemaVersion") == 2:
-        # Priority 1: schema-v2 authority. Profile and every other release
-        # policy decision below come ONLY from this same-run evidence --
-        # release_platforms.load_* is never called on this path.
-        release_selections = release_config_report.get("releaseSelections") or {}
-        eff_production = release_selections.get("profile") == "production"
-        if production_opt is not None and production_opt != eff_production:
-            click.echo(click.style(
-                f"[NOTE] --{'production' if production_opt else 'development'} was given, but schema-v2 "
-                f"release-config evidence is authoritative for the release profile "
-                f"({release_selections.get('profile')!r}) -- the flag is ignored.",
-                fg="yellow",
-            ), err=True)
-        calee_mobile_identity = (release_selections.get("expectedIdentities") or {}).get("caleeMobile") or {}
-        selector_evidence_required = bool(calee_mobile_identity.get("selectorEvidenceRequired", True))
-        distributed_build_acceptance_required = bool(
-            calee_mobile_identity.get("distributedBuildAcceptanceRequired", True)
-        )
-    else:
-        # Schema v1, or a bare diagnostic invocation with no run-scoped
-        # release-config evidence at all -- unchanged legacy behaviour.
-        try:
-            expected_identity = release_platforms.load_expected_build_identity()
-        except release_platforms.ReleasePlatformsError as exc:
-            click.echo(str(exc), err=True)
-            raise SystemExit(EXIT_INVALID_CONFIG)
-        eff_production = production_opt if production_opt is not None else expected_identity.production
-        selector_evidence_required = None
-        distributed_build_acceptance_required = None
-
-    # Release-gating: unconditionally true in production; for a staging/
-    # development profile, a run carrying a shared run ID is a real
-    # launcher-driven release run (Priority 2 policy -- see docstring above).
-    signer_trust_required = bool(eff_production) or bool(run_id_opt)
 
     # Candidate freeze enforcement: once release-config has snapshotted +
     # fingerprinted this run's approved release candidate (release_candidate.
@@ -4165,7 +4585,15 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     # (a bare/diagnostic invocation, or release-config composed without
     # --bundle) is unaffected -- it installs from --bundle exactly as before
     # this existed.
+    #
+    # Priority 1: this is resolved BEFORE the schema-v2-vs-legacy policy
+    # decision below (moved up from its previous position after it), so a
+    # frozen candidate's mere existence can gate that decision -- a run whose
+    # release-config report is missing/wrong-schema must never silently fall
+    # back to legacy release-platforms.yaml policy just because a same-run
+    # candidate happens not to be readable at policy-decision time.
     fingerprint = None
+    candidate_workspace = None
     if run_id_opt:
         candidate_workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
         snapshot_dir = candidate_workspace.component_dir("release-candidate")
@@ -4183,18 +4611,25 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
                 click.echo(click.style(f"[INVALID] {payload['detail'][0]}", fg="red"), err=True)
                 raise SystemExit(EXIT_INVALID_CONFIG)
 
-            # Priority 5: bind this verification to the SAME release-config
-            # evidence that governs policy above, when one exists -- a
-            # candidate copied wholesale from another run, or one approved
-            # under a different release-config composition, is rejected here
-            # even though its own internal envelope digest is self-consistent.
+            # Priority 5 (prior session): bind this verification to the SAME
+            # release-config evidence that governs policy above, when one
+            # exists -- a candidate copied wholesale from another run, or one
+            # approved under a different release-config composition, is
+            # rejected here even though its own internal envelope digest is
+            # self-consistent. Priority 2 (this session): the expected digest
+            # passed here is the INDEPENDENTLY RECOMPUTED one (not the
+            # report's own stored copy), so this comparison never relies on a
+            # stored value either.
             fp_kwargs = {}
             if release_config_report is not None:
                 fp_kwargs = dict(
                     expected_run_id=run_id_opt,
                     expected_release_id=release_config_report.get("releaseId"),
                     expected_schema_version=release_config_report.get("schemaVersion"),
-                    expected_release_config_digest=release_config_report.get("releaseConfigDigest"),
+                    expected_release_config_digest=(
+                        parsed_release_config.recomputed_digest if parsed_release_config is not None
+                        else release_config_report.get("releaseConfigDigest")
+                    ),
                 )
             fp_problems = release_candidate_mod.verify_candidate_fingerprint(snapshot_dir, fingerprint, **fp_kwargs)
             if release_config_report is not None:
@@ -4228,6 +4663,66 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
             # Install ONLY from the frozen snapshot from here on -- the
             # original --bundle path is never read again in this run.
             bundle_path = str(snapshot_dir)
+
+    # Priority 1: a frozen release candidate existing for this run makes a
+    # matching same-run release-config MANDATORY -- never silently fall back
+    # to legacy release-platforms.yaml policy just because the report happens
+    # to be missing right now (a real crash-consistency window: release-
+    # config writes the candidate snapshot before it writes its own report,
+    # so a killed/OOM'd process can leave exactly this state on disk). This
+    # also guarantees a schema-v2 candidate can never fall back to legacy
+    # policy: when a release-config report IS present, the schema-version
+    # agreement between it and the candidate is already enforced above (the
+    # verify_candidate_fingerprint call's expected_schema_version binding) --
+    # a same-run report whose schema disagrees with the candidate is already
+    # BLOCKED before this point is ever reached.
+    if fingerprint is not None and release_config_report is None:
+        _reject_release_config(
+            f"A frozen release candidate exists for run {run_id_opt!r} (releaseId="
+            f"{fingerprint.release_id!r}, schemaVersion={fingerprint.schema_version!r}) but this run has "
+            f"no matching release-config evidence at {candidate_workspace.component_report_path('release-config')} "
+            f"-- refusing to fall back to legacy release-platforms.yaml policy for a run with a frozen candidate."
+        )
+
+    if release_config_report is not None and release_config_report.get("schemaVersion") == 2:
+        # Priority 1: schema-v2 authority. Profile and every other release
+        # policy decision below come ONLY from this same-run evidence --
+        # release_platforms.load_* is never called on this path.
+        release_selections = release_config_report.get("releaseSelections") or {}
+        parsed_selections = parsed_release_config.release_selections
+        eff_production = parsed_selections.profile == "production"
+        if production_opt is not None and production_opt != eff_production:
+            click.echo(click.style(
+                f"[NOTE] --{'production' if production_opt else 'development'} was given, but schema-v2 "
+                f"release-config evidence is authoritative for the release profile "
+                f"({release_selections.get('profile')!r}) -- the flag is ignored.",
+                fg="yellow",
+            ), err=True)
+        # Priority 2: sourced from the STRICTLY-TYPED parse, not
+        # bool(dict.get(...)) over untrusted JSON -- a non-boolean value here
+        # already BLOCKED above, during parsing.
+        selector_evidence_required = parsed_selections.calee_mobile_selector_evidence_required
+        if selector_evidence_required is None:
+            selector_evidence_required = True
+        distributed_build_acceptance_required = parsed_selections.calee_mobile_distributed_build_acceptance_required
+        if distributed_build_acceptance_required is None:
+            distributed_build_acceptance_required = True
+    else:
+        # Schema v1, or a bare diagnostic invocation with no run-scoped
+        # release-config evidence at all -- unchanged legacy behaviour.
+        try:
+            expected_identity = release_platforms.load_expected_build_identity()
+        except release_platforms.ReleasePlatformsError as exc:
+            click.echo(str(exc), err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        eff_production = production_opt if production_opt is not None else expected_identity.production
+        selector_evidence_required = None
+        distributed_build_acceptance_required = None
+
+    # Release-gating: unconditionally true in production; for a staging/
+    # development profile, a run carrying a shared run ID is a real
+    # launcher-driven release run (Priority 2 policy -- see docstring above).
+    signer_trust_required = bool(eff_production) or bool(run_id_opt)
 
     verification = release_installer.verify_release_bundle(bundle_path)
     if not verification.ok:

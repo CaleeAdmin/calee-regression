@@ -151,12 +151,38 @@ def test_check_appium_unreachable_is_blocked():
     assert result.status == qp.STATUS_BLOCKED
 
 
-def test_check_flutter_found_is_ready():
-    assert qp.check_flutter(which=lambda name: "/usr/bin/flutter" if name == "flutter" else None).status == qp.STATUS_READY
+def _flutter_version_runner(version=qp.EXPECTED_FLUTTER_VERSION):
+    import json as _json
+    return lambda argv: _FakeCompletedProcess(stdout=_json.dumps({"frameworkVersion": version, "dartSdkVersion": "3.5.0"}))
+
+
+def test_check_flutter_found_with_pinned_version_is_ready():
+    result = qp.check_flutter(
+        which=lambda name: "/usr/bin/flutter" if name == "flutter" else None, runner=_flutter_version_runner(),
+    )
+    assert result.status == qp.STATUS_READY
 
 
 def test_check_flutter_missing_is_blocked():
     assert qp.check_flutter(which=lambda name: None).status == qp.STATUS_BLOCKED
+
+
+def test_check_flutter_wrong_version_is_blocked():
+    # Priority 7 requirement 8: EXACT pinned version, not just presence.
+    result = qp.check_flutter(
+        which=lambda name: "/usr/bin/flutter" if name == "flutter" else None,
+        runner=_flutter_version_runner(version="3.10.0"),
+    )
+    assert result.status == qp.STATUS_BLOCKED
+    assert "3.10.0" in result.detail
+
+
+def test_check_flutter_unparseable_version_output_is_blocked():
+    result = qp.check_flutter(
+        which=lambda name: "/usr/bin/flutter" if name == "flutter" else None,
+        runner=lambda argv: _FakeCompletedProcess(stdout="not json"),
+    )
+    assert result.status == qp.STATUS_BLOCKED
 
 
 def test_check_mobile_devices_for_scope_android_required_and_present():
@@ -332,13 +358,38 @@ def test_check_manual_check_definitions_valid(tmp_path):
 # ── report aggregation ───────────────────────────────────────────────────
 
 
-def test_preflight_report_overall_ready_when_no_blocked():
+def test_preflight_report_overall_warning_when_a_check_warns_and_none_blocked():
+    # Priority 7 requirement 17: any warning prevents an unqualified READY --
+    # this is the corrected behaviour. The PREVIOUS behaviour (any number of
+    # WARNINGs still reported READY) was exactly the fail-open defect this
+    # closes; do not reintroduce it.
     report = qp.PreflightReport(checks=[
         qp.PreflightCheck("a", qp.STATUS_READY, "ok"),
         qp.PreflightCheck("b", qp.STATUS_WARNING, "meh"),
     ])
+    assert report.overall == qp.STATUS_WARNING
+    assert report.to_dict()["overall"] == "WARNING"
+    assert report.to_dict()["warnedCapabilities"] == ["b"]
+
+
+def test_preflight_report_overall_ready_only_when_every_check_is_ready():
+    report = qp.PreflightReport(checks=[
+        qp.PreflightCheck("a", qp.STATUS_READY, "ok"),
+        qp.PreflightCheck("b", qp.STATUS_READY, "ok"),
+    ])
     assert report.overall == qp.STATUS_READY
     assert report.to_dict()["overall"] == "READY"
+    assert report.to_dict()["blockedCapabilities"] == []
+    assert report.to_dict()["warnedCapabilities"] == []
+
+
+def test_preflight_report_overall_blocked_beats_warning():
+    report = qp.PreflightReport(checks=[
+        qp.PreflightCheck("a", qp.STATUS_WARNING, "meh"),
+        qp.PreflightCheck("b", qp.STATUS_BLOCKED, "nope"),
+    ])
+    assert report.overall == qp.STATUS_BLOCKED
+    assert report.to_dict()["blockedCapabilities"] == ["b"]
 
 
 def test_preflight_report_overall_blocked_when_any_blocked():
@@ -353,6 +404,16 @@ def test_preflight_report_overall_blocked_when_any_blocked():
 # ── full orchestration (injected seams, fully offline) ──────────────────
 
 
+def _multiplex_subprocess_runner(argv):
+    import json as _json
+
+    if argv[:1] == ["/usr/bin/flutter"] or (argv and argv[0].endswith("flutter")):
+        return _FakeCompletedProcess(stdout=_json.dumps({"frameworkVersion": qp.EXPECTED_FLUTTER_VERSION, "dartSdkVersion": "3.5.0"}))
+    if argv[:1] == ["git"]:
+        return _FakeCompletedProcess(stdout="a" * 40)
+    return _FakeCompletedProcess(stdout="")
+
+
 def test_run_qualification_preflight_end_to_end_offline(tmp_path):
     config_path = _write_machine_config(tmp_path)
     (tmp_path / "reports").mkdir()
@@ -363,17 +424,22 @@ def test_run_qualification_preflight_end_to_end_offline(tmp_path):
         adb_runner=lambda argv: _FakeCompletedProcess(stdout="List of devices attached\nTAB123\tdevice\n"),
         which=lambda name: {"adb": "/usr/bin/adb", "flutter": "/usr/bin/flutter"}.get(name),
         http_opener=lambda url: (_ for _ in ()).throw(OSError("no network in test")),
+        subprocess_runner=_multiplex_subprocess_runner,
         env={},
     )
     data = report.to_dict()
-    assert data["overall"] in ("READY", "BLOCKED")
+    assert data["overall"] in ("READY", "WARNING", "BLOCKED")
+    assert "blockedCapabilities" in data
+    assert "warnedCapabilities" in data
     names = {c["name"] for c in data["checks"]}
     assert "machine_config" in names
     assert "report_root" in names
     assert "android_sdk_tools" in names
+    assert "android_build_tools" in names
     assert "adb_device_availability" in names
     assert "expected_tablet_serial" in names
     assert "appium" in names
+    assert "appium_drivers" in names
     assert "flutter" in names
     assert "caleemobile_checkout" in names
     assert "caleemobile_regression_checkout" in names
@@ -385,6 +451,8 @@ def test_run_qualification_preflight_end_to_end_offline(tmp_path):
     assert "distributed_build_evidence_availability" in names
     assert "frozen_candidate_ability" in names
     assert "manual_check_definitions" in names
+    assert "main_ci_evidence" in names
+    assert "main_ci_artifact_authenticated" in names
     # Secret-free output, no matter what.
     dumped = json.dumps(data)
     assert "hunter2" not in dumped

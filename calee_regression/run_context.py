@@ -43,7 +43,8 @@ COMPONENT_NAMES = (
     # captured in the run evidence. Written before any release verification.
     "machine-config",
     # Effective RELEASE configuration (Priority 3): the machine config and the
-    # release candidate (release-platforms.yaml) composed into ONE authoritative
+    # release candidate (a schema-v2 release-bundle manifest when one is given,
+    # else legacy release-platforms.yaml) composed into ONE authoritative
     # configuration for THIS run -- enabled platforms/features, selected backend,
     # expected identities, device ids, report root, and every conflict decision.
     # An unresolved machine/release conflict is recorded here and BLOCKS.

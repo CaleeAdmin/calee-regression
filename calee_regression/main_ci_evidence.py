@@ -30,6 +30,19 @@ Never accepts a ``pull_request`` (or any other non-main-commit) event as
 merged-main evidence, regardless of how well-formed the rest of the evidence
 otherwise looks -- see :func:`verify_main_ci_evidence`'s ``event``/``ref``
 checks.
+
+Priority 5 (this session) versions the contract explicitly (``schemaVersion``)
+and gives the CaleeMobile-Regression shape a CANONICAL required-gate set that
+lives in code (:data:`CALEEMOBILE_REGRESSION_REPOSITORY` /
+:data:`CALEEMOBILE_REGRESSION_REQUIRED_GATES`) -- so a missing/empty/truncated
+``gates`` object BLOCKS even when the caller passes no ``--required-gate`` at
+all, closing the gap where an evidence file with ``"gates": {}`` (or no
+``gates`` key) previously produced zero problems from the gate-checking
+section entirely. The SAME canonical set is duplicated (never imported) in
+CaleeMobile-Regression's stdlib-only ``api/verify_main_ci_evidence.py``, and a
+contract test in that repo reads the workflow file itself and proves the two
+agree -- mirroring the ``selector_release_certification.schema.json``
+duplicated-schema pattern already used for selector evidence.
 """
 
 from __future__ import annotations
@@ -46,6 +59,32 @@ from typing import Any
 MAIN_EVENT_PUSH = "push"
 MAIN_EVENT_MERGE_GROUP = "merge_group"
 MAIN_REF = "refs/heads/main"
+
+# Priority 5: the only schemaVersion this consumer knows how to read. A
+# summary declaring a version outside this set was produced by a newer (or
+# older, incompatible) emitter -- refuse it rather than guess, exactly like
+# selector_evidence.SUPPORTED_SCHEMA_VERSIONS.
+SCHEMA_VERSION = 1
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
+
+# Priority 5: CaleeMobile-Regression's canonical required gates, owned HERE in
+# code (not just in prose/docs), matching EXACTLY the keys
+# `.github/workflows/ci.yml`'s `ci-evidence` job's "Record CI evidence" step
+# emits into its `gates` dict -- see that repo's
+# api/verify_main_ci_evidence.py (the byte-identical duplicate of this
+# constant) and its workflow-contract test. Deliberately camelCase (matching
+# the emitter), never GitHub job IDs (which are kebab-case) -- the two must
+# not be conflated.
+CALEEMOBILE_REGRESSION_REPOSITORY = "CaleeAdmin/CaleeMobile-Regression"
+CALEEMOBILE_REGRESSION_WORKFLOW_FILE = ".github/workflows/ci.yml"
+CALEEMOBILE_REGRESSION_REQUIRED_GATES = (
+    "apiFrameworkTests",
+    "uiReportWrapperTests",
+    "fixtureCliSmoke",
+    "selectorContract",
+    "uiSuiteAnalyze",
+    "releaseCertificationGuard",
+)
 
 
 class MainCiEvidenceError(Exception):
@@ -79,6 +118,9 @@ def verify_main_ci_evidence(
     required_gates: "list[str] | None" = None,
     raw_bytes: "bytes | None" = None,
     expected_artifact_sha256: "str | None" = None,
+    expected_repository: "str | None" = None,
+    expected_workflow_file: "str | None" = None,
+    canonical_required_gates: "tuple[str, ...] | list[str] | None" = None,
 ) -> "list[str]":
     """Verify one retained CI-evidence summary describes the EXACT merged-main
     commit expected, with every required gate accounted for. Returns a list
@@ -90,11 +132,49 @@ def verify_main_ci_evidence(
     merge/main commit -- retrieved and checked AFTER the merge, never
     predicted or assumed during a PR session (see the module docstring and
     the CLI command's own help text).
+
+    Priority 5: ``expected_repository``/``expected_workflow_file``, when
+    given, cross-check the evidence's own ``repository``/``workflowFile``
+    fields (present or not, a mismatch BLOCKS). ``canonical_required_gates``,
+    when given, is ALWAYS enforced in addition to (union with) any explicit
+    ``required_gates`` -- unlike ``required_gates`` alone, this closes the gap
+    where an evidence file with no ``gates`` key, or an empty ``gates: {}``,
+    produced zero gate-related problems simply because the caller passed no
+    ``--required-gate``: with a non-empty canonical set, every one of its
+    gates is looked up and reported missing.
     """
     problems: "list[str]" = []
 
     if not expected_sha or len(expected_sha) != 40 or not all(c in "0123456789abcdefABCDEF" for c in expected_sha):
         problems.append(f"--expected-sha {expected_sha!r} must be the full 40-character commit SHA.")
+
+    schema_version = summary.get("schemaVersion")
+    if schema_version is None:
+        problems.append("evidence has no schemaVersion recorded.")
+    elif not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        problems.append(f"evidence schemaVersion must be a JSON integer (got {schema_version!r}).")
+    elif schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        problems.append(
+            f"evidence schemaVersion {schema_version!r} is not supported (this verifier supports "
+            f"{sorted(SUPPORTED_SCHEMA_VERSIONS)}) -- refusing to read evidence produced by an "
+            f"unknown emitter version."
+        )
+
+    if expected_repository is not None:
+        repository = summary.get("repository")
+        if not repository:
+            problems.append(f"expected repository {expected_repository!r} but evidence has no repository recorded.")
+        elif repository != expected_repository:
+            problems.append(f"evidence repository {repository!r} != expected {expected_repository!r}.")
+
+    if expected_workflow_file is not None:
+        workflow_file = summary.get("workflowFile")
+        if not workflow_file:
+            problems.append(
+                f"expected workflowFile {expected_workflow_file!r} but evidence has no workflowFile recorded."
+            )
+        elif workflow_file != expected_workflow_file:
+            problems.append(f"evidence workflowFile {workflow_file!r} != expected {expected_workflow_file!r}.")
 
     commit_sha = summary.get("commitSha")
     if not commit_sha:
@@ -135,14 +215,27 @@ def verify_main_ci_evidence(
 
     gates = summary.get("gates")
     skip_classification = summary.get("skipClassification") or {}
-    if required_gates:
+    # Priority 5: the EFFECTIVE required-gate set is the union of whatever the
+    # caller explicitly asked for (--required-gate, repeatable) and the
+    # verifier's OWN canonical set (when the caller identified a consumer --
+    # e.g. CaleeMobile-Regression -- that has one). This is what makes a
+    # missing required gate BLOCK even when --required-gate was never passed
+    # at all: the canonical set is not optional, caller-suppliable input, it
+    # is a baseline this verifier owns.
+    effective_required_gates = sorted(set(required_gates or ()) | set(canonical_required_gates or ()))
+    if effective_required_gates:
         if not isinstance(gates, dict):
             problems.append(
-                f"required gate(s) {sorted(required_gates)} were requested, but this evidence carries no "
+                f"required gate(s) {effective_required_gates} were requested, but this evidence carries no "
                 f"'gates' breakdown at all -- cannot verify them."
             )
+        elif not gates:
+            problems.append(
+                f"required gate(s) {effective_required_gates} were requested, but this evidence's 'gates' "
+                f"breakdown is empty -- cannot verify them."
+            )
         else:
-            for gate in required_gates:
+            for gate in effective_required_gates:
                 result = gates.get(gate)
                 if result is None:
                     problems.append(f"required gate {gate!r} is not present in the evidence's gates.")
@@ -158,10 +251,11 @@ def verify_main_ci_evidence(
                         )
                 else:
                     problems.append(f"required gate {gate!r} did not succeed (result: {result!r}).")
-    elif isinstance(gates, dict):
-        # No explicit --required-gate list given, but the evidence itself
-        # carries a gates breakdown -- verify EVERY gate it lists, so a
-        # caller can't accidentally under-specify and miss a real failure.
+    elif isinstance(gates, dict) and gates:
+        # No required-gate set at all (explicit or canonical), but the
+        # evidence itself carries a non-empty gates breakdown -- verify EVERY
+        # gate it lists, so a caller can't accidentally under-specify and
+        # miss a real failure.
         for gate, result in gates.items():
             if result == "success":
                 continue

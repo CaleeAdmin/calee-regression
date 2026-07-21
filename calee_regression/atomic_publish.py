@@ -35,9 +35,15 @@ ANY point:
     already recorded on disk from a previous successful publish;
   * old versions are deleted only AFTER the pointer switch is verified;
   * a lock file (created with ``O_CREAT | O_EXCL``, containing the owning
-    PID) serialises concurrent writers to the same publication root; a lock
-    left behind by a process that is no longer alive is detected and
-    reclaimed rather than wedging every future publish attempt forever.
+    host, PID, a random owner token, and a lease/acquisition timestamp)
+    serialises concurrent writers to the same publication root -- including
+    ``recover()`` itself (Priority 4 this session: recovery mutates the
+    pointer, journal, and version directories exactly like a publish does,
+    so it must never run outside this same lock). A lock left behind by a
+    process that is no longer alive is detected and reclaimed rather than
+    wedging every future publish attempt forever -- but ONLY under a
+    documented safe rule (see ``_lock``'s docstring): a lock whose owning PID
+    is confirmed alive ON THIS HOST is never reclaimed merely for being old.
 
 A consumer that simply opens/reads/iterates ``pub_root`` (e.g.
 ``release_installer.verify_release_bundle``) is unaffected -- ``pathlib``
@@ -57,16 +63,31 @@ import errno
 import hashlib
 import json
 import os
+import secrets
 import shutil
+import socket
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
 
 # How long a lock file may be held before it is considered abandoned by a
 # dead process even when the owning PID cannot be checked (e.g. the lock was
-# left by a process on a different host sharing this filesystem).
+# left by a process on a different host sharing this filesystem, so its PID
+# cannot be tested against this host's process table at all). A lock whose
+# PID IS checkable on this host (see _lock's docstring) is never reclaimed on
+# age alone -- only this cross-host/unattributable case falls back to it.
 _STALE_LOCK_SECONDS = 6 * 60 * 60
+
+
+def _current_host() -> str:
+    """The identifier this process stamps into a lock file it creates, and
+    compares against when deciding whether a held lock's PID can be trusted
+    (Priority 4). A thin wrapper so tests can simulate "a lock left by a
+    process on a different host sharing this filesystem" without actually
+    using two machines."""
+    return socket.gethostname()
 
 
 class PublishError(Exception):
@@ -129,6 +150,33 @@ def _fsync_tree(directory: Path) -> None:
             os.close(fd)
 
 
+def _fsync_dir(directory: Path) -> None:
+    """Best-effort fsync of a single directory's inode -- used to make a
+    directory-entry change (a rename/replace that added, removed, or
+    retargeted an entry inside it) durable, as distinct from ``_fsync_tree``
+    which walks and fsyncs an entire file tree BEFORE that tree is made
+    visible. Swallows OSError exactly like ``_fsync_tree`` (some sandboxed/
+    overlay filesystems reject fsync on a directory fd)."""
+    with contextlib.suppress(OSError):
+        fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def _fsync_file(path: Path) -> None:
+    """Best-effort fsync of a single file already written to disk (e.g. the
+    transaction journal) -- as opposed to ``_fsync_tree``, which is for an
+    entire freshly-built directory."""
+    with contextlib.suppress(OSError):
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -152,36 +200,109 @@ class _Paths:
         self.link_tmp_prefix = f".{pub_root.name}.link-tmp-"
 
 
+def _write_lock_file(path: Path, owner: dict) -> None:
+    """Publish ``path`` fully-formed or not at all (Priority 4).
+
+    A naive ``O_CREAT | O_EXCL`` open followed by a separate write leaves a
+    window where ``path`` exists but is empty/partially written; a
+    concurrent ``_read_lock_file`` that lands in that window gets a
+    ``JSONDecodeError``, which ``_lock_is_stale`` (correctly, for a
+    genuinely corrupt leftover file) treats as "abandoned -- reclaim it".
+    Against a live, mid-write owner that is wrong: the reader steals a lock
+    that is not actually abandoned, and two writers end up unlocked at once.
+    This was a real, reproducible flake in the concurrency tests, not a
+    theoretical concern.
+
+    The fix: write the complete content to a private temp file (same
+    directory, so the next step is same-filesystem) and fsync it, THEN
+    publish it at ``path`` with ``os.link`` -- a hard link, like
+    ``O_CREAT | O_EXCL``, is created atomically and fails with
+    ``FileExistsError`` if ``path`` is already taken, so a reader can only
+    ever observe ``path`` as absent or as a complete, valid lock file --
+    never partially written.
+    """
+    tmp_path = path.parent / f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(8)}"
+    fd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(json.dumps(owner).encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.link(str(tmp_path), str(path))
+    finally:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink()
+    _fsync_dir(path.parent)
+
+
+def _read_lock_file(path: Path) -> "dict | None":
+    try:
+        held = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(held, dict):
+        return None
+    return held
+
+
+def _lock_is_stale(held: "dict | None") -> bool:
+    """The ONE documented safe reclaim rule (Priority 4):
+
+      * an unreadable/corrupt/non-object lock file can never legitimately be
+        held by a live writer -- abandoned;
+      * a lock recorded as created ON THIS HOST (``host`` matches
+        :func:`_current_host`) whose PID is confirmed dead (``_pid_alive`` is
+        False) -- abandoned;
+      * a lock recorded as created on THIS HOST whose PID is confirmed ALIVE
+        is NEVER reclaimed on age alone -- a demonstrably live owner is
+        always protected, however long it has held the lock;
+      * a lock whose ``host`` is missing, or does not match this host (a
+        shared filesystem: the owning process cannot be PID-checked from
+        here at all) falls back to the age-only rule: abandoned once older
+        than ``_STALE_LOCK_SECONDS``, exactly the same "how long may a lock
+        be held before it's abandoned by a process we cannot check" case the
+        module docstring has always described.
+    """
+    if held is None:
+        return True
+    try:
+        held_pid = int(held.get("pid", -1))
+        acquired_at = float(held.get("acquiredAt", 0))
+    except (TypeError, ValueError):
+        return True
+    held_host = held.get("host")
+    same_host = isinstance(held_host, str) and held_host == _current_host()
+    if same_host:
+        return not _pid_alive(held_pid)
+    return (time.time() - acquired_at) > _STALE_LOCK_SECONDS
+
+
 @contextlib.contextmanager
 def _lock(paths: _Paths, *, timeout: float = 30.0):
     paths.pub_root.parent.mkdir(parents=True, exist_ok=True)
+    owner = {
+        "host": _current_host(),
+        "pid": os.getpid(),
+        "token": secrets.token_hex(16),
+        "acquiredAt": time.time(),
+    }
     deadline = None
     while True:
         try:
-            fd = os.open(str(paths.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w") as f:
-                f.write(json.dumps({"pid": os.getpid(), "acquiredAt": time.time()}))
+            _write_lock_file(paths.lock_path, owner)
             break
         except FileExistsError:
-            stale = False
-            try:
-                held = json.loads(paths.lock_path.read_text(encoding="utf-8"))
-                held_pid = int(held.get("pid", -1))
-                acquired_at = float(held.get("acquiredAt", 0))
-            except (OSError, ValueError, json.JSONDecodeError):
-                # An unreadable/corrupt lock file can never legitimately be
-                # held by a live writer -- treat it as abandoned.
-                stale = True
-                held_pid = -1
-                acquired_at = 0
-            if not stale and not _pid_alive(held_pid):
-                stale = True
-            if not stale and (time.time() - acquired_at) > _STALE_LOCK_SECONDS:
-                stale = True
-            if stale:
+            held = _read_lock_file(paths.lock_path)
+            if _lock_is_stale(held):
+                # Reclaim by replacing (not blindly unlinking) the exact file
+                # we inspected -- if a third process races us and replaces it
+                # first, our unlink() would otherwise silently steal or
+                # destroy THEIR fresh lock. Fall through to retry either way;
+                # the next loop iteration re-inspects whatever is there now.
                 with contextlib.suppress(OSError):
                     paths.lock_path.unlink()
                 continue
+            held_pid = held.get("pid") if held else None
             if deadline is None:
                 deadline = time.time() + timeout
             if time.time() >= deadline:
@@ -193,8 +314,16 @@ def _lock(paths: _Paths, *, timeout: float = 30.0):
     try:
         yield
     finally:
-        with contextlib.suppress(OSError):
-            paths.lock_path.unlink()
+        # Compare-and-delete: only remove the lock file if it still records
+        # OUR acquisition (Priority 4). If it now names a different token, a
+        # reclaimer decided (correctly, under _lock_is_stale's rule, or
+        # incorrectly) that we were abandoned and has already taken over --
+        # unconditionally unlinking here would delete THEIR live lock and let
+        # a third acquirer in underneath them.
+        current = _read_lock_file(paths.lock_path)
+        if current is not None and current.get("token") == owner["token"]:
+            with contextlib.suppress(OSError):
+                paths.lock_path.unlink()
 
 
 def _current_version_name(paths: _Paths) -> "str | None":
@@ -246,6 +375,10 @@ def _swap_pointer(paths: _Paths, version_name: str) -> None:
     os.symlink(str(target), str(tmp_link))
     _make_way_for_pointer(paths)
     os.replace(str(tmp_link), str(paths.pub_root))
+    # Priority 4: fsync the pointer's parent directory so the rename that
+    # just retargeted (or created) the pub_root entry is itself durable, not
+    # just the version directory it points at.
+    _fsync_dir(paths.pub_root.parent)
 
 
 def _cleanup_orphans(paths: _Paths, *, keep: "set[str]") -> None:
@@ -261,17 +394,27 @@ def _cleanup_orphans(paths: _Paths, *, keep: "set[str]") -> None:
                     entry.unlink()
 
 
-def recover(pub_root: "Path | str") -> "list[str]":
-    """Detect and finish/roll back any transaction an earlier (killed)
-    process left interrupted for ``pub_root``. Idempotent -- safe to call
-    even when nothing is interrupted (the common case). Returns a list of
-    human-readable actions taken (empty when nothing needed recovery).
+def _recover_locked(paths: _Paths) -> "list[str]":
+    """The actual recovery logic (Priority 4): detect and finish/roll back
+    any transaction an earlier (killed) process left interrupted for
+    ``paths.pub_root``. Idempotent -- safe to call even when nothing is
+    interrupted (the common case). Returns a list of human-readable actions
+    taken (empty when nothing needed recovery).
+
+    REQUIRES the caller to already hold ``paths.lock_path`` (via ``_lock``).
+    Recovery reads/deletes the journal, swaps the pointer, and deletes
+    superseded version directories -- exactly the same mutations a publish
+    performs -- so running it without the lock held would race a concurrent
+    ``publish_version``/``recover`` the same way an unlocked publish would.
+    This function is intentionally private (leading underscore, no locking
+    of its own, like ``_publish_locked``); ``recover()`` below is the public,
+    lock-acquiring entry point, and ``publish_version`` calls this directly
+    from inside the lock it already holds.
 
     Guarantees: after this returns, ``pub_root`` either points at a version
     directory that fully exists on disk, or (only when NO version has ever
     been successfully published for this root) is absent -- it is never left
     pointing at a partially-written or missing version."""
-    paths = _Paths(Path(pub_root))
     actions: "list[str]" = []
     paths.versions_dir.mkdir(parents=True, exist_ok=True)
 
@@ -296,6 +439,12 @@ def recover(pub_root: "Path | str") -> "list[str]":
                 # crash, but the pointer swap itself may not have happened
                 # (or may have raced the crash) -- redo it now (idempotent).
                 _swap_pointer(paths, new_version)
+                resolved = _current_version_name(paths)
+                if resolved != new_version:
+                    raise PublishError(
+                        f"recovery resumed publishing {new_version!r} but the pointer at "
+                        f"{paths.pub_root} did not verify afterwards."
+                    )
                 actions.append(f"resumed interrupted publish: pointer now activated for {new_version!r}.")
                 activated = True
             else:
@@ -326,9 +475,26 @@ def recover(pub_root: "Path | str") -> "list[str]":
         if candidates:
             fallback = candidates[-1]
             _swap_pointer(paths, fallback.name)
+            resolved = _current_version_name(paths)
+            if resolved != fallback.name:
+                raise PublishError(
+                    f"recovery repointed to {fallback.name!r} but the pointer at {paths.pub_root} "
+                    f"did not verify afterwards."
+                )
             actions.append(f"pointer was missing with no journal; recovered to the newest known version {fallback.name!r}.")
 
     return actions
+
+
+def recover(pub_root: "Path | str", *, lock_timeout: float = 30.0) -> "list[str]":
+    """Public entry point for recovery (Priority 4): acquires the SAME lock
+    ``publish_version`` uses, then runs :func:`_recover_locked`. Safe to call
+    at any time, including concurrently with an in-flight ``publish_version``
+    for the same root (it simply waits for the lock like any other writer).
+    """
+    paths = _Paths(Path(pub_root))
+    with _lock(paths, timeout=lock_timeout):
+        return _recover_locked(paths)
 
 
 def publish_version(
@@ -352,9 +518,15 @@ def publish_version(
     """
     pub_root = Path(pub_root)
     paths = _Paths(pub_root)
-    recover(pub_root)
 
     with _lock(paths, timeout=lock_timeout):
+        # Priority 4: recovery runs INSIDE the same lock this publish is
+        # about to use -- it mutates the pointer/journal/version directories
+        # exactly like a publish does, so running it before the lock was
+        # acquired (the previous behaviour) could race a concurrent
+        # publish_version/recover for the same root.
+        _recover_locked(paths)
+
         paths.versions_dir.mkdir(parents=True, exist_ok=True)
         tmp_dir = Path(tempfile.mkdtemp(dir=paths.versions_dir, prefix=".tmp-"))
         try:
@@ -399,12 +571,24 @@ def _publish_locked(paths: _Paths, tmp_dir: Path, build_fn, verify_fn) -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
     else:
         os.rename(str(tmp_dir), str(version_dir))
+        # Priority 4: fsync the completed version directory's PARENT so the
+        # rename that just made it a named entry under versions_dir is
+        # itself durable -- _fsync_tree above already fsync'd the version's
+        # own file contents before this rename, while it was still tmp_dir.
+        _fsync_dir(paths.versions_dir)
 
     previous_version = _current_version_name(paths)
-    paths.journal_path.write_text(
-        json.dumps({"newVersion": version_name, "previousVersion": previous_version, "phase": "swapping"}),
-        encoding="utf-8",
-    )
+    journal_bytes = json.dumps(
+        {"newVersion": version_name, "previousVersion": previous_version, "phase": "swapping"}
+    ).encode("utf-8")
+    paths.journal_path.write_bytes(journal_bytes)
+    # Priority 4: fsync the journal file itself and its parent directory --
+    # recover() relies on this file surviving a crash exactly as written, so
+    # both the file's own bytes and the directory entry that names it must be
+    # durable before the pointer swap (the next step) makes the transaction
+    # externally observable.
+    _fsync_file(paths.journal_path)
+    _fsync_dir(paths.journal_path.parent)
     _swap_pointer(paths, version_name)
 
     resolved = _current_version_name(paths)
