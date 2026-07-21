@@ -91,6 +91,11 @@ launchers never do this automatically.
 
 ### Release platform profile (which platforms this release includes)
 
+If you're testing against a schema-v2 release bundle (`release-manifest.json` with
+`schemaVersion: 2`, resolved via `config/machine.local.yaml`'s `release_bundle_dir`), the bundle
+itself is authoritative for which platforms/features this release includes — this file is not
+consulted at all, and you can skip this step. Otherwise (a schema-v1 bundle, or no bundle):
+
 ```bash
 cp config/release-platforms.example.yaml config/release-platforms.yaml
 ```

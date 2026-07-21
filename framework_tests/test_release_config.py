@@ -819,3 +819,221 @@ def test_effective_release_config_to_dict_embeds_release_config_digest(tmp_path)
     d = cfg.to_dict()
     assert d["releaseConfigDigest"] == rc.release_selections_digest(d["releaseSelections"])
     assert d["releaseConfigDigest"].startswith("sha256:")
+
+
+# ── Priority 2 (this session): parse_release_config_report -- strict typed
+#    parsing + independent digest recomputation ────────────────────────────
+
+
+def _valid_selections(**over):
+    base = {
+        "selectedBackend": "https://hub.calee.com.au",
+        "enabledPlatforms": ["tablet", "android", "ios"],
+        "enabledFeatures": ["synchronization"],
+        "profile": "production",
+        "distributedBuildRequired": True,
+        "expectedIdentities": {
+            "caleeMobile": {
+                "buildVersion": "0.0.24+24", "gitSha": "a" * 40,
+                "selectorEvidenceRequired": True, "distributedBuildAcceptanceRequired": True,
+            },
+        },
+    }
+    base.update(over)
+    return base
+
+
+def _report_for(selections, **over):
+    report = {
+        "status": "ok", "schemaVersion": 2, "releaseSelections": selections,
+        "releaseConfigDigest": rc.release_selections_digest(selections),
+    }
+    report.update(over)
+    return report
+
+
+def test_parse_release_config_report_accepts_well_formed_report():
+    selections = _valid_selections()
+    parsed = rc.parse_release_config_report(_report_for(selections))
+    assert parsed.digest_matches
+    assert parsed.schema_version == 2
+    assert parsed.release_selections.profile == "production"
+    assert parsed.release_selections.enabled_platforms == ("tablet", "android", "ios")
+    assert parsed.release_selections.calee_mobile_selector_evidence_required is True
+    assert parsed.release_selections.calee_mobile_distributed_build_acceptance_required is True
+
+
+def test_parse_release_config_report_recomputes_digest_not_trusting_stored_copy():
+    """The core Priority 2 defect: releaseSelections changes, the stored
+    releaseConfigDigest is left as the OLD (now-stale) value -- the digest
+    recomputed from the actual releaseSelections must disagree with it."""
+    selections = _valid_selections()
+    stale_digest = rc.release_selections_digest(selections)
+    tampered = _valid_selections(profile="staging")
+    report = {"status": "ok", "schemaVersion": 2, "releaseSelections": tampered, "releaseConfigDigest": stale_digest}
+
+    parsed = rc.parse_release_config_report(report)
+    assert not parsed.digest_matches
+    assert parsed.recomputed_digest == rc.release_selections_digest(tampered)
+    assert parsed.recomputed_digest != parsed.stored_digest
+
+
+def test_parse_release_config_report_detects_edited_stored_digest_with_unchanged_selections():
+    """The other direction of the same defect: releaseSelections is
+    untouched, but the stored releaseConfigDigest was edited -- still caught,
+    because the digest is recomputed from content, never read as trusted."""
+    selections = _valid_selections()
+    report = _report_for(selections, releaseConfigDigest="sha256:" + "0" * 64)
+    parsed = rc.parse_release_config_report(report)
+    assert not parsed.digest_matches
+
+
+@pytest.mark.parametrize("bad_value", ["true", 1, 0, [], {}])
+def test_parse_release_selections_rejects_non_boolean_distributed_build_required(bad_value):
+    selections = _valid_selections()
+    selections["distributedBuildRequired"] = bad_value
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(_report_for(selections))
+
+
+def test_parse_release_selections_treats_null_distributed_build_required_as_absent():
+    """Unlike a present-but-wrong-typed value, an explicit JSON null for an
+    optional boolean field is treated the same as the key being absent
+    entirely (falls back to the default) -- it must NOT be rejected."""
+    selections = _valid_selections()
+    selections["distributedBuildRequired"] = None
+    parsed = rc.parse_release_config_report(_report_for(selections))
+    assert parsed.release_selections.distributed_build_required is False
+
+
+@pytest.mark.parametrize("bad_value", ["true", 1, 0, [], {}])
+def test_parse_release_selections_rejects_non_boolean_selector_evidence_required(bad_value):
+    selections = _valid_selections()
+    selections["expectedIdentities"]["caleeMobile"]["selectorEvidenceRequired"] = bad_value
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(_report_for(selections))
+
+
+@pytest.mark.parametrize("bad_value", ["true", 1, 0, [], {}])
+def test_parse_release_selections_rejects_non_boolean_distributed_build_acceptance_required(bad_value):
+    selections = _valid_selections()
+    selections["expectedIdentities"]["caleeMobile"]["distributedBuildAcceptanceRequired"] = bad_value
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(_report_for(selections))
+
+
+@pytest.mark.parametrize("bad_value", [123, True, None, "tablet,android"])
+def test_parse_release_selections_rejects_non_array_enabled_platforms(bad_value):
+    selections = _valid_selections()
+    selections["enabledPlatforms"] = bad_value
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(_report_for(selections))
+
+
+def test_parse_release_selections_rejects_non_string_items_in_enabled_platforms():
+    selections = _valid_selections()
+    selections["enabledPlatforms"] = ["tablet", 1, True]
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(_report_for(selections))
+
+
+@pytest.mark.parametrize("bad_value", [123, True, None, "", "  "])
+def test_parse_release_selections_rejects_non_string_or_empty_profile(bad_value):
+    selections = _valid_selections()
+    selections["profile"] = bad_value
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(_report_for(selections))
+
+
+def test_parse_release_config_report_rejects_non_integer_schema_version():
+    selections = _valid_selections()
+    report = _report_for(selections)
+    report["schemaVersion"] = "2"
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(report)
+
+
+def test_parse_release_config_report_rejects_boolean_schema_version():
+    selections = _valid_selections()
+    report = _report_for(selections)
+    report["schemaVersion"] = True
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(report)
+
+
+def test_parse_release_selections_rejects_unknown_critical_key():
+    selections = _valid_selections()
+    selections["injectedField"] = "smuggled-value"
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(_report_for(selections))
+
+
+def test_parse_release_selections_rejects_unknown_key_in_caleemobile_identity():
+    selections = _valid_selections()
+    selections["expectedIdentities"]["caleeMobile"]["injectedField"] = "smuggled-value"
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(_report_for(selections))
+
+
+@pytest.mark.parametrize("missing_key", ["profile", "enabledPlatforms", "enabledFeatures", "expectedIdentities"])
+def test_parse_release_selections_rejects_missing_required_key(missing_key):
+    selections = _valid_selections()
+    del selections[missing_key]
+    report = {
+        "status": "ok", "schemaVersion": 2, "releaseSelections": selections,
+        "releaseConfigDigest": rc.release_selections_digest(selections),
+    }
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(report)
+
+
+@pytest.mark.parametrize("missing_key", ["schemaVersion", "releaseSelections", "releaseConfigDigest"])
+def test_parse_release_config_report_rejects_missing_top_level_required_key(missing_key):
+    selections = _valid_selections()
+    report = _report_for(selections)
+    del report[missing_key]
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(report)
+
+
+def test_parse_release_config_report_rejects_non_dict_release_selections():
+    report = {"status": "ok", "schemaVersion": 2, "releaseSelections": "not-an-object", "releaseConfigDigest": "sha256:" + "0" * 64}
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(report)
+
+
+def test_parse_release_config_report_rejects_non_dict_report():
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(["not", "a", "dict"])
+
+
+def test_parse_release_config_report_accepts_missing_optional_calee_mobile_identity():
+    """expectedIdentities.caleeMobile is optional (some releases have no
+    CaleeMobile component in scope at all) -- its absence must not fail
+    parsing, and the selector/distributed-build requirement flags read None
+    (the caller decides the default)."""
+    selections = _valid_selections(expectedIdentities={})
+    parsed = rc.parse_release_config_report(_report_for(selections))
+    assert parsed.release_selections.calee_mobile_selector_evidence_required is None
+    assert parsed.release_selections.calee_mobile_distributed_build_acceptance_required is None
+
+
+def test_parse_release_config_report_rejects_malformed_digest_string():
+    selections = _valid_selections()
+    report = _report_for(selections, releaseConfigDigest="not-a-digest")
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(report)
+
+
+def test_parse_release_config_report_accepts_and_validates_release_candidate_fingerprint_type():
+    selections = _valid_selections()
+    report = _report_for(selections, releaseCandidateFingerprint={"releaseId": "r1", "schemaVersion": 2})
+    parsed = rc.parse_release_config_report(report)
+    assert parsed.release_candidate_fingerprint == {"releaseId": "r1", "schemaVersion": 2}
+
+
+def test_parse_release_config_report_rejects_non_dict_release_candidate_fingerprint():
+    selections = _valid_selections()
+    report = _report_for(selections, releaseCandidateFingerprint="not-an-object")
+    with pytest.raises(rc.ReleaseConfigReportError):
+        rc.parse_release_config_report(report)

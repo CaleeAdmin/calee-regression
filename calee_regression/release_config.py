@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from typing import Any
 
 from .machine_config import MachineConfig
 from .release_installer import (
@@ -237,6 +238,226 @@ def release_selections_digest(release_selections: dict) -> str:
     candidate fingerprint (``release_candidate.py``)."""
     canonical = json.dumps(release_selections, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class ReleaseConfigReportError(Exception):
+    """A release-config evidence report (``release-config/results.json``) is
+    structurally invalid -- a wrong JSON type, an unknown critical key, or a
+    missing required field -- a framework/pipeline fault, never silently
+    coerced (e.g. via ``bool(value)``) into something policy can act on."""
+
+
+# The exact key set ``EffectiveReleaseConfig.to_dict()`` writes into
+# ``releaseSelections`` -- anything else appearing there was not produced by
+# this codebase's own composition and is rejected rather than silently
+# ignored (a coordinated edit could otherwise smuggle an extra field past
+# every check below without ever being noticed).
+_ALLOWED_RELEASE_SELECTIONS_KEYS = frozenset({
+    "selectedBackend", "enabledPlatforms", "enabledFeatures", "profile",
+    "distributedBuildRequired", "expectedIdentities",
+})
+
+# Sub-keys of releaseSelections.expectedIdentities.caleeMobile that installer
+# policy (install-tablet-release) actually reads and type-checks. The calee/
+# caleeShell identity blocks are not constrained here -- they are policy
+# inputs to apk_inspect/release_installer, which read them from the verified
+# bundle manifest directly, not from this report.
+_ALLOWED_CALEEMOBILE_IDENTITY_KEYS = frozenset({
+    "buildVersion", "gitSha", "selectorEvidenceRequired", "distributedBuildAcceptanceRequired",
+})
+
+# Top-level keys install-tablet-release's policy decisions actually depend
+# on. (runId/releaseId/machineSelections/deviceIds/conflicts/detail are
+# already required and run-ID/staleness-validated by the caller via
+# run_context.validate_component_report + _RELEASE_CONFIG_REQUIRED_KEYS --
+# this set is deliberately narrower, and about VALUE TYPES, not presence
+# already covered elsewhere.)
+_REQUIRED_REPORT_KEYS_FOR_POLICY = frozenset({"schemaVersion", "releaseSelections", "releaseConfigDigest"})
+
+
+def _reject(path: str, message: str) -> "None":
+    raise ReleaseConfigReportError(f"{path}: {message}")
+
+
+def _require_dict(raw: "Any", path: str) -> dict:
+    if not isinstance(raw, dict):
+        _reject(path, f"must be a JSON object (got {raw!r}).")
+    return raw
+
+
+def _require_str_list(container: dict, key: str, path: str) -> "tuple[str, ...]":
+    if key not in container:
+        _reject(path, f"missing required key {key!r}.")
+    value = container[key]
+    if not isinstance(value, list) or not all(isinstance(v, str) and not isinstance(v, bool) for v in value):
+        _reject(path, f"{key} must be a JSON array of strings (got {value!r}).")
+    return tuple(value)
+
+
+def _require_nonempty_str(container: dict, key: str, path: str) -> str:
+    if key not in container:
+        _reject(path, f"missing required key {key!r}.")
+    value = container[key]
+    if not isinstance(value, str) or isinstance(value, bool) or not value.strip():
+        _reject(path, f"{key} must be a non-empty JSON string (got {value!r}).")
+    return value
+
+
+def _optional_bool(container: dict, key: str, path: str) -> "bool | None":
+    if key not in container or container[key] is None:
+        return None
+    value = container[key]
+    if not isinstance(value, bool):
+        _reject(path, f"{key} must be a JSON boolean (got {value!r}) -- refusing to coerce with bool().")
+    return value
+
+
+def _required_bool(container: dict, key: str, path: str, *, default: bool) -> bool:
+    if key not in container or container[key] is None:
+        return default
+    value = container[key]
+    if not isinstance(value, bool):
+        _reject(path, f"{key} must be a JSON boolean (got {value!r}) -- refusing to coerce with bool().")
+    return value
+
+
+@dataclass(frozen=True)
+class ParsedReleaseSelections:
+    """Strictly-typed view of a release-config report's ``releaseSelections``
+    (Priority 2). Every field has already been type-checked; nothing here was
+    reached via Python truthiness coercion of untrusted JSON."""
+
+    selected_backend: "str | None"
+    enabled_platforms: "tuple[str, ...]"
+    enabled_features: "tuple[str, ...]"
+    profile: str
+    distributed_build_required: bool
+    expected_identities: dict
+    calee_mobile_selector_evidence_required: "bool | None"
+    calee_mobile_distributed_build_acceptance_required: "bool | None"
+
+
+def parse_release_selections(raw: "Any", *, path: str = "releaseSelections") -> ParsedReleaseSelections:
+    """Strictly parse+validate a ``releaseSelections`` object (Priority 2).
+
+    Raises :class:`ReleaseConfigReportError` for ANY structural problem --
+    wrong JSON type, unknown key -- rather than silently truthiness-coercing
+    (``bool(value)``) a value that might be a string, an integer, ``null`` or
+    an array. Booleans are validated as actual ``bool`` (rejecting ``True``/
+    ``False`` look-alikes like ``1``/``"true"``/``[]``).
+    """
+    raw = _require_dict(raw, path)
+    unknown = sorted(set(raw) - _ALLOWED_RELEASE_SELECTIONS_KEYS)
+    if unknown:
+        _reject(path, f"has unknown critical key(s) {unknown} -- refusing to trust an unrecognised field.")
+
+    profile = _require_nonempty_str(raw, "profile", path)
+    enabled_platforms = _require_str_list(raw, "enabledPlatforms", path)
+    enabled_features = _require_str_list(raw, "enabledFeatures", path)
+    distributed_build_required = _required_bool(raw, "distributedBuildRequired", path, default=False)
+
+    identities_path = f"{path}.expectedIdentities"
+    if "expectedIdentities" not in raw:
+        _reject(path, "missing required key 'expectedIdentities'.")
+    expected_identities = _require_dict(raw["expectedIdentities"], identities_path)
+
+    selector_evidence_required = None
+    distributed_build_acceptance_required = None
+    calee_mobile = expected_identities.get("caleeMobile")
+    if calee_mobile is not None:
+        calee_mobile_path = f"{identities_path}.caleeMobile"
+        calee_mobile = _require_dict(calee_mobile, calee_mobile_path)
+        unknown_cm = sorted(set(calee_mobile) - _ALLOWED_CALEEMOBILE_IDENTITY_KEYS)
+        if unknown_cm:
+            _reject(calee_mobile_path, f"has unknown critical key(s) {unknown_cm}.")
+        selector_evidence_required = _optional_bool(calee_mobile, "selectorEvidenceRequired", calee_mobile_path)
+        distributed_build_acceptance_required = _optional_bool(
+            calee_mobile, "distributedBuildAcceptanceRequired", calee_mobile_path
+        )
+
+    selected_backend = raw.get("selectedBackend")
+    if selected_backend is not None and not isinstance(selected_backend, str):
+        _reject(path, f"selectedBackend must be a string or null (got {selected_backend!r}).")
+
+    return ParsedReleaseSelections(
+        selected_backend=selected_backend,
+        enabled_platforms=enabled_platforms,
+        enabled_features=enabled_features,
+        profile=profile,
+        distributed_build_required=distributed_build_required,
+        expected_identities=expected_identities,
+        calee_mobile_selector_evidence_required=selector_evidence_required,
+        calee_mobile_distributed_build_acceptance_required=distributed_build_acceptance_required,
+    )
+
+
+@dataclass(frozen=True)
+class ParsedReleaseConfigReport:
+    """Strictly-typed, digest-recomputed view of a release-config evidence
+    report (Priority 2). ``recomputed_digest`` is computed HERE, from the
+    parsed ``releaseSelections`` this object exposes -- never read as a
+    stored, trusted opaque string."""
+
+    schema_version: int
+    release_selections: ParsedReleaseSelections
+    stored_digest: str
+    recomputed_digest: str
+    release_candidate_fingerprint: "dict | None"
+
+    @property
+    def digest_matches(self) -> bool:
+        return self.stored_digest == self.recomputed_digest
+
+
+def parse_release_config_report(raw: "Any") -> ParsedReleaseConfigReport:
+    """Strictly parse+validate a release-config evidence report (Priority 2).
+
+    Validates the actual JSON types of every field installer policy depends
+    on -- ``schemaVersion`` (int, not bool), ``profile`` (non-empty str),
+    ``enabledPlatforms``/``enabledFeatures`` (str arrays), expected
+    identities (object), the selector/distributed-build requirement flags
+    (bool), and ``releaseCandidateFingerprint`` (object, when present) --
+    raising :class:`ReleaseConfigReportError` for any type mismatch or
+    unknown critical key rather than silently coercing it.
+
+    Independently RECOMPUTES ``releaseConfigDigest`` from the parsed
+    ``releaseSelections`` (:func:`release_selections_digest`) instead of
+    trusting the report's own stored copy -- see
+    :attr:`ParsedReleaseConfigReport.digest_matches`. A caller MUST check
+    ``digest_matches`` itself; a mismatch is a policy verdict (BLOCK), not a
+    structural error, so it is not raised here.
+    """
+    raw = _require_dict(raw, "release-config report")
+    missing = sorted(_REQUIRED_REPORT_KEYS_FOR_POLICY - set(raw))
+    if missing:
+        _reject("release-config report", f"is missing required key(s) {missing}.")
+
+    schema_version = raw["schemaVersion"]
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        _reject("release-config report", f"schemaVersion must be a JSON integer (got {schema_version!r}).")
+
+    stored_digest = raw["releaseConfigDigest"]
+    if not isinstance(stored_digest, str) or not stored_digest.startswith("sha256:"):
+        _reject(
+            "release-config report",
+            f"releaseConfigDigest must be a 'sha256:<hex>' string (got {stored_digest!r}).",
+        )
+
+    release_selections_raw = raw["releaseSelections"]
+    release_selections = parse_release_selections(release_selections_raw)
+    recomputed_digest = release_selections_digest(release_selections_raw)
+
+    fingerprint_raw = raw.get("releaseCandidateFingerprint")
+    if fingerprint_raw is not None:
+        fingerprint_raw = _require_dict(fingerprint_raw, "releaseCandidateFingerprint")
+
+    return ParsedReleaseConfigReport(
+        schema_version=schema_version,
+        release_selections=release_selections,
+        stored_digest=stored_digest,
+        recomputed_digest=recomputed_digest,
+        release_candidate_fingerprint=fingerprint_raw,
+    )
 
 
 def resolve_selector_evidence_required(

@@ -35,8 +35,14 @@ release_bundle_dir: "~/Calee-Releases/current"
 # The Hub backend the fixture is reset against and the apps are built to talk
 # to (e.g. https://hub-dev.calee.com.au for a pre-release environment).
 backend_url: "https://hub-dev.calee.com.au"
-# Which release profile config/release-platforms.yaml to use (a label; the
-# actual platform/feature gating lives in that file).
+# The profile this MACHINE is set up for -- "production" or "staging".
+# For a schema-v1 release-platforms.yaml (or no bundle), this selects which
+# profile's platform/feature gating in that file applies. For a schema-v2
+# release-candidate bundle, the BUNDLE's own profile is authoritative
+# instead (release-platforms.yaml is not consulted); this field is then a
+# SAFETY CROSS-CHECK only -- a release must not run against a machine set up
+# for a different profile than the bundle actually is, so a mismatch BLOCKS
+# rather than silently using either value.
 release_profile: "production"
 
 # ── mobile platforms ─────────────────────────────────────────────────────

@@ -509,8 +509,9 @@ def component_from_release_config_report(
     where) with the release candidate (what), including every conflict
     decision (profile disagreement, backend pin mismatch, missing required
     platform capability, ...). A composition that reports ``ok`` is PASS; any
-    other status (a real conflict, or a missing/unreadable release-platforms.yaml)
-    BLOCKS -- a release-config conflict is a setup/configuration blocker, never a
+    other status (a real conflict, or -- for a schema-v1/bare run only, never a
+    schema-v2 bundle -- a missing/unreadable release-platforms.yaml) BLOCKS --
+    a release-config conflict is a setup/configuration blocker, never a
     product FAIL, but it must gate the release exactly like machine-config and
     installation: this is a pre-product gate, and no product test may run, or
     read as contributing to a PASS, once it is BLOCKED."""
@@ -1021,8 +1022,19 @@ def component_from_distributed_build_acceptance_report(
 
       * a ``provenance`` record (this session's Priority 3) -- the
         authenticated App Store Connect/TestFlight/Play Console/signed-export/
-        CI-artifact evidence, envelope- and raw-byte-digest protected. Only
-        this shape can ever reach PASS.
+        CI-artifact evidence, envelope- and raw-byte-digest protected, AND
+        stamped with an ``evidenceTier`` that must be one of
+        ``provider_evidence.AUTHENTICATED_TIERS``. This double condition
+        matters: the envelope/digest checks alone only prove the record
+        wasn't tampered with AFTER being recorded -- they say nothing about
+        whether it was ever actually authenticated when it WAS recorded. A
+        hand-typed ``--source`` claim is perfectly capable of being
+        internally self-consistent (a correct digest over fabricated
+        content is still a correct digest); the ``evidenceTier`` check is
+        what actually rejects it, because ``record-distributed-build-
+        acceptance`` stamps ``evidenceTier: manual-unverified`` on that path
+        unconditionally, never from the claimed content. Only when BOTH
+        checks pass can this reach PASS.
       * the legacy flat ``evidence`` shape (operator-typed identity flags +
         a ``verifiedVia`` label, with no cryptographic provenance at all) --
         DEPRECATED. Even when every field is well-formed, this can never
@@ -1032,6 +1044,7 @@ def component_from_distributed_build_acceptance_report(
     """
     from . import distributed_build_acceptance as dba
     from . import distributed_build_provenance as dbp
+    from . import provider_evidence as pe
 
     if report_dict is None:
         if not mandatory:
@@ -1073,6 +1086,23 @@ def component_from_distributed_build_acceptance_report(
                 name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
                 detail=[f"Distributed-build provenance record is malformed: {exc}"],
             )
+        problems = list(problems)
+        evidence_tier = provenance.get("evidenceTier")
+        if evidence_tier not in pe.AUTHENTICATED_TIERS:
+            # Priority 3's actual close of the "arbitrary --source JSON"
+            # hole: digest/envelope checks above only prove the record
+            # wasn't tampered with AFTER adoption -- they say nothing about
+            # whether it was ever authenticated AT adoption. This is
+            # evaluated independently here (never trusting the report's own
+            # recorded ``status``), so even a hand-edited report.json that
+            # restores a matching envelope digest around a fabricated claim
+            # still blocks unless evidenceTier genuinely names an
+            # authenticated tier.
+            problems.append(
+                f"evidence tier {evidence_tier!r} is not an independently-authenticated tier "
+                f"({sorted(pe.AUTHENTICATED_TIERS)}) -- operator-supplied/manual-unverified evidence "
+                f"can never reach PASS, however well-formed it looks."
+            )
         evidence = dbp.source_evidence_of(provenance) or {}
         evidence_summary = {
             "provider": evidence.get("provider"),
@@ -1081,6 +1111,7 @@ def component_from_distributed_build_acceptance_report(
             "testedGitSha": evidence.get("testedGitSha"),
             "testedVersion": evidence.get("testedVersion"),
             "generatedBy": evidence.get("generatedBy"),
+            "evidenceTier": evidence_tier,
             "releaseId": evidence.get("releaseId"),
             "timestamp": evidence.get("timestamp"),
             "expectedReleaseId": expected_release_id,
@@ -1133,8 +1164,10 @@ def component_from_distributed_build_acceptance_report(
     }
     deprecation_notice = (
         "Manual/self-declared distributed-build evidence (no authenticated provenance record) is "
-        "DEPRECATED and can never PASS -- provide provenance-backed evidence via "
-        "'record-distributed-build-acceptance --source'."
+        "DEPRECATED and can never PASS -- provide authenticated evidence via "
+        "'record-distributed-build-acceptance --provider' (live provider-API collection), "
+        "'--signed-export' (cryptographically verified signature), or '--github-run-id' (authenticated "
+        "CI artifact). Plain '--source' evidence is recorded but can never PASS either."
     )
     return ComponentResult(
         name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
@@ -1681,8 +1714,11 @@ def build_release_report(
     mobile_exit_floors: "dict[str, int | None] | None" = None,
     extra_components: "list[ComponentResult] | None" = None,
 ) -> ReleaseReport:
-    """`android_mandatory`/`ios_mandatory` come from the technical owner's
-    release-platform profile (calee_regression/release_platforms.py),
+    """`android_mandatory`/`ios_mandatory` are already-resolved booleans --
+    this function is agnostic to where they came from. The `consolidate` CLI
+    (their only real caller) resolves them from THIS run's own schema-v2
+    release-config scope when one was composed, else the technical owner's
+    legacy release-platform profile (calee_regression/release_platforms.py),
     never a hard-coded default here -- an omitted platform selection must
     default to mandatory=True (the release-gating, safe default), the same
     "default must be required" rule applied everywhere else in this
@@ -1703,10 +1739,11 @@ def build_release_report(
     component: True -> release-gating (a missing/BLOCKED/FAILED sync prevents a
     PASS), False -> shown but optional, None -> not included at all (the
     legacy/ad-hoc caller doesn't deal with sync). The `consolidate` CLI always
-    passes a concrete True/False from the release feature profile
-    (release_features.synchronization), so a real release always includes the
-    sync component -- never silently omitted -- while unit tests that don't
-    exercise sync leave it None.
+    passes a concrete True/False, resolved from THIS run's own schema-v2
+    release-config feature scope when one was composed, else the release
+    feature profile (release_features.synchronization) -- so a real release
+    always includes the sync component -- never silently omitted -- while
+    unit tests that don't exercise sync leave it None.
     """
     # A recorded exit-code floor (from the run manifest's worst-wins history)
     # can only make a mobile component worse, never better -- so a later run

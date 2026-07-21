@@ -21,10 +21,12 @@ def test_runs_read_only_and_never_crashes(tmp_path):
     assert "check(s):" in result.output
 
     payload = json.loads(report_path.read_text())
-    assert payload["overall"] in ("READY", "BLOCKED")
+    assert payload["overall"] in ("READY", "WARNING", "BLOCKED")
     assert isinstance(payload["checks"], list) and payload["checks"]
     for check in payload["checks"]:
         assert check["status"] in ("ready", "warning", "blocked")
+    assert isinstance(payload["blockedCapabilities"], list)
+    assert isinstance(payload["warnedCapabilities"], list)
 
 
 def test_explicit_missing_manual_checks_path_blocks_overall(tmp_path):
@@ -41,3 +43,42 @@ def test_report_json_check_count_matches_printed_output(tmp_path):
     payload = json.loads(report_path.read_text())
     for check in payload["checks"]:
         assert check["name"] in result.output
+
+
+def test_main_ci_evidence_flag_is_verified_via_canonical_verifier(tmp_path):
+    summary = {
+        "schemaVersion": 1, "repository": "CaleeAdmin/CaleeMobile-Regression",
+        "workflow": "ci", "workflowFile": ".github/workflows/ci.yml",
+        "event": "push", "ref": "refs/heads/main", "commitSha": "a" * 40,
+        "runId": "1", "runAttempt": "1", "isMainPush": True, "isMergeGroup": False,
+        "gates": {
+            "apiFrameworkTests": "success", "uiReportWrapperTests": "success",
+            "fixtureCliSmoke": "success", "selectorContract": "success",
+            "uiSuiteAnalyze": "success", "releaseCertificationGuard": "success",
+        },
+        "skipClassification": {}, "generatedAt": "2026-07-21T00:00:00Z",
+    }
+    path = tmp_path / "ci-summary.json"
+    path.write_text(json.dumps(summary))
+    result = _invoke(
+        "--main-ci-evidence", str(path), "--main-ci-repository", "CaleeAdmin/CaleeMobile-Regression",
+    )
+    assert "main_ci_evidence" in result.output
+    assert "main_ci_evidence: Main-CI evidence" in result.output
+
+
+def test_main_ci_evidence_missing_required_gate_blocks(tmp_path):
+    summary = {
+        "schemaVersion": 1, "repository": "CaleeAdmin/CaleeMobile-Regression",
+        "workflow": "ci", "workflowFile": ".github/workflows/ci.yml",
+        "event": "push", "ref": "refs/heads/main", "commitSha": "a" * 40,
+        "runId": "1", "runAttempt": "1", "isMainPush": True, "isMergeGroup": False,
+        "gates": {"apiFrameworkTests": "success"}, "skipClassification": {},
+        "generatedAt": "2026-07-21T00:00:00Z",
+    }
+    path = tmp_path / "ci-summary.json"
+    path.write_text(json.dumps(summary))
+    result = _invoke(
+        "--main-ci-evidence", str(path), "--main-ci-repository", "CaleeAdmin/CaleeMobile-Regression",
+    )
+    assert result.exit_code == EXIT_BLOCKED, result.output

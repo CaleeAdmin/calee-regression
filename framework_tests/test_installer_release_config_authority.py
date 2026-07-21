@@ -460,3 +460,142 @@ def test_release_config_digest_mismatch_blocks(tmp_path, monkeypatch):
 
     result = _assert_blocked_with_no_adb_calls(tmp_path, bundle, run_id, monkeypatch)
     assert "releaseConfigDigest" in result.output
+
+
+# ── Priority 1 (this session): a frozen candidate makes a matching same-run
+#    release-config MANDATORY -- deleted/never-written report, wrong release
+#    ID, wrong schema version, schema-v2 + malformed legacy YAML together ──
+
+
+def test_release_config_report_deleted_after_candidate_freeze_blocks(tmp_path, monkeypatch):
+    """The exact crash-consistency window release-config's own write order
+    creates: the candidate snapshot is written BEFORE its own report
+    (release_config_cmd calls snapshot_release_candidate, then _record), so a
+    killed/OOM'd process can leave a frozen candidate with no report at all.
+    Simulated here by deleting an otherwise-valid report after both were
+    written. A frozen candidate existing for this run makes a matching
+    release-config MANDATORY -- this must BLOCK (with zero adb calls), never
+    silently fall back to (here, deliberately malformed) legacy policy."""
+    run_id = "release-20260721-000000-noreport1"
+    bundle = _prep_v2_release_with_candidate(tmp_path, monkeypatch, run_id)
+
+    rc_path = tmp_path / "reports" / "runs" / run_id / "release-config" / "results.json"
+    assert rc_path.is_file()
+    rc_path.unlink()
+
+    result = _assert_blocked_with_no_adb_calls(tmp_path, bundle, run_id, monkeypatch)
+    assert "frozen release candidate exists" in result.output
+    assert "no matching release-config evidence" in result.output
+
+
+def test_candidate_frozen_without_release_config_report_ever_existing_blocks(tmp_path, monkeypatch):
+    """Distinct from the deleted-after-the-fact case above: here NO
+    release-config command ever ran for this run at all (no results.json was
+    ever written) -- only a frozen candidate is present, built directly via
+    release_candidate.snapshot_release_candidate as release-config itself
+    would. The installer must derive "release-config is mandatory" from the
+    candidate's mere presence on disk, not from having observed the
+    release-config command run."""
+    from calee_regression import release_candidate as release_candidate_mod
+    from calee_regression import run_context
+
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    _write_malformed_legacy_yaml(tmp_path, monkeypatch)
+    bundle = _write_bundle_v2(tmp_path)
+    run_id = "release-20260721-000000-noreport2"
+    workspace = run_context.RunWorkspace(tmp_path, run_id)
+    workspace.ensure_created()
+
+    verification = release_installer.verify_release_bundle(str(bundle))
+    assert verification.ok, verification.errors
+    release_candidate_mod.snapshot_release_candidate(
+        verification, workspace.component_dir("release-candidate"),
+        release_id="2026.07.21-rc1", schema_version=2, run_id=run_id,
+        release_config_digest="sha256:" + "0" * 64,
+    )
+    assert not workspace.component_report_path("release-config").is_file()
+
+    result = _assert_blocked_with_no_adb_calls(tmp_path, bundle, run_id, monkeypatch)
+    assert "frozen release candidate exists" in result.output
+
+
+def test_release_config_wrong_release_id_blocks(tmp_path, monkeypatch):
+    """A release-config report whose releaseId disagrees with the frozen
+    candidate's recorded releaseId must BLOCK, even though its own
+    releaseSelections/releaseConfigDigest are otherwise untouched."""
+    run_id = "release-20260721-000000-wrongrelid"
+    bundle = _prep_v2_release_with_candidate(tmp_path, monkeypatch, run_id)
+
+    rc_path = tmp_path / "reports" / "runs" / run_id / "release-config" / "results.json"
+    raw = json.loads(rc_path.read_text())
+    raw["releaseId"] = "2099.01.01-someone-elses-release"
+    rc_path.write_text(json.dumps(raw))
+
+    result = _assert_blocked_with_no_adb_calls(tmp_path, bundle, run_id, monkeypatch)
+    assert "releaseId" in result.output
+
+
+def test_release_config_wrong_schema_version_blocks(tmp_path, monkeypatch):
+    """A release-config report whose schemaVersion disagrees with the frozen
+    (schema-v2) candidate's recorded schemaVersion must BLOCK -- a schema-v2
+    candidate must never end up governed by a differently-schema'd report."""
+    run_id = "release-20260721-000000-wrongschema"
+    bundle = _prep_v2_release_with_candidate(tmp_path, monkeypatch, run_id)
+
+    rc_path = tmp_path / "reports" / "runs" / run_id / "release-config" / "results.json"
+    raw = json.loads(rc_path.read_text())
+    raw["schemaVersion"] = 1
+    rc_path.write_text(json.dumps(raw))
+
+    result = _assert_blocked_with_no_adb_calls(tmp_path, bundle, run_id, monkeypatch)
+    assert "schemaVersion" in result.output
+
+
+def test_schema_v1_candidate_with_valid_schema_v1_release_config_uses_legacy(tmp_path, monkeypatch):
+    """Schema-v1 compatibility must survive Priority 1's stricter gating: a
+    run whose frozen candidate is schema-v1 (release-config was run WITH
+    --bundle, so a candidate was frozen, but the bundle itself is a v1
+    manifest) and whose same-run release-config report is a valid, matching
+    schema-v1 report must still use legacy release-platforms.yaml policy --
+    it must NOT be blocked merely because a candidate exists."""
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    legacy = tmp_path / "release-platforms.yaml"
+    legacy.write_text("expected_build_identity:\n  production: false\n")
+    monkeypatch.setenv("CALEE_RELEASE_PLATFORMS", str(legacy))
+
+    bundle = tmp_path / "Calee-Tablet-Release"
+    bundle.mkdir()
+    (bundle / "calee.apk").write_bytes(CALEE_BYTES)
+    (bundle / "caleeshell.apk").write_bytes(SHELL_BYTES)
+    manifest = {
+        "releaseId": "2026.07.21-rc-v1cand",
+        "calee": {"included": True, "packageId": "com.viso.calee", "versionName": "founder-v0.3.25",
+                  "versionCode": 325, "gitSha": CALEE_SHA, "apk": "calee.apk", "sha256": _sha256(CALEE_BYTES)},
+        "caleeShell": {"included": True, "packageId": "com.viso.caleeshell", "versionName": "founder-v0.2.12",
+                       "versionCode": 212, "gitSha": SHELL_SHA, "apk": "caleeshell.apk", "sha256": _sha256(SHELL_BYTES)},
+    }
+    (bundle / "release-manifest.json").write_text(json.dumps(manifest))
+    (bundle / "checksums.sha256").write_text(
+        f"{_sha256(CALEE_BYTES)}  calee.apk\n{_sha256(SHELL_BYTES)}  caleeshell.apk\n"
+    )
+    machine = _write_machine_yaml(tmp_path, bundle, profile="staging")
+    run_id = "release-20260721-000000-v1candidate"
+
+    rc_result = _run_release_config(tmp_path, machine, bundle, run_id)
+    assert rc_result.exit_code == EXIT_SUCCESS, rc_result.output
+    rc_path = tmp_path / "reports" / "runs" / run_id / "release-config" / "results.json"
+    raw = json.loads(rc_path.read_text())
+    assert raw["schemaVersion"] == 1
+    fp_path = tmp_path / "reports" / "runs" / run_id / "release-candidate" / "release-candidate-fingerprint.json"
+    assert fp_path.is_file(), "a v1 bundle passed with --bundle is still frozen into a candidate"
+    assert json.loads(fp_path.read_text())["schemaVersion"] == 1
+
+    report_path = tmp_path / "install.json"
+    result = CliRunner().invoke(
+        cli.main,
+        ["install-tablet-release", "--bundle", str(bundle), "--serial", "TAB1",
+         "--run-id", run_id, "--plan-only", "--report", str(report_path)],
+    )
+    assert result.exit_code == EXIT_SUCCESS, result.output
+    payload = json.loads(report_path.read_text())
+    assert payload["status"] == "plan-only"

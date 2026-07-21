@@ -4,6 +4,14 @@
 # tester.local.yaml) and edit it once per release-candidate build. This is
 # NOT something a non-technical tester should ever need to touch.
 #
+# ONLY consulted for a schema-v1 release-candidate bundle, or when running
+# with no bundle at all (ad-hoc/dev). A schema-v2 release-candidate bundle
+# (release-manifest.json's schemaVersion: 2) is self-contained and
+# authoritative instead -- this file is not read at all in that case, and a
+# malformed/absent copy of it can never block a schema-v2 run. See
+# docs/RELEASE_POLICY.md's "Schema-v2 release bundles are authoritative for
+# scope".
+#
 # `consolidate` uses this to decide whether the CaleeMobile Android UI and
 # iPhone UI results are mandatory (release-gating) or optional. If this
 # file is absent, every platform defaults to mandatory=true -- an omitted

@@ -80,6 +80,31 @@ With no physical/distributed evidence, distributed-build acceptance BLOCKS rathe
 is never inferred from a local checkout or an unsigned build (`calee_regression/
 distributed_build_acceptance.py`'s `verifiedVia` allow-list enforces this).
 
+### Distributed-build evidence must be authenticated at its origin (Priority 3, this session)
+
+`record-distributed-build-acceptance` (`calee_regression/provider_evidence.py` +
+`distributed_build_provenance.py`) can only reach PASS through evidence THIS process itself
+independently authenticated, never from an operator's own claim about what a provider said:
+
+- **`--provider {app_store_connect,play_console}`** — a live, JWT-authenticated HTTPS request to the
+  real provider API, made by this process right now (tier `provider-api-live`).
+- **`--signed-export`** — a detached signature cryptographically verified (RSA or EC, real
+  `cryptography`-library verification, not merely "a signature-shaped object is present") against a
+  configured trusted public key (tier `verified-signed-export`).
+- **`--github-run-id`** — an authenticated GitHub Actions artifact chain (repository/workflow-path/run
+  success/artifact ownership/digest — the same style of chain `python -m calee_regression
+  verify-main-ci-artifact` enforces for merged-main CI evidence, see `calee_regression/
+  main_ci_artifact.py`) whose contained result is itself a live-collected `provider-api` record, never
+  a hand-typed claim smuggled through an otherwise-real artifact (tier `github-authenticated-artifact`).
+- **`--source`** (an operator-supplied JSON file) and the legacy `--channel`/`--verified-via` flags can
+  at best record an explicit `blocked-unverified`/`manual-unverified` claim — **never** a PASS, no
+  matter how well-formed or internally self-consistent the content looks. This is enforced by an
+  `evidenceTier` stamped by the CLI's own control flow (never read from the operator-supplied content),
+  carried inside the same envelope-digest-protected provenance record `distributed_build_provenance.py`
+  already used for tamper-evidence, and independently re-checked at consolidation
+  (`consolidated_report.component_from_distributed_build_acceptance_report`) — never trusting a
+  report's recorded `status` alone, so a hand-edited `results.json` cannot forge a stronger tier either.
+
 ### Subscribed-fixture evidence is bound to the release (Priority 7)
 
 The subscribed-calendar-fixture component (`prepare-subscribed-fixture` /
@@ -132,13 +157,18 @@ folded into BLOCKED for a mandatory component. `reports/latest-run` is a conveni
 `consolidate` (re)creates only *after* a run finishes, for `07 Open Latest Report` to follow; it is
 never a consolidation input.
 
-Android/iOS UI mandatory-ness is **not** hard-coded — it comes from the technical owner's
-`config/release-platforms.yaml` (copy `config/release-platforms.example.yaml`), or `--android-
-mandatory`/`--android-optional`/`--ios-mandatory`/`--ios-optional` on `consolidate` directly. An
-**omitted** or absent config file means every platform defaults to mandatory: a platform must be
+Android/iOS UI mandatory-ness is **not** hard-coded — it comes from an explicit `--android-
+mandatory`/`--android-optional`/`--ios-mandatory`/`--ios-optional` on `consolidate` directly, else
+(per "Schema-v2 release bundles are authoritative for scope" above) THIS run's own composed
+schema-v2 release-config when one exists, else the technical owner's legacy
+`config/release-platforms.yaml` (copy `config/release-platforms.example.yaml`). An **omitted** or
+absent config/scope source means every platform defaults to mandatory: a platform must be
 explicitly opted out (e.g. `mobile_ios: false` for an Android-only hotfix), never silently narrowed
-by convenience. `06 Test Full Calee Solution.command` reads this same profile to decide which
-platforms to even attempt running (see `release-platforms` CLI output).
+by convenience. `06 Test Full Calee Solution.command` reads the SAME composed scope `consolidate`
+uses to decide which platforms to even attempt running when a machine config is present (via the
+`release-config` command's emitted `RELEASE_CFG_OUT` variables); only when no machine config
+exists at all (schema-v1/bare, the only case a bundle can't be resolved) does it fall back to the
+legacy `release-platforms` CLI output directly.
 
 Any component simply omitted from `consolidate`'s inputs is recorded as `not_run`, which is treated
 exactly like BLOCKED for a mandatory component — its absence can never become an easy PASS.
@@ -180,8 +210,11 @@ Beyond the pass/fail/blocked roll-up above, an overall PASS additionally require
 - `calee_regression/consolidated_report.py::build_release_report` — combines the tablet suite, the
   CaleeMobile API/UI reports, and manual checks into one `ReleaseReport`, applying the
   mandatory/optional distinction above and `component_from_build_version_match`.
-- `calee_regression/release_platforms.py` — loads `config/release-platforms.yaml` and resolves the
-  Android/iOS mandatory flags passed into `build_release_report`.
+- `calee_regression/release_platforms.py` — loads `config/release-platforms.yaml` (schema-v1/bare
+  runs only) and resolves the legacy Android/iOS mandatory flags; `calee_regression/release_config.py`
+  (`compose_effective_release_config`) is the schema-v2 equivalent, authoritative whenever this run
+  composed a schema-v2 bundle. `cli.py`'s `consolidate` command (`_v2_platforms_features_expected`)
+  picks between the two before passing the resolved flags into `build_release_report`.
 - `calee_regression/runner.py::run_scenario`/`_step_tap_if_present` — the required/optional step
   default and the "no real verification occurred" BLOCKED rule.
 - `calee_regression/models.py::SuiteResult.mandatory_skipped_count` — a mandatory scenario ending up

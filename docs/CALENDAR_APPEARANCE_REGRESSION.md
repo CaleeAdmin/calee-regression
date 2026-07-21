@@ -317,9 +317,10 @@ flows -- and `component_from_sync_report` (in `consolidated_report.py`)
 builds the `sync` release component from *whatever* flows a report
 contains, generically, by status. That means this flow becomes
 release-gating through the **exact same, already-existing mechanism** the
-other three flows use -- `release_features.synchronization` in
-`config/release-platforms.yaml` (defaults to mandatory when the file is
-absent) -- with **no new feature flag, CLI option, or consolidation code**
+other three flows use -- `release_features.synchronization`, resolved from
+this run's schema-v2 release-config feature scope when composed, else
+`config/release-platforms.yaml` (defaults to mandatory when neither is
+available) -- with **no new feature flag, CLI option, or consolidation code**
 needed. See `docs/SUITE_REFERENCE.md`'s "Partially implemented: `sync-smoke`"
 section, now listing all four flows.
 

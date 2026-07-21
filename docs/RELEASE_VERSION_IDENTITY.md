@@ -146,7 +146,12 @@ A production consolidation must pin `caleemobile_build_version: 0.0.24+24` and
 `caleemobile_git_sha: 41c97a97eddaf8676d43bb5efd5b2018d51b7faa` in
 `config/release-platforms.yaml` (see `config/release-platforms.example.yaml`) —
 NOT the 0.0.23 identity (already-shipped release main) and NOT the `3e43138`
-PR-head SHA (never merged as-is).
+PR-head SHA (never merged as-is). (This is a point-in-time incident record
+from before schema-v2 release-bundle support existed; a schema-v2 bundle
+pins this identity in the bundle manifest itself instead, and
+`release-platforms.yaml` is not consulted for it at all — see
+`docs/RELEASE_POLICY.md`'s "Schema-v2 release bundles are authoritative for
+scope".)
 
 > Tree equivalence is not a substitute for exact-SHA evidence: even if the
 > merged tree matched the PR-head tree, the release gate proves selectors

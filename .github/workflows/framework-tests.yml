@@ -104,11 +104,14 @@ jobs:
         if: always()
         run: |
           python - <<'PY'
-          import json, os
+          import datetime, json, os
           event = os.environ.get("GITHUB_EVENT_NAME", "")
           ref = os.environ.get("GITHUB_REF", "")
           summary = {
+              "schemaVersion": 1,
+              "repository": os.environ.get("GITHUB_REPOSITORY", ""),
               "workflow": "framework-tests",
+              "workflowFile": ".github/workflows/framework-tests.yml",
               "event": event,
               "ref": ref,
               "commitSha": os.environ.get("GITHUB_SHA", ""),
@@ -116,6 +119,7 @@ jobs:
               "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
               "isMainPush": event == "push" and ref == "refs/heads/main",
               "isMergeGroup": event == "merge_group",
+              "generatedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
           }
           with open("framework-test-summary.json", "w") as f:
               json.dump(summary, f, indent=2)

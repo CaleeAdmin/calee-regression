@@ -190,3 +190,43 @@ def test_resolver_repr_never_contains_a_secret():
     resolver.require(credentials.REGRESSION_PASSWORD)
     assert SECRET_PASSWORD not in repr(resolver)
     assert SECRET_EMAIL not in repr(resolver)
+
+
+# ── Priority 3 (this session): distributed-build provider credentials ──────
+# (App Store Connect / Play Console / signed-export). See also
+# test_provider_evidence.py's collector-level leak tests (the private key
+# never ends up in a collected evidence dict) and
+# test_cli_distributed_build_acceptance.py's full CLI-round-trip leak test
+# (the private key never ends up in a written report.json/evidence bundle).
+# These live here too because this file is the canonical "no secret leaks"
+# location for every credential family the framework resolves.
+
+
+SECRET_ASC_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\nFAKE-TOP-SECRET-KEY-MATERIAL\n-----END PRIVATE KEY-----"
+SECRET_PLAY_ACCESS_TOKEN = "ya29.FAKE-TOP-SECRET-PLAY-ACCESS-TOKEN"
+
+
+def test_resolver_repr_never_contains_distributed_build_provider_secrets():
+    resolver = credentials.default_resolver(injected={
+        "app_store_connect_key_id": "KID1", "app_store_connect_issuer_id": "ISS1",
+        "app_store_connect_private_key": SECRET_ASC_PRIVATE_KEY,
+        "play_console_access_token": SECRET_PLAY_ACCESS_TOKEN,
+    })
+    resolver.require(credentials.APP_STORE_CONNECT_PRIVATE_KEY)
+    resolver.require(credentials.PLAY_CONSOLE_ACCESS_TOKEN)
+    assert SECRET_ASC_PRIVATE_KEY not in repr(resolver)
+    assert SECRET_PLAY_ACCESS_TOKEN not in repr(resolver)
+    assert "BEGIN PRIVATE KEY" not in repr(resolver)
+
+
+def test_redact_scrubs_distributed_build_provider_secrets_from_a_report():
+    leaked = json.dumps({
+        "runId": "release-x",
+        "detail": f"App Store Connect auth failed using key {SECRET_ASC_PRIVATE_KEY} "
+                   f"and Play Console token {SECRET_PLAY_ACCESS_TOKEN}",
+    })
+    scrubbed = credentials.redact(leaked, {SECRET_ASC_PRIVATE_KEY, SECRET_PLAY_ACCESS_TOKEN})
+    assert SECRET_ASC_PRIVATE_KEY not in scrubbed
+    assert SECRET_PLAY_ACCESS_TOKEN not in scrubbed
+    assert credentials._REDACTED in scrubbed
+    assert json.loads(scrubbed)["runId"] == "release-x"
