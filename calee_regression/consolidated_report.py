@@ -1000,10 +1000,13 @@ def component_from_distributed_build_acceptance_report(
     expected_git_sha: "str | None" = None,
     expected_version: "str | None" = None,
     expected_release_id: "str | None" = None,
+    expected_release_run_id: "str | None" = None,
+    component_dir: "Any | None" = None,
+    expected_envelope_digest: "str | None" = None,
     now: "Any | None" = None,
 ) -> ComponentResult:
     """Build a ComponentResult from the recorded distributed-build-acceptance
-    report (Priority 3).
+    report (Priority 3; provenance-backed re-verification added this session).
 
     ``mandatory`` reflects the release manifest's own
     ``caleeMobile.distributedBuildAcceptanceRequired`` flag (or an explicit
@@ -1012,8 +1015,23 @@ def component_from_distributed_build_acceptance_report(
     omitted. When True and no report exists at all, this BLOCKS: with no
     physical/distributed evidence, acceptance is never inferred from a local
     checkout or an unsigned build.
+
+    Two report shapes are independently re-verified here, never merely
+    trusted from the recorded ``status``:
+
+      * a ``provenance`` record (this session's Priority 3) -- the
+        authenticated App Store Connect/TestFlight/Play Console/signed-export/
+        CI-artifact evidence, envelope- and raw-byte-digest protected. Only
+        this shape can ever reach PASS.
+      * the legacy flat ``evidence`` shape (operator-typed identity flags +
+        a ``verifiedVia`` label, with no cryptographic provenance at all) --
+        DEPRECATED. Even when every field is well-formed, this can never
+        reach PASS any more; it is re-derived as BLOCKED here regardless of
+        what the report's own ``status`` claims, closing the loophole where a
+        hand-edited report could still claim ``status: "passed"``.
     """
     from . import distributed_build_acceptance as dba
+    from . import distributed_build_provenance as dbp
 
     if report_dict is None:
         if not mandatory:
@@ -1028,6 +1046,65 @@ def component_from_distributed_build_acceptance_report(
                     "run. Acceptance is never inferred from a local checkout or an unsigned build."],
         )
 
+    provenance = report_dict.get("provenance") if isinstance(report_dict.get("provenance"), dict) else None
+
+    if provenance is not None:
+        # Priority 3: the ONLY path that can produce a PASS -- authenticated,
+        # envelope- and raw-byte-digest-protected provenance.
+        source_bytes = None
+        if component_dir is not None:
+            from pathlib import Path as _Path
+
+            source_path = _Path(component_dir) / dbp.BUNDLE_SOURCE_JSON
+            if source_path.is_file():
+                try:
+                    source_bytes = source_path.read_bytes()
+                except OSError:
+                    source_bytes = None
+        try:
+            problems = dbp.verify_provenance_record(
+                provenance, source_bytes=source_bytes, expected_release_run_id=expected_release_run_id,
+                trusted_envelope_digest=expected_envelope_digest,
+                expected_git_sha=expected_git_sha, expected_version=expected_version,
+                expected_release_id=expected_release_id, now=now,
+            )
+        except dbp.DistributedProvenanceError as exc:
+            return ComponentResult(
+                name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
+                detail=[f"Distributed-build provenance record is malformed: {exc}"],
+            )
+        evidence = dbp.source_evidence_of(provenance) or {}
+        evidence_summary = {
+            "provider": evidence.get("provider"),
+            "channel": evidence.get("channel"),
+            "distributedBuildId": evidence.get("distributedBuildId"),
+            "testedGitSha": evidence.get("testedGitSha"),
+            "testedVersion": evidence.get("testedVersion"),
+            "generatedBy": evidence.get("generatedBy"),
+            "releaseId": evidence.get("releaseId"),
+            "timestamp": evidence.get("timestamp"),
+            "expectedReleaseId": expected_release_id,
+        }
+        if not problems:
+            return ComponentResult(
+                name=name, status=STATUS_PASS, mandatory=mandatory, passed=1,
+                detail=[
+                    f"Distributed-build acceptance PASS via {evidence.get('provider')}/"
+                    f"{evidence.get('generatedBy')} ({evidence.get('channel')} build "
+                    f"{evidence.get('distributedBuildId')}) for CaleeMobile "
+                    f"{evidence.get('testedVersion')} @ {evidence.get('testedGitSha')}."
+                ],
+                evidence=evidence_summary,
+            )
+        return ComponentResult(
+            name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
+            detail=list(problems), evidence=evidence_summary,
+        )
+
+    # Legacy flat evidence (no provenance record at all): DEPRECATED, can
+    # NEVER reach PASS -- re-derived as BLOCKED here regardless of the
+    # report's own recorded status (including a legacy "passed" a stale or
+    # hand-edited report might still claim).
     evidence = report_dict.get("evidence") if isinstance(report_dict.get("evidence"), dict) else report_dict
     try:
         result = dba.parse_distributed_build_acceptance_result(evidence)
@@ -1054,19 +1131,14 @@ def component_from_distributed_build_acceptance_report(
         "timestamp": result.timestamp,
         "expectedReleaseId": expected_release_id,
     }
-    if verdict.ok:
-        return ComponentResult(
-            name=name, status=STATUS_PASS, mandatory=mandatory, passed=1,
-            detail=[
-                f"Distributed-build acceptance PASS via {result.verified_via} "
-                f"({result.channel} build {result.distributed_build_id}) for CaleeMobile "
-                f"{result.tested_version} @ {result.tested_git_sha}."
-            ],
-            evidence=evidence_summary,
-        )
+    deprecation_notice = (
+        "Manual/self-declared distributed-build evidence (no authenticated provenance record) is "
+        "DEPRECATED and can never PASS -- provide provenance-backed evidence via "
+        "'record-distributed-build-acceptance --source'."
+    )
     return ComponentResult(
         name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
-        detail=list(verdict.problems), evidence=evidence_summary,
+        detail=[deprecation_notice] + list(verdict.problems), evidence=evidence_summary,
     )
 
 

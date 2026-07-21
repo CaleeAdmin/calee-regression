@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from . import url_validation
 from .build_identity import parse_dumpsys_version_code, parse_dumpsys_version_name
 from .identity_format import is_full_git_sha, is_wellformed_version
 
@@ -603,10 +604,15 @@ def parse_manifest(raw: Any) -> "tuple[ReleaseManifest, list[str]]":
             errors.append("manifest.backend is required for schemaVersion 2.")
         elif not isinstance(backend, str) or not backend.strip():
             errors.append("manifest.backend must be a non-empty string.")
-        elif not backend.strip().lower().startswith("https://"):
-            # Staging/production are the only valid v2 profiles (checked
-            # above), so an HTTPS backend is unconditionally required here.
-            errors.append(f"manifest.backend {backend!r} must be an HTTPS URL for schemaVersion 2.")
+        else:
+            # Priority 7: structured validation (scheme/host/userinfo/
+            # fragment/port/whitespace), not a bare startswith("https://")
+            # test -- staging/production are the only valid v2 profiles
+            # (checked above), so a well-formed HTTPS backend is
+            # unconditionally required here.
+            url_problems = url_validation.validate_backend_url(backend)
+            if url_problems:
+                errors.append(f"manifest.backend {backend!r} is not a valid HTTPS URL: {'; '.join(url_problems)}")
 
         if raw.get("platforms") is None:
             errors.append("manifest.platforms is required for schemaVersion 2.")

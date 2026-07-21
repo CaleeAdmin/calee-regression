@@ -1165,12 +1165,26 @@ def release_platforms_cmd():
     try:
         platforms = release_platforms.load_release_platforms()
         features = release_platforms.load_release_features()
+        expected = release_platforms.load_expected_build_identity()
     except release_platforms.ReleasePlatformsError as exc:
         click.echo(f"echo '{exc}' >&2; exit {EXIT_INVALID_CONFIG}")
         raise SystemExit(EXIT_INVALID_CONFIG)
     click.echo(f"RELEASE_PLATFORM_TABLET={'true' if platforms.tablet else 'false'}")
     click.echo(f"RELEASE_PLATFORM_ANDROID={'true' if platforms.mobile_android else 'false'}")
     click.echo(f"RELEASE_PLATFORM_IOS={'true' if platforms.mobile_ios else 'false'}")
+    # Priority 2 (this session): same resolved selector-evidence policy as
+    # _emit_release_config_vars, for the no-machine-config (legacy-only)
+    # path -- schema-v1/legacy policy: mandatory whenever a mobile platform
+    # is in scope, unconditionally mandatory in production.
+    from . import release_config as _rc_mod
+
+    resolved_selector_required = _rc_mod.resolve_selector_evidence_required(
+        profile=("production" if expected.production else "staging"),
+        enabled_platforms=[p for p, on in (("android", platforms.mobile_android), ("ios", platforms.mobile_ios)) if on],
+        schema_version=1,
+        manifest_required=None,
+    )
+    click.echo(f"RELEASE_SELECTOR_EVIDENCE_REQUIRED={'true' if resolved_selector_required else 'false'}")
     # Feature scope (Workstream 2). A full-solution launcher branches on
     # $RELEASE_FEATURE_SYNCHRONIZATION (and the others) to decide whether that
     # feature's leg is mandatory this release, the same way it branches on the
@@ -1726,39 +1740,52 @@ def selector_contract_cmd(
          "reports/runs/<run-id>/distributed-build-acceptance/results.json.",
 )
 @click.option(
-    "--channel", required=True,
+    "--source", "source_path", default=None, type=click.Path(exists=True, dir_okay=False),
+    help="Priority 3: path to an AUTHENTICATED provenance evidence JSON file -- an App Store "
+         "Connect/TestFlight API result, a Play Console API result, a signed store-export package, "
+         "or a retained CI artifact containing authenticated provider evidence. Required for this "
+         "command to ever produce a PASS; without it, only a deprecated, always-blocked-unverified "
+         "manual record can be written (see the legacy --channel/--verified-via flags below).",
+)
+@click.option("--adopted-by", default=None, help="Who/what is adopting this evidence (defaults to the OS user).")
+@click.option(
+    "--channel", required=False, default=None,
     type=click.Choice(sorted(distributed_build_acceptance_mod.VALID_CHANNELS)),
-    help="Which distribution channel this evidence is for.",
+    help="DEPRECATED legacy path (no --source): which distribution channel this manual claim is for.",
 )
 @click.option(
-    "--distributed-build-id", "distributed_build_id", required=True,
-    help="The distributed build's own identifier (TestFlight build number, App Store Connect "
-         "version, or Play Console release id).",
+    "--distributed-build-id", "distributed_build_id", default=None,
+    help="DEPRECATED legacy path: the distributed build's own identifier.",
 )
-@click.option("--tested-git-sha", "tested_git_sha", required=True, help="Full 40-character CaleeMobile Git SHA the distributed build was built from.")
-@click.option("--tested-version", "tested_version", required=True, help="CaleeMobile version the distributed build reports.")
+@click.option("--tested-git-sha", "tested_git_sha", default=None, help="DEPRECATED legacy path: full 40-character CaleeMobile Git SHA.")
+@click.option("--tested-version", "tested_version", default=None, help="DEPRECATED legacy path: CaleeMobile version.")
 @click.option(
-    "--verified-via", "verified_via", required=True,
-    help="How this was actually verified -- must be a real distributed/store verification source "
-         f"(one of {sorted(distributed_build_acceptance_mod.VALID_VERIFIED_VIA)}). A local checkout "
-         "or an unsigned build is refused, never fabricated as acceptance.",
+    "--verified-via", "verified_via", default=None,
+    help="DEPRECATED legacy path: an operator-typed label. This can NEVER produce a PASS any more -- "
+         "see --source. Retained only so a legacy/manual claim can still be recorded as an explicit, "
+         "clearly-labelled blocked-unverified (or informational, when not required) component, never "
+         "silently omitted.",
 )
 @click.option("--release-id", "release_id_opt", envvar="CALEE_RELEASE_ID", default=None, help="The release ID this evidence is bound to.")
 @click.option("--expected-git-sha", "expected_git_sha", default=None, help="Expected CaleeMobile release SHA; a mismatch BLOCKS.")
 @click.option("--expected-version", "expected_version", default=None, help="Expected CaleeMobile release version; a mismatch BLOCKS.")
 @click.option("--expected-release-id", "expected_release_id", default=None, help="Expected release ID; defaults to this run's own release-config releaseId.")
 def record_distributed_build_acceptance_cmd(
-    run_id_opt, channel, distributed_build_id, tested_git_sha, tested_version, verified_via,
-    release_id_opt, expected_git_sha, expected_version, expected_release_id,
+    run_id_opt, source_path, adopted_by, channel, distributed_build_id, tested_git_sha, tested_version,
+    verified_via, release_id_opt, expected_git_sha, expected_version, expected_release_id,
 ):
     """Records distributed-build acceptance evidence for THIS release run
     (Priority 3): explicit, externally-verifiable proof that a distributed/
     TestFlight/store build's identity matches the release candidate.
 
-    Never fabricates acceptance from a local checkout or an unsigned build --
-    ``--verified-via`` must name a real TestFlight/App Store Connect/Play
-    Console API check or a signed store export; anything else BLOCKS.
+    A PASS is produced ONLY from an authenticated provenance evidence file
+    (``--source``) -- never from operator-typed identity flags alone (the
+    legacy ``--channel``/``--verified-via`` path below can, at best, record an
+    explicit ``blocked-unverified`` component). With no authentic evidence at
+    all, the component stays BLOCKED.
     """
+    from . import distributed_build_provenance as dbp_mod
+
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
@@ -1772,6 +1799,77 @@ def record_distributed_build_acceptance_cmd(
             expected_release_id = release_config_dict.get("releaseId")
 
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    if source_path:
+        # Priority 3: the ONLY path that can produce a PASS.
+        raw_bytes = Path(source_path).read_bytes()
+        try:
+            evidence = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            click.echo(f"--source {source_path!r} is not valid JSON: {exc}", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        if not isinstance(evidence, dict):
+            click.echo(f"--source {source_path!r} must contain a JSON object.", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+
+        adopted_by_label = adopted_by or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+        record = dbp_mod.build_provenance_record(
+            evidence, release_run_id=run_id_opt, adopted_at=timestamp, adopted_by=adopted_by_label,
+            source_path=str(source_path), raw_source_bytes=raw_bytes,
+        )
+        problems = dbp_mod.verify_provenance_record(
+            record, source_bytes=raw_bytes, expected_release_run_id=run_id_opt,
+            expected_git_sha=expected_git_sha, expected_version=expected_version,
+            expected_release_id=expected_release_id,
+        )
+        status = "passed" if not problems else "blocked"
+        report = {
+            "runId": run_id_opt,
+            "component": dbp_mod.DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT,
+            "status": status,
+            "provenance": record,
+            "problems": list(problems),
+            "generatedAt": timestamp,
+        }
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        component_dir = workspace.component_dir("distributed-build-acceptance")
+        dbp_mod.write_evidence_bundle(component_dir, record, source_bytes=raw_bytes)
+        for problem in problems:
+            click.echo(f"  - {problem}", err=status != "passed")
+        if status == "passed":
+            ev = record["sourceEvidence"]
+            click.echo(
+                f"Distributed-build acceptance PASS via {ev.get('provider')}/{ev.get('generatedBy')} "
+                f"({ev.get('channel')} build {ev.get('distributedBuildId')}) for CaleeMobile "
+                f"{ev.get('testedVersion')} @ {ev.get('testedGitSha')}."
+            )
+        else:
+            click.echo("Distributed-build acceptance evidence REJECTED: " + "; ".join(problems))
+        click.echo(f"Recorded: {report_path}")
+        raise SystemExit(EXIT_SUCCESS if status == "passed" else EXIT_BLOCKED)
+
+    # Legacy manual path (DEPRECATED): can never reach PASS -- see the module
+    # docstring and consolidated_report.component_from_distributed_build_
+    # acceptance_report. Retained so a technical owner's claim is still
+    # recorded (as explicit blocked-unverified evidence), never silently
+    # dropped, rather than removed outright.
+    missing = [
+        name for name, value in (
+            ("--channel", channel), ("--distributed-build-id", distributed_build_id),
+            ("--tested-git-sha", tested_git_sha), ("--tested-version", tested_version),
+            ("--verified-via", verified_via),
+        ) if not value
+    ]
+    if missing:
+        click.echo(
+            "Either --source (an authenticated provenance evidence file -- the only way to reach a "
+            f"PASS) or ALL of {['--channel', '--distributed-build-id', '--tested-git-sha', '--tested-version', '--verified-via']} "
+            f"(the deprecated, always-blocked-unverified manual path) must be given. Missing: {missing}.",
+            err=True,
+        )
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
     result = distributed_build_acceptance_mod.DistributedBuildAcceptanceResult(
         schema_version=distributed_build_acceptance_mod.DISTRIBUTED_BUILD_ACCEPTANCE_SCHEMA_VERSION,
         component=distributed_build_acceptance_mod.DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT,
@@ -1783,26 +1881,33 @@ def record_distributed_build_acceptance_cmd(
         release_id=release_id_opt,
         timestamp=timestamp,
     )
+    # Still run the well-formedness/identity checks so a technical owner sees
+    # exactly what's wrong -- but the OUTCOME can never be better than
+    # blocked-unverified, regardless of verdict.ok (Priority 3: "deprecate
+    # direct PASS creation from identity flags alone").
     verdict = distributed_build_acceptance_mod.verify_distributed_build_acceptance_evidence(
         result, expected_git_sha=expected_git_sha, expected_version=expected_version,
         expected_release_id=expected_release_id,
     )
-    status = "passed" if verdict.ok else "blocked"
+    deprecation_notice = (
+        "Manual/self-declared distributed-build evidence is DEPRECATED and can never PASS -- "
+        "provide an authenticated provenance evidence file via --source."
+    )
     report = {
         "runId": run_id_opt,
         "component": distributed_build_acceptance_mod.DISTRIBUTED_BUILD_ACCEPTANCE_COMPONENT,
-        "status": status,
+        "status": "blocked-unverified",
         "evidence": result.to_dict(),
-        "problems": list(verdict.problems),
+        "problems": [deprecation_notice] + list(verdict.problems),
         "generatedAt": timestamp,
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    click.echo(deprecation_notice, err=True)
     for problem in verdict.problems:
-        click.echo(f"  - {problem}", err=not verdict.ok)
-    click.echo(verdict.summary())
-    click.echo(f"Recorded: {report_path}")
-    raise SystemExit(EXIT_SUCCESS if verdict.ok else EXIT_BLOCKED)
+        click.echo(f"  - {problem}", err=True)
+    click.echo(f"Recorded (blocked-unverified): {report_path}")
+    raise SystemExit(EXIT_BLOCKED)
 
 
 @main.command("build-identity")
@@ -2599,6 +2704,11 @@ def consolidate(
             expected_git_sha=eff_expected_caleemobile_sha,
             expected_version=eff_expected_caleemobile_build,
             expected_release_id=expected_release_id_for_selector,
+            expected_release_run_id=run_id_opt,
+            component_dir=(
+                workspace.component_dir("distributed-build-acceptance")
+                if distributed_build_acceptance_report is not None else None
+            ),
         )
         extra_components.append(distributed_build_component)
 
@@ -2676,6 +2786,18 @@ def consolidate(
             )
         ]
         for candidate in (raw_evidence, provenance_evidence, selector_report_path, *p3_bundle):
+            if candidate.is_file():
+                evidence_paths.append(candidate)
+    # Priority 3 (this session): the distributed-build-acceptance provenance
+    # bundle (raw source evidence + its raw-byte sha256 sidecar + the
+    # envelope-protected provenance record) travels with the release ZIP too,
+    # exactly like the selector-contract bundle above.
+    if distributed_build_gating is not None and distributed_build_acceptance_report is not None:
+        from . import distributed_build_provenance as _dbp_mod
+
+        dist_dir = workspace.component_dir("distributed-build-acceptance")
+        for name in (_dbp_mod.BUNDLE_SOURCE_JSON, _dbp_mod.BUNDLE_SOURCE_SHA, _dbp_mod.BUNDLE_PROVENANCE):
+            candidate = dist_dir / name
             if candidate.is_file():
                 evidence_paths.append(candidate)
     # Priority 5.9: row-scoped runtime diagnostics (screenshots + page sources)
@@ -3052,7 +3174,18 @@ def _load_machine_backend_url(config_path: "Path | None") -> "str | None":
 )
 @click.option("--target-date", "date_opt", default=None, help="Pin the subscribed target date (YYYY-MM-DD); defaults to today. Ignored in fixed-date mode (its own known date is used).")
 @click.option("--timezone", "tz_opt", default=None, help="Timezone label recorded in evidence (default Australia/Perth).")
-def prepare_subscribed_fixture_cmd(run_id_opt, release_id_opt, config_path, mode_opt, date_opt, tz_opt):
+@click.option(
+    "--gate/--non-gating", "gate_opt", default=None,
+    help="Priority 6 (this session): explicit execution policy for THIS COMMAND's own exit code. "
+         "--gate: a publication, exact public-read, or Calee-ingestion failure exits BLOCKED here and "
+         "now (not merely recorded). --non-gating: every failure is still recorded in full, but this "
+         "command exits success regardless (matches this scenario staying draft-unverified/optional). "
+         "Defaults to config/machine.local.yaml's subscribed_fixture.gate when set, else this "
+         "scenario's OWN promotion state (scenarios/promotion/subscribed_calendar.yaml's "
+         "releaseSuiteEligible) -- the SAME derivation 'consolidate' uses for whether this component "
+         "is mandatory, so the two can never disagree.",
+)
+def prepare_subscribed_fixture_cmd(run_id_opt, release_id_opt, config_path, mode_opt, date_opt, tz_opt, gate_opt):
     """Generate the today-relative subscribed ICS and run it through exactly
     ONE explicit mode -- published / fixed-date / offline-only (Priority 5/6)
     -- recording first-class subscribed-fixture evidence (Priority 7).
@@ -3063,12 +3196,17 @@ def prepare_subscribed_fixture_cmd(run_id_opt, release_id_opt, config_path, mode
     observable, using bounded polling (never an arbitrary sleep). fixed-date:
     uses the existing static fixture at its own known date, never Today.
     offline-only (the default -- always safe, no setup required): generates
-    and validates the ICS locally only, never claims provisioning.
+    and validates the ICS locally only, never claims provisioning. Neither
+    fixed-date nor offline-only ever claims published verification (their
+    publicationStatus/publicReadVerificationStatus/ingestionStatus stay
+    "not-attempted").
 
     Writes reports/runs/<run-id>/subscribed-fixture/results.json and
     reg_sub_today_relative.ics, and records the generated event titles as
-    scenario variables so the tablet scenario asserts the exact events this
-    run produced. Never silently falls back from published to fixed-date.
+    scenario variables -- consumable ONLY via subscribed_publisher.
+    safe_scenario_variables_from_report (Priority 6), which refuses anything
+    but a same-run, same-release, fully-"ok" published report. Never silently
+    falls back from published to fixed-date.
     """
     import datetime as _dt
 
@@ -3202,11 +3340,36 @@ def prepare_subscribed_fixture_cmd(run_id_opt, release_id_opt, config_path, mode
     click.echo(f"  mode: {result.mode}  status: {result.status}  date: {result.resolved_date}")
     for d in result.detail:
         click.echo(f"  - {d}")
-    # This preparation step itself always exits success; the subscribed
-    # scenario (draft-unverified, mandatory:false while draft -- see Priority
-    # 7) is what honours a BLOCKED publication/observation, so a BLOCKED
-    # subscribed-fixture result never blocks the whole run on its own UNLESS
-    # the scenario has been promoted (consolidate then requires status "ok").
+
+    # Priority 6 (this session): an explicit --gate/--non-gating always wins;
+    # otherwise default to this scenario's OWN promotion state -- the SAME
+    # derivation 'consolidate' uses to decide whether this component is
+    # mandatory, so a technical owner never sees this step's own exit code
+    # disagree with what the final release verdict will do with the same
+    # evidence.
+    if gate_opt is not None:
+        gate = gate_opt
+    else:
+        from . import promotion as promotion_mod
+
+        try:
+            gate = promotion_mod.load_promotion(
+                promotion_mod.PROMOTION_DIR / "subscribed_calendar.yaml"
+            ).release_suite_eligible
+        except (promotion_mod.PromotionError, OSError):
+            gate = False
+
+    if gate and not result.ok:
+        click.echo(
+            click.style(
+                "[BLOCKED] Subscribed-fixture gating is ON and this run's evidence did not reach "
+                "status \"ok\" -- see the detail above (publication/public-read/ingestion). No scenario "
+                "variables from this run are safe to consume (see safe_scenario_variables_from_report).",
+                fg="red",
+            ),
+            err=True,
+        )
+        raise SystemExit(EXIT_BLOCKED)
     raise SystemExit(EXIT_SUCCESS)
 
 
@@ -3329,7 +3492,24 @@ def _emit_release_config_vars(workspace: run_context.RunWorkspace, effective_dic
 
     _emit("EXPECTED_CALEEMOBILE_VERSION", expected_caleemobile.get("buildVersion") or "")
     _emit("EXPECTED_CALEEMOBILE_GIT_SHA", expected_caleemobile.get("gitSha") or "")
-    _emit_bool("SELECTOR_EVIDENCE_REQUIRED", expected_caleemobile.get("selectorEvidenceRequired", True))
+    # Priority 2 (this session): the FULLY RESOLVED selector-evidence policy
+    # (production+mobile-in-scope override > schema-v2 manifest opinion >
+    # legacy mobile-in-scope default), not merely the bundle manifest's raw,
+    # unresolved flag -- this is the ONE value launcher "06" reads to decide
+    # its own --mandatory/--optional on the selector-contract command itself
+    # (see release_config.resolve_selector_evidence_required's docstring).
+    # Emitted as a concrete true/false (never left unset) so a launcher
+    # always has an explicit decision to act on; "not applicable" (no mobile
+    # platform in scope) is emitted as false -- non-gating, like "optional".
+    from . import release_config as _rc_mod
+
+    resolved_selector_required = _rc_mod.resolve_selector_evidence_required(
+        profile=release_selections.get("profile"),
+        enabled_platforms=enabled_platforms,
+        schema_version=effective_dict.get("schemaVersion"),
+        manifest_required=expected_caleemobile.get("selectorEvidenceRequired"),
+    )
+    _emit_bool("SELECTOR_EVIDENCE_REQUIRED", bool(resolved_selector_required))
     _emit_bool("DISTRIBUTED_BUILD_ACCEPTANCE_REQUIRED", expected_caleemobile.get("distributedBuildAcceptanceRequired", True))
 
 
@@ -3450,7 +3630,7 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, bundle_path,
     # exactly as before Priority 2 existed, even if a machine config happens
     # to declare a release_bundle_dir for unrelated (installation) purposes.
     bundle_manifest = None
-    candidate_fingerprint = None
+    verification = None
     if bundle_path:
         verification = ri_mod.verify_release_bundle(bundle_path)
         if not verification.ok:
@@ -3464,27 +3644,6 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, bundle_path,
                 click.echo(f"  - {err}", err=True)
             raise SystemExit(EXIT_BLOCKED)
         bundle_manifest = verification.manifest
-
-        # Priority 4: freeze the just-verified release candidate into a run-
-        # scoped immutable snapshot + content-addressed fingerprint BEFORE
-        # composing anything from it, closing the TOCTOU gap between this
-        # approval and install-tablet-release's first mutating ADB command --
-        # see release_candidate.py. A snapshot failure (source vanished/
-        # changed mid-copy) is itself a hard BLOCK; nothing is composed from
-        # an unsnapshotted bundle.
-        try:
-            candidate_fingerprint = release_candidate_mod.snapshot_release_candidate(
-                verification, workspace.component_dir("release-candidate"),
-                release_id=bundle_manifest.release_id, schema_version=bundle_manifest.schema_version,
-            )
-        except release_candidate_mod.CandidateFingerprintError as exc:
-            _record({
-                "status": STATUS_BLOCKED,
-                "detail": [f"Could not freeze the approved release candidate: {exc}"],
-                "bundleVerification": verification.to_dict(),
-            }, EXIT_BLOCKED)
-            click.echo(click.style(f"[BLOCKED] Could not freeze the approved release candidate: {exc}", fg="red"), err=True)
-            raise SystemExit(EXIT_BLOCKED)
 
     # Priority 2 (requirement 7): once a schema-v2 bundle has been verified,
     # config/release-platforms.yaml is not consulted AT ALL -- the bundle
@@ -3535,11 +3694,37 @@ def release_config_cmd(config_path, platforms_path, release_id_opt, bundle_path,
     )
     exit_code = EXIT_SUCCESS if effective.ok else EXIT_BLOCKED
     effective_dict = effective.to_dict()
-    if candidate_fingerprint is not None:
+
+    if bundle_path and verification is not None:
+        # Priority 4/5: freeze the just-verified release candidate into a
+        # run-scoped immutable snapshot + content-addressed fingerprint,
+        # binding it (Priority 5) to THIS run and to the digest of the
+        # release selections just composed above -- so install-tablet-
+        # release can later independently recompute that same digest from
+        # this same-run report and refuse to install if they disagree.
+        # Closes the TOCTOU gap between this approval and install-tablet-
+        # release's first mutating ADB command -- see release_candidate.py.
+        # A snapshot failure (source vanished/changed mid-copy) is itself a
+        # hard BLOCK.
+        try:
+            candidate_fingerprint = release_candidate_mod.snapshot_release_candidate(
+                verification, workspace.component_dir("release-candidate"),
+                release_id=bundle_manifest.release_id, schema_version=bundle_manifest.schema_version,
+                run_id=run_id_opt, release_config_digest=effective_dict["releaseConfigDigest"],
+            )
+        except release_candidate_mod.CandidateFingerprintError as exc:
+            _record({
+                "status": STATUS_BLOCKED,
+                "detail": [f"Could not freeze the approved release candidate: {exc}"],
+                "bundleVerification": verification.to_dict(),
+            }, EXIT_BLOCKED)
+            click.echo(click.style(f"[BLOCKED] Could not freeze the approved release candidate: {exc}", fg="red"), err=True)
+            raise SystemExit(EXIT_BLOCKED)
         # Priority 4: the same fingerprint install-tablet-release will later
         # re-verify against, so release-config and installation evidence
         # always reference the identical approved candidate.
         effective_dict["releaseCandidateFingerprint"] = candidate_fingerprint.to_dict()
+
     _record(effective_dict, exit_code)
     _emit_release_config_vars(workspace, effective_dict)
 
@@ -3639,6 +3824,119 @@ def verify_release_bundle_cmd(bundle_path, report_path):
     for err in result.errors:
         click.echo(f"  - {err}", err=True)
     raise SystemExit(EXIT_INVALID_CONFIG)
+
+
+@main.command("verify-main-ci-evidence")
+@click.option(
+    "--expected-sha", "expected_sha", required=True,
+    help="The full 40-character commit SHA of the ACTUAL merge/main commit. Retrieve this AFTER the "
+         "PR merges -- never predict or assume it during the PR session.",
+)
+@click.option(
+    "--summary", "summary_path", required=True, type=click.Path(exists=True, dir_okay=False),
+    help="Path to a downloaded CI-evidence summary file -- calee-regression's own "
+         "framework-test-summary-<sha>.json, or CaleeMobile-Regression's ci-summary-<sha>.json.",
+)
+@click.option(
+    "--required-gate", "required_gates", multiple=True,
+    help="A gate name that must be present and successful (or an explicitly not-applicable skip) in the "
+         "summary's 'gates' breakdown. Repeatable. Omit to verify every gate the summary itself lists "
+         "(or, for calee-regression's single-job evidence, just its identity/event).",
+)
+@click.option(
+    "--artifact-sha256", "artifact_sha256", default=None,
+    help="Optional: the expected raw-byte sha256 of the --summary file itself (e.g. recorded elsewhere "
+         "when the artifact was retrieved) -- a mismatch means the file was altered since retrieval.",
+)
+def verify_main_ci_evidence_cmd(expected_sha, summary_path, required_gates, artifact_sha256):
+    """Priority 8: independently verify that a downloaded CI-evidence summary
+    describes the EXACT merged-main (or merge-queue) commit, never a pull
+    request's HEAD commit.
+
+    Run this AFTER a pull request has merged: download the retained
+    framework-test-summary-<merge-sha>.json (or CaleeMobile-Regression's
+    ci-summary-<merge-sha>.json) artifact from the Actions run that executed
+    for the ACTUAL merge commit on main, and pass its SHA as --expected-sha.
+    A PR-head run's evidence -- even one that passed every gate -- is REJECTED
+    here; it is proof about the PR HEAD commit only, never about what
+    actually landed on main.
+
+    Exits 0 only when the evidence's commitSha exactly matches --expected-sha,
+    its event is a push to refs/heads/main or a merge_group run, and every
+    requested (or, if none requested, every evidence-listed) gate succeeded
+    or was an explicitly not-applicable skip. Otherwise exits BLOCKED with
+    every problem listed.
+    """
+    from . import main_ci_evidence as mce_mod
+
+    try:
+        summary, raw_bytes = mce_mod.load_summary(summary_path)
+    except mce_mod.MainCiEvidenceError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    problems = mce_mod.verify_main_ci_evidence(
+        summary, expected_sha=expected_sha, required_gates=list(required_gates) or None,
+        raw_bytes=raw_bytes, expected_artifact_sha256=artifact_sha256,
+    )
+    if not problems:
+        click.echo(click.style(
+            f"[OK] Merged-main CI evidence verified: commit {summary.get('commitSha')} "
+            f"(event {summary.get('event')!r}, ref {summary.get('ref')!r}).",
+            fg="green",
+        ))
+        raise SystemExit(EXIT_SUCCESS)
+    click.echo(click.style(f"[BLOCKED] Merged-main CI evidence has {len(problems)} problem(s):", fg="red"), err=True)
+    for p in problems:
+        click.echo(f"  - {p}", err=True)
+    raise SystemExit(EXIT_BLOCKED)
+
+
+@main.command("qualification-preflight")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(), help="Path to machine.local.yaml (defaults to config/machine.local.yaml).")
+@click.option("--bundle", "bundle_path", default=None, type=click.Path(), help="Release bundle directory, to check frozen-candidate readiness.")
+@click.option("--distributed-build-evidence", "distributed_build_evidence_path", default=None, type=click.Path(), help="Distributed-build acceptance evidence path, to check availability.")
+@click.option("--manual-checks", "manual_checks_path", default=None, type=click.Path(), help="Path to manual-checks.json (defaults to config/manual-checks.json, falling back to the .example.json).")
+@click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON result.")
+def qualification_preflight_cmd(config_path, bundle_path, distributed_build_evidence_path, manual_checks_path, report_path):
+    """Priority 9: a read-only preflight for a technical owner about to run a
+    real physical qualification -- reports whether THIS machine is actually
+    ready (Android SDK, connected tablet, Appium, Flutter, sibling checkouts,
+    keychain credentials, subscribed-fixture config, CI/distributed-build
+    evidence availability, frozen-candidate ability, manual-check
+    definitions) before hardware time is spent discovering a broken step.
+
+    Every check is read-only: no APK is installed, no fixture is published,
+    no credential value is printed, no product API is mutated. A check that
+    cannot be verified is reported BLOCKED or WARNING, never fabricated as
+    passing.
+
+    Exits 0 (READY) only when no check is BLOCKED; exits BLOCKED otherwise,
+    listing every failing check.
+    """
+    from . import qualification_preflight as qp_mod
+
+    report = qp_mod.run_qualification_preflight(
+        config_path=Path(config_path) if config_path else None,
+        bundle_path=Path(bundle_path) if bundle_path else None,
+        distributed_build_evidence_path=Path(distributed_build_evidence_path) if distributed_build_evidence_path else None,
+        manual_checks_path=Path(manual_checks_path) if manual_checks_path else None,
+        repo_root=REPO_ROOT,
+    )
+    payload = report.to_dict()
+    _write_installer_report(Path(report_path) if report_path else None, payload)
+
+    color = "green" if report.overall == qp_mod.STATUS_READY else "red"
+    click.echo(click.style(f"[{payload['overall']}] qualification preflight -- {len(report.checks)} check(s):", fg=color))
+    for check in report.checks:
+        marker = {"ready": "OK", "warning": "WARN", "blocked": "BLOCKED"}.get(check.status, check.status.upper())
+        click.echo(f"  [{marker}] {check.name}: {check.detail}")
+        if check.hint:
+            click.echo(f"           hint: {check.hint}")
+
+    if report.overall == qp_mod.STATUS_READY:
+        raise SystemExit(EXIT_SUCCESS)
+    raise SystemExit(EXIT_BLOCKED)
 
 
 @main.command("inspect-tablet")
@@ -3741,25 +4039,113 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     HOME problem exits EXIT_BLOCKED. The installer NEVER auto-uninstalls or
     clears data. ``--plan-only`` records the ordered plan without running it.
 
+    Priority 1 -- schema-v2 authority: when ``--run-id`` identifies a
+    same-run ``release-config`` evidence report (``reports/runs/<run-id>/
+    release-config/results.json``) whose OWN ``schemaVersion`` is 2, that
+    report is the SOLE source of the release profile and every other release
+    policy decision below -- ``config/release-platforms.yaml`` is never even
+    read for this run, so a malformed/stale legacy file cannot affect a valid
+    schema-v2 installation. Missing, stale, malformed, or wrong-run
+    release-config evidence BLOCKS outright rather than silently falling
+    back to legacy configuration. A same-run report whose OWN schema is 1,
+    or the complete absence of one (a bare/diagnostic invocation with no
+    run-scoped release-config at all), keeps the original
+    ``release_platforms.yaml``-based behaviour unchanged.
+
     Priority 2 -- trusted signer policy: the post-install complete-solution
     verification requires a trusted ``signerSha256`` for BOTH Calee and
     CaleeShell (a missing/malformed/unreadable/mismatching signer BLOCKS)
     whenever this is a release-gating run -- a production release
-    (``--production``, or config/release-platforms.yaml's
+    (schema-v2: the same-run release-config's ``releaseSelections.profile``;
+    otherwise ``--production``, or config/release-platforms.yaml's
     ``expected_build_identity.production``), or ANY run carrying a ``--run-id``
     (every real release run through the launcher always does; only a bare
     ad-hoc/diagnostic invocation with no run ID is treated as non-release
     development, where an undeclared signer may still record 'not_compared').
     """
     from . import apk_inspect
+    from . import release_candidate as release_candidate_mod
     from . import release_installer
 
-    try:
-        expected_identity = release_platforms.load_expected_build_identity()
-    except release_platforms.ReleasePlatformsError as exc:
-        click.echo(str(exc), err=True)
-        raise SystemExit(EXIT_INVALID_CONFIG)
-    eff_production = production_opt if production_opt is not None else expected_identity.production
+    # Priority 1: resolve this run's release-config evidence (if any) FIRST,
+    # before any release-policy decision is made, so schema-v2 authority is
+    # established up front and release_platforms.py is never even imported
+    # for that path below.
+    release_config_report = None
+    if run_id_opt:
+        probe_workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
+        rc_report_path = probe_workspace.component_report_path("release-config")
+        if rc_report_path.is_file():
+            def _reject_release_config(detail: str) -> None:
+                payload = {"status": "blocked", "detail": [detail]}
+                _write_installer_report(Path(report_path) if report_path else None, payload)
+                _record_installation_component(run_id_opt, payload, EXIT_BLOCKED)
+                click.echo(click.style(f"[BLOCKED] {detail}", fg="red"), err=True)
+                raise SystemExit(EXIT_BLOCKED)
+
+            try:
+                raw_release_config = json.loads(rc_report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                _reject_release_config(f"This run's release-config evidence at {rc_report_path} is unreadable: {exc}")
+
+            run_manifest_probe = _load_or_init_manifest(probe_workspace)
+            run_started_at_epoch = None
+            if run_manifest_probe.started_at:
+                try:
+                    run_started_at_epoch = time.mktime(time.strptime(run_manifest_probe.started_at, "%Y-%m-%d %H:%M:%S"))
+                except ValueError:
+                    run_started_at_epoch = None
+            try:
+                run_context.validate_component_report(
+                    raw_release_config, report_path=rc_report_path, run_id=run_id_opt, workspace=probe_workspace,
+                    component="release-config", run_started_at_epoch=run_started_at_epoch,
+                )
+            except run_context.RunIdError as exc:
+                _reject_release_config(f"This run's release-config evidence was rejected: {exc}")
+
+            if not _RELEASE_CONFIG_REQUIRED_KEYS.issubset(raw_release_config):
+                _reject_release_config(
+                    f"This run's release-config evidence at {rc_report_path} is malformed "
+                    f"(missing one of {sorted(_RELEASE_CONFIG_REQUIRED_KEYS)})."
+                )
+
+            if raw_release_config.get("status") != "ok":
+                detail = ["This run's release-config composition did not pass -- installation cannot proceed:"]
+                detail.extend(str(d) for d in raw_release_config.get("detail", []))
+                _reject_release_config("\n  - ".join(detail))
+
+            release_config_report = raw_release_config
+
+    if release_config_report is not None and release_config_report.get("schemaVersion") == 2:
+        # Priority 1: schema-v2 authority. Profile and every other release
+        # policy decision below come ONLY from this same-run evidence --
+        # release_platforms.load_* is never called on this path.
+        release_selections = release_config_report.get("releaseSelections") or {}
+        eff_production = release_selections.get("profile") == "production"
+        if production_opt is not None and production_opt != eff_production:
+            click.echo(click.style(
+                f"[NOTE] --{'production' if production_opt else 'development'} was given, but schema-v2 "
+                f"release-config evidence is authoritative for the release profile "
+                f"({release_selections.get('profile')!r}) -- the flag is ignored.",
+                fg="yellow",
+            ), err=True)
+        calee_mobile_identity = (release_selections.get("expectedIdentities") or {}).get("caleeMobile") or {}
+        selector_evidence_required = bool(calee_mobile_identity.get("selectorEvidenceRequired", True))
+        distributed_build_acceptance_required = bool(
+            calee_mobile_identity.get("distributedBuildAcceptanceRequired", True)
+        )
+    else:
+        # Schema v1, or a bare diagnostic invocation with no run-scoped
+        # release-config evidence at all -- unchanged legacy behaviour.
+        try:
+            expected_identity = release_platforms.load_expected_build_identity()
+        except release_platforms.ReleasePlatformsError as exc:
+            click.echo(str(exc), err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        eff_production = production_opt if production_opt is not None else expected_identity.production
+        selector_evidence_required = None
+        distributed_build_acceptance_required = None
+
     # Release-gating: unconditionally true in production; for a staging/
     # development profile, a run carrying a shared run ID is a real
     # launcher-driven release run (Priority 2 policy -- see docstring above).
@@ -3781,8 +4167,6 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     # this existed.
     fingerprint = None
     if run_id_opt:
-        from . import release_candidate as release_candidate_mod
-
         candidate_workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
         snapshot_dir = candidate_workspace.component_dir("release-candidate")
         fingerprint_path = snapshot_dir / release_candidate_mod.FINGERPRINT_FILENAME
@@ -3798,7 +4182,31 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
                 _record_installation_component(run_id_opt, payload, EXIT_INVALID_CONFIG)
                 click.echo(click.style(f"[INVALID] {payload['detail'][0]}", fg="red"), err=True)
                 raise SystemExit(EXIT_INVALID_CONFIG)
-            fp_problems = release_candidate_mod.verify_candidate_fingerprint(snapshot_dir, fingerprint)
+
+            # Priority 5: bind this verification to the SAME release-config
+            # evidence that governs policy above, when one exists -- a
+            # candidate copied wholesale from another run, or one approved
+            # under a different release-config composition, is rejected here
+            # even though its own internal envelope digest is self-consistent.
+            fp_kwargs = {}
+            if release_config_report is not None:
+                fp_kwargs = dict(
+                    expected_run_id=run_id_opt,
+                    expected_release_id=release_config_report.get("releaseId"),
+                    expected_schema_version=release_config_report.get("schemaVersion"),
+                    expected_release_config_digest=release_config_report.get("releaseConfigDigest"),
+                )
+            fp_problems = release_candidate_mod.verify_candidate_fingerprint(snapshot_dir, fingerprint, **fp_kwargs)
+            if release_config_report is not None:
+                recorded_fp = release_config_report.get("releaseCandidateFingerprint") or {}
+                if recorded_fp.get("envelopeDigest") != fingerprint.envelope_digest:
+                    fp_problems.append(
+                        "this run's release-config evidence recorded a DIFFERENT candidate fingerprint "
+                        f"(envelopeDigest {recorded_fp.get('envelopeDigest')!r}) than the one on disk in the "
+                        f"release-candidate snapshot ({fingerprint.envelope_digest!r}) -- release-config, the "
+                        f"candidate fingerprint, and this installation must all reference the identical "
+                        f"approved candidate."
+                    )
             if fp_problems:
                 payload = {
                     "status": "blocked",
@@ -3937,6 +4345,16 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
         "releaseId": plan.release_id,
         "productionProfile": bool(eff_production),
         "signerTrustRequired": signer_trust_required,
+        # Priority 1: which source actually governed this installation's
+        # release policy -- "release-config-v2" (release_platforms.py never
+        # consulted), "release-config-v1"/"legacy" (release-platforms.yaml,
+        # or explicit CLI flags with no run-scoped release-config at all).
+        "releasePolicySource": (
+            "release-config-v2" if (release_config_report is not None and release_config_report.get("schemaVersion") == 2)
+            else ("release-config-v1" if release_config_report is not None else "legacy")
+        ),
+        "selectorEvidenceRequired": selector_evidence_required,
+        "distributedBuildAcceptanceRequired": distributed_build_acceptance_required,
         "releaseCandidateFingerprint": fingerprint.to_dict() if fingerprint is not None else None,
     }
     _write_installer_report(Path(report_path) if report_path else None, payload)

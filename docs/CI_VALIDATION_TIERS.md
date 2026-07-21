@@ -42,6 +42,30 @@ embeds that exact SHA:
 CaleeMobile) -- this evidence is about the regression framework's own code
 passing its own tests, not about any tablet/mobile build being certified.
 
+**Independent re-verification (Priority 8).** The in-workflow "Merge-commit /
+main smoke check" step above only proves what THAT SPECIFIC RUN believed
+about itself -- it is not something a technical owner can re-check after the
+fact without re-reading the workflow's own live log. `python -m
+calee_regression verify-main-ci-evidence --expected-sha <full-main-sha>
+--summary <downloaded-framework-test-summary.json>`
+(`calee_regression/main_ci_evidence.py`) re-derives the SAME verdict
+independently and offline, from a downloaded copy of the retained artifact:
+exact commit SHA, a genuine `push`-to-`refs/heads/main` or `merge_group`
+event (a `pull_request` event's evidence is rejected outright, however
+clean), and every gate the evidence lists (there is only one, unconditional
+job here; CaleeMobile-Regression's richer multi-gate `ci-summary.json` is
+verified with the same command/module and its own `--required-gate` flags).
+
+**This command must be run AFTER the pull request has actually merged** --
+using the artifact from the Actions run that executed for the real merge
+commit on `main` (or the merge-queue's synthetic merge commit), never a
+PR-head run's evidence and never a SHA merely predicted before the merge
+happened. A Claude Code session working on a not-yet-merged PR cannot
+truthfully claim merged-main evidence was verified during that session; it
+can only state that this command exists and name it as the next step for a
+human (or a later, post-merge run) to execute against the real merge-commit
+artifact.
+
 ## 3. Release-candidate certification
 
 This tier is **not a GitHub Actions job on this repo**. It is the actual

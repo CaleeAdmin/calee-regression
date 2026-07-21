@@ -299,8 +299,12 @@ if len(argv) >= 3 and argv[0] == "-m" and argv[1] == "calee_regression":
             sys.stdout.write("export AUTO_CALEE_IDENTITY_AVAILABLE=true\\n")
         sys.exit(0)
     if cmd == "selector-contract":
-        wc("selector-contract", {{"status": "pass"}})
-        sys.exit(0)
+        # Priority 2 (this session): controllable via FAKE_SELECTOR_EXIT so
+        # tests can exercise mandatory/optional PASS/FAIL launcher branching
+        # without a real CaleeMobile checkout.
+        exit_code = int(os.environ.get("FAKE_SELECTOR_EXIT", "0"))
+        wc("selector-contract", {{"status": "pass" if exit_code == 0 else "blocked"}})
+        sys.exit(exit_code)
     if cmd == "suite":
         wc("tablet", {{"passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
                        "scenarios": [{{"name": "REG", "status": "passed"}}]}})
@@ -490,9 +494,12 @@ def test_launcher_one_run_id_machine_config_and_install_evidence(tmp_path):
     argvs = [a for step in install["plan"]["steps"] for a in step["argv"]]
     apk_args = [a for a in argvs if a.endswith(".apk")]
     assert apk_args, install
+    # release-candidate is a symlink pointer (Priority 4 crash-recoverable
+    # publication -- see atomic_publish.py) into a content-addressed version
+    # directory; the resolved APK path lives under the pointer's real target.
     for a in apk_args:
         assert a.startswith("/"), a
-        assert str(run_dir / "release-candidate") in a
+        assert Path(a).is_relative_to((run_dir / "release-candidate").resolve())
     assert install.get("releaseCandidateFingerprint") is not None, install
 
 
@@ -774,3 +781,163 @@ def test_custom_report_root_controls_every_artifact_through_the_real_launcher(tm
         input="", capture_output=True, text=True, timeout=30,
     )
     assert str(custom_root) in open_report.stdout, open_report.stdout + open_report.stderr
+
+
+# ═══════════ Priority 2 (this session): selector mandatory/optional policy ═══
+#
+# Launcher "06" reads $RELEASE_SELECTOR_EVIDENCE_REQUIRED (emitted by
+# release-config from calee_regression/release_config.py's
+# resolve_selector_evidence_required) to decide --mandatory/--optional on the
+# selector-contract gate, and to decide which mobile legs to skip on failure.
+# These use a schema-v2 bundle so the manifest's own caleeMobile.
+# selectorEvidenceRequired opinion is what's actually being exercised.
+
+
+def _external_bundle_v2(tmp_path, *, selector_evidence_required=True, profile="staging"):
+    bundle = tmp_path / "Calee-Releases" / "current-v2"
+    bundle.mkdir(parents=True)
+    calee_bytes = b"calee-apk-bytes-v2"
+    (bundle / "calee.apk").write_bytes(calee_bytes)
+    import hashlib
+    sha = hashlib.sha256(calee_bytes).hexdigest()
+    manifest = {
+        "schemaVersion": 2,
+        "releaseId": "2026.07.21-rcv2",
+        "profile": profile,
+        "backend": "https://hub.calee.com.au" if profile == "production" else "https://hub-dev.calee.com.au",
+        "platforms": {"tablet": True, "mobileAndroid": True, "mobileIos": False},
+        "features": {
+            "synchronization": True, "meals": True, "onboarding": True,
+            "googleCalendar": True, "kioskAdmin": False, "notifications": True,
+        },
+        "tabletSolution": {
+            "calee": {
+                "installArtifact": True, "apk": "calee.apk", "sha256": sha,
+                "expectedInstalled": {
+                    "packageId": "com.viso.calee", "versionName": "founder-v0.3.25",
+                    "versionCode": 325, "gitSha": CALEE_SHA, "signerSha256": FAKE_SIGNER_SHA256,
+                },
+            },
+            "caleeShell": {
+                "installArtifact": False,
+                "expectedInstalled": {
+                    "packageId": "com.viso.caleeshell", "versionName": "founder-v0.2.12",
+                    "versionCode": 212, "gitSha": CALEESHELL_SHA, "signerSha256": FAKE_SIGNER_SHA256,
+                },
+            },
+        },
+        "caleeMobile": {
+            "version": "0.0.24+24", "gitSha": CM_SHA,
+            "selectorEvidenceRequired": selector_evidence_required,
+            "distributedBuildAcceptanceRequired": True,
+        },
+    }
+    (bundle / "release-manifest.json").write_text(json.dumps(manifest))
+    (bundle / "checksums.sha256").write_text(f"{sha}  calee.apk\n")
+    return bundle
+
+
+def _machine_yaml_v2(repo, bundle, *, profile="staging", report_dir="."):
+    # Schema v2 is self-contained/authoritative for scope -- no release-
+    # platforms.yaml needed (and none is written here, proving it).
+    (repo / "config" / "machine.local.yaml").write_text(yaml.safe_dump({
+        "tablet_serial": "TAB123",
+        "expected_tablet_state": "logged_in_tablet",
+        "calee_package_id": "com.viso.calee",
+        "caleeshell_package_id": "com.viso.caleeshell",
+        "home_activity": "com.viso.caleeshell/.ui.LauncherActivity",
+        "calee_launch_action": "com.viso.calee.action.START",
+        "release_bundle_dir": str(bundle),
+        "backend_url": "https://hub.calee.com.au" if profile == "production" else "https://hub-dev.calee.com.au",
+        "release_profile": profile,
+        "report_dir": report_dir,
+        "mobile_platforms": ["android"],
+    }))
+
+
+def _credential_invocation_count(repo) -> int:
+    order_log = repo / "order.log"
+    if not order_log.is_file():
+        return 0
+    return order_log.read_text().count("run-with-credentials")
+
+
+def test_mandatory_selector_pass_runs_mobile_legs_and_sync(tmp_path):
+    repo = _copy_repo(tmp_path)
+    bundle = _external_bundle_v2(tmp_path, selector_evidence_required=True, profile="staging")
+    _machine_yaml_v2(repo, bundle, profile="staging")
+    fakebin = _fakebin(tmp_path)
+
+    proc = _run_launcher(repo, fakebin, extra_env={"FAKE_SELECTOR_EXIT": "0"})
+    run_dir = _only_run_dir(repo)
+    assert json.loads((run_dir / "selector-contract" / "results.json").read_text())["status"] == "pass"
+    assert (run_dir / "sync" / "results.json").is_file(), "sync-smoke must run after a passing selector gate"
+    assert _credential_invocation_count(repo) >= 1, "the API leg (at least) must run after a passing selector gate: " + proc.stdout + proc.stderr
+
+
+def test_mandatory_selector_failure_skips_every_mobile_leg(tmp_path):
+    repo = _copy_repo(tmp_path)
+    bundle = _external_bundle_v2(tmp_path, selector_evidence_required=True, profile="staging")
+    _machine_yaml_v2(repo, bundle, profile="staging")
+    fakebin = _fakebin(tmp_path)
+
+    proc = _run_launcher(repo, fakebin, extra_env={"FAKE_SELECTOR_EXIT": "3"})
+    run_dir = _only_run_dir(repo)
+    assert json.loads((run_dir / "selector-contract" / "results.json").read_text())["status"] == "blocked"
+    assert not (run_dir / "sync" / "results.json").is_file(), "sync-smoke must not run after a failed mandatory selector gate"
+    assert _credential_invocation_count(repo) == 0, (
+        "no mobile leg (API or UI) may run after a failed MANDATORY selector gate: " + proc.stdout + proc.stderr
+    )
+
+
+def test_optional_selector_pass_runs_mobile_legs_and_sync(tmp_path):
+    repo = _copy_repo(tmp_path)
+    bundle = _external_bundle_v2(tmp_path, selector_evidence_required=False, profile="staging")
+    _machine_yaml_v2(repo, bundle, profile="staging")
+    fakebin = _fakebin(tmp_path)
+
+    proc = _run_launcher(repo, fakebin, extra_env={"FAKE_SELECTOR_EXIT": "0"})
+    run_dir = _only_run_dir(repo)
+    assert json.loads((run_dir / "selector-contract" / "results.json").read_text())["status"] == "pass"
+    assert (run_dir / "sync" / "results.json").is_file()
+    assert _credential_invocation_count(repo) >= 1, proc.stdout + proc.stderr
+
+
+def test_optional_selector_failure_runs_api_but_skips_ui_and_sync(tmp_path):
+    # Priority 2, requirement 5: a selector-OPTIONAL failure may allow the
+    # device-independent API check to continue, but every selector-dependent
+    # leg (Android/iOS UI, and sync -- which drives that same UI) must be
+    # skipped.
+    repo = _copy_repo(tmp_path)
+    bundle = _external_bundle_v2(tmp_path, selector_evidence_required=False, profile="staging")
+    _machine_yaml_v2(repo, bundle, profile="staging")
+    fakebin = _fakebin(tmp_path)
+
+    proc = _run_launcher(repo, fakebin, extra_env={"FAKE_SELECTOR_EXIT": "3"})
+    run_dir = _only_run_dir(repo)
+    assert json.loads((run_dir / "selector-contract" / "results.json").read_text())["status"] == "blocked"
+    assert not (run_dir / "sync" / "results.json").is_file(), (
+        "cross-device sync drives mobile UI -- it must not run when selector evidence was not verified"
+    )
+    # Exactly one credential-boundary invocation: the API leg only (never the
+    # Android/iOS UI legs, which depend on unverified selectors).
+    assert _credential_invocation_count(repo) == 1, proc.stdout + proc.stderr
+
+
+def test_production_profile_forces_selector_mandatory_despite_manifest_optional(tmp_path):
+    # Priority 2, requirement (precedence): a PRODUCTION release with a
+    # mobile platform in scope is unconditionally mandatory, regardless of
+    # the manifest's own selectorEvidenceRequired: false.
+    repo = _copy_repo(tmp_path)
+    bundle = _external_bundle_v2(tmp_path, selector_evidence_required=False, profile="production")
+    _machine_yaml_v2(repo, bundle, profile="production")
+    fakebin = _fakebin(tmp_path)
+
+    proc = _run_launcher(repo, fakebin, extra_env={"FAKE_SELECTOR_EXIT": "3"})
+    run_dir = _only_run_dir(repo)
+    assert json.loads((run_dir / "selector-contract" / "results.json").read_text())["status"] == "blocked"
+    assert not (run_dir / "sync" / "results.json").is_file()
+    assert _credential_invocation_count(repo) == 0, (
+        "a production release must treat selector evidence as mandatory even though the manifest said "
+        "selectorEvidenceRequired: false: " + proc.stdout + proc.stderr
+    )

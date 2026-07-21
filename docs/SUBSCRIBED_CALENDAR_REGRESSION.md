@@ -84,6 +84,46 @@ missing or mismatched `releaseId` BLOCKS, and a `published`-mode report is re-ve
 trusted outright — see `docs/RELEASE_POLICY.md`'s "Subscribed-fixture evidence is bound to the release"
 section for the full precedence and rejection rules.
 
+**Explicit execution policy (Priority 6, this session).** `prepare-subscribed-fixture`
+takes `--gate`/`--non-gating`, controlling THIS COMMAND's OWN process exit code (not
+merely the recorded evidence):
+
+* `--gate`: a publication failure, an exact public-read-verification failure,
+  or a Calee-ingestion failure each make this command itself exit **BLOCKED**
+  — the technical owner sees the problem immediately, at this step, not only
+  later in a consolidated report.
+* `--non-gating`: every failure is still recorded in full (nothing is ever
+  silently dropped), but the command exits success regardless — appropriate
+  only while the subscribed-calendar scenario is genuinely optional.
+* With neither flag given, the default is derived exactly the way
+  `consolidate` derives this component's mandatory-ness: this scenario's OWN
+  promotion state (`scenarios/promotion/subscribed_calendar.yaml`'s
+  `releaseSuiteEligible`) — draft (the default today) is non-gating; promoted
+  is gating. The two can never disagree.
+* Launcher `06` derives which flag to pass from (in order): an explicit
+  technical-owner override (`CALEE_SUBSCRIBED_FIXTURE_GATE=true|false`), this
+  release's own feature scope (`$RELEASE_FEATURE_GOOGLE_CALENDAR` — not in
+  scope means non-gating), else it omits the flag entirely and lets
+  `prepare-subscribed-fixture` fall back to the promotion-state default above.
+  A gated BLOCKED result prints an unmissable banner and does **not** abort
+  the rest of the launcher (the general tablet suite, which excludes this
+  still-draft scenario by tag regardless, continues) — `consolidate` remains
+  the final, authoritative release gate.
+
+**Scenario-variable safety (Priority 6, this session).** The generated event
+titles (`REG_SUB_TIMED_TITLE`/`REG_SUB_ALLDAY_TITLE`/`REG_SUB_DATE`) may be
+consumed by a scenario-variable substitution mechanism **only** through
+`subscribed_publisher.safe_scenario_variables_from_report(report,
+expected_run_id=..., expected_release_id=...)`. This returns the titles only
+when `report["mode"] == "published"` **and** `publicationStatus`,
+`publicReadVerificationStatus`, **and** `ingestionStatus` are all `"ok"`, and
+the report's own `runId`/`releaseId` match the caller's expectations —
+returning `None` for a blocked/partial published attempt, a `fixed-date`/
+`offline-only` report (which never claims published verification), a missing
+report, or one for a different run/release. A blocked published fixture can
+therefore never silently supply scenario variables to a subscribed-calendar
+UI scenario once one is wired to consume them.
+
 Exercise **both** ingestion paths:
 
 1. **subscription cache expansion** (the normal path — hub expands the feed into

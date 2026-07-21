@@ -720,3 +720,102 @@ def test_cli_release_config_v1_bundleless_still_blocks_on_malformed_legacy_yaml(
          "--run-id", run_id],
     )
     assert result.exit_code == EXIT_BLOCKED, result.output
+
+
+# ── Priority 2 (this session): resolve_selector_evidence_required ──────────
+
+
+def test_selector_evidence_production_with_mobile_in_scope_is_mandatory_regardless_of_manifest():
+    assert rc.resolve_selector_evidence_required(
+        profile="production", enabled_platforms=["tablet", "android"], schema_version=2,
+        manifest_required=False,
+    ) is True
+
+
+def test_selector_evidence_production_with_ios_in_scope_is_mandatory():
+    assert rc.resolve_selector_evidence_required(
+        profile="production", enabled_platforms=["ios"], schema_version=2, manifest_required=False,
+    ) is True
+
+
+def test_selector_evidence_non_production_v2_honours_manifest_true():
+    assert rc.resolve_selector_evidence_required(
+        profile="staging", enabled_platforms=["android"], schema_version=2, manifest_required=True,
+    ) is True
+
+
+def test_selector_evidence_non_production_v2_honours_manifest_false():
+    assert rc.resolve_selector_evidence_required(
+        profile="staging", enabled_platforms=["android"], schema_version=2, manifest_required=False,
+    ) is False
+
+
+def test_selector_evidence_schema_v1_uses_legacy_mobile_in_scope_default():
+    assert rc.resolve_selector_evidence_required(
+        profile="staging", enabled_platforms=["android"], schema_version=1, manifest_required=None,
+    ) is True
+
+
+def test_selector_evidence_schema_v1_no_mobile_in_scope_is_not_applicable():
+    assert rc.resolve_selector_evidence_required(
+        profile="staging", enabled_platforms=["tablet"], schema_version=1, manifest_required=None,
+    ) is None
+
+
+def test_selector_evidence_v2_no_manifest_opinion_falls_back_to_mobile_in_scope():
+    assert rc.resolve_selector_evidence_required(
+        profile="staging", enabled_platforms=["android"], schema_version=2, manifest_required=None,
+    ) is True
+
+
+def test_selector_evidence_no_mobile_platform_at_all_is_not_applicable():
+    assert rc.resolve_selector_evidence_required(
+        profile="production", enabled_platforms=[], schema_version=2, manifest_required=True,
+    ) is True  # manifest opinion still applies even with no mobile platform, if explicitly stated
+    assert rc.resolve_selector_evidence_required(
+        profile="staging", enabled_platforms=[], schema_version=1, manifest_required=None,
+    ) is None
+
+
+def test_selector_evidence_production_but_no_mobile_platform_defers_to_manifest():
+    # Production alone doesn't force it -- only production WITH a mobile
+    # platform in scope does (a tablet-only production release has nothing
+    # selector-dependent to verify).
+    assert rc.resolve_selector_evidence_required(
+        profile="production", enabled_platforms=["tablet"], schema_version=2, manifest_required=False,
+    ) is False
+
+
+# ── Priority 5 (this session): release_selections_digest ───────────────────
+
+
+def test_release_selections_digest_is_deterministic_and_key_order_independent():
+    a = {"profile": "staging", "enabledPlatforms": ["tablet", "android"], "expectedIdentities": {"x": 1}}
+    b = {"expectedIdentities": {"x": 1}, "enabledPlatforms": ["tablet", "android"], "profile": "staging"}
+    assert rc.release_selections_digest(a) == rc.release_selections_digest(b)
+
+
+def test_release_selections_digest_changes_with_content():
+    a = {"profile": "staging", "enabledPlatforms": ["tablet"]}
+    b = {"profile": "production", "enabledPlatforms": ["tablet"]}
+    assert rc.release_selections_digest(a) != rc.release_selections_digest(b)
+
+
+def test_effective_release_config_to_dict_embeds_release_config_digest(tmp_path):
+    machine = MachineConfig(
+        tablet_serial="TAB1", expected_tablet_state="logged_in_tablet",
+        calee_package_id="com.viso.calee", caleeshell_package_id="com.viso.caleeshell",
+        home_activity="com.viso.caleeshell/.ui.LauncherActivity",
+        calee_launch_action="com.viso.calee.action.START",
+        release_bundle_dir=str(tmp_path), backend_url="https://hub-dev.calee.com.au",
+        release_profile="staging", report_dir="reports", mobile_platforms=["android"],
+        android_device="R5C", allow_caleeshell_technical=False,
+    )
+    cfg = rc.compose_effective_release_config(
+        machine, ReleasePlatforms(tablet=True, mobile_android=True, mobile_ios=False),
+        ReleaseFeatures(kiosk_admin=False), ExpectedBuildIdentity(),
+        run_id="release-test-digest", release_id="r1",
+    )
+    d = cfg.to_dict()
+    assert d["releaseConfigDigest"] == rc.release_selections_digest(d["releaseSelections"])
+    assert d["releaseConfigDigest"].startswith("sha256:")

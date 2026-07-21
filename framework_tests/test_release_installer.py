@@ -538,12 +538,30 @@ def test_v2_manifest_caleemobile_missing_gitsha_only_is_rejected():
 
 @pytest.mark.parametrize(
     "bad_backend",
-    ["not-a-url-at-all", "http://hub-dev.calee.com.au", "ftp://hub-dev.calee.com.au", "  "],
+    [
+        "not-a-url-at-all", "http://hub-dev.calee.com.au", "ftp://hub-dev.calee.com.au", "  ",
+        # Priority 7 (this session): structured validation catches deceptive/
+        # malformed URLs a bare startswith("https://") test would have missed.
+        "https://user:pass@hub-dev.calee.com.au",
+        "https://hub-dev.calee.com.au@evil.example",
+        "https://hub-dev.calee.com.au#fragment",
+        "https://hub-dev.calee.com.au:99999",
+        "https:///no-host-at-all",
+        " https://hub-dev.calee.com.au",
+        "https://hub-dev.calee.com.au/\x00",
+    ],
 )
 def test_v2_manifest_non_https_backend_is_rejected(bad_backend):
     raw = _v2_manifest(backend=bad_backend)
     manifest, errors = parse_manifest(raw)
     assert any("backend" in e for e in errors), errors
+
+
+def test_v2_manifest_https_backend_with_port_and_path_is_accepted():
+    raw = _v2_manifest(backend="https://hub-dev.calee.com.au:8443/api")
+    manifest, errors = parse_manifest(raw)
+    assert errors == [], errors
+    assert manifest.backend == "https://hub-dev.calee.com.au:8443/api"
 
 
 def test_v2_manifest_unknown_top_level_key_is_rejected():

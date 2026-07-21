@@ -20,6 +20,8 @@ from pathlib import Path
 
 import yaml
 
+from . import url_validation
+
 VALID_TABLET_STATES = {"fresh", "logged_in_tablet"}
 VALID_MOBILE_PLATFORMS = {"android", "ios"}
 
@@ -105,6 +107,15 @@ def validate_machine_config(raw: dict) -> "list[str]":
         value = raw.get(name)
         if not isinstance(value, str) or not value.strip():
             errors.append(f"machine config field {name!r} is required and must be a non-empty string.")
+
+    # Priority 7: structured URL validation for backend_url (scheme/host/
+    # userinfo/fragment/port/whitespace) -- checked only when it's otherwise a
+    # non-empty string (the required-field check above already reports a
+    # missing/blank value; this adds format checking on top of that).
+    backend_url = raw.get("backend_url")
+    if isinstance(backend_url, str) and backend_url.strip():
+        for problem in url_validation.validate_backend_url(backend_url):
+            errors.append(f"machine config field 'backend_url' is invalid: {problem}")
 
     state = raw.get("expected_tablet_state")
     if state is not None and state not in VALID_TABLET_STATES:

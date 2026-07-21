@@ -30,6 +30,8 @@ non-secret selections are recorded).
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 
 from .machine_config import MachineConfig
@@ -178,6 +180,14 @@ class EffectiveReleaseConfig:
         return {"ios": self.iphone_device, "android": self.android_device, "tablet": self.tablet_serial}.get(platform)
 
     def to_dict(self) -> dict:
+        release_selections = {
+            "selectedBackend": self.selected_backend,
+            "enabledPlatforms": list(self.enabled_platforms),
+            "enabledFeatures": list(self.enabled_features),
+            "profile": self.profile,
+            "distributedBuildRequired": self.distributed_build_required,
+            "expectedIdentities": dict(self.expected_identities),
+        }
         return {
             "status": self.status,
             "runId": self.run_id,
@@ -196,14 +206,14 @@ class EffectiveReleaseConfig:
                 "allowCaleeShellTechnical": self.allow_caleeshell_technical,
                 "machineBackendUrl": self.machine_backend_url,
             },
-            "releaseSelections": {
-                "selectedBackend": self.selected_backend,
-                "enabledPlatforms": list(self.enabled_platforms),
-                "enabledFeatures": list(self.enabled_features),
-                "profile": self.profile,
-                "distributedBuildRequired": self.distributed_build_required,
-                "expectedIdentities": dict(self.expected_identities),
-            },
+            "releaseSelections": release_selections,
+            # Priority 5: a digest of ONLY releaseSelections (see
+            # release_selections_digest's docstring for why machine-derived
+            # fields are excluded) -- the installer independently recomputes
+            # this same digest and compares it against what the candidate
+            # fingerprint recorded, rather than trusting this report's own
+            # copy of it.
+            "releaseConfigDigest": release_selections_digest(release_selections),
             "deviceIds": {
                 "tablet": self.tablet_serial,
                 "ios": self.iphone_device,
@@ -211,6 +221,58 @@ class EffectiveReleaseConfig:
             },
             "conflicts": [c.to_dict() for c in self.conflicts],
         }
+
+
+def release_selections_digest(release_selections: dict) -> str:
+    """A digest (Priority 5) over exactly the RELEASE-derived selections a
+    composed ``EffectiveReleaseConfig`` produced -- profile, scope, backend,
+    distributed-build requirement, and expected identities -- deliberately
+    EXCLUDING ``machineSelections``/``deviceIds``/``conflicts``. Those are
+    derived from the machine and would make this digest depend on which
+    machine composed it; the release-derived fields are what an installer
+    running on a DIFFERENT machine (or the same machine independently
+    recomputing this digest from a same-run release-config report, or a
+    schema-v2 bundle's own manifest, per Priority 1/5) must be able to
+    reproduce byte-for-byte and compare against what's embedded in the
+    candidate fingerprint (``release_candidate.py``)."""
+    canonical = json.dumps(release_selections, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def resolve_selector_evidence_required(
+    *, profile: "str | None", enabled_platforms: "list[str] | None", schema_version: "int | None" = None,
+    manifest_required: "bool | None" = None,
+) -> "bool | None":
+    """Priority 2 (this session) -- the ONE documented selector-evidence
+    precedence, evaluated with only what is knowable at release-config
+    composition time (no explicit per-command CLI flag, no waiver -- those
+    only exist at the point a technical owner actually invokes
+    ``selector-contract``/``consolidate``, and ``consolidate`` re-derives and
+    re-enforces its OWN, fully authoritative decision independently of this
+    one -- see its ``selector_contract_gating`` logic):
+
+      * a PRODUCTION release with a mobile platform (android/ios) in scope --
+        mandatory, regardless of what the manifest states;
+      * a non-production schema-v2 release -- the bundle manifest's own
+        ``caleeMobile.selectorEvidenceRequired`` decides, when it states one;
+      * a schema-v1 release, or a v2 release whose manifest states no
+        opinion -- legacy policy: mandatory whenever a mobile platform is in
+        scope;
+      * no mobile platform in scope at all, and nothing else says otherwise
+        -- selector evidence is not applicable here (returns ``None``).
+
+    A launcher uses this to decide, up front, whether the mobile UI legs are
+    even worth attempting; it is never the last word -- ``consolidate``
+    always re-validates independently before a release can PASS.
+    """
+    mobile_in_scope = any(p in (enabled_platforms or ()) for p in ("android", "ios"))
+    if (profile or "").strip().lower() == "production" and mobile_in_scope:
+        return True
+    if schema_version == 2 and manifest_required is not None:
+        return bool(manifest_required)
+    if mobile_in_scope:
+        return True
+    return None
 
 
 def _machine_can(platform: str, machine: MachineConfig) -> bool:

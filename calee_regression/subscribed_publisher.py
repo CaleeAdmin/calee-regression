@@ -354,6 +354,41 @@ def scenario_variables(target_date: _dt.date, *, run_token: str) -> dict:
     }
 
 
+def safe_scenario_variables_from_report(
+    report: "dict | None", *, expected_run_id: "str | None" = None, expected_release_id: "str | None" = None,
+) -> "dict | None":
+    """Priority 6 (this session): the ONLY sanctioned way for a consumer (a
+    subscribed-calendar UI scenario, once wired) to obtain this run's
+    generated event titles. Returns the ``generatedTitles`` dict ONLY when
+    ``report`` is a same-run, same-release ``mode: "published"`` result that
+    independently shows ``publicationStatus``, ``publicReadVerificationStatus``
+    AND ``ingestionStatus`` all ``"ok"`` -- never merely a top-level
+    ``status: "ok"`` (which a tampered or stale report could claim without
+    every phase actually having passed). Returns ``None`` for anything else:
+    a blocked/partial published attempt, a fixed-date/offline-only report
+    (which never claims published verification and has no run-specific
+    titles worth substituting), a missing report, or one for a different
+    run/release -- so a blocked published fixture can never silently supply
+    scenario variables to a UI scenario.
+    """
+    if not isinstance(report, dict):
+        return None
+    if report.get("mode") != MODE_PUBLISHED:
+        return None
+    if (
+        report.get("publicationStatus") != STATUS_OK
+        or report.get("publicReadVerificationStatus") != STATUS_OK
+        or report.get("ingestionStatus") != STATUS_OK
+    ):
+        return None
+    if expected_run_id is not None and str(report.get("runId") or "").strip() != str(expected_run_id).strip():
+        return None
+    if expected_release_id is not None and str(report.get("releaseId") or "").strip() != str(expected_release_id).strip():
+        return None
+    titles = report.get("generatedTitles")
+    return dict(titles) if isinstance(titles, dict) else None
+
+
 def prepare_subscribed_fixture(
     *,
     run_id: "str | None",

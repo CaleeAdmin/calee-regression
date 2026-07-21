@@ -459,7 +459,10 @@ def test_write_release_bundle_failure_partway_through_leaves_prior_bundle_untouc
 
     monkeypatch.setattr(rba.shutil, "copyfile", _flaky_copyfile)
 
-    with pytest.raises(OSError):
+    # atomic_publish.publish_version wraps a build-time failure in
+    # PublishError (Priority 4) -- the underlying OSError is chained as
+    # __cause__, and nothing about out_dir has changed yet at this point.
+    with pytest.raises(rba.atomic_publish.PublishError):
         rba.write_release_bundle(assembly2, out_dir)
 
     # The ORIGINAL bundle (release #1) is completely untouched -- never a mix
@@ -471,9 +474,15 @@ def test_write_release_bundle_failure_partway_through_leaves_prior_bundle_untouc
     assert verification.ok, verification.errors
     assert verification.manifest.release_id == "r1"
 
-    # No temp/backup directory left behind alongside out_dir.
-    leftovers = [p.name for p in out_dir.parent.iterdir() if p != out_dir]
-    assert leftovers == [], leftovers
+    # No STALE temp/backup directory left behind -- only the permanent
+    # versions store remains, holding exactly release #1's version (the
+    # failed release #2 build was cleaned up before it was ever renamed in).
+    siblings = [p.name for p in out_dir.parent.iterdir() if p != out_dir]
+    assert siblings == [f".{out_dir.name}.versions"], siblings
+    versions_dir = out_dir.parent / f".{out_dir.name}.versions"
+    version_entries = [p.name for p in versions_dir.iterdir()]
+    assert len(version_entries) == 1, version_entries
+    assert not version_entries[0].startswith(".tmp-"), version_entries
 
 
 def test_write_release_bundle_leaves_no_temp_dir_on_success(tmp_path):
@@ -491,8 +500,16 @@ def test_write_release_bundle_leaves_no_temp_dir_on_success(tmp_path):
     assert assembly.ok, assembly.errors
     out_dir = tmp_path / "release-output" / "out"
     rba.write_release_bundle(assembly, out_dir)
-    leftovers = [p.name for p in out_dir.parent.iterdir() if p != out_dir]
-    assert leftovers == [], leftovers
+    # Priority 4: publication now goes through atomic_publish, which keeps a
+    # permanent (not a leftover) ".out.versions" directory alongside the
+    # out_dir pointer -- but no transient .tmp-*/lock/journal artifact may
+    # survive a successful publish.
+    siblings = [p.name for p in out_dir.parent.iterdir() if p != out_dir]
+    assert siblings == [f".{out_dir.name}.versions"], siblings
+    versions_dir = out_dir.parent / f".{out_dir.name}.versions"
+    version_entries = [p.name for p in versions_dir.iterdir()]
+    assert len(version_entries) == 1, version_entries
+    assert not version_entries[0].startswith(".tmp-"), version_entries
 
 
 def test_cli_assemble_release_bundle_end_to_end(tmp_path, monkeypatch):

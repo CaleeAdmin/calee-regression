@@ -83,6 +83,8 @@ def _fresh_ts() -> str:
 
 
 def _write_acceptance(workspace, **overrides):
+    """The DEPRECATED legacy flat shape (Priority 3, this session) -- kept for
+    the tests that specifically prove it can never PASS any more."""
     data = dict(
         schemaVersion=1, component="caleemobile-distributed-build-acceptance",
         channel="testflight", distributedBuildId="TF-4821",
@@ -93,6 +95,32 @@ def _write_acceptance(workspace, **overrides):
     data.update(overrides)
     path = workspace.component_report_path("distributed-build-acceptance")
     path.write_text(json.dumps({"runId": RUN_ID, "evidence": data, "status": "passed"}))
+
+
+def _write_provenance_acceptance(workspace, run_id=RUN_ID, **overrides):
+    """Priority 3 (this session): the authenticated provenance-backed shape --
+    the only one that can reach PASS. Mirrors exactly what
+    'record-distributed-build-acceptance --source ...' produces."""
+    from calee_regression import distributed_build_provenance as dbp
+
+    evidence = dict(
+        schemaVersion=2, component="caleemobile-distributed-build-acceptance",
+        provider="app_store_connect", channel="testflight", distributedBuildId="TF-4821",
+        releaseId=RELEASE_A, testedGitSha=SHA_RELEASE, testedVersion=VERSION_RELEASE,
+        providerAccountOrProject="acct-12345", providerRecordId="asc-build-98765",
+        providerObservedAt=_fresh_ts(), generatedBy="provider-api",
+        sourceDigest="sha256:" + "1" * 64, timestamp=_fresh_ts(),
+    )
+    evidence.update(overrides)
+    raw_bytes = json.dumps(evidence).encode("utf-8")
+    record = dbp.build_provenance_record(
+        evidence, release_run_id=run_id, adopted_at=_fresh_ts(), adopted_by="technical-owner",
+        source_path="/tmp/fake-evidence.json", raw_source_bytes=raw_bytes,
+    )
+    component_dir = workspace.component_dir("distributed-build-acceptance")
+    dbp.write_evidence_bundle(component_dir, record, source_bytes=raw_bytes)
+    path = workspace.component_report_path("distributed-build-acceptance")
+    path.write_text(json.dumps({"runId": run_id, "provenance": record, "status": "passed"}))
 
 
 def _consolidate(tmp_path, *, extra_args=()):
@@ -130,11 +158,23 @@ def test_required_and_missing_blocks(tmp_path):
 
 def test_required_and_valid_evidence_passes(tmp_path):
     workspace = _seed_minimal_release(tmp_path, distributed_build_required=True)
-    _write_acceptance(workspace)
+    _write_provenance_acceptance(workspace)
     result = _consolidate(tmp_path)
     assert result.exit_code == EXIT_SUCCESS, result.output
     component = _component(tmp_path, "Distributed-build acceptance")
     assert component["status"] == "pass"
+
+
+def test_required_and_legacy_manual_evidence_can_never_pass(tmp_path):
+    # Priority 3 (this session): deprecation -- even a WELL-FORMED, otherwise-
+    # valid legacy flat (no provenance) record can never PASS any more.
+    workspace = _seed_minimal_release(tmp_path, distributed_build_required=True)
+    _write_acceptance(workspace)
+    result = _consolidate(tmp_path)
+    assert result.exit_code == EXIT_BLOCKED, result.output
+    component = _component(tmp_path, "Distributed-build acceptance")
+    assert component["status"] == "blocked"
+    assert any("DEPRECATED" in d and "never PASS" in d for d in component["detail"])
 
 
 def test_required_but_evidence_claims_local_checkout_blocks(tmp_path):
@@ -209,7 +249,7 @@ def test_no_release_config_at_all_omits_component_entirely(tmp_path):
 
 def test_evidence_zip_includes_distributed_build_acceptance_report(tmp_path):
     workspace = _seed_minimal_release(tmp_path, distributed_build_required=True)
-    _write_acceptance(workspace)
+    _write_provenance_acceptance(workspace)
     result = _consolidate(tmp_path)
     assert result.exit_code == EXIT_SUCCESS, result.output
     import zipfile
@@ -218,3 +258,9 @@ def test_evidence_zip_includes_distributed_build_acceptance_report(tmp_path):
     with zipfile.ZipFile(zip_candidates[0]) as zf:
         names = zf.namelist()
     assert any("distributed-build-acceptance" in n for n in names), names
+    # Priority 3 (this session): the raw provenance evidence bundle -- source
+    # JSON + its raw-byte sha256 sidecar + the envelope-protected provenance
+    # record -- travels with the release ZIP too, not just the flat results.json.
+    assert any(n.endswith("distributed-build-source.json") for n in names), names
+    assert any(n.endswith("distributed-build-source.sha256") for n in names), names
+    assert any(n.endswith("distributed-build-provenance.json") for n in names), names
