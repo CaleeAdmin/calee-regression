@@ -72,9 +72,21 @@ def test_technical_permission_maps_onto_allow_release_technical():
     assert rec.resolution == "overridden"
 
 
-def test_snapshot_records_selected_backend_devices_packages_profile_no_secrets():
+def test_snapshot_records_selected_backend_devices_packages_profile_no_secrets(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    release_root = home / "Calee-Releases"
+    target = release_root / ".current.versions" / "bundle-123"
+    target.mkdir(parents=True)
+    (release_root / "current").symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+
     eff = machine_adapter.reconcile(_machine(), {"udid": "TAB123"})
-    snap = machine_adapter.snapshot(eff, machine_config_path="/x/machine.yaml", effective_tester_config_path="/x/eff.yaml")
+    snap = machine_adapter.snapshot(
+        eff,
+        machine_config_path="/x/machine.yaml",
+        effective_tester_config_path="/x/eff.yaml",
+    )
+
     assert snap["status"] == "ok"
     sel = snap["selected"]
     assert sel["backendUrl"] == "https://hub-dev.calee.com.au"
@@ -83,8 +95,8 @@ def test_snapshot_records_selected_backend_devices_packages_profile_no_secrets()
     assert sel["caleePackageId"] == "com.viso.calee"
     assert sel["caleeShellPackageId"] == "com.viso.caleeshell"
     assert sel["mobilePlatforms"] == ["android", "ios"]
-    assert sel["releaseBundleDir"].endswith("Calee-Releases/current")
-    # No secret keys anywhere in the snapshot.
+    assert sel["releaseBundleDir"] == str(target.resolve())
+
     import json
 
     text = json.dumps(snap).lower()

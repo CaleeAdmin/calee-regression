@@ -1100,3 +1100,23 @@ def test_inspect_tablet_healthy_reports_identities_and_home():
     assert inspection.home_package == "com.viso.caleeshell"
     codes = {i.package_id: i.version_code for i in inspection.installed}
     assert codes["com.viso.calee"] == "325"
+
+
+
+def test_execute_install_plan_reboot_zero_without_success_text_is_ok(tmp_path):
+    """adb reboot normally succeeds silently; it is not an APK install."""
+
+    v = _verified(tmp_path)
+    plan = build_install_plan(v, serial="TAB1")
+
+    rules = [
+        (_contains("reboot"), AdbResult(returncode=0, stdout="", stderr="")),
+    ] + _healthy_device_rules()
+
+    execution = ri.execute_install_plan(plan, v, FakeAdb(rules))
+
+    reboot = next(step for step in execution.steps if step.label == "reboot")
+
+    assert reboot.returncode == 0
+    assert reboot.outcome == ri.OUTCOME_OK
+    assert execution.status == ri.STATUS_OK

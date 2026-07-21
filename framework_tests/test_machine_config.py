@@ -49,11 +49,19 @@ def test_valid_machine_config_loads(tmp_path):
     assert cfg.iphone_device is None  # empty string normalised to None
 
 
-def test_resolved_bundle_dir_expands_home(tmp_path):
+def test_resolved_bundle_dir_expands_home_and_pins_symlink_target(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    release_root = home / "Calee-Releases"
+    target = release_root / ".current.versions" / "bundle-123"
+    target.mkdir(parents=True)
+    (release_root / "current").symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+
     cfg = load_machine_config(_write(tmp_path, _VALID))
-    resolved = str(cfg.resolved_bundle_dir())
-    assert "~" not in resolved
-    assert resolved.endswith("Calee-Releases/current")
+    resolved = cfg.resolved_bundle_dir()
+
+    assert "~" not in str(resolved)
+    assert resolved == target.resolve()
 
 
 def test_missing_required_field_is_rejected(tmp_path):
