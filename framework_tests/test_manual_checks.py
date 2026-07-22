@@ -213,6 +213,7 @@ def test_numbered_launchers_include_a_manual_check_recorder_before_full_solution
         "05 Record Manual Checks.command",
         "06 Test Full Calee Solution.command",
         "07 Open Latest Report.command",
+        "08 Resume Blocked Release.command",
     ]
     # The record-manual-checks recorder must come before the full-solution run.
     assert names.index("05 Record Manual Checks.command") < names.index("06 Test Full Calee Solution.command")

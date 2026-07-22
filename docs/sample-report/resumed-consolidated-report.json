@@ -1,0 +1,399 @@
+{
+  "overallStatus": "pass",
+  "meta": {
+    "runId": "release-sample-resumed-000001",
+    "buildVersion": "SAMPLE",
+    "fixtureVersion": "v42"
+  },
+  "generatedAt": "2026-07-16 09:12:00",
+  "components": [
+    {
+      "name": "Calee tablet release installation",
+      "status": "pass",
+      "mandatory": true,
+      "passed": 1,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [],
+      "evidence": {
+        "runId": "release-sample-resumed-000001",
+        "status": "ok",
+        "releaseId": "2026.07.16-rc1",
+        "tabletStableIdentity": {
+          "configuredTransport": "TAB1",
+          "serialno": "SN-SAMPLE",
+          "manufacturer": "Google",
+          "model": "Pixel Tablet",
+          "product": "tangorpro",
+          "transportType": "usb"
+        },
+        "execution": {
+          "installed": [
+            {
+              "packageId": "com.viso.calee",
+              "present": true,
+              "versionName": "founder-v0.3.25",
+              "versionCode": "325"
+            }
+          ]
+        }
+      },
+      "resume": {
+        "executionMode": "reused",
+        "sourceAttempt": 1,
+        "evidencePath": "reports/runs/release-sample-resumed-000001/installation/results.json",
+        "reuseValidation": "PASS",
+        "previousAttempts": []
+      }
+    },
+    {
+      "name": "Release configuration (machine + release-candidate composition)",
+      "status": "pass",
+      "mandatory": true,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [],
+      "evidence": {
+        "runId": "release-sample-resumed-000001",
+        "status": "ok",
+        "schemaVersion": 2,
+        "releaseId": "2026.07.16-rc1",
+        "releaseConfigDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "releaseSelections": {
+          "selectedBackend": "https://hub-dev.calee.com.au",
+          "enabledPlatforms": [
+            "tablet"
+          ],
+          "enabledFeatures": [],
+          "profile": "staging",
+          "distributedBuildRequired": false,
+          "expectedIdentities": {
+            "calee": {
+              "applicationId": "com.viso.calee"
+            },
+            "caleeShell": {},
+            "caleeMobile": {}
+          }
+        }
+      },
+      "resume": {
+        "executionMode": "reused",
+        "sourceAttempt": 1,
+        "evidencePath": "reports/runs/release-sample-resumed-000001/release-config/results.json",
+        "reuseValidation": "PASS",
+        "previousAttempts": []
+      }
+    },
+    {
+      "name": "Test environment and regression fixture",
+      "status": "pass",
+      "mandatory": true,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [
+        "Environment and fixture ready."
+      ],
+      "resume": {
+        "executionMode": "executed",
+        "sourceAttempt": 2,
+        "evidencePath": "reports/runs/release-sample-resumed-000001/environment/results.json",
+        "reuseValidation": "NOT_APPLICABLE",
+        "previousAttempts": []
+      }
+    },
+    {
+      "name": "Calee tablet",
+      "status": "pass",
+      "mandatory": true,
+      "passed": 12,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [],
+      "resume": {
+        "executionMode": "executed",
+        "sourceAttempt": 2,
+        "evidencePath": "reports/runs/release-sample-resumed-000001/tablet/results.json",
+        "reuseValidation": "NOT_APPLICABLE",
+        "previousAttempts": []
+      }
+    },
+    {
+      "name": "CaleeMobile Client API",
+      "status": "pass",
+      "mandatory": true,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [],
+      "resume": {
+        "executionMode": "executed",
+        "sourceAttempt": 2,
+        "evidencePath": "reports/runs/release-sample-resumed-000001/mobile-api/results.json",
+        "reuseValidation": "NOT_APPLICABLE",
+        "previousAttempts": []
+      }
+    },
+    {
+      "name": "CaleeMobile Android UI",
+      "status": "not_run",
+      "mandatory": false,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [
+        "Not executed."
+      ],
+      "resume": {
+        "executionMode": "required",
+        "sourceAttempt": 2,
+        "evidencePath": "reports/runs/release-sample-resumed-000001/mobile-android/results.json",
+        "reuseValidation": "NOT_APPLICABLE",
+        "previousAttempts": []
+      }
+    },
+    {
+      "name": "CaleeMobile iPhone UI",
+      "status": "not_run",
+      "mandatory": false,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [
+        "Not executed."
+      ],
+      "resume": {
+        "executionMode": "required",
+        "sourceAttempt": 2,
+        "evidencePath": "reports/runs/release-sample-resumed-000001/mobile-ios/results.json",
+        "reuseValidation": "NOT_APPLICABLE",
+        "previousAttempts": []
+      }
+    },
+    {
+      "name": "CaleeMobile cross-device synchronization",
+      "status": "not_run",
+      "mandatory": false,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [
+        "Not executed."
+      ],
+      "resume": {
+        "executionMode": "required",
+        "sourceAttempt": 2,
+        "evidencePath": "reports/runs/release-sample-resumed-000001/sync/results.json",
+        "reuseValidation": "NOT_APPLICABLE",
+        "previousAttempts": []
+      }
+    },
+    {
+      "name": "Subscribed-calendar fixture",
+      "status": "not_run",
+      "mandatory": false,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [
+        "No subscribed-fixture evidence was recorded for this run."
+      ],
+      "resume": {
+        "executionMode": "required",
+        "sourceAttempt": 2,
+        "evidencePath": "reports/runs/release-sample-resumed-000001/subscribed-fixture/results.json",
+        "reuseValidation": "NOT_APPLICABLE",
+        "previousAttempts": []
+      }
+    },
+    {
+      "name": "CaleeMobile Meals",
+      "status": "not_run",
+      "mandatory": false,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [
+        "No test step tagged for the 'meals' feature was found in any in-scope report. A optional feature's result is derived only from its own tagged steps -- never inferred from the broad platform component passing."
+      ],
+      "evidence": {
+        "feature": "meals",
+        "applicability": "optional",
+        "executionStatus": "not_run",
+        "steps": [],
+        "platforms": [],
+        "devices": [],
+        "buildShas": [],
+        "backends": [],
+        "reportPaths": [],
+        "screenshots": [],
+        "blockedPrerequisite": [
+          "No test step tagged for the 'meals' feature was found in any in-scope report. A optional feature's result is derived only from its own tagged steps -- never inferred from the broad platform component passing."
+        ]
+      }
+    },
+    {
+      "name": "Calee onboarding and display/mobile handoff",
+      "status": "not_run",
+      "mandatory": false,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [
+        "No test step tagged for the 'onboarding' feature was found in any in-scope report. A optional feature's result is derived only from its own tagged steps -- never inferred from the broad platform component passing."
+      ],
+      "evidence": {
+        "feature": "onboarding",
+        "applicability": "optional",
+        "executionStatus": "not_run",
+        "steps": [],
+        "platforms": [],
+        "devices": [],
+        "buildShas": [],
+        "backends": [],
+        "reportPaths": [],
+        "screenshots": [],
+        "blockedPrerequisite": [
+          "No test step tagged for the 'onboarding' feature was found in any in-scope report. A optional feature's result is derived only from its own tagged steps -- never inferred from the broad platform component passing."
+        ]
+      }
+    },
+    {
+      "name": "Google Calendar connection",
+      "status": "not_run",
+      "mandatory": false,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [
+        "No test step tagged for the 'google_calendar' feature was found in any in-scope report. A optional feature's result is derived only from its own tagged steps -- never inferred from the broad platform component passing."
+      ],
+      "evidence": {
+        "feature": "google_calendar",
+        "applicability": "optional",
+        "executionStatus": "not_run",
+        "steps": [],
+        "platforms": [],
+        "devices": [],
+        "buildShas": [],
+        "backends": [],
+        "reportPaths": [],
+        "screenshots": [],
+        "blockedPrerequisite": [
+          "No test step tagged for the 'google_calendar' feature was found in any in-scope report. A optional feature's result is derived only from its own tagged steps -- never inferred from the broad platform component passing."
+        ]
+      }
+    },
+    {
+      "name": "CaleeShell kiosk/admin",
+      "status": "not_run",
+      "mandatory": false,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [
+        "No test step tagged for the 'kiosk_admin' feature was found in any in-scope report. A optional feature's result is derived only from its own tagged steps -- never inferred from the broad platform component passing."
+      ],
+      "evidence": {
+        "feature": "kiosk_admin",
+        "applicability": "optional",
+        "executionStatus": "not_run",
+        "steps": [],
+        "platforms": [],
+        "devices": [],
+        "buildShas": [],
+        "backends": [],
+        "reportPaths": [],
+        "screenshots": [],
+        "blockedPrerequisite": [
+          "No test step tagged for the 'kiosk_admin' feature was found in any in-scope report. A optional feature's result is derived only from its own tagged steps -- never inferred from the broad platform component passing."
+        ]
+      },
+      "resume": {
+        "executionMode": "required",
+        "sourceAttempt": 2,
+        "evidencePath": "reports/runs/release-sample-resumed-000001/kiosk-admin/results.json",
+        "reuseValidation": "NOT_APPLICABLE",
+        "previousAttempts": []
+      }
+    },
+    {
+      "name": "manual checks",
+      "status": "pass",
+      "mandatory": true,
+      "passed": 1,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [],
+      "resume": {
+        "executionMode": "required",
+        "sourceAttempt": 2,
+        "evidencePath": "reports/runs/release-sample-resumed-000001/manual-checks/results.json",
+        "reuseValidation": "NOT_APPLICABLE",
+        "previousAttempts": []
+      }
+    },
+    {
+      "name": "Distributed-build acceptance",
+      "status": "not_run",
+      "mandatory": false,
+      "passed": 0,
+      "failed": 0,
+      "blocked": 0,
+      "skipped": 0,
+      "detail": [
+        "Not required for this release (caleeMobile.distributedBuildAcceptanceRequired=false)."
+      ],
+      "resume": {
+        "executionMode": "required",
+        "sourceAttempt": 2,
+        "evidencePath": "reports/runs/release-sample-resumed-000001/distributed-build-acceptance/results.json",
+        "reuseValidation": "NOT_APPLICABLE",
+        "previousAttempts": []
+      }
+    }
+  ],
+  "manualChecks": [
+    {
+      "title": "Calendar shows today's events",
+      "instruction": "Open the calendar tab.",
+      "expectedResult": "Today's REG-* events are visible.",
+      "status": "pass",
+      "note": "",
+      "screenshotRef": null,
+      "mandatory": true
+    }
+  ],
+  "summary": {
+    "blockedComponents": [
+      "CaleeMobile Android UI",
+      "CaleeMobile iPhone UI",
+      "CaleeMobile cross-device synchronization",
+      "Subscribed-calendar fixture",
+      "CaleeMobile Meals",
+      "Calee onboarding and display/mobile handoff",
+      "Google Calendar connection",
+      "CaleeShell kiosk/admin",
+      "Distributed-build acceptance"
+    ],
+    "failedComponents": [],
+    "skippedMandatoryManualChecks": [],
+    "skippedOptionalManualChecks": [],
+    "suggestedNextAction": "All mandatory components passed. Review any optional/skipped items below, then this build is approved to release."
+  }
+}
