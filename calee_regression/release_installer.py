@@ -1145,6 +1145,70 @@ class AdbResult:
 AdbRunner = Callable[["list[str]"], AdbResult]
 
 
+@dataclass(frozen=True)
+class DeviceIdentity:
+    """Read-only identity used to ensure a reboot never changes tablets."""
+    configured_transport: "str | None"
+    serialno: "str | None" = None
+    manufacturer: "str | None" = None
+    model: "str | None" = None
+    product: "str | None" = None
+    transport_type: str = "usb"
+    wireless_host: "str | None" = None
+    wireless_port: "str | None" = None
+
+    def to_dict(self) -> dict:
+        return {"configuredTransport": self.configured_transport, "serialno": self.serialno,
+                "manufacturer": self.manufacturer, "model": self.model, "product": self.product,
+                "transportType": self.transport_type, "wirelessHost": self.wireless_host,
+                "wirelessPort": self.wireless_port}
+
+
+def _transport_parts(serial: "str | None") -> "tuple[str, str | None, str | None]":
+    if serial and ":" in serial:
+        host, port = serial.rsplit(":", 1)
+        return "wireless", host, port
+    return "usb", None, None
+
+
+def parse_getprop_identity(serial: "str | None", output: str) -> DeviceIdentity:
+    """Parse ``adb shell getprop`` without trusting the transport as identity."""
+    props = dict(re.findall(r"^\[([^]]+)\]: \[([^]]*)\]$", output, re.MULTILINE))
+    transport, host, port = _transport_parts(serial)
+    # ro.serialno is preferred; boot serial is a useful stable fallback.
+    serialno = props.get("ro.serialno") or props.get("ro.boot.serialno") or props.get("ro.boot.hardware.sku")
+    return DeviceIdentity(serial, serialno or None, props.get("ro.product.manufacturer") or None,
+                          props.get("ro.product.model") or None, props.get("ro.build.product") or None,
+                          transport, host, port)
+
+
+def capture_device_identity(runner: AdbRunner, serial: "str | None") -> "tuple[DeviceIdentity | None, str]":
+    result = runner(_adb_base(serial) + ["shell", "getprop"])
+    if result.returncode != 0:
+        return None, (result.stderr or result.stdout or "could not read tablet identity").strip()
+    identity = parse_getprop_identity(serial, result.stdout)
+    if not any((identity.serialno, identity.manufacturer, identity.model, identity.product)):
+        return None, "tablet returned no stable Android identity properties"
+    return identity, ""
+
+
+def parse_adb_devices_long(output: str) -> "list[str]":
+    """Return only usable connected transports; never include offline/unauthorised."""
+    candidates = []
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == "device" and not line.startswith("List of devices"):
+            candidates.append(fields[0])
+    return candidates
+
+
+def stable_identity_matches(expected: DeviceIdentity, candidate: DeviceIdentity) -> bool:
+    """Require every available stable property to agree (not merely a model)."""
+    keys = ("serialno", "manufacturer", "model", "product")
+    compared = [key for key in keys if getattr(expected, key)]
+    return bool(compared) and all(getattr(expected, key) == getattr(candidate, key) for key in compared)
+
+
 def real_adb_runner(argv: "list[str]", *, timeout: float = 300.0) -> AdbResult:
     """Run adb for real. Missing binary -> returncode 127 (classified as
     adb_unavailable); timeout/other OS error -> returncode 124. Never raises,
@@ -1313,6 +1377,7 @@ class InstallExecution:
     serial: "str | None" = None
     steps: "list[StepOutcome]" = field(default_factory=list)
     installed: "list[InstalledIdentity]" = field(default_factory=list)
+    reconnect: "dict | None" = None
     detail: str = ""
 
     def to_dict(self) -> dict:
@@ -1322,6 +1387,7 @@ class InstallExecution:
             "serial": self.serial,
             "steps": [s.to_dict() for s in self.steps],
             "installed": [i.to_dict() for i in self.installed],
+            "reconnect": self.reconnect,
             "detail": self.detail,
         }
 
@@ -1353,6 +1419,54 @@ _BLOCKING_DETAIL = {
 }
 
 
+def _replace_serial(argv: "list[str]", old: str, new: str) -> "list[str]":
+    result = list(argv)
+    try:
+        index = result.index("-s")
+        if result[index + 1] == old:
+            result[index + 1] = new
+    except (ValueError, IndexError):
+        pass
+    return result
+
+
+def recover_wireless_transport(runner: AdbRunner, identity: DeviceIdentity, *, attempts: int = 2) -> "tuple[str | None, list[dict], str]":
+    """Boundedly rediscover and uniquely match a wireless tablet after reboot.
+
+    Candidates are always inspected individually and are never chosen by list
+    order.  ``adb devices -l`` is also the mDNS discovery source on modern adb.
+    """
+    considered: list[dict] = []
+    original = identity.configured_transport
+    for _ in range(attempts):
+        # This command is bounded by the runner timeout (300 seconds for the
+        # real runner) and deliberately precedes discovery.
+        if original and runner(_adb_base(original) + ["wait-for-device"]).returncode == 0:
+            observed, error = capture_device_identity(runner, original)
+            item = {"transport": original, "identity": observed.to_dict() if observed else None,
+                    "match": bool(observed and stable_identity_matches(identity, observed)), "error": error or None}
+            considered.append(item)
+            if item["match"]:
+                return original, considered, "unique stable-identity match on original transport"
+        # Try the configured endpoint first; this is harmless if it did not change.
+        if identity.wireless_host and identity.wireless_port:
+            runner(["adb", "connect", f"{identity.wireless_host}:{identity.wireless_port}"])
+        listing = runner(["adb", "devices", "-l"])
+        matches: list[str] = []
+        for transport in parse_adb_devices_long(listing.stdout):
+            observed, error = capture_device_identity(runner, transport)
+            item = {"transport": transport, "identity": observed.to_dict() if observed else None,
+                    "match": bool(observed and stable_identity_matches(identity, observed)), "error": error or None}
+            considered.append(item)
+            if item["match"]:
+                matches.append(transport)
+        if len(matches) == 1:
+            return matches[0], considered, "unique stable-identity match"
+        if len(matches) > 1:
+            return None, considered, "multiple connected transports match the pre-reboot tablet stable identity"
+    return None, considered, "no connected transport matches the pre-reboot tablet stable identity"
+
+
 def execute_install_plan(
     plan: InstallPlan,
     verification: BundleVerification,
@@ -1372,11 +1486,41 @@ def execute_install_plan(
     execution = InstallExecution(status=STATUS_OK, release_id=plan.release_id, serial=plan.serial)
     calee = verification.app("calee")
     caleeshell = verification.app("caleeShell")
+    original_serial = plan.serial
+    transport_type, _, _ = _transport_parts(original_serial)
+    pre_reboot_identity: DeviceIdentity | None = None
 
     for step in plan.steps:
+        # USB remains exactly as before. Wireless must capture a stable identity
+        # before reboot because its tcp/mDNS transport is explicitly transient.
+        if step.label == "reboot" and transport_type == "wireless":
+            pre_reboot_identity, identity_error = capture_device_identity(runner, original_serial)
+            execution.reconnect = {"preRebootIdentity": pre_reboot_identity.to_dict() if pre_reboot_identity else None,
+                                   "originalTransport": original_serial, "postRebootTransport": None,
+                                   "candidatesConsidered": [], "matchingResult": None,
+                                   "elapsedReconnectSeconds": None}
+            if pre_reboot_identity is None:
+                execution.status = STATUS_BLOCKED
+                execution.detail = f"Cannot safely reboot wireless tablet: {identity_error}"
+                break
         started = datetime.now(timezone.utc)
         started_monotonic = time.monotonic()
-        result = runner(step.argv)
+        if step.label == "wait-for-device" and pre_reboot_identity is not None:
+            recovered, candidates, detail = recover_wireless_transport(runner, pre_reboot_identity)
+            elapsed = time.monotonic() - started_monotonic
+            if execution.reconnect is not None:
+                execution.reconnect.update({"postRebootTransport": recovered, "candidatesConsidered": candidates,
+                                            "matchingResult": detail, "elapsedReconnectSeconds": round(elapsed, 6)})
+            if recovered is None:
+                result = AdbResult(returncode=1, stderr=detail)
+            else:
+                execution.serial = recovered
+                plan.serial = recovered
+                for pending in plan.steps:
+                    pending.argv = _replace_serial(pending.argv, original_serial or "", recovered)
+                result = AdbResult(returncode=0, stdout=detail)
+        else:
+            result = runner(step.argv)
         completed = datetime.now(timezone.utc)
         duration = time.monotonic() - started_monotonic
         if step.kind == "verify":
