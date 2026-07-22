@@ -392,6 +392,48 @@ def test_check_selector_ci_evidence_availability_authenticates_a_real_artifact(m
     assert captured["expected_version"] == "0.0.24+24"
 
 
+def test_check_selector_ci_evidence_availability_passes_local_zip_to_authenticated_chain(monkeypatch, tmp_path):
+    """A cached ZIP replaces the redirected download, never GitHub metadata authentication."""
+    from calee_regression import github_artifact as ga_mod
+
+    cached_zip = tmp_path / "selector-contract-result.zip"
+    cached_zip.write_bytes(b"not-read-by-this-injected-chain")
+    captured = {}
+
+    def _fake_acquire(**kwargs):
+        captured.update(kwargs)
+        return ga_mod.GithubArtifactChain(ok=True, problems=[])
+
+    monkeypatch.setattr(ga_mod, "acquire_github_artifact", _fake_acquire)
+    result = qp.check_selector_ci_evidence_availability(
+        env={"GITHUB_TOKEN": "tok"}, workflow_run_id="555", artifact_id="666",
+        selector_artifact_zip=cached_zip,
+    )
+
+    assert result.status == qp.STATUS_READY
+    assert captured["local_zip_path"] == str(cached_zip)
+    assert "supplied local ZIP" in result.detail
+
+
+def test_check_selector_ci_evidence_availability_local_zip_without_token_is_blocked(monkeypatch, tmp_path):
+    cached_zip = tmp_path / "selector-contract-result.zip"
+    cached_zip.write_bytes(b"zip")
+    called = False
+
+    def _unexpected_acquire(**kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("calee_regression.github_artifact.acquire_github_artifact", _unexpected_acquire)
+    result = qp.check_selector_ci_evidence_availability(
+        env={}, required=True, workflow_run_id="555", artifact_id="666", selector_artifact_zip=cached_zip,
+    )
+
+    assert result.status == qp.STATUS_BLOCKED
+    assert "No GitHub API credential" in result.detail
+    assert not called
+
+
 def test_check_selector_ci_evidence_availability_rejected_artifact_blocks(monkeypatch):
     from calee_regression import github_artifact as ga_mod
 

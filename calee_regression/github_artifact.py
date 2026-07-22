@@ -345,6 +345,7 @@ def verify_github_artifact_chain(
     expected_regression_sha: "str | None" = None,
     expected_tested_sha: "str | None" = None,
     expected_version: "str | None" = None,
+    expected_release_id: "str | None" = None,
     expected_run_id: "str | None" = None,
     expected_artifact_id: "str | None" = None,
     allow_legacy_repository_dispatch: bool = False,
@@ -520,6 +521,16 @@ def verify_github_artifact_chain(
                 problems.append(
                     f"extracted evidence pubspecVersion {ev_version!r} != release target {expected_version!r}."
                 )
+        if expected_release_id is not None:
+            ev_release_id = _opt_str(result.get("releaseId"))
+            if ev_release_id is None:
+                problems.append(
+                    "extracted evidence has no releaseId -- release authentication requires the exact release ID."
+                )
+            elif ev_release_id != expected_release_id.strip():
+                problems.append(
+                    f"extracted evidence releaseId {ev_release_id!r} != release target {expected_release_id!r}."
+                )
 
     return GithubArtifactChain(
         ok=not problems,
@@ -564,6 +575,7 @@ def acquire_github_artifact(
     expected_regression_sha: "str | None" = None,
     expected_tested_sha: "str | None" = None,
     expected_version: "str | None" = None,
+    expected_release_id: "str | None" = None,
     owner_repo: str = EXPECTED_WORKFLOW_REPO,
     allow_legacy_repository_dispatch: bool = False,
     json_fetcher: "JsonFetcher | None" = None,
@@ -645,6 +657,7 @@ def acquire_github_artifact(
         expected_regression_sha=expected_regression_sha,
         expected_tested_sha=expected_tested_sha,
         expected_version=expected_version,
+        expected_release_id=expected_release_id,
         expected_run_id=run_id,
         expected_artifact_id=artifact_id,
         allow_legacy_repository_dispatch=allow_legacy_repository_dispatch,

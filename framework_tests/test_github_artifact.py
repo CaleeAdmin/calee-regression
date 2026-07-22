@@ -384,6 +384,61 @@ def test_acquire_with_injected_fetchers_verifies_end_to_end():
     assert chain.result["pubspecVersion"] == "0.0.24+24"
 
 
+def test_acquire_local_zip_authenticates_metadata_without_redirect_download(tmp_path):
+    """A cached ZIP must still pass GitHub metadata/digest checks, but never fetch its archive URL."""
+    zb = _valid_zip(releaseId="release-42")
+    cached_zip = tmp_path / "selector-contract-result.zip"
+    cached_zip.write_bytes(zb)
+
+    def json_fetcher(url: str) -> dict:
+        if url.endswith(f"/runs/{RUN_ID}"):
+            return {"id": int(RUN_ID), "repository": {"full_name": ga.EXPECTED_WORKFLOW_REPO},
+                    "path": ga.EXPECTED_WORKFLOW_PATH, "event": "workflow_dispatch", "head_sha": RUN_HEAD_SHA,
+                    "status": "completed", "conclusion": "success"}
+        if url.endswith(f"/runs/{RUN_ID}/jobs"):
+            return {"jobs": [{"name": "CaleeMobile selector contract", "status": "completed", "conclusion": "success"}]}
+        if url.endswith(f"/artifacts/{ARTIFACT_ID}"):
+            return {"id": int(ARTIFACT_ID), "name": ga.EXPECTED_ARTIFACT_NAME, "expired": False,
+                    "size_in_bytes": len(zb), "digest": "sha256:" + ga.sha256_hex(zb),
+                    "workflow_run": {"id": int(RUN_ID)}, "archive_download_url": "https://redirect.example/zip"}
+        raise AssertionError(f"unexpected metadata URL {url}")
+
+    def redirect_download_must_not_run(url: str) -> bytes:
+        raise AssertionError(f"redirect download should not be attempted: {url}")
+
+    chain = ga.acquire_github_artifact(
+        run_id=RUN_ID, artifact_id=ARTIFACT_ID, local_zip_path=str(cached_zip),
+        expected_regression_sha=RUN_HEAD_SHA, expected_release_id="release-42",
+        json_fetcher=json_fetcher, bytes_fetcher=redirect_download_must_not_run, token="fake",
+    )
+    assert chain.ok, chain.problems
+
+
+def test_acquire_rejects_local_zip_for_another_release(tmp_path):
+    zb = _valid_zip(releaseId="other-release")
+    cached_zip = tmp_path / "selector-contract-result.zip"
+    cached_zip.write_bytes(zb)
+    run = _run()
+    artifact = _artifact(zb)
+
+    responses = {
+        f"/runs/{RUN_ID}": {"id": int(RUN_ID), "repository": {"full_name": run.repo_full_name},
+                            "path": run.workflow_path, "event": run.event, "head_sha": run.head_sha,
+                            "status": run.status, "conclusion": run.conclusion},
+        f"/runs/{RUN_ID}/jobs": {"jobs": [{"name": "selector contract", "status": "completed", "conclusion": "success"}]},
+        f"/artifacts/{ARTIFACT_ID}": {"id": int(ARTIFACT_ID), "name": artifact.name, "expired": False,
+                                      "size_in_bytes": len(zb), "digest": artifact.digest,
+                                      "workflow_run": {"id": int(RUN_ID)}},
+    }
+    chain = ga.acquire_github_artifact(
+        run_id=RUN_ID, artifact_id=ARTIFACT_ID, local_zip_path=str(cached_zip), expected_release_id="release-42",
+        json_fetcher=lambda url: next(value for suffix, value in responses.items() if url.endswith(suffix)),
+        bytes_fetcher=lambda _url: pytest.fail("local ZIP must prevent archive download"), token="fake",
+    )
+    assert not chain.ok
+    assert any("releaseId" in problem for problem in chain.problems)
+
+
 # --- P7 hardening: adversarial rejections -----------------------------------
 
 

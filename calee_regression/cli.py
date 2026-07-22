@@ -4609,6 +4609,7 @@ def verify_main_ci_artifact_cmd(
 @click.option("--expected-caleemobile-regression-sha", "expected_caleemobile_regression_sha", default=None, help="Expected CaleeMobile-Regression sibling-checkout HEAD SHA -- also the expected 'regressionSha' a selector-contract artifact must carry (see --selector-workflow-run-id).")
 @click.option("--selector-workflow-run-id", "selector_workflow_run_id", default=None, help="Priority 6: GitHub Actions workflow run ID (CaleeMobile-Regression) that produced a selector-contract-result artifact -- with --selector-artifact-id, authenticates it via the GitHub API instead of only checking that a credential is resolvable.")
 @click.option("--selector-artifact-id", "selector_artifact_id", default=None, help="GitHub Actions artifact ID of the selector-contract-result artifact, paired with --selector-workflow-run-id.")
+@click.option("--selector-artifact-zip", "selector_artifact_zip", envvar="CALEEMOBILE_SELECTOR_GITHUB_ARTIFACT_ZIP", default=None, type=click.Path(exists=True, dir_okay=False), help="Already-downloaded selector-contract-result artifact ZIP. This is the same CALEEMOBILE_SELECTOR_GITHUB_ARTIFACT_ZIP input accepted by launcher 06: it avoids only the redirected ZIP download; GitHub API run/job/artifact/digest authentication still requires --selector-workflow-run-id, --selector-artifact-id, and a token.")
 @click.option("--calee-regression-main-sha", "calee_regression_main_sha", default=None, help="Priority 8: expected calee-regression HEAD SHA for its OWN authenticated merged-main CI check -- never the CaleeMobile product SHA.")
 @click.option("--calee-regression-main-workflow-run-id", "calee_regression_main_workflow_run_id", default=None, help="GitHub Actions workflow run ID for calee-regression's own framework-tests.yml run, paired with --calee-regression-main-artifact-id.")
 @click.option("--calee-regression-main-artifact-id", "calee_regression_main_artifact_id", default=None, help="GitHub Actions artifact ID, paired with --calee-regression-main-workflow-run-id.")
@@ -4619,7 +4620,7 @@ def verify_main_ci_artifact_cmd(
 def qualification_preflight_cmd(
     config_path, bundle_path, distributed_build_evidence_path, manual_checks_path, main_ci_evidence_path,
     main_ci_repository, expected_caleemobile_sha,
-    expected_caleemobile_regression_sha, selector_workflow_run_id, selector_artifact_id,
+    expected_caleemobile_regression_sha, selector_workflow_run_id, selector_artifact_id, selector_artifact_zip,
     calee_regression_main_sha, calee_regression_main_workflow_run_id, calee_regression_main_artifact_id,
     caleemobile_regression_main_sha, caleemobile_regression_main_workflow_run_id, caleemobile_regression_main_artifact_id,
     report_path,
@@ -4660,6 +4661,7 @@ def qualification_preflight_cmd(
         expected_caleemobile_sha=expected_caleemobile_sha,
         expected_caleemobile_regression_sha=expected_caleemobile_regression_sha,
         selector_workflow_run_id=selector_workflow_run_id, selector_artifact_id=selector_artifact_id,
+        selector_artifact_zip=Path(selector_artifact_zip) if selector_artifact_zip else None,
         calee_regression_main_sha=calee_regression_main_sha,
         calee_regression_main_workflow_run_id=calee_regression_main_workflow_run_id,
         calee_regression_main_artifact_id=calee_regression_main_artifact_id,

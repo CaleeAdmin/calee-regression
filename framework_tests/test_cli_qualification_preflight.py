@@ -82,3 +82,27 @@ def test_main_ci_evidence_missing_required_gate_blocks(tmp_path):
         "--main-ci-evidence", str(path), "--main-ci-repository", "CaleeAdmin/CaleeMobile-Regression",
     )
     assert result.exit_code == EXIT_BLOCKED, result.output
+
+
+def test_selector_artifact_zip_option_and_launcher_environment_are_forwarded(monkeypatch, tmp_path):
+    cached_zip = tmp_path / "selector-contract-result.zip"
+    cached_zip.write_bytes(b"zip")
+    captured = {}
+
+    def _fake_preflight(**kwargs):
+        captured.update(kwargs)
+        from calee_regression.qualification_preflight import PreflightReport
+        return PreflightReport(checks=[])
+
+    monkeypatch.setattr("calee_regression.qualification_preflight.run_qualification_preflight", _fake_preflight)
+    result = _invoke("--selector-artifact-zip", str(cached_zip))
+    assert result.exit_code == EXIT_SUCCESS, result.output
+    assert captured["selector_artifact_zip"] == cached_zip
+
+    captured.clear()
+    result = CliRunner().invoke(
+        cli.main, ["qualification-preflight"],
+        env={"CALEEMOBILE_SELECTOR_GITHUB_ARTIFACT_ZIP": str(cached_zip)},
+    )
+    assert result.exit_code == EXIT_SUCCESS, result.output
+    assert captured["selector_artifact_zip"] == cached_zip
