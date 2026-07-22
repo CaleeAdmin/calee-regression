@@ -75,6 +75,28 @@ _STATUS_TO_EXIT_CODE = {
     "blocked": EXIT_BLOCKED,
 }
 
+# ComponentResult.name (the human-readable label build_release_report hard-
+# codes for each component) -> the run_context.COMPONENT_NAMES slug it came
+# from. Used only to attach resume provenance (see resume_release.py) onto
+# the right ComponentResult after build_release_report returns -- kept next
+# to _STATUS_TO_EXIT_CODE as another "one place both sides must agree" map.
+_CONSOLIDATED_COMPONENT_SLUGS = {
+    "Test environment and regression fixture": "environment",
+    "Calee tablet": "tablet",
+    "CaleeMobile Client API": "mobile-api",
+    "CaleeMobile Android UI": "mobile-android",
+    "CaleeMobile iPhone UI": "mobile-ios",
+    "manual checks": "manual-checks",
+    "CaleeMobile selector contract": "selector-contract",
+    "CaleeMobile cross-device synchronization": "sync",
+    "Subscribed-calendar fixture": "subscribed-fixture",
+    "Calee tablet release installation": "installation",
+    "Release configuration (machine + release-candidate composition)": "release-config",
+    "Machine configuration (config/machine.local.yaml)": "machine-config",
+    "Distributed-build acceptance": "distributed-build-acceptance",
+    "CaleeShell kiosk/admin": "kiosk-admin",
+}
+
 
 def _exit_code_for(result) -> int:
     """Map a SuiteResult to the framework's exit-code contract.
@@ -3320,6 +3342,20 @@ def consolidate(
         extra_components=extra_components,
     )
 
+    # Attach resume provenance (reused vs. executed, source attempt, reuse
+    # validation, input digest, previous attempts) onto each component this
+    # run resumed at least once -- see resume_release.component_resume_info.
+    # A run that was never resumed has no attempts/ directory at all, so this
+    # is a no-op and every existing report is unaffected.
+    from . import resume_release as resume_release_mod
+
+    resume_info = resume_release_mod.component_resume_info(workspace)
+    if resume_info:
+        for component_result in report.components:
+            slug = _CONSOLIDATED_COMPONENT_SLUGS.get(component_result.name)
+            if slug is not None and slug in resume_info:
+                component_result.resume = resume_info[slug]
+
     out = Path(out_dir) if out_dir else workspace.consolidated_dir
     # Retain the raw selector-contract evidence inside the release ZIP so the
     # selector proof travels with the bundle as a downloadable artifact
@@ -5126,6 +5162,13 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     # Wireless ADB may receive a new mDNS/tcp transport after reboot.  The
     # installer only sets this after a unique stable-identity match.
     serial = execution.serial or serial
+    # Record the tablet's own stable identity (read-only) alongside the
+    # installation evidence, so a later `resume-release` can confirm the
+    # SAME physical tablet is still connected before reusing this passed
+    # installation -- see resume_release.evaluate_installation_reuse.
+    tablet_stable_identity, _tablet_identity_detail = release_installer.capture_device_identity(
+        release_installer.real_adb_runner, serial
+    )
     status = "ok" if execution.status == release_installer.STATUS_OK else "blocked"
     detail = [] if status == "ok" else [execution.detail or "Installation did not complete."]
     if tablet_inspection.status != release_installer.STATUS_OK and status == "ok":
@@ -5179,6 +5222,7 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
         "selectorEvidenceRequired": selector_evidence_required,
         "distributedBuildAcceptanceRequired": distributed_build_acceptance_required,
         "releaseCandidateFingerprint": fingerprint.to_dict() if fingerprint is not None else None,
+        "tabletStableIdentity": tablet_stable_identity.to_dict() if tablet_stable_identity is not None else None,
     }
     _write_installer_report(Path(report_path) if report_path else None, payload)
     exit_code = EXIT_SUCCESS if status == "ok" else EXIT_BLOCKED
@@ -5188,6 +5232,211 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
         raise SystemExit(EXIT_SUCCESS)
     click.echo(click.style(f"[BLOCKED] {'; '.join(detail) or execution.detail}", fg="yellow"), err=True)
     raise SystemExit(EXIT_BLOCKED)
+
+
+def _resume_serial(config_path: "str | None", serial: "str | None") -> "str | None":
+    if serial is not None:
+        return serial
+    if config_path:
+        try:
+            return config_mod.load_config(config_path).udid
+        except config_mod.ConfigError:
+            return None
+    return None
+
+
+def _print_resume_decisions(decisions) -> None:
+    from . import resume_release
+
+    for decision in decisions:
+        label = {
+            resume_release.DECISION_REUSE: "REUSED PASS",
+            resume_release.DECISION_EXECUTE: "REQUIRES EXECUTION",
+            resume_release.DECISION_REFUSED: "REFUSED (must re-execute)",
+        }[decision.decision]
+        click.echo(f"  {decision.component}: {label} -- {decision.reason}")
+
+
+@main.command("inspect-resume")
+@click.option("--run-id", "run_id_opt", required=True, help="The run ID to inspect for resumability.")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(), help="Path to machine/tester config (used only to resolve --serial and to resolve the report root).")
+@click.option("--serial", "serial", default=None, help="ADB serial for the bounded, read-only tablet-identity/installed-package recheck; falls back to the config's udid. Omit when no tablet is attached this invocation.")
+@click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON inspection result.")
+def inspect_resume_cmd(run_id_opt, config_path, serial, report_path):
+    """Read-only: report whether a blocked release run can be resumed.
+
+    Never mutates anything -- no attempt is recorded, Prepare is never
+    rerun, and the tablet is only ever touched with the same bounded,
+    read-only identity probe a real resume would perform. Reports every
+    immutable-input mismatch, which components are reusable, which require
+    execution, and which can never be reused (see docs/RELEASE_POLICY.md).
+
+    Exit codes: 0 when the run is resumable (or has never been attempted
+    before, and would establish its immutable-input baseline on first
+    resume); 2 for a malformed --run-id or a run workspace that doesn't
+    exist; 3 when resuming is refused (an immutable input no longer
+    matches the original attempt, or a tablet/installed-package identity
+    changed) -- a new release run is required.
+    """
+    from . import release_installer
+    from . import resume_release
+
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r} (expected letters/digits/._- only).", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    report_root = _resolved_report_root(config_path)
+    workspace = run_context.RunWorkspace(report_root, run_id_opt)
+    if not workspace.root.is_dir():
+        click.echo(f"No run workspace found for run ID {run_id_opt!r} at {workspace.root}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    serial = _resume_serial(config_path, serial)
+    outcome = resume_release.inspect_resume(
+        run_id_opt, repo_root=REPO_ROOT, report_root=report_root,
+        adb_runner=release_installer.real_adb_runner, tablet_serial=serial,
+    )
+    click.echo(f"Run ID: {run_id_opt}")
+    click.echo(f"Would be attempt: {outcome.attempt_number}")
+    if outcome.immutable_mismatches:
+        click.echo(click.style("Immutable-input mismatches (resume would be REFUSED):", fg="red"), err=True)
+        for problem in outcome.immutable_mismatches:
+            click.echo(f"  - {problem}", err=True)
+    else:
+        click.echo(click.style("Immutable inputs: MATCH the original attempt.", fg="green"))
+    if outcome.decisions:
+        click.echo("Components:")
+        _print_resume_decisions(outcome.decisions)
+    if report_path:
+        _write_installer_report(Path(report_path), {
+            "runId": run_id_opt,
+            "attemptNumber": outcome.attempt_number,
+            "resumable": outcome.resumable,
+            "immutableMismatches": outcome.immutable_mismatches,
+            "components": [d.to_dict() for d in outcome.decisions],
+        })
+    if outcome.resumable:
+        click.echo(click.style("[OK] This run can be resumed.", fg="green"))
+    else:
+        click.echo(click.style("[BLOCKED] This run cannot be resumed -- a new release run is required.", fg="red"), err=True)
+    raise SystemExit(outcome.exit_code)
+
+
+@main.command("resume-release")
+@click.option("--run-id", "run_id_opt", required=True, help="The blocked run to resume.")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(), help="Path to machine/tester config, passed through to a rerun of Prepare and used to resolve --serial and the report root.")
+@click.option("--suite", "suite_name", default=None, help="Suite name to pass through to a rerun of Prepare (see the `prepare` command).")
+@click.option("--serial", "serial", default=None, help="ADB serial for the bounded, read-only tablet-identity/installed-package recheck; falls back to the config's udid.")
+@click.option("--tester", "tester_opt", envvar="CALEE_TESTER_ID", default=None, help="Operator identity recorded on this attempt, when available.")
+@click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON attempt summary.")
+def resume_release_cmd(run_id_opt, config_path, suite_name, serial, tester_opt, report_path):
+    """Resume a blocked release qualification without repeating already-passed
+    destructive or disruptive steps.
+
+    Fail-closed: refuses outright (exit 3) when any immutable input --
+    release ID, release-candidate fingerprint, APK digests, expected
+    identities, release configuration digest, backend, profile, platform/
+    feature scope, calee-regression/CaleeMobile-Regression SHAs, or tablet
+    stable identity -- no longer matches the ORIGINAL attempt. There is no
+    flag to bypass a mismatch; a refused resume always means a new release
+    run is required.
+
+    A previously-passed installation is reused (no reinstall, no reboot)
+    only after a bounded, read-only recheck confirms the same tablet and
+    the same installed package identity. Prepare (environment readiness +
+    the deterministic fixture) is rerun in-process whenever it is not
+    reusable, exactly as a fresh run would. Every other component is
+    decided (reused / requires execution / refused) but left for the
+    normal per-component commands to actually (re-)execute -- see the
+    tester launcher integration for how this is wired end-to-end.
+
+    Every call is recorded as a new, immutable attempt under
+    reports/runs/<run-id>/attempts/<n>/ -- a later PASS never erases an
+    earlier FAIL/BLOCKED attempt's history.
+
+    Exit codes: 0 resume succeeded (remaining components, if any, still
+    need execution -- see the printed list); 1 a mandatory component
+    already carries a real product regression that a resume cannot fix;
+    2 invalid --run-id or no run workspace; 3 resume refused (a new
+    release run is required).
+    """
+    from . import release_installer
+    from . import resume_release
+
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r} (expected letters/digits/._- only).", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    report_root = _resolved_report_root(config_path)
+    workspace = run_context.RunWorkspace(report_root, run_id_opt)
+    if not workspace.root.is_dir():
+        click.echo(f"No run workspace found for run ID {run_id_opt!r} at {workspace.root}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    serial = _resume_serial(config_path, serial)
+    outcome = resume_release.perform_resume(
+        run_id_opt, repo_root=REPO_ROOT, report_root=report_root,
+        adb_runner=release_installer.real_adb_runner, tablet_serial=serial,
+        config_path=config_path, suite_name=suite_name, operator=tester_opt,
+    )
+    click.echo(f"Run ID: {run_id_opt}")
+    click.echo(f"Attempt: {outcome.attempt_number}")
+    if outcome.immutable_mismatches:
+        click.echo(click.style("[BLOCKED] Immutable-input mismatch -- a new release run is required:", fg="red"), err=True)
+        for problem in outcome.immutable_mismatches:
+            click.echo(f"  - {problem}", err=True)
+    else:
+        click.echo(click.style("Immutable inputs: MATCH the original attempt.", fg="green"))
+        if outcome.decisions:
+            click.echo("Components:")
+            _print_resume_decisions(outcome.decisions)
+    if report_path and outcome.attempt is not None:
+        _write_installer_report(Path(report_path), outcome.attempt.to_dict())
+    if outcome.exit_code == EXIT_SUCCESS:
+        click.echo(click.style(f"[OK] Attempt {outcome.attempt_number} resumed for run {run_id_opt}.", fg="green"))
+    elif outcome.exit_code == EXIT_REGRESSION:
+        click.echo(click.style("[REGRESSION] A mandatory component already carries a real product FAIL.", fg="red"), err=True)
+    else:
+        click.echo(click.style("[BLOCKED] This run cannot be resumed -- a new release run is required.", fg="red"), err=True)
+    raise SystemExit(outcome.exit_code)
+
+
+@main.command("list-resumable-runs")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(), help="Path to machine/tester config (used only to resolve the report root).")
+def list_resumable_runs_cmd(config_path):
+    """Read-only: list every run workspace under reports/runs/, for a tester
+    to explicitly choose one to resume (see the resume launcher). Never
+    picks a run automatically -- this only ever lists them.
+    """
+    from . import resume_release
+
+    report_root = _resolved_report_root(config_path)
+    runs = resume_release.list_runs(REPO_ROOT, report_root=report_root)
+    if not runs:
+        click.echo("No runs found under reports/runs/.")
+        raise SystemExit(EXIT_SUCCESS)
+    click.echo(resume_release.render_run_menu(runs))
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@main.command("select-run-to-resume")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(), help="Path to machine/tester config (used only to resolve the report root).")
+@click.option("--out-file", "out_file", default=None, type=click.Path(), help="Write the selected run ID here (one line), for a shell launcher to read back. Nothing is written if the tester cancels.")
+def select_run_to_resume_cmd(config_path, out_file):
+    """Interactive, tester-facing: list every run under reports/runs/ and
+    require an EXPLICIT choice -- never auto-picks the newest run. See the
+    "08 Resume Blocked Release" launcher, which drives this then hands the
+    selected run ID to `resume-release`.
+    """
+    from . import resume_release
+
+    report_root = _resolved_report_root(config_path)
+    runs = resume_release.list_runs(REPO_ROOT, report_root=report_root)
+    chosen = resume_release.choose_run(runs)
+    if chosen is None:
+        raise SystemExit(EXIT_SUCCESS)
+    if out_file:
+        Path(out_file).write_text(chosen.run_id + "\n", encoding="utf-8")
+    click.echo(chosen.run_id)
+    raise SystemExit(EXIT_SUCCESS)
 
 
 def _load_expected_identity_json(path: "str | None", flag_name: str) -> "dict | None":

@@ -119,3 +119,21 @@ constructs and records the full ordered plan for review; a real run of
 `BLOCKED` with an honest "no device" result. The command construction,
 ordering, downgrade/signature/version/HOME classification, and post-install
 `dumpsys` parsing are all proven offline with an injected fake adb runner.
+
+## Reusing a passed installation on resume
+
+A successful install also records the tablet's own stable identity
+(`tabletStableIdentity` in the installation report — read-only `adb shell
+getprop`, see `release_installer.capture_device_identity`) alongside the
+usual bundle/APK/plan/execution evidence. `python -m calee_regression
+resume-release` uses this, together with the recorded installed
+`versionName`/`versionCode` per package, to decide whether a blocked
+release run's *already-passed* installation can be reused without another
+install or reboot: it performs a bounded, read-only recheck (the same
+`capture_device_identity`/`stable_identity_matches` and `inspect_tablet`
+this file already documents, never a fresh `adb install`) and only reuses
+the installation when the CURRENTLY connected tablet is the same physical
+device and its installed package identity is unchanged. Either check
+failing refuses the resume outright — never a silent reinstall, and never
+a silent "close enough." See `docs/RELEASE_POLICY.md`'s "Resuming a
+blocked run" for the full policy.

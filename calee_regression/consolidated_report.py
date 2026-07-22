@@ -141,6 +141,13 @@ class ComponentResult:
     # the JSON report. None (the default) means "no structured evidence", and
     # is omitted from to_dict so existing components are unchanged.
     evidence: "dict | None" = None
+    # Optional resume provenance (see resume_release.py / the `resume-release`
+    # CLI command): {"executionMode": "reused"|"executed"|"required",
+    # "sourceAttempt": int, "evidencePath": str, "reuseValidation": str,
+    # "inputDigest": str, "previousAttempts": [...]}. None (the default) means
+    # this run was never resumed -- omitted from to_dict so a non-resumed
+    # report is byte-identical to before this field existed.
+    resume: "dict | None" = None
 
     def to_dict(self) -> dict:
         data = {
@@ -155,6 +162,8 @@ class ComponentResult:
         }
         if self.evidence is not None:
             data["evidence"] = dict(self.evidence)
+        if self.resume is not None:
+            data["resume"] = dict(self.resume)
         return data
 
 
@@ -2007,6 +2016,34 @@ def _evidence_html(evidence: dict) -> str:
     return f"<table style='margin:6px 0;border-collapse:collapse'>{cells}</table>"
 
 
+_RESUME_LABELS = {
+    "executionMode": "Execution mode",
+    "sourceAttempt": "Evidence from attempt",
+    "evidencePath": "Original evidence path",
+    "reuseValidation": "Reuse validation",
+    "inputDigest": "Input digest",
+}
+
+
+def _resume_html(resume: dict) -> str:
+    """Render a component's resume provenance (reused vs. executed, which
+    attempt produced the effective evidence, reuse-validation result, input
+    digest, and any previous attempts) so a resumed run's report makes that
+    obvious at a glance -- see resume_release.py."""
+    rows = "".join(
+        f"<tr><td style='padding:2px 12px 2px 0;color:#57606a'>{_escape(_RESUME_LABELS.get(key, key))}</td>"
+        f"<td style='padding:2px 0'>{_escape('—' if value in (None, '') else value)}</td></tr>"
+        for key, value in resume.items()
+        if key != "previousAttempts"
+    )
+    html = f"<div class='detail'><b>Resume:</b></div><table style='margin:6px 0;border-collapse:collapse'>{rows}</table>"
+    previous = resume.get("previousAttempts")
+    if previous:
+        items = "".join(f"<li>{_escape(p)}</li>" for p in previous)
+        html += f"<div>Previous attempts:</div><ul>{items}</ul>"
+    return html
+
+
 def write_json(report: ReleaseReport, path: Path) -> None:
     path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
 
@@ -2043,6 +2080,8 @@ def write_html(report: ReleaseReport, path: Path) -> None:
         )
         if component.evidence is not None:
             parts.append(_evidence_html(component.evidence))
+        if component.resume is not None:
+            parts.append(_resume_html(component.resume))
         for line in component.detail:
             parts.append(f"<div class='detail'>{_escape(line)}</div>")
         parts.append("</div>")
@@ -2079,6 +2118,16 @@ def write_junit(report: ReleaseReport, path: Path) -> None:
         elif component.status in (STATUS_BLOCKED, STATUS_NOT_RUN):
             error = ET.SubElement(testcase, "error", {"message": "; ".join(component.detail) or component.status})
             error.text = "; ".join(component.detail)
+        if component.resume is not None:
+            # A resumed run's report must make reuse/execution obvious even
+            # in CI's JUnit ingestion -- <properties> is JUnit's own standard
+            # extension point for exactly this (never <system-out>, which
+            # some CI dashboards treat as raw log noise).
+            properties = ET.SubElement(testcase, "properties")
+            for key, value in component.resume.items():
+                if key == "previousAttempts":
+                    value = "; ".join(str(v) for v in value)
+                ET.SubElement(properties, "property", {"name": f"resume.{key}", "value": "" if value is None else str(value)})
     tree = ET.ElementTree(testsuite)
     ET.indent(tree, space="  ")
     tree.write(path, encoding="utf-8", xml_declaration=True)

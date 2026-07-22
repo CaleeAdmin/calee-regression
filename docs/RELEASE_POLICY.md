@@ -173,6 +173,84 @@ legacy `release-platforms` CLI output directly.
 Any component simply omitted from `consolidate`'s inputs is recorded as `not_run`, which is treated
 exactly like BLOCKED for a mandatory component — its absence can never become an easy PASS.
 
+### Resuming a blocked run
+
+`python -m calee_regression resume-release --run-id <id>` continues a blocked run's existing
+`CALEE_RUN_ID` workspace instead of starting a new one — it never repeats an already-passed
+destructive/disruptive step unless something about it can no longer be trusted. See
+`calee_regression/resume_release.py` for the implementation; `docs/NON_TECH_TESTER_GUIDE.md`
+§12b and the "08 Resume Blocked Release" launcher for the tester-facing workflow.
+
+A run may be resumed only when its immutable inputs still match the ORIGINAL attempt: release ID,
+release-manifest schema version, the frozen release-candidate fingerprint, APK SHA-256 digests,
+expected package IDs/version names/version codes/signer fingerprints/Git SHAs (Calee, CaleeShell,
+CaleeMobile), the effective release-configuration digest, target backend, release profile,
+platform/feature scope, this repo's own Git SHA, CaleeMobile-Regression's Git SHA, the tablet's own
+stable identity, the manual-check definition version, and the selector-evidence/distributed-build-
+evidence requirement flags. **Any mismatch refuses the resume outright (exit `3`) and requires a new
+release run — there is no flag to bypass this.** A resume request that fails immutable-input
+validation is never silently downgraded to a fresh run and a stale/mismatched checkpoint can never
+read as an eligible resume; the mismatch is reported and nothing more happens.
+
+Component reuse is a narrower, per-component decision on top of that gate: a prior **PASS** may be
+reused only when its report still validates (same run, same release, its recorded input digest
+still matches, every evidence file it references still exists and still hashes the same) — this is
+the same rule the "Attempt 1 / Attempt 2" table below shows. **FAIL, BLOCKED, NOT_RUN, and a
+mandatory SKIP are never reused** — they always require (re-)execution, same as everywhere else in
+this policy: absence or an unproven result must never read as a pass by omission. An optional SKIP
+remains explicitly represented rather than silently disappearing. A component whose evidence
+exists but fails any integrity check (wrong run, wrong release, a report path outside the workspace,
+a tampered/edited report, a missing referenced evidence file, an evidence digest that no longer
+matches, or a stale/malformed report) is refused for reuse with a recorded reason — never silently
+treated the same as a component that simply never ran.
+
+Installation gets one further, narrower, ADDITIONAL check: even a structurally valid prior PASS is
+reused (no reinstall, no reboot) only after a bounded, read-only ADB probe confirms the CURRENTLY
+connected tablet is the same physical device (`calee_regression/release_installer.py::
+capture_device_identity`/`stable_identity_matches`) and its installed package identity is
+unchanged. Either check failing refuses the resume and requires a new release run — resuming never
+falls back to "reinstall anyway and hope."
+
+Prepare (environment readiness + the deterministic REG-* fixture) is rerun in-process by
+`resume-release` whenever it is not itself a valid reusable PASS — a fixture reset that previously
+BLOCKED may simply run again (`fixture_bridge.run_fixture_action`'s reset/verify are idempotent by
+construction). A new, different verified fixture version may be established this way; any
+component whose OWN report recorded which fixture version it ran against is never reused once that
+version has moved on — a resumed run's downstream functional results are always bound to the
+CURRENT verified fixture, never a stale one.
+
+Every resume call is recorded as its own immutable attempt under
+`reports/runs/<run-id>/attempts/<n>/` — never overwriting a previous attempt. Attempt 1 is the
+run's original state (snapshotted the first time anyone asks to resume it) and its
+`immutable-inputs.json` is the permanent baseline every later attempt is compared against, not
+merely the most recent one. A later PASS never erases an earlier FAIL/BLOCKED attempt's history:
+
+```text
+Attempt 1
+installation: PASS
+prepare: BLOCKED — calendar service unavailable
+remaining components: NOT_RUN
+
+Attempt 2
+installation: REUSED PASS
+prepare: PASS
+tablet: PASS
+mobile-api: PASS
+...
+```
+
+`python -m calee_regression inspect-resume --run-id <id>` is the read-only counterpart: it reports
+whether a run is resumable, every immutable-input mismatch, which components are reusable, which
+require execution, and which can never be reused — without mutating anything (no attempt is
+recorded, Prepare is never rerun, and the tablet is only ever touched with the same bounded
+read-only probe a real resume would perform).
+
+`resume-release`/`inspect-resume` exit codes: `0` resume inspection is valid, or the resumed
+qualification's own directly-executed steps (Prepare, the installation recheck) all succeeded; `1`
+a mandatory component already carries a real product FAIL that a resume cannot fix; `2` invalid
+`--run-id` or no run workspace; `3` resume refused (a new release run is required) — the same
+exit-code contract every other command in this framework already follows.
+
 ## Additional PASS preconditions
 
 Beyond the pass/fail/blocked roll-up above, an overall PASS additionally requires:
@@ -227,6 +305,13 @@ Beyond the pass/fail/blocked roll-up above, an overall PASS additionally require
 - `calee_regression/run_context.py` — the single-run-ID/workspace primitives:
   `RunWorkspace`/`RunManifest`/`validate_component_report`, shared by `prepare`/`suite`/
   `record-manual-checks`/`consolidate`.
+- `calee_regression/resume_release.py` — immutable-input collection/diffing, the per-component
+  reuse policy, installation's extra live tablet/package-identity recheck, and the
+  `reports/runs/<run-id>/attempts/<n>/` attempt ledger `resume-release`/`inspect-resume` (`cli.py`)
+  are built on.
+- `framework_tests/test_resume_release.py`, `test_cli_resume_release.py` — self-test the resume
+  policy against synthetic valid-reuse/refused-reuse/interruption-point scenarios (no real device or
+  backend needed).
 - `framework_tests/test_consolidated_report.py`, `test_release_platforms.py`,
   `test_mandatory_skip_handling.py`, `test_cli_prepare.py`, `test_cli_consolidate.py`,
   `test_run_context.py` — self-test this policy against synthetic pass/fail/blocked/missing/stale/

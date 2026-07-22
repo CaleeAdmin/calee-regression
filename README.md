@@ -91,6 +91,9 @@ command: `0` success, `1` product regression, `2` invalid usage/configuration, `
 | `python -m calee_regression release-platforms` | Print the resolved release-platform profile (`config/release-platforms.yaml`) |
 | `python -m calee_regression stop-appium` | Stop Appium, but only if this framework auto-started it |
 | `python -m calee_regression consolidate --tablet-report <json> --mobile-api-report <json> ...` | Combine per-framework JSON reports into one release report (HTML/JSON/JUnit + zip bundle); Android/iOS UI mandatory-ness comes from `config/release-platforms.yaml` |
+| `python -m calee_regression inspect-resume --run-id <id>` | Read-only: report whether a blocked release run can be resumed, and what would happen if it were |
+| `python -m calee_regression resume-release --run-id <id>` | Resume a blocked release run without repeating already-passed destructive/disruptive steps — see [docs/RELEASE_POLICY.md](docs/RELEASE_POLICY.md) |
+| `python -m calee_regression list-resumable-runs` | List every run workspace under `reports/runs/`, for choosing one to resume |
 
 ## Suites
 

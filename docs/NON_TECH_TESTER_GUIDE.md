@@ -35,8 +35,9 @@ Terminal window yourself. Then pick the one launcher that matches what you were 
 | Just CaleeMobile on iPhone | `04 Test CaleeMobile iPhone.command` |
 | Just the manual guided checks | `05 Record Manual Checks.command` |
 | To see the last report again | `07 Open Latest Report.command` |
+| A previous release run got BLOCKED and you want to continue it (not start over) | `08 Resume Blocked Release.command` — see §12b |
 
-You should not normally need anything outside these seven files. Files under `tester/advanced/` and
+You should not normally need anything outside these eight files. Files under `tester/advanced/` and
 `tester/technical/` are for a technical owner — **never** double-click anything in
 `tester/technical/` unless specifically asked to; it requires a real physical tablet and admin
 access.
@@ -167,6 +168,9 @@ yourself.
 - Don't try to start Appium yourself in a Terminal — `01 Prepare Test Environment.command` does
   this automatically.
 - Don't report a BLOCKED result as if it were a product bug — see §6.
+- Don't try to resume a blocked release run on a different tablet or with a different release
+  build than the original attempt — the resume check will refuse it; start a new release run
+  instead (see §12b).
 
 ## 12. How to retry a blocked test safely
 
@@ -176,6 +180,41 @@ yourself.
 4. If it's still BLOCKED after that, stop and send the report to your technical owner rather than
    retrying repeatedly — repeated retries won't fix an environment problem, and the report already
    captures what's needed for them to diagnose it.
+
+## 12b. Resuming a blocked run
+
+Unlike a plain retry (§12), which starts the whole thing over, **resuming** picks up a
+*specific* previous release run from the point it got BLOCKED, instead of repeating everything
+that already passed — so a tablet that's already installed and verified isn't reinstalled/rebooted
+again, and steps that already passed aren't re-run. But it only does this when nothing about the
+release, the build, or the tablet has changed since that run started; if anything has changed, it
+refuses and tells you to start a new run instead (§3) — you cannot force it.
+
+To resume a blocked release run:
+
+1. Double-click **`08 Resume Blocked Release.command`**.
+2. It lists every previous run and asks you to pick one by number — it never guesses which one you
+   mean, so pick the one your technical owner asked about (or the one you remember getting BLOCKED).
+3. It checks whether that run can still be resumed and shows you: the release ID, the run ID, when
+   it started, its current result, and what it last got blocked on. Read this before continuing.
+4. If it says the run cannot be resumed, it tells you a new release run is required — go back to §3
+   and start over with `00 Run Calee Release Regression.command` instead.
+5. If it can be resumed, it continues automatically: reusing anything that's still valid (you'll see
+   `REUSED PASS` next to those), safely re-checking Prepare/the fixture, and only reinstalling the
+   tablet if it decides the previous installation can no longer be trusted. It then runs whatever
+   still needs to run and opens the final report exactly like every other launcher.
+
+A terminal transcript looks like this (you'll see something similar):
+
+```text
+1. release=2026.07.20-rc3 run=release-20260720-090512-a1b2c3 started=2026-07-20 09:05:12 result=BLOCKED blocked_at=environment installation_reusable=yes
+0. Cancel
+Select a run to resume (number): 1
+```
+
+Don't try to resume a run on a different tablet or with a different release bundle than the
+original attempt — the check will refuse it every time; this is by design, not a bug. If you're not
+sure whether to resume or start over, ask a technical owner.
 
 ## 13. Baselines (screenshot comparison)
 
