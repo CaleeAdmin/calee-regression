@@ -717,6 +717,11 @@ class AttemptRecord:
     components_refused: "list[dict]" = field(default_factory=list)
     exit_code: "int | None" = None
     final_result: "str | None" = None
+    # Evidence acquisition performed FOR THIS ATTEMPT (this session): a
+    # secret-free summary of what acquire-release-evidence did before blocked
+    # components were re-decided. Newly acquired evidence is bound to this
+    # attempt via this record; earlier attempts' snapshots are never touched.
+    evidence_acquisition: "dict | None" = None
 
     def to_dict(self) -> dict:
         return {
@@ -734,6 +739,8 @@ class AttemptRecord:
             "componentsRefused": list(self.components_refused),
             "exitCode": self.exit_code,
             "finalResult": self.final_result,
+            **({"evidenceAcquisition": self.evidence_acquisition}
+               if self.evidence_acquisition is not None else {}),
         }
 
     @classmethod
@@ -753,6 +760,7 @@ class AttemptRecord:
             components_refused=list(data.get("componentsRefused") or []),
             exit_code=data.get("exitCode"),
             final_result=data.get("finalResult"),
+            evidence_acquisition=data.get("evidenceAcquisition"),
         )
 
     def write(self, workspace: run_context.RunWorkspace) -> Path:
@@ -862,6 +870,11 @@ class PrepareOutcome:
 
 
 PrepareRunner = Callable[[], PrepareOutcome]
+
+# Acquires missing release evidence for a resume attempt (see
+# evidence_acquisition.py + the resume-release CLI wiring). Takes the run
+# workspace, returns a secret-free summary dict recorded on the attempt.
+EvidenceAcquirer = Callable[[run_context.RunWorkspace], dict]
 
 
 def default_prepare_runner(
@@ -1018,6 +1031,7 @@ def perform_resume(
     config_path: "str | None" = None,
     suite_name: "str | None" = None,
     operator: "str | None" = None,
+    evidence_acquirer: "EvidenceAcquirer | None" = None,
 ) -> ResumeOutcome:
     """Resume `run_id`: validate immutable inputs (refusing outright on any
     mismatch, no bypass), decide per-component reuse, rerun Prepare in-process
@@ -1051,6 +1065,20 @@ def perform_resume(
             run_id=run_id, attempt_number=attempt_number, resumable=False, immutable_mismatches=mismatches,
             decisions=[], exit_code=EXIT_BLOCKED, attempt=record,
         )
+
+    # Evidence acquisition (this session): acquire evidence that was missing
+    # when the run blocked, BEFORE component reuse is decided, so blocked
+    # evidence-dependent components can be rerun against it in THIS attempt.
+    # The acquirer is fail-closed and run-scoped; it never mutates a prior
+    # attempt's snapshots, and reused-PASS components are untouched -- a
+    # PASS's evidence is never silently replaced (evaluate_component_reuse
+    # still re-verifies every referenced evidence file's digest).
+    evidence_acquisition_summary: "dict | None" = None
+    if evidence_acquirer is not None:
+        try:
+            evidence_acquisition_summary = evidence_acquirer(workspace)
+        except Exception as exc:  # noqa: BLE001 - an acquirer fault must never abort the resume gate
+            evidence_acquisition_summary = {"status": "blocked", "detail": str(exc)}
 
     manifest = run_context.RunManifest.load(workspace.manifest_path) if workspace.manifest_path.is_file() else None
     run_started_at_epoch = _epoch(manifest.started_at) if manifest else None
@@ -1111,6 +1139,7 @@ def perform_resume(
             immutable_validation={"matched": True, "mismatches": [], "baselineDigest": baseline.digest() if baseline else None},
             components_refused=[d.to_dict() for d in decisions if d.decision == DECISION_REFUSED],
             exit_code=EXIT_BLOCKED, final_result="blocked",
+            evidence_acquisition=evidence_acquisition_summary,
         )
         record.write(workspace)
         return ResumeOutcome(
@@ -1142,6 +1171,7 @@ def perform_resume(
         immutable_validation={"matched": True, "mismatches": [], "baselineDigest": baseline.digest() if baseline else None},
         components_reused=reused, components_executed=executed, components_refused=refused,
         exit_code=exit_code, final_result=overall,
+        evidence_acquisition=evidence_acquisition_summary,
     )
     record.write(workspace)
     return ResumeOutcome(

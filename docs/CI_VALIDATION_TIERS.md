@@ -109,3 +109,17 @@ for how the two repos connect.
 A green tier-1 or tier-2 check on this repo's own commits is never, on its
 own, evidence that a product release is certified -- certification requires
 an actual release run whose evidence is bound to that release's ID.
+
+## How release runs find tier-2/tier-3 evidence
+
+A release run no longer needs a technical owner to hand-copy workflow run
+IDs and artifact IDs: `acquire-release-evidence` derives the expected
+identities from the verified release bundle, finds the exact matching runs
+(tier 2 for both regression repos by exact merged-main SHA; tier 3 selector
+certification by exact CaleeMobile SHA + version + release ID), and
+authenticates each artifact against its run and GitHub-recorded digest. A
+tier-2/tier-3 run that merely *exists* but doesn't match the exact identity
+is rejected; "the latest successful run" is never used. Manual run/artifact
+IDs remain available as diagnostic overrides only. See
+`docs/CONFIGURATION_AND_QUALIFICATION.md` §"Automatic exact-identity
+evidence acquisition".

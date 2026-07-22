@@ -76,6 +76,14 @@ claim that Calee or CaleeMobile is broken. Common reasons you'll see spelled out
   technical owner rather than trying to start it yourself.
 - A required check was skipped (e.g. an on-screen control the test needed wasn't where it expected)
   — this reports BLOCKED rather than a false PASS, since nothing was actually verified.
+- The release evidence step (you'll see `Finding exact CI evidence…`, `Authenticating selector
+  evidence…`, `Authenticating Android build evidence…`, `Authenticating iOS build evidence…`)
+  couldn't find or verify the proof this exact release version was built and certified properly.
+  The launcher will say plainly which of these it is — GitHub authentication missing, no
+  successful merged-main run for this version, selector certification not run for this release,
+  App Store Connect / Play Console evidence unavailable, or matching evidence being ambiguous or
+  expired. None of these are something you can fix yourself — send the report to your technical
+  owner.
 
 If you see BLOCKED, the right move is almost always: check the device is connected and in the
 right state, then retry (see §12). If it's still BLOCKED after that, send the report to your
@@ -200,7 +208,9 @@ To resume a blocked release run:
 4. If it says the run cannot be resumed, it tells you a new release run is required — go back to §3
    and start over with `00 Run Calee Release Regression.command` instead.
 5. If it can be resumed, it continues automatically: reusing anything that's still valid (you'll see
-   `REUSED PASS` next to those), safely re-checking Prepare/the fixture, and only reinstalling the
+   `REUSED PASS` next to those), safely re-checking Prepare/the fixture, automatically fetching any
+   release evidence that was missing last time (if it has become available since — e.g. a CI run
+   that has now finished), and only reinstalling the
    tablet if it decides the previous installation can no longer be trusted. It then runs whatever
    still needs to run and opens the final report exactly like every other launcher.
 

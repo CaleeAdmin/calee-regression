@@ -280,6 +280,46 @@ Beyond the pass/fail/blocked roll-up above, an overall PASS additionally require
   automated block-on-mismatch check; if no expected version is configured, this isn't checked and
   falls back to manual confirmation, same as before.
 
+## Exact-identity evidence acquisition
+
+Release evidence (merged-main CI for both regression repositories, selector
+certification, distributed-build provenance) is located and authenticated by
+`acquire-release-evidence` (`calee_regression/evidence_acquisition.py`),
+which is fail-closed by policy:
+
+- every expected identity is derived from the **verified release bundle**,
+  the frozen release candidate / recorded immutable baseline, and the
+  effective release configuration — never from "the newest GitHub run", an
+  operator-typed expected SHA, or artifact content that has not yet been
+  origin-authenticated;
+- selection requires the exact repository, the approved workflow path, an
+  approved event (organic `push` to `main`/`merge_group` for main-CI;
+  `workflow_dispatch` for selector certification), a successful conclusion,
+  the exact head SHA / release tuple, and exactly one matching artifact —
+  zero matches, ambiguity, expiry, or a missing token are BLOCKED;
+- every artifact is authenticated against its workflow run (ownership) and
+  GitHub's recorded digest before its content is trusted;
+- cached evidence under `reports/runs/<run-id>/evidence/acquired/` is
+  run-scoped, re-authenticated against freshly fetched GitHub metadata, and
+  re-hashed on every reuse — a missing, changed, or mismatched cache file is
+  rejected and re-downloaded, never trusted;
+- an authenticated exact-identity artifact whose *content* contradicts (a
+  failed required gate on a successful run, a failing selector contract for
+  the exact release tuple) is a genuine evidence contradiction — exit 1
+  under this policy, distinct from "evidence missing" (exit 3);
+- distributed-build provider evidence that cannot be automatically collected
+  with approved credentials is BLOCKED with a precise remediation; a
+  placeholder PASS is never fabricated, and the existing evidence tiers are
+  unchanged.
+
+During a resume, `resume-release` acquires still-missing evidence *before*
+blocked components are re-decided, binds the acquisition summary to the new
+attempt record (`evidenceAcquisition` in `attempts/<n>/attempt.json`), and
+never touches a prior attempt's snapshots — evidence that produced an
+earlier PASS is never silently replaced (component reuse still re-verifies
+every referenced evidence file's digest), and evidence belonging to another
+release or immutable input set is rejected by the same exact-tuple matching.
+
 ## Where this is enforced in code
 
 - `calee_regression/consolidated_report.py::decide_status` — the core PASS/FAIL/BLOCKED decision
