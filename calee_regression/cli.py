@@ -5123,6 +5123,9 @@ def install_tablet_release_cmd(config_path, bundle_path, serial, allow_downgrade
     if calee_launch_action:
         execute_kwargs["calee_launch_action"] = calee_launch_action
     execution = release_installer.execute_install_plan(plan, verification, release_installer.real_adb_runner, **execute_kwargs)
+    # Wireless ADB may receive a new mDNS/tcp transport after reboot.  The
+    # installer only sets this after a unique stable-identity match.
+    serial = execution.serial or serial
     status = "ok" if execution.status == release_installer.STATUS_OK else "blocked"
     detail = [] if status == "ok" else [execution.detail or "Installation did not complete."]
     if tablet_inspection.status != release_installer.STATUS_OK and status == "ok":

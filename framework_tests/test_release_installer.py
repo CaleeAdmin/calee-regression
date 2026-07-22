@@ -39,6 +39,63 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+_TABLET_PROPS = """[ro.serialno]: [CALEE-01]
+[ro.product.manufacturer]: [Calee]
+[ro.product.model]: [Wall Tablet]
+[ro.build.product]: [calee_tablet]
+"""
+
+
+def _wireless_runner(devices):
+    """Injected adb seam for deterministic reboot rediscovery tests."""
+    def run(argv):
+        if argv[:2] == ["adb", "devices"]:
+            return AdbResult(0, "List of devices attached\n" + "\n".join(f"{name}\t{state}" for name, state, _ in devices) + "\n")
+        if argv[:2] == ["adb", "connect"]:
+            return AdbResult(0, "connected")
+        if "getprop" in argv:
+            serial = argv[argv.index("-s") + 1]
+            for name, state, props in devices:
+                if name == serial and state == "device":
+                    return AdbResult(0, props)
+            return AdbResult(1, stderr="device offline")
+        return AdbResult(0)
+    return run
+
+
+def test_wireless_recovery_accepts_unchanged_transport():
+    runner = _wireless_runner([("192.0.2.4:5555", "device", _TABLET_PROPS)])
+    identity, error = ri.capture_device_identity(runner, "192.0.2.4:5555")
+    assert not error
+    recovered, candidates, detail = ri.recover_wireless_transport(runner, identity)
+    assert recovered == "192.0.2.4:5555" and len(candidates) == 1 and "unique" in detail
+
+
+def test_wireless_recovery_accepts_changed_mdns_transport_and_rejects_phone():
+    phone = _TABLET_PROPS.replace("CALEE-01", "PHONE-99").replace("Wall Tablet", "Phone")
+    runner = _wireless_runner([("calee._adb-tls-connect._tcp:37123", "device", _TABLET_PROPS), ("usb-phone", "device", phone)])
+    expected = ri.parse_getprop_identity("192.0.2.4:5555", _TABLET_PROPS)
+    recovered, candidates, _ = ri.recover_wireless_transport(runner, expected)
+    assert recovered == "calee._adb-tls-connect._tcp:37123"
+    assert [item["match"] for item in candidates] == [False, True, False]
+
+
+def test_wireless_recovery_blocks_ambiguous_missing_and_unusable_candidates():
+    expected = ri.parse_getprop_identity("192.0.2.4:5555", _TABLET_PROPS)
+    duplicate = _wireless_runner([("one:5555", "device", _TABLET_PROPS), ("two:5555", "device", _TABLET_PROPS)])
+    assert ri.recover_wireless_transport(duplicate, expected)[0] is None
+    assert "multiple" in ri.recover_wireless_transport(duplicate, expected)[2]
+    none = _wireless_runner([("offline:5555", "offline", _TABLET_PROPS), ("unauth:5555", "unauthorized", _TABLET_PROPS)])
+    assert ri.recover_wireless_transport(none, expected)[0] is None
+    assert "no connected" in ri.recover_wireless_transport(none, expected)[2]
+
+
+def test_usb_identity_is_not_treated_as_wireless_transport():
+    identity = ri.parse_getprop_identity("USB123", _TABLET_PROPS)
+    assert identity.transport_type == "usb"
+    assert identity.wireless_host is None
+
+
 def _write_bundle(
     tmp_path,
     *,
