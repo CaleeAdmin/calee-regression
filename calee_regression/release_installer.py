@@ -35,7 +35,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -92,6 +94,56 @@ OUTCOME_VERSION_MISMATCH = "version_mismatch"
 OUTCOME_HOME_MISMATCH = "home_mismatch"
 OUTCOME_DOWNGRADE_BLOCKED = "downgrade_blocked"
 OUTCOME_INSTALL_FAILED = "install_failed"
+OUTCOME_TIMEOUT = "timeout"
+
+# Evidence must remain useful when adb prints a large failure while never
+# becoming a vehicle for copying credentials into the release report.
+DIAGNOSTIC_OUTPUT_LIMIT = 16_384
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s]+"),
+    re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\s*([:=])\s*[^\s&]+"),
+    re.compile(r"(?i)([?&](?:token|access_token|api_key|apikey|password)=)[^&#\s]+"),
+)
+
+
+def sanitize_adb_diagnostic(value: "str | None", *, limit: int = DIAGNOSTIC_OUTPUT_LIMIT) -> "tuple[str, bool]":
+    """Redact likely credentials and bound output while preserving both ends.
+
+    ADB diagnostics are release evidence, not a secret store.  The explicit
+    marker also makes it clear to an operator that the middle was omitted,
+    rather than suggesting adb emitted a contiguous short message.
+    """
+    text = value or ""
+    for pattern in _SECRET_PATTERNS:
+        if pattern.pattern.startswith("(?i)([?&]"):
+            text = pattern.sub(r"\1[REDACTED]", text)
+        elif "authorization" in pattern.pattern.lower():
+            text = pattern.sub(r"\1[REDACTED]", text)
+        else:
+            text = pattern.sub(r"\1\2[REDACTED]", text)
+    if len(text) <= limit:
+        return text, False
+    marker = "\n... [truncated; start and end retained] ...\n"
+    remaining = max(0, limit - len(marker))
+    start = remaining // 2
+    return text[:start] + marker + text[-(remaining - start):], True
+
+
+def command_kind_for_step(step: "InstallStep") -> str:
+    """Stable, command-specific classification for installation evidence."""
+    if step.label.startswith("install-"):
+        return "apk_install"
+    return {
+        "set-home": "home_assignment",
+        "reboot": "reboot",
+        "wait-for-device": "wait_for_device",
+        "verify-calee-version": "version_inspection",
+        "verify-caleeshell-version": "version_inspection",
+        "verify-calee-signer": "signer_inspection",
+        "verify-caleeshell-signer": "signer_inspection",
+        "verify-home": "home_resolution",
+        "verify-calee-launch": "launch_resolution",
+    }.get(step.label, "adb_command")
 
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _APK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$")
@@ -1132,6 +1184,8 @@ def classify_install_output(result: AdbResult) -> str:
     lower = combined.lower()
     if result.returncode == 127 or any(m.lower() in lower for m in _ADB_UNAVAILABLE_MARKERS):
         return OUTCOME_ADB_UNAVAILABLE
+    if result.returncode == 124:
+        return OUTCOME_TIMEOUT
     if any(m.lower() in lower for m in _DEVICE_UNAVAILABLE_MARKERS):
         return OUTCOME_DEVICE_UNAVAILABLE
     if any(m.lower() in lower for m in _SIGNATURE_MARKERS):
@@ -1217,6 +1271,16 @@ class StepOutcome:
     outcome: str
     returncode: "int | None" = None
     detail: str = ""
+    command_kind: str = "adb_command"
+    serial: "str | None" = None
+    stdout: str = ""
+    stderr: str = ""
+    started_at: "str | None" = None
+    completed_at: "str | None" = None
+    duration_seconds: "float | None" = None
+    timed_out: bool = False
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -1226,6 +1290,19 @@ class StepOutcome:
             "outcome": self.outcome,
             "returncode": self.returncode,
             "detail": self.detail,
+            "commandKind": self.command_kind,
+            "serial": self.serial,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "startedAt": self.started_at,
+            "completedAt": self.completed_at,
+            "durationSeconds": self.duration_seconds,
+            "timedOut": self.timed_out,
+            "truncation": {
+                "limitBytes": DIAGNOSTIC_OUTPUT_LIMIT,
+                "stdoutTruncated": self.stdout_truncated,
+                "stderrTruncated": self.stderr_truncated,
+            },
         }
 
 
@@ -1257,6 +1334,7 @@ _HALTING_OUTCOMES = {
     OUTCOME_SIGNATURE_MISMATCH,
     OUTCOME_DOWNGRADE_BLOCKED,
     OUTCOME_INSTALL_FAILED,
+    OUTCOME_TIMEOUT,
 }
 
 _BLOCKING_DETAIL = {
@@ -1271,6 +1349,7 @@ _BLOCKING_DETAIL = {
     OUTCOME_VERSION_MISMATCH: "The installed version does not match the manifest after install -- BLOCKED.",
     OUTCOME_HOME_MISMATCH: "HOME does not resolve to CaleeShell after install -- BLOCKED.",
     OUTCOME_INSTALL_FAILED: "adb reported an install failure -- BLOCKED (see step detail).",
+    OUTCOME_TIMEOUT: "adb did not complete within the bounded command timeout -- BLOCKED.",
 }
 
 
@@ -1295,16 +1374,27 @@ def execute_install_plan(
     caleeshell = verification.app("caleeShell")
 
     for step in plan.steps:
+        started = datetime.now(timezone.utc)
+        started_monotonic = time.monotonic()
         result = runner(step.argv)
+        completed = datetime.now(timezone.utc)
+        duration = time.monotonic() - started_monotonic
         if step.kind == "verify":
             outcome, detail = _classify_verify_step(step, result, calee, caleeshell, execution)
         else:
             outcome = classify_install_output(result)
             detail = _BLOCKING_DETAIL.get(outcome, "") if outcome != OUTCOME_OK else ""
+        stdout, stdout_truncated = sanitize_adb_diagnostic(result.stdout)
+        stderr, stderr_truncated = sanitize_adb_diagnostic(result.stderr)
         execution.steps.append(
             StepOutcome(
                 label=step.label, kind=step.kind, argv=step.argv, outcome=outcome,
-                returncode=result.returncode, detail=detail or (result.stderr or "")[:400],
+                returncode=result.returncode, detail=detail or stderr[:400],
+                command_kind=command_kind_for_step(step), serial=plan.serial,
+                stdout=stdout, stderr=stderr,
+                started_at=started.isoformat(), completed_at=completed.isoformat(),
+                duration_seconds=round(duration, 6), timed_out=result.returncode == 124,
+                stdout_truncated=stdout_truncated, stderr_truncated=stderr_truncated,
             )
         )
         if outcome != OUTCOME_OK:
@@ -1322,6 +1412,8 @@ def _classify_verify_step(step, result, calee, caleeshell, execution) -> "tuple[
     combined = f"{result.stdout}\n{result.stderr}".lower()
     if result.returncode == 127 or "adb executable not found" in combined:
         return OUTCOME_ADB_UNAVAILABLE, _BLOCKING_DETAIL[OUTCOME_ADB_UNAVAILABLE]
+    if result.returncode == 124:
+        return OUTCOME_TIMEOUT, _BLOCKING_DETAIL[OUTCOME_TIMEOUT]
     if any(m.lower() in combined for m in _DEVICE_UNAVAILABLE_MARKERS):
         return OUTCOME_DEVICE_UNAVAILABLE, _BLOCKING_DETAIL[OUTCOME_DEVICE_UNAVAILABLE]
 

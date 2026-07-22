@@ -1120,3 +1120,52 @@ def test_execute_install_plan_reboot_zero_without_success_text_is_ok(tmp_path):
     assert reboot.returncode == 0
     assert reboot.outcome == ri.OUTCOME_OK
     assert execution.status == ri.STATUS_OK
+
+
+def test_step_evidence_preserves_raw_install_diagnostics_and_stable_outcome(tmp_path):
+    v = _verified(tmp_path)
+    plan = build_install_plan(v, serial="TAB1")
+    message = "INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match"
+    execution = ri.execute_install_plan(plan, v, FakeAdb([(_contains("install"), AdbResult(1, "", message))]))
+
+    step = execution.steps[0]
+    payload = step.to_dict()
+    assert step.outcome == ri.OUTCOME_SIGNATURE_MISMATCH
+    assert payload["stderr"] == message
+    assert payload["detail"] != message  # generic release decision remains separate
+    assert payload["commandKind"] == "apk_install"
+    assert payload["serial"] == "TAB1"
+    assert payload["startedAt"] and payload["completedAt"]
+    assert payload["durationSeconds"] >= 0
+
+
+def test_step_evidence_redacts_and_bounds_unusual_adb_output(tmp_path):
+    v = _verified(tmp_path)
+    plan = build_install_plan(v)
+    output = "start api_key=super-secret " + ("x" * (ri.DIAGNOSTIC_OUTPUT_LIMIT + 100)) + " end"
+    execution = ri.execute_install_plan(plan, v, FakeAdb([(_contains("install"), AdbResult(1, output, ""))]))
+
+    payload = execution.steps[0].to_dict()
+    assert "super-secret" not in payload["stdout"]
+    assert payload["stdout"].startswith("start api_key=[REDACTED]")
+    assert payload["stdout"].endswith(" end")
+    assert payload["truncation"]["stdoutTruncated"] is True
+    assert len(payload["stdout"]) <= ri.DIAGNOSTIC_OUTPUT_LIMIT
+
+
+def test_step_evidence_marks_timeout_and_command_specific_kinds(tmp_path):
+    v = _verified(tmp_path)
+    plan = build_install_plan(v)
+    execution = ri.execute_install_plan(plan, v, FakeAdb([(_contains("install"), AdbResult(124, "", "timed out"))]))
+    step = execution.steps[0]
+    assert step.outcome == ri.OUTCOME_TIMEOUT
+    assert step.timed_out is True
+    assert step.command_kind == "apk_install"
+
+    kinds = {step.label: ri.command_kind_for_step(step) for step in plan.steps}
+    assert kinds["reboot"] == "reboot"
+    assert kinds["wait-for-device"] == "wait_for_device"
+    assert kinds["set-home"] == "home_assignment"
+    assert kinds["verify-calee-version"] == "version_inspection"
+    assert kinds["verify-home"] == "home_resolution"
+    assert kinds["verify-calee-launch"] == "launch_resolution"
