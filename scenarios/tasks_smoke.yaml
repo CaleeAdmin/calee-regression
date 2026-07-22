@@ -15,9 +15,13 @@ steps:
     action: tap
     id: llTask
 
+  # taskView (fragment_task.xml's always-visible content root), NOT llAll:
+  # llAll lives in the task-list navigation sidebar, which TaskFragment renders
+  # View.GONE by default (revealed only via ivExpand), so it is absent from the
+  # Appium hierarchy and timed out despite the Tasks screen rendering fine.
   - name: Wait for the Tasks screen to render
     action: wait_for_id
-    id: llAll
+    id: taskView
     timeout_seconds: 10
 
   - name: Capture tasks screen

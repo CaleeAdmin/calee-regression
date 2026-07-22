@@ -20,9 +20,15 @@ steps:
     action: tap
     id: ivHomeSetting
 
+  # Assert tvProfileHeader (the "Profile" header at the top of the settings
+  # ScrollView), NOT tvLogout: tvLogout is the "Log out" button at the very
+  # bottom of the scroll, which is a fragile render proxy and conflates
+  # "Settings rendered" with "logout available". tvProfileHeader renders first
+  # and proves the screen opened. This scenario's subject is "Settings renders",
+  # not logging out, so it must not hinge on the logout control.
   - name: Wait for the Settings screen to render
     action: wait_for_id
-    id: tvLogout
+    id: tvProfileHeader
     timeout_seconds: 10
 
   - name: Capture settings screen

@@ -485,6 +485,48 @@ def _step_is_real_verification(step: dict) -> bool:
     return False
 
 
+def _locator_for(step: dict) -> "str | None":
+    """A short, non-secret description of the locator a step used, for failure
+    diagnostics -- e.g. ``id='taskView'`` or ``text='REG-EVENT-RECURRING-001'``.
+    REG-* fixture titles and resource ids are non-secret by construction."""
+    for kind in ("id", "text", "xpath"):
+        value = step.get(kind)
+        if value is not None:
+            return f"{kind}={value!r}"
+    verify_id = step.get("then_wait_for_id")
+    if verify_id is not None:
+        return f"then_wait_for_id={verify_id!r}"
+    return None
+
+
+def _failure_diagnostics(ctx, step: dict, *, elapsed: float) -> dict:
+    """Best-effort, non-secret context captured when a tablet step fails: the
+    locator it used, how long it waited, the scenario/step names, and -- when
+    the driver can supply them -- the active activity and current package. So a
+    failed step is diagnosable from the report without a live device.
+
+    A driver/test-double lacking current_activity/current_package must never
+    make this raise and mask the real failure -- mirrors the screenshot/
+    page-source capture's own failure-swallowing (see _execute_step)."""
+    diag: dict = {"elapsed_wait_seconds": round(elapsed, 3), "step": step.get("name")}
+    locator = _locator_for(step)
+    if locator is not None:
+        diag["locator"] = locator
+    scenario = ctx.get("scenario")
+    if scenario is not None and getattr(scenario, "name", None):
+        diag["scenario"] = scenario.name
+    driver = ctx.get("driver")
+    for key in ("current_activity", "current_package"):
+        method = getattr(driver, key, None)
+        if method is None:
+            continue
+        try:
+            diag[key] = method()
+        except Exception:
+            pass
+    return diag
+
+
 def _execute_step(ctx, step: dict) -> StepResult:
     action = step.get("action")
     handler = ACTIONS.get(action)
@@ -543,6 +585,13 @@ def _execute_step(ctx, step: dict) -> StepResult:
                     result.page_source_path = result.page_source_path or src
             except Exception:
                 pass
+        # Richer non-secret failure context (active activity/package, the
+        # locator this step used, elapsed wait, scenario/step) so a failed
+        # tablet step is diagnosable from the report without a live device
+        # (Workstream 4). Best-effort, like the capture above.
+        result.diagnostics = _failure_diagnostics(
+            ctx, step, elapsed=time.monotonic() - started
+        )
         if ctx["scenario"].requires_state == "logged_in_tablet" and action in STATE_SENSITIVE_ACTIONS:
             result.hint = STATE_MISMATCH_HINT
     finally:
