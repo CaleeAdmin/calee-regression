@@ -224,6 +224,9 @@ class CaleeDriver:
     def current_activity(self) -> str:
         return self.driver.current_activity or ""
 
+    def current_package(self) -> str:
+        return self.driver.current_package or ""
+
     def page_source(self) -> str:
         return self.driver.page_source
 

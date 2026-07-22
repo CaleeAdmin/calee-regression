@@ -287,3 +287,60 @@ def test_summary_txt_reports_blocked_count_and_reason(tmp_path):
     summary = (report_dir / "summary.txt").read_text()
     assert "Blocked: 1" in summary
     assert "blocked reason: Appium is unreachable" in summary
+
+
+class _WaitForIdFailsDriverWithContext(_WaitForTextFailsDriver):
+    """A driver whose wait_for_id never resolves but which CAN report the
+    active activity and current package -- exercises the enriched on-failure
+    diagnostics (Workstream 4: the artifacts a failed tablet step must
+    preserve, e.g. the llAll/tvLogout/recurring-event timeouts)."""
+
+    def wait_for_id(self, raw_id, timeout):
+        return False
+
+    def capture_diagnostics(self, label):
+        return "/tmp/fake-screenshot.png", "/tmp/fake-page-source.xml"
+
+    def current_activity(self):
+        return ".ui.task.TaskActivity"
+
+    def current_package(self):
+        return "com.viso.calee"
+
+
+def test_generic_step_failure_records_enriched_diagnostics(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "CaleeDriver", _WaitForIdFailsDriverWithContext)
+    step = {"name": "Wait for tasks", "action": "wait_for_id", "id": "taskView", "timeout_seconds": 1}
+    scenario_path = _write_scenario(
+        tmp_path, {"name": "tasks-smoke", "requires_state": "any", "steps": [step]}
+    )
+
+    result = runner.ScenarioRunner(_make_config()).run_scenarios([scenario_path])
+
+    step_result = result.scenarios[0].steps[0]
+    assert step_result.status == STATUS_FAILED
+    diag = step_result.diagnostics
+    assert diag is not None
+    assert diag["locator"] == "id='taskView'"
+    assert diag["current_activity"] == ".ui.task.TaskActivity"
+    assert diag["current_package"] == "com.viso.calee"
+    assert diag["scenario"] == "tasks-smoke"
+    assert diag["step"] == "Wait for tasks"
+    assert "elapsed_wait_seconds" in diag
+    # It also survives serialization into the JSON/HTML/ZIP evidence.
+    assert step_result.to_dict()["diagnostics"] == diag
+
+
+def test_diagnostics_activity_package_capture_is_best_effort(tmp_path, monkeypatch):
+    # A driver without current_activity/current_package must still get locator/
+    # elapsed diagnostics, and never raise while capturing them.
+    monkeypatch.setattr(runner, "CaleeDriver", _WaitForTextFailsDriverWithDiagnostics)
+    scenario_path = _wait_for_text_scenario(tmp_path, blocks_on_absence=False)
+
+    result = runner.ScenarioRunner(_make_config()).run_scenarios([scenario_path])
+
+    diag = result.scenarios[0].steps[0].diagnostics
+    assert diag is not None
+    assert diag["locator"] == "text='REG-TASK-OPEN-001'"
+    assert "current_activity" not in diag
+    assert "current_package" not in diag

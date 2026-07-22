@@ -54,6 +54,12 @@ class StepResult:
     # they enter the JSON/HTML/ZIP evidence alongside the screenshot.
     page_source_path: "str | None" = None
     row_metrics: "dict | None" = None
+    # Non-secret on-failure context for tablet steps (Workstream 4): the active
+    # activity, current package, the locator this step used, the elapsed wait,
+    # and the scenario/step names -- so a failed step is diagnosable from the
+    # report without a live device. Populated best-effort on failure only;
+    # None for passing steps and drivers/test-doubles that can't supply it.
+    diagnostics: "dict | None" = None
 
     def to_dict(self) -> dict:
         return {
@@ -67,6 +73,7 @@ class StepResult:
             "hint": self.hint,
             "page_source_path": self.page_source_path,
             "row_metrics": self.row_metrics,
+            "diagnostics": self.diagnostics,
         }
 
 

@@ -25,10 +25,34 @@ steps:
     action: tap
     id: llSchedule
 
+  # Navigate to the exact expected occurrence date before searching for the
+  # title, in Australia/Perth date semantics. REG-EVENT-RECURRING-001's first
+  # occurrence is created on the fixture-reset date -- "today" in Perth --
+  # (CaleeMobile-Regression fixture.py: startsAt = <today>T14:00:00,
+  # FREQ=WEEKLY;COUNT=6). Tapping the date title (llDateSelect) invokes
+  # CalendarFragment's goToToday(), anchoring the agenda's window on today so we
+  # never text-search on a stale/wrong day. (If the tablet's Perth "today" has
+  # rolled past the fixture machine's date, the +7d occurrence carries the same
+  # title and is still within the agenda's forward window.)
+  - name: Anchor the calendar on today (go to today)
+    action: tap
+    id: llDateSelect
+
+  # Force a fresh Hub load and let sync settle, so a just-reset fixture is
+  # actually fetched before we assert on it (avoids a false "not found" on a
+  # calendar that simply hadn't synced the new events yet).
+  - name: Force a calendar refresh
+    action: tap
+    id: ivRefreshCalendar
+
+  - name: Let the calendar sync settle
+    action: sleep
+    seconds: 3
+
   - name: Wait for the recurring fixture event to appear
     action: wait_for_text
     text: REG-EVENT-RECURRING-001
-    timeout_seconds: 20
+    timeout_seconds: 25
 
   - name: Capture agenda view with recurring fixture event
     action: screenshot

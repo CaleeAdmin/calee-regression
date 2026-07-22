@@ -40,9 +40,15 @@ steps:
     action: tap
     id: llTask
 
+  # Assert the always-visible Tasks content root (fragment_task.xml's
+  # @+id/taskView FrameLayout), NOT llAll: llAll lives inside the task-list
+  # navigation sidebar (layout_task_navigation.xml), which TaskFragment.initView
+  # sets to View.GONE by default and only reveals when the user taps ivExpand.
+  # A GONE view is absent from the Appium hierarchy, so waiting for llAll timed
+  # out even though the Tasks screen had rendered correctly.
   - name: Assert the Tasks screen actually rendered
     action: wait_for_id
-    id: llAll
+    id: taskView
     timeout_seconds: 10
 
   - name: Capture tasks tab
@@ -81,9 +87,17 @@ steps:
     action: tap
     id: ivHomeSetting
 
+  # Assert a stable top-of-screen Settings landmark (fragment_settings.xml's
+  # @+id/tvProfileHeader, the "Profile" header rendered first in the settings
+  # ScrollView), NOT tvLogout: tvLogout is the "Log out" button at the very
+  # bottom of that ScrollView. Using logout as the generic render assertion is
+  # both fragile (bottom of a long scroll) and conflates "Settings rendered"
+  # with "logout is available"; tvProfileHeader proves the screen rendered
+  # without either problem. (Logout-specific behaviour belongs in a scenario
+  # whose subject is logging out.)
   - name: Assert the Settings screen actually rendered
     action: wait_for_id
-    id: tvLogout
+    id: tvProfileHeader
     timeout_seconds: 10
 
   - name: Capture settings tab
