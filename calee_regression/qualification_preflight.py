@@ -579,8 +579,9 @@ def check_ingestion_bridge(repo_root: Path, *, required: bool = False) -> Prefli
 def check_selector_ci_evidence_availability(
     *, env: "dict | None" = None, required: bool = False,
     workflow_run_id: "str | None" = None, artifact_id: "str | None" = None,
+    selector_artifact_zip: "str | Path | None" = None,
     expected_regression_sha: "str | None" = None, expected_tested_sha: "str | None" = None,
-    expected_version: "str | None" = None,
+    expected_version: "str | None" = None, expected_release_id: "str | None" = None,
 ) -> PreflightCheck:
     """Priority 6 (this session): a resolvable GitHub API credential alone is
     NOT evidence -- it only proves a request COULD be made, not that a real
@@ -593,7 +594,10 @@ def check_selector_ci_evidence_availability(
     identity checked against the expected CaleeMobile-Regression SHA and
     CaleeMobile tested SHA/version -- so a preflight READY here means a real
     artifact was independently authenticated, never merely that credentials
-    exist."""
+    exist. ``selector_artifact_zip`` is the same already-downloaded ZIP input
+    accepted by the release launcher. It replaces only the redirected archive
+    download: GitHub API authentication of the run, jobs, artifact ownership,
+    and recorded digest is always retained."""
     from . import github_artifact as ga_mod
 
     token = ga_mod.resolve_token(env=env)
@@ -617,8 +621,9 @@ def check_selector_ci_evidence_availability(
     try:
         chain = ga_mod.acquire_github_artifact(
             run_id=workflow_run_id, artifact_id=artifact_id,
+            local_zip_path=str(selector_artifact_zip) if selector_artifact_zip else None,
             expected_regression_sha=expected_regression_sha, expected_tested_sha=expected_tested_sha,
-            expected_version=expected_version, env=env,
+            expected_version=expected_version, expected_release_id=expected_release_id, env=env,
         )
     except ga_mod.GithubArtifactError as exc:
         return _check("selector_ci_evidence_availability", STATUS_BLOCKED, str(exc))
@@ -629,7 +634,8 @@ def check_selector_ci_evidence_availability(
         )
     return _check(
         "selector_ci_evidence_availability", STATUS_READY,
-        f"Authenticated selector-contract artifact verified (run {workflow_run_id}, artifact {artifact_id}).",
+        f"Authenticated selector-contract artifact verified (run {workflow_run_id}, artifact {artifact_id}"
+        f"{' using the supplied local ZIP' if selector_artifact_zip else ''}).",
     )
 
 
@@ -1051,6 +1057,7 @@ def run_qualification_preflight(
     expected_caleemobile_regression_sha: "str | None" = None,
     selector_workflow_run_id: "str | None" = None,
     selector_artifact_id: "str | None" = None,
+    selector_artifact_zip: "Path | None" = None,
     calee_regression_main_sha: "str | None" = None,
     calee_regression_main_workflow_run_id: "str | None" = None,
     calee_regression_main_artifact_id: "str | None" = None,
@@ -1220,9 +1227,11 @@ def run_qualification_preflight(
     checks.append(check_selector_ci_evidence_availability(
         env=environ, required=selector_required,
         workflow_run_id=selector_workflow_run_id, artifact_id=selector_artifact_id,
+        selector_artifact_zip=selector_artifact_zip,
         expected_regression_sha=expected_caleemobile_regression_sha,
         expected_tested_sha=caleemobile_identity.get("gitSha"),
         expected_version=caleemobile_identity.get("buildVersion"),
+        expected_release_id=effective.release_id if effective is not None else None,
     ))
 
     distributed_required = bool(caleemobile_identity.get("distributedBuildAcceptanceRequired"))

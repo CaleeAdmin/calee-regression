@@ -74,6 +74,29 @@ Run once, with a prepared physical Calee tablet + a connected iPhone:
    invariant) will refuse an inconsistent promotion.
 8. Re-run to confirm the promoted scenarios now gate the release.
 
+## Selector evidence preflight
+
+Before a production qualification, a technical owner can authenticate selector
+evidence without downloading its redirected GitHub artifact ZIP again:
+
+```bash
+python -m calee_regression qualification-preflight \
+  --bundle /path/to/release-bundle \
+  --selector-workflow-run-id <run-id> \
+  --selector-artifact-id <artifact-id> \
+  --selector-artifact-zip /path/to/selector-contract-result.zip
+```
+
+`--selector-artifact-zip` (or the launcher-compatible
+`CALEEMOBILE_SELECTOR_GITHUB_ARTIFACT_ZIP` environment variable) supplies only
+the ZIP bytes. The run ID and artifact ID remain mandatory, and a GitHub API
+token (`REGRESSION_API_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN`) is still required
+to authenticate the repository, workflow, successful run, artifact ownership,
+and GitHub-recorded SHA-256 digest. A missing token, mismatched ZIP, malformed
+archive, or identity mismatch is **BLOCKED**; a local file never bypasses
+GitHub-origin verification. If no local ZIP is supplied, preflight retains the
+normal authenticated GitHub download behavior.
+
 ### CaleeShell kiosk/admin — physical qualification (BLOCKED here)
 
 On a **disposable** device-owner tablet only (never a customer device),
