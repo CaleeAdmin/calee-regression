@@ -4653,13 +4653,15 @@ def verify_main_ci_artifact_cmd(
 @click.option("--caleemobile-regression-main-workflow-run-id", "caleemobile_regression_main_workflow_run_id", default=None, help="GitHub Actions workflow run ID for CaleeMobile-Regression's own ci.yml run, paired with --caleemobile-regression-main-artifact-id.")
 @click.option("--caleemobile-regression-main-artifact-id", "caleemobile_regression_main_artifact_id", default=None, help="GitHub Actions artifact ID, paired with --caleemobile-regression-main-workflow-run-id.")
 @click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write a JSON result.")
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None, help="Release run ID. With --bundle, evidence acquisition runs FIRST (acquire-release-evidence) and every discovered run/artifact ID feeds the authenticated checks below -- the normal workflow needs only --bundle and --run-id.")
+@click.option("--acquire/--no-acquire", "acquire_evidence", default=True, help="Disable the automatic evidence acquisition step (diagnostics only).")
 def qualification_preflight_cmd(
     config_path, bundle_path, distributed_build_evidence_path, manual_checks_path, main_ci_evidence_path,
     main_ci_repository, expected_caleemobile_sha,
     expected_caleemobile_regression_sha, selector_workflow_run_id, selector_artifact_id, selector_artifact_zip,
     calee_regression_main_sha, calee_regression_main_workflow_run_id, calee_regression_main_artifact_id,
     caleemobile_regression_main_sha, caleemobile_regression_main_workflow_run_id, caleemobile_regression_main_artifact_id,
-    report_path,
+    report_path, run_id_opt, acquire_evidence,
 ):
     """Priority 9 (prior session); Priority 7-8 (this session) -- a
     read-only, RELEASE-AUTHORITATIVE preflight for a technical owner about
@@ -4686,6 +4688,64 @@ def qualification_preflight_cmd(
     listing every failing check.
     """
     from . import qualification_preflight as qp_mod
+
+    # Automatic exact-identity evidence acquisition (this session): with
+    # --bundle and --run-id, acquisition derives every expected identity from
+    # the verified bundle, finds/authenticates the exact GitHub evidence, and
+    # the discovered run/artifact IDs + cached ZIPs feed the authenticated
+    # checks below. Explicit --selector-*/--*-main-* values remain supported
+    # as diagnostic overrides and are authenticated identically.
+    acquisition_outcome = None
+    if bundle_path and run_id_opt and acquire_evidence:
+        from . import evidence_acquisition as ea_mod
+
+        report_root, plan = _acquisition_plan_or_exit(bundle_path, run_id_opt, config_path)
+        overrides = _acquisition_overrides(
+            selector_workflow_run_id, selector_artifact_id, selector_artifact_zip,
+            calee_regression_main_workflow_run_id, calee_regression_main_artifact_id,
+            caleemobile_regression_main_workflow_run_id, caleemobile_regression_main_artifact_id,
+        )
+        try:
+            acquisition_outcome = ea_mod.acquire_release_evidence(
+                plan, report_root=report_root, overrides=overrides or None,
+            )
+        except ea_mod.AcquisitionError as exc:
+            click.echo(click.style(f"[BLOCKED] evidence acquisition: {exc}", fg="red"), err=True)
+            raise SystemExit(EXIT_BLOCKED)
+        click.echo("Evidence acquisition (automatic vs explicit vs cache):")
+        _echo_acquisition_items(acquisition_outcome.items)
+
+        def _feed(evidence_type):
+            item = acquisition_outcome.item(evidence_type)
+            if item is None or item.status not in (ea_mod.STATUS_ACQUIRED, ea_mod.STATUS_REUSED_CACHE):
+                return None, None, None, None
+            run = item.run_data or {}
+            art = item.artifact_data or {}
+            return (str(run.get("id")) if run.get("id") is not None else None,
+                    str(art.get("id")) if art.get("id") is not None else None,
+                    item.cached_path, item.spec.expected_head_sha)
+
+        if not (selector_workflow_run_id or selector_artifact_id):
+            rid, aid, zpath, _sha = _feed(ea_mod.TYPE_SELECTOR_CERTIFICATION)
+            selector_workflow_run_id = rid or selector_workflow_run_id
+            selector_artifact_id = aid or selector_artifact_id
+            selector_artifact_zip = zpath or selector_artifact_zip
+        if not (calee_regression_main_workflow_run_id or calee_regression_main_artifact_id):
+            rid, aid, _z, sha = _feed(ea_mod.TYPE_CALEE_REGRESSION_MAIN_CI)
+            calee_regression_main_workflow_run_id = rid or calee_regression_main_workflow_run_id
+            calee_regression_main_artifact_id = aid or calee_regression_main_artifact_id
+            calee_regression_main_sha = calee_regression_main_sha or sha
+        if not (caleemobile_regression_main_workflow_run_id or caleemobile_regression_main_artifact_id):
+            rid, aid, _z, sha = _feed(ea_mod.TYPE_CALEEMOBILE_REGRESSION_MAIN_CI)
+            caleemobile_regression_main_workflow_run_id = rid or caleemobile_regression_main_workflow_run_id
+            caleemobile_regression_main_artifact_id = aid or caleemobile_regression_main_artifact_id
+            caleemobile_regression_main_sha = caleemobile_regression_main_sha or sha
+        if distributed_build_evidence_path is None:
+            for dist_type in (ea_mod.TYPE_DISTRIBUTED_BUILD_ANDROID, ea_mod.TYPE_DISTRIBUTED_BUILD_IOS):
+                item = acquisition_outcome.item(dist_type)
+                if item is not None and item.source == ea_mod.SOURCE_RECORDED and item.cached_path:
+                    distributed_build_evidence_path = item.cached_path
+                    break
 
     report = qp_mod.run_qualification_preflight(
         config_path=Path(config_path) if config_path else None,
@@ -5306,6 +5366,10 @@ def inspect_resume_cmd(run_id_opt, config_path, serial, report_path):
     if outcome.decisions:
         click.echo("Components:")
         _print_resume_decisions(outcome.decisions)
+    # This session: state whether missing evidence can now be automatically
+    # acquired (read-only assessment -- no GitHub call, no download).
+    evidence_note = _resume_evidence_acquirability(workspace)
+    click.echo(f"Evidence acquisition: {evidence_note}")
     if report_path:
         _write_installer_report(Path(report_path), {
             "runId": run_id_opt,
@@ -5313,6 +5377,7 @@ def inspect_resume_cmd(run_id_opt, config_path, serial, report_path):
             "resumable": outcome.resumable,
             "immutableMismatches": outcome.immutable_mismatches,
             "components": [d.to_dict() for d in outcome.decisions],
+            "evidenceAcquisition": evidence_note,
         })
     if outcome.resumable:
         click.echo(click.style("[OK] This run can be resumed.", fg="green"))
@@ -5376,7 +5441,12 @@ def resume_release_cmd(run_id_opt, config_path, suite_name, serial, tester_opt, 
         run_id_opt, repo_root=REPO_ROOT, report_root=report_root,
         adb_runner=release_installer.real_adb_runner, tablet_serial=serial,
         config_path=config_path, suite_name=suite_name, operator=tester_opt,
+        evidence_acquirer=_default_resume_evidence_acquirer(report_root),
     )
+    if outcome.attempt is not None and outcome.attempt.evidence_acquisition:
+        summary = outcome.attempt.evidence_acquisition
+        click.echo(f"Evidence acquisition for this attempt: {summary.get('status', 'unknown')}"
+                   + (f" -- {summary.get('detail')}" if summary.get("detail") else ""))
     click.echo(f"Run ID: {run_id_opt}")
     click.echo(f"Attempt: {outcome.attempt_number}")
     if outcome.immutable_mismatches:
@@ -5566,6 +5636,216 @@ def assemble_release_bundle_cmd(
         else:
             click.echo(f"     {key}: unchanged, expected {section['expectedInstalled']['versionName']} (code {section['expectedInstalled']['versionCode']})")
     raise SystemExit(EXIT_SUCCESS)
+
+
+# --- exact-identity release evidence acquisition -----------------------------
+
+
+def _acquisition_plan_or_exit(bundle_path, run_id_opt, config_path):
+    """Shared derivation for acquire/inspect-release-evidence: resolves the
+    report root and derives the evidence plan. Invalid usage exits 2 BEFORE
+    any GitHub call could happen."""
+    from . import evidence_acquisition as ea_mod
+
+    report_root = _resolved_report_root(config_path)
+    try:
+        plan = ea_mod.derive_evidence_plan(
+            bundle_path=Path(bundle_path), run_id=run_id_opt,
+            repo_root=REPO_ROOT, report_root=report_root,
+        )
+    except ea_mod.AcquisitionUsageError as exc:
+        click.echo(click.style(f"[INVALID] {exc}", fg="red"), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    return report_root, plan
+
+
+def _acquisition_overrides(selector_run_id, selector_artifact_id, selector_zip,
+                           cr_run_id, cr_artifact_id, cmr_run_id, cmr_artifact_id):
+    from . import evidence_acquisition as ea_mod
+
+    overrides = {}
+    if selector_run_id or selector_artifact_id or selector_zip:
+        overrides[ea_mod.TYPE_SELECTOR_CERTIFICATION] = {
+            "run_id": selector_run_id, "artifact_id": selector_artifact_id, "zip_path": selector_zip,
+        }
+    if cr_run_id or cr_artifact_id:
+        overrides[ea_mod.TYPE_CALEE_REGRESSION_MAIN_CI] = {
+            "run_id": cr_run_id, "artifact_id": cr_artifact_id,
+        }
+    if cmr_run_id or cmr_artifact_id:
+        overrides[ea_mod.TYPE_CALEEMOBILE_REGRESSION_MAIN_CI] = {
+            "run_id": cmr_run_id, "artifact_id": cmr_artifact_id,
+        }
+    return overrides
+
+
+_ACQ_STATUS_STYLE = {
+    "acquired": ("green", "ACQUIRED"),
+    "reused-cache": ("green", "REUSED"),
+    "not_applicable": ("cyan", "N/A"),
+    "blocked": ("red", "BLOCKED"),
+    "contradicted": ("red", "CONTRADICTED"),
+}
+
+
+def _echo_acquisition_items(items):
+    for item in items:
+        color, label = _ACQ_STATUS_STYLE.get(item.status, ("red", item.status.upper()))
+        source = f" ({item.source})" if item.source else ""
+        click.echo(click.style(f"  [{label}] {item.spec.evidence_type}{source}", fg=color))
+        for problem in item.problems:
+            click.echo(f"      - {problem}")
+        if item.remediation:
+            click.echo(f"      remediation: {item.remediation}")
+
+
+def _frozen_candidate_bundle_dir(workspace):
+    """The run's frozen release candidate directory (manifest + checksums +
+    APKs), usable as the --bundle identity source for acquisition. Returns
+    None when this run has no (readable) frozen candidate."""
+    from . import release_candidate as release_candidate_mod
+
+    root = workspace.component_dir("release-candidate")
+    if not root.is_dir():
+        return None
+    for manifest in sorted(root.rglob(release_candidate_mod.MANIFEST_NAME)):
+        if (manifest.parent / release_candidate_mod.CHECKSUMS_NAME).is_file():
+            return manifest.parent
+    return None
+
+
+def _resume_evidence_acquirability(workspace):
+    """Read-only, network-free assessment for inspect-resume: can missing
+    evidence now be automatically acquired?"""
+    bundle_dir = _frozen_candidate_bundle_dir(workspace)
+    if bundle_dir is None:
+        return ("not automatically acquirable -- this run has no frozen release candidate; "
+                "run acquire-release-evidence with the original --bundle.")
+    if not github_artifact_mod.resolve_token():
+        missing = " or ".join(github_artifact_mod.TOKEN_ENV_VARS)
+        return (f"missing evidence could be acquired from the frozen candidate at {bundle_dir}, "
+                f"but no GitHub credentials are available (set one of {missing}).")
+    return (f"missing evidence CAN be automatically acquired (frozen candidate: {bundle_dir}; "
+            f"GitHub credentials available). resume-release will acquire it before rerunning "
+            f"blocked components.")
+
+
+def _default_resume_evidence_acquirer(report_root):
+    """The evidence acquirer resume-release hands to perform_resume: acquires
+    missing evidence from the run's own frozen candidate BEFORE blocked
+    components are re-decided. Fail-closed: no candidate or no token yields a
+    'skipped'/'blocked' summary, never an unauthenticated fallback."""
+    from . import evidence_acquisition as ea_mod
+
+    def _acquire(workspace):
+        bundle_dir = _frozen_candidate_bundle_dir(workspace)
+        if bundle_dir is None:
+            return {"status": "skipped",
+                    "detail": "no frozen release candidate in this run workspace."}
+        if not github_artifact_mod.resolve_token():
+            missing = " or ".join(github_artifact_mod.TOKEN_ENV_VARS)
+            return {"status": "blocked",
+                    "detail": f"GitHub credentials missing (set one of {missing})."}
+        try:
+            plan = ea_mod.derive_evidence_plan(
+                bundle_path=bundle_dir, run_id=workspace.run_id,
+                repo_root=REPO_ROOT, report_root=Path(report_root),
+            )
+            outcome = ea_mod.acquire_release_evidence(plan, report_root=Path(report_root))
+        except (ea_mod.AcquisitionUsageError, ea_mod.AcquisitionError) as exc:
+            return {"status": "blocked", "detail": str(exc)}
+        return {
+            "status": "ok" if outcome.ok else "blocked",
+            "manifestPath": outcome.manifest_path,
+            "items": {i.spec.evidence_type: i.status for i in outcome.items},
+        }
+
+    return _acquire
+
+
+@main.command("acquire-release-evidence")
+@click.option("--bundle", "bundle_path", required=True, type=click.Path(exists=True, file_okay=False), help="Verified release bundle directory -- the ONLY identity source of truth (with the effective release configuration). Never 'the newest GitHub run'.")
+@click.option("--run-id", "run_id_opt", required=True, help="Release run ID whose workspace receives the cached evidence + acquisition manifest.")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(), help="Path to machine.local.yaml (report-root resolution only).")
+@click.option("--selector-run-id", default=None, help="DIAGNOSTIC override: selector workflow run ID. Authenticated exactly like discovered evidence; a mismatch BLOCKS.")
+@click.option("--selector-artifact-id", default=None, help="DIAGNOSTIC override: selector artifact ID.")
+@click.option("--selector-artifact-zip", default=None, type=click.Path(exists=True, dir_okay=False), help="DIAGNOSTIC override: already-downloaded selector artifact ZIP (still authenticated against GitHub metadata + digest).")
+@click.option("--calee-regression-main-run-id", default=None, help="DIAGNOSTIC override: calee-regression merged-main workflow run ID.")
+@click.option("--calee-regression-main-artifact-id", default=None, help="DIAGNOSTIC override: calee-regression merged-main artifact ID.")
+@click.option("--caleemobile-regression-main-run-id", default=None, help="DIAGNOSTIC override: CaleeMobile-Regression merged-main workflow run ID.")
+@click.option("--caleemobile-regression-main-artifact-id", default=None, help="DIAGNOSTIC override: CaleeMobile-Regression merged-main artifact ID.")
+@click.option("--report", "report_path", default=None, type=click.Path(), help="Optional extra copy of the acquisition manifest.")
+def acquire_release_evidence_cmd(bundle_path, run_id_opt, config_path,
+                                 selector_run_id, selector_artifact_id, selector_artifact_zip,
+                                 calee_regression_main_run_id, calee_regression_main_artifact_id,
+                                 caleemobile_regression_main_run_id, caleemobile_regression_main_artifact_id,
+                                 report_path):
+    """Fail-closed exact-identity evidence acquisition: derives every expected
+    identity from the verified release bundle + effective release
+    configuration, locates the EXACT matching GitHub Actions evidence
+    (exact repository, approved workflow path, approved event, exact SHA /
+    release tuple, exactly one artifact), authenticates run ownership and the
+    GitHub-recorded digest, caches the bytes under
+    reports/runs/<run-id>/evidence/acquired/ and writes a secret-free
+    acquisition manifest. Zero or ambiguous matches BLOCK; 'latest successful
+    run' is never used. Exit codes: 0 acquired, 1 authenticated evidence
+    contradiction (a genuine regression), 2 invalid usage/bundle, 3 missing/
+    ambiguous/unauthenticated evidence."""
+    from . import evidence_acquisition as ea_mod
+
+    report_root, plan = _acquisition_plan_or_exit(bundle_path, run_id_opt, config_path)
+    overrides = _acquisition_overrides(
+        selector_run_id, selector_artifact_id, selector_artifact_zip,
+        calee_regression_main_run_id, calee_regression_main_artifact_id,
+        caleemobile_regression_main_run_id, caleemobile_regression_main_artifact_id,
+    )
+    try:
+        outcome = ea_mod.acquire_release_evidence(
+            plan, report_root=report_root, overrides=overrides or None,
+        )
+    except ea_mod.AcquisitionError as exc:
+        click.echo(click.style(f"[BLOCKED] {exc}", fg="red"), err=True)
+        raise SystemExit(EXIT_BLOCKED)
+    _echo_acquisition_items(outcome.items)
+    if outcome.manifest_path:
+        click.echo(f"Acquisition manifest: {outcome.manifest_path}")
+    if report_path:
+        _write_installer_report(Path(report_path), outcome.to_manifest_dict())
+    raise SystemExit(outcome.exit_code)
+
+
+@main.command("inspect-release-evidence")
+@click.option("--bundle", "bundle_path", required=True, type=click.Path(exists=True, file_okay=False), help="Verified release bundle directory.")
+@click.option("--run-id", "run_id_opt", required=True, help="Release run ID whose workspace/cache is inspected.")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(), help="Path to machine.local.yaml (report-root resolution only).")
+@click.option("--report", "report_path", default=None, type=click.Path(), help="Optional path to write the JSON planning report.")
+def inspect_release_evidence_cmd(bundle_path, run_id_opt, config_path, report_path):
+    """Read-only planning twin of acquire-release-evidence: reports the
+    expected evidence, what is already cached, what needs a GitHub lookup,
+    missing credentials, matching workflow runs / ambiguity, distributed-
+    provider prerequisites, and whether acquisition can proceed. Downloads
+    nothing and writes nothing into the run workspace."""
+    from . import evidence_acquisition as ea_mod
+
+    report_root, plan = _acquisition_plan_or_exit(bundle_path, run_id_opt, config_path)
+    try:
+        result = ea_mod.inspect_release_evidence(plan, report_root=report_root)
+    except ea_mod.AcquisitionError as exc:
+        click.echo(click.style(f"[BLOCKED] {exc}", fg="red"), err=True)
+        raise SystemExit(EXIT_BLOCKED)
+    _write_installer_report(Path(report_path) if report_path else None, result)
+    click.echo(f"Credentials available: {'yes' if result['credentialsAvailable'] else 'NO'}")
+    for entry in result["items"]:
+        spec = entry["spec"]
+        cached = " [cached]" if entry.get("cached") else ""
+        click.echo(f"  {spec['evidenceType']}{cached}: {entry.get('assessment', '')}")
+    for problem in result["planProblems"]:
+        click.echo(click.style(f"  plan problem: {problem}", fg="red"))
+    if result["canProceed"]:
+        click.echo(click.style("[READY] acquisition can proceed.", fg="green"))
+        raise SystemExit(EXIT_SUCCESS)
+    click.echo(click.style("[BLOCKED] acquisition cannot proceed yet (see above).", fg="red"))
+    raise SystemExit(EXIT_BLOCKED)
 
 
 if __name__ == "__main__":

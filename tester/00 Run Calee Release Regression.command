@@ -226,6 +226,36 @@ fi
 rm -f release_config_error.txt
 state_pass "Effective release configuration composed."
 
+# ── 4.5. acquire exact-identity release evidence — NO device touch ──────────
+# Derives every expected identity from the just-verified bundle + effective
+# configuration, finds the EXACT matching GitHub Actions evidence (never "the
+# latest successful run"), authenticates each artifact against its workflow
+# run and GitHub-recorded digest, and caches it under
+# reports/runs/$CALEE_RUN_ID/evidence/. Fail-closed: missing credentials or
+# missing/ambiguous evidence BLOCKS here with a plain-language remediation --
+# no token or API detail is ever shown or logged.
+state_doing "Finding exact CI evidence…" "VERIFYING"
+echo "  Authenticating selector evidence…"
+echo "  Authenticating Android build evidence…"
+echo "  Authenticating iOS build evidence…"
+python3 -m calee_regression acquire-release-evidence \
+    --bundle "$MACHINE_RELEASE_BUNDLE_DIR" \
+    --run-id "$CALEE_RUN_ID"
+EVIDENCE_STATUS=$?
+
+if [ $EVIDENCE_STATUS -ne 0 ]; then
+    state_block "The release evidence could not be authenticated (see the acquisition manifest)."
+    needs_owner "The exact CI/selector/build evidence for this release could not be found or authenticated." \
+                "No — evidence is missing, ambiguous, or GitHub authentication is not set up; nothing was installed or tested." \
+                "Ask your technical owner to check the acquisition manifest: GitHub authentication may be missing, the merged-main CI run for this exact version may not exist yet, selector certification may not have been run for this release, or App Store Connect / Play Console evidence may be unavailable." \
+                "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/evidence/acquisition-manifest.json"
+    consolidate_gate
+    CONSOLIDATED_STATUS=$?
+    read -r -p "Press Enter to close..." _
+    exit $CONSOLIDATED_STATUS
+fi
+state_pass "Release evidence found and authenticated."
+
 # ── 5. install the release into the SAME run (Priority 1/5/6) ────────────────
 # Only reached once BOTH the bundle verification AND release configuration
 # gates above have passed. inspect actual APK contents + signer -> read-only

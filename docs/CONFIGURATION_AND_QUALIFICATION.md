@@ -74,6 +74,61 @@ Run once, with a prepared physical Calee tablet + a connected iPhone:
    invariant) will refuse an inconsistent promotion.
 8. Re-run to confirm the promoted scenarios now gate the release.
 
+## Automatic exact-identity evidence acquisition
+
+The normal qualification workflow no longer requires a technical owner to
+find or copy GitHub workflow run IDs, artifact IDs, or local ZIP paths:
+
+```bash
+python -m calee_regression acquire-release-evidence \
+  --bundle /path/to/release-bundle \
+  --run-id <release-run-id>
+```
+
+derives every expected identity from the **verified release bundle** and the
+effective release configuration (framework SHAs come from the run's recorded
+immutable baseline when one exists), locates the exact matching GitHub
+Actions evidence for:
+
+1. calee-regression merged-main CI (`framework-tests.yml`, organic `push` to
+   `main` or `merge_group`, head SHA exactly the expected framework SHA);
+2. CaleeMobile-Regression merged-main CI (`ci.yml`, its canonical required
+   gates);
+3. selector certification (exact CaleeMobile SHA + version + release ID +
+   supported schema version, `workflow_dispatch` only);
+4. distributed-build evidence per required mobile platform (already-recorded
+   authenticated provenance in the run workspace is re-verified and reused;
+   otherwise BLOCKED with a precise remediation — a placeholder PASS is
+   never fabricated);
+
+authenticates each artifact against its workflow run and GitHub-recorded
+digest, caches the bytes under `reports/runs/<run-id>/evidence/acquired/`
+(atomic, private, immutable names embedding type/repo/run/artifact IDs) and
+writes a secret-free `evidence/acquisition-manifest.json`. Zero matches,
+multiple (ambiguous) matches, expired artifacts, or a missing GitHub token
+are all **BLOCKED** — "the latest successful run" is never used, and no
+unauthenticated fallback exists. The read-only twin is
+`inspect-release-evidence` (same arguments; downloads and writes nothing).
+
+`qualification-preflight` runs this acquisition automatically when given
+`--bundle` and `--run-id`, so the normal preflight is just:
+
+```bash
+python -m calee_regression qualification-preflight \
+  --bundle /path/to/release-bundle --run-id <release-run-id>
+```
+
+The preflight output labels each evidence item `automatic`,
+`explicit-override`, `cache`, or `recorded-evidence`, and reports blocked/
+rejected items with remediation.
+
+**Migration note:** the manual `--selector-workflow-run-id` /
+`--selector-artifact-id` / `--selector-artifact-zip` /
+`--*-main-workflow-run-id` / `--*-main-artifact-id` flags remain fully
+supported as *diagnostic overrides* — they are authenticated exactly as
+strictly as discovered evidence and a mismatch BLOCKS — but they are no
+longer the standard operator workflow.
+
 ## Selector evidence preflight
 
 Before a production qualification, a technical owner can authenticate selector

@@ -91,6 +91,8 @@ command: `0` success, `1` product regression, `2` invalid usage/configuration, `
 | `python -m calee_regression release-platforms` | Print the resolved release-platform profile (`config/release-platforms.yaml`) |
 | `python -m calee_regression stop-appium` | Stop Appium, but only if this framework auto-started it |
 | `python -m calee_regression consolidate --tablet-report <json> --mobile-api-report <json> ...` | Combine per-framework JSON reports into one release report (HTML/JSON/JUnit + zip bundle); Android/iOS UI mandatory-ness comes from `config/release-platforms.yaml` |
+| `python -m calee_regression acquire-release-evidence --bundle <dir> --run-id <id>` | Fail-closed: derive every expected identity from the verified release bundle, find the EXACT matching GitHub Actions evidence (never "latest successful run"), authenticate it against its workflow run + GitHub-recorded digest, cache it under `reports/runs/<id>/evidence/` and write a secret-free acquisition manifest |
+| `python -m calee_regression inspect-release-evidence --bundle <dir> --run-id <id>` | Read-only planning twin: expected evidence, cache state, credential availability, matching-run counts/ambiguity, provider prerequisites, and whether acquisition can proceed |
 | `python -m calee_regression inspect-resume --run-id <id>` | Read-only: report whether a blocked release run can be resumed, and what would happen if it were |
 | `python -m calee_regression resume-release --run-id <id>` | Resume a blocked release run without repeating already-passed destructive/disruptive steps — see [docs/RELEASE_POLICY.md](docs/RELEASE_POLICY.md) |
 | `python -m calee_regression list-resumable-runs` | List every run workspace under `reports/runs/`, for choosing one to resume |
