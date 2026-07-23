@@ -9,9 +9,14 @@ from pathlib import Path
 from .models import DEVICE_INIT_STANDARD, certification_block
 
 # Bump when the tablet results.json shape changes in a way a consumer (the
-# consolidator, the schema tests) must know about (Workstream 8/9).
+# consolidator, the schema tests) must know about (Workstream 8/9). A consumer
+# only certifies a report whose reportType is TABLET_REPORT_TYPE and whose
+# reportSchemaVersion is in SUPPORTED_TABLET_REPORT_SCHEMA_VERSIONS; an
+# unsupported/absent version is diagnostic only and never certifies (Workstream
+# 1/7).
 TABLET_REPORT_SCHEMA_VERSION = 1
 TABLET_REPORT_TYPE = "tablet-scenario-suite"
+SUPPORTED_TABLET_REPORT_SCHEMA_VERSIONS = frozenset({1})
 
 
 def default_run_name(kind: str, name: str) -> str:

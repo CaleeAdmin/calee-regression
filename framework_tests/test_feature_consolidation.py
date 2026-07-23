@@ -29,6 +29,7 @@ import pytest
 from click.testing import CliRunner
 
 from calee_regression import run_context
+from tablet_fixtures import TABLET_CERTIFYING_ENVELOPE as _TABLET_CERTIFYING_ENVELOPE
 from calee_regression.cli import main
 from calee_regression.consolidated_report import (
     FEATURE_COMPONENT_NAMES,
@@ -180,7 +181,7 @@ def _write(workspace, component, data):
 
 def _write_passing_base(workspace, run_id=RUN_ID):
     _write(workspace, "environment", {"runId": run_id, "status": "pass", "detail": []})
-    _write(workspace, "tablet", {"runId": run_id, "passed_count": 1, "failed_count": 0,
+    _write(workspace, "tablet", {**_TABLET_CERTIFYING_ENVELOPE, "runId": run_id, "passed_count": 1, "failed_count": 0,
                                  "blocked_count": 0, "skipped_count": 0,
                                  "scenarios": [{"name": "a", "status": "passed"}]})
     _write(workspace, "mobile-api", {"runId": run_id, "counts": {"PASS": 1},

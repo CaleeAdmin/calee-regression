@@ -14,7 +14,14 @@ from pathlib import Path
 
 from calee_regression import reporting, run_context, targeted_repeat
 from calee_regression.config import Config
-from calee_regression.consolidated_report import diagnostic_tablet_block_reason
+from calee_regression.consolidated_report import (
+    MOBILE_API_REPORT_TYPES,
+    MOBILE_UI_REPORT_TYPES,
+    STATUS_BLOCKED,
+    STATUS_PASS,
+    component_from_api_report,
+    diagnostic_tablet_block_reason,
+)
 from calee_regression.models import (
     DEVICE_INIT_SKIP,
     DEVICE_INIT_STANDARD,
@@ -89,6 +96,54 @@ def test_targeted_report_embeds_schema_version_type_and_certification():
     assert report["certificationEligible"] is True
 
 
+# ── consumer validates mobile report type + schema (Workstream 1) ──────────
+
+
+def _mobile_report(report_type=None, schema=1, status="PASS"):
+    d = {"counts": {"PASS": 1}, "steps": [{"name": "s", "status": status, "mandatory": True}]}
+    if report_type is not None:
+        d["reportType"] = report_type
+    if schema is not None:
+        d["reportSchemaVersion"] = schema
+    return d
+
+
+def test_api_report_with_correct_type_is_consumed():
+    report = _mobile_report(report_type="mobile-api-suite")
+    c = component_from_api_report("CaleeMobile Client API", report, accepted_types=MOBILE_API_REPORT_TYPES)
+    assert c.status == STATUS_PASS
+
+
+def test_api_report_declaring_wrong_type_is_blocked():
+    # A serial-aggregate report accidentally wired to the API component blocks.
+    report = _mobile_report(report_type="mobile-serial-aggregate")
+    c = component_from_api_report("CaleeMobile Client API", report, accepted_types=MOBILE_API_REPORT_TYPES)
+    assert c.status == STATUS_BLOCKED
+    assert "reportType" in " ".join(c.detail)
+
+
+def test_ui_report_with_unsupported_schema_is_blocked():
+    report = _mobile_report(report_type="mobile-serial-aggregate", schema=999)
+    c = component_from_api_report("CaleeMobile Android UI", report, accepted_types=MOBILE_UI_REPORT_TYPES)
+    assert c.status == STATUS_BLOCKED
+    assert "reportSchemaVersion" in " ".join(c.detail)
+
+
+def test_ui_report_serial_aggregate_type_is_accepted():
+    report = _mobile_report(report_type="mobile-serial-aggregate")
+    c = component_from_api_report("CaleeMobile Android UI", report, accepted_types=MOBILE_UI_REPORT_TYPES)
+    assert c.status == STATUS_PASS
+
+
+def test_legacy_unversioned_report_has_no_type_to_mismatch():
+    # A legacy report with no reportType is not itself a *type mismatch*; the
+    # producers now always version their reports, so this path is only for old
+    # fixtures. It is consumed by count (no envelope to reject).
+    report = _mobile_report(report_type=None, schema=None)
+    c = component_from_api_report("CaleeMobile Client API", report, accepted_types=MOBILE_API_REPORT_TYPES)
+    assert c.status == STATUS_PASS
+
+
 # ── report paths never collide (run-manifest component references) ─────────
 
 
@@ -100,22 +155,72 @@ def test_targeted_and_full_suite_component_paths_never_collide(tmp_path):
     assert ws.is_within(ws.component_dir("tablet-targeted"))
 
 
-# ── deliberate backward compatibility ──────────────────────────────────────
+# ── fail-closed certification (Workstream 7) ───────────────────────────────
 
 
-def test_legacy_report_without_certification_fields_is_allowed():
-    # Pre-diagnostic reports (no fields) keep certifying -- the only mode then
-    # was standard.
-    assert diagnostic_tablet_block_reason({"passed_count": 1}) is None
+def _certifying(**extra):
+    """A fully certifying tablet report envelope: supported reportType + schema
+    + explicit standard certification block. ``**extra`` overrides a field to
+    model a defect."""
+    return {
+        "reportType": reporting.TABLET_REPORT_TYPE,
+        "reportSchemaVersion": reporting.TABLET_REPORT_SCHEMA_VERSION,
+        **certification_block(DEVICE_INIT_STANDARD),
+        **extra,
+    }
+
+
+def test_legacy_report_without_certification_fields_is_blocked():
+    # Reversed (Workstream 7): a legacy/unversioned tablet report (no reportType,
+    # no schema, no certification fields) is diagnostic-only historical evidence
+    # and MUST NOT certify -- it fails closed.
+    reason = diagnostic_tablet_block_reason({"passed_count": 1})
+    assert reason is not None
+    assert "unversioned" in reason.lower() or "legacy" in reason.lower()
 
 
 def test_explicit_standard_certifies_and_diagnostic_blocks():
-    assert diagnostic_tablet_block_reason(certification_block(DEVICE_INIT_STANDARD)) is None
-    assert diagnostic_tablet_block_reason(certification_block(DEVICE_INIT_SKIP)) is not None
+    assert diagnostic_tablet_block_reason(_certifying()) is None
+    # Envelope present but diagnostic (skip) -> blocked.
+    assert diagnostic_tablet_block_reason(
+        _certifying(**certification_block(DEVICE_INIT_SKIP))
+    ) is not None
+
+
+def test_bare_certification_block_without_envelope_does_not_certify():
+    # A certification_block dict alone (no reportType/schema envelope) is NOT a
+    # certifying report -- the envelope is required.
+    assert diagnostic_tablet_block_reason(certification_block(DEVICE_INIT_STANDARD)) is not None
+
+
+def test_unsupported_schema_version_blocks():
+    assert diagnostic_tablet_block_reason(_certifying(reportSchemaVersion=999)) is not None
+    assert diagnostic_tablet_block_reason(_certifying(reportSchemaVersion=None)) is not None
+
+
+def test_wrong_report_type_blocks():
+    assert diagnostic_tablet_block_reason(_certifying(reportType="tablet-targeted-repeat")) is not None
+
+
+def test_skip_device_initialization_capability_blocks_even_in_standard_metadata():
+    # Standard cert metadata but a skipDeviceInitialization capability present ->
+    # inconsistent; blocks.
+    assert diagnostic_tablet_block_reason(_certifying(skipDeviceInitialization=True)) is not None
+    assert diagnostic_tablet_block_reason(
+        _certifying(capabilities={"appium:skipDeviceInitialization": True})
+    ) is not None
 
 
 def test_ambiguous_partial_certification_metadata_blocks():
-    # A report claiming eligibility WITHOUT declaring diagnosticMode is ambiguous;
-    # eligibility must never be inferred -> it blocks.
-    assert diagnostic_tablet_block_reason({"certificationEligible": True}) is not None
-    assert diagnostic_tablet_block_reason({"diagnosticMode": False}) is not None
+    # Even WITH a valid envelope, claiming eligibility WITHOUT declaring
+    # diagnosticMode (or vice versa) is ambiguous; eligibility is never inferred.
+    assert diagnostic_tablet_block_reason(
+        {"reportType": reporting.TABLET_REPORT_TYPE,
+         "reportSchemaVersion": reporting.TABLET_REPORT_SCHEMA_VERSION,
+         "certificationEligible": True}
+    ) is not None
+    assert diagnostic_tablet_block_reason(
+        {"reportType": reporting.TABLET_REPORT_TYPE,
+         "reportSchemaVersion": reporting.TABLET_REPORT_SCHEMA_VERSION,
+         "diagnosticMode": False}
+    ) is not None

@@ -20,6 +20,7 @@ import pytest
 from click.testing import CliRunner
 
 from calee_regression import run_context
+from tablet_fixtures import TABLET_CERTIFYING_ENVELOPE as _TABLET_CERTIFYING_ENVELOPE
 from calee_regression.cli import main
 from calee_regression.models import EXIT_BLOCKED, EXIT_INVALID_CONFIG, EXIT_SUCCESS
 
@@ -51,6 +52,7 @@ def _seed_base(tmp_path, run_id=RUN_ID, *, android=True, ios=False, selector=Non
     workspace = _make_workspace(tmp_path, run_id)
     _write(workspace, "environment", {"runId": run_id, "status": "pass", "detail": []})
     _write(workspace, "tablet", {
+        **_TABLET_CERTIFYING_ENVELOPE,
         "runId": run_id, "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
         "scenarios": [{"name": "a", "status": "passed"}],
     })

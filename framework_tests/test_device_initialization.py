@@ -33,7 +33,14 @@ from calee_regression.models import (
     SuiteResult,
     certification_block,
 )
-from calee_regression.reporting import ReportBuilder
+from calee_regression.reporting import (
+    TABLET_REPORT_SCHEMA_VERSION,
+    TABLET_REPORT_TYPE,
+    ReportBuilder,
+)
+
+# The certifying envelope a real tablet report carries (Workstream 7).
+_ENVELOPE = {"reportType": TABLET_REPORT_TYPE, "reportSchemaVersion": TABLET_REPORT_SCHEMA_VERSION}
 
 
 def _config(**overrides) -> Config:
@@ -204,31 +211,49 @@ def _passing_tablet_report(**extra):
 
 
 def test_standard_all_pass_certifies():
-    report = _passing_tablet_report(**certification_block(DEVICE_INIT_STANDARD))
+    report = _passing_tablet_report(**_ENVELOPE, **certification_block(DEVICE_INIT_STANDARD))
     component = component_from_tablet_report("Calee tablet", report)
     assert component.status == STATUS_PASS
     assert diagnostic_tablet_block_reason(report) is None
 
 
 def test_diagnostic_all_pass_is_blocked_not_certified():
-    report = _passing_tablet_report(**certification_block(DEVICE_INIT_SKIP))
+    report = _passing_tablet_report(**_ENVELOPE, **certification_block(DEVICE_INIT_SKIP))
     component = component_from_tablet_report("Calee tablet", report)
     assert component.status == STATUS_BLOCKED  # a diagnostic PASS never certifies
     assert "DIAGNOSTIC" in " ".join(component.detail)
 
 
-def test_legacy_report_without_fields_still_certifies():
-    # A pre-diagnostic report (no certification fields) keeps working -- the only
-    # mode that existed then was standard.
+def test_legacy_report_without_fields_is_blocked_but_displayed():
+    # Reversed (Workstream 7): a legacy/unversioned report is diagnostic-only
+    # historical evidence and MUST NOT certify. It is still DISPLAYED (a BLOCKED
+    # component with the reason), never silently rewritten to appear certifying.
     report = _passing_tablet_report()
-    assert diagnostic_tablet_block_reason(report) is None
-    assert component_from_tablet_report("Calee tablet", report).status == STATUS_PASS
+    assert diagnostic_tablet_block_reason(report) is not None
+    component = component_from_tablet_report("Calee tablet", report)
+    assert component.status == STATUS_BLOCKED
+    assert any("legacy" in d.lower() or "unversioned" in d.lower() for d in component.detail)
+
+
+def test_unsupported_schema_version_is_blocked():
+    report = _passing_tablet_report(**_ENVELOPE, **certification_block(DEVICE_INIT_STANDARD))
+    report["reportSchemaVersion"] = 999
+    assert diagnostic_tablet_block_reason(report) is not None
+    assert component_from_tablet_report("Calee tablet", report).status == STATUS_BLOCKED
+
+
+def test_skip_device_initialization_capability_blocks():
+    report = _passing_tablet_report(
+        **_ENVELOPE, **certification_block(DEVICE_INIT_STANDARD), skipDeviceInitialization=True
+    )
+    assert diagnostic_tablet_block_reason(report) is not None
+    assert component_from_tablet_report("Calee tablet", report).status == STATUS_BLOCKED
 
 
 def test_ambiguous_partial_metadata_blocks():
     # diagnosticMode absent but certificationEligible True alone, or contradictory
-    # values, must never be inferred as eligible.
-    report = _passing_tablet_report(certificationEligible=True)  # no diagnosticMode
+    # values, must never be inferred as eligible -- even with a valid envelope.
+    report = _passing_tablet_report(**_ENVELOPE, certificationEligible=True)  # no diagnosticMode
     assert diagnostic_tablet_block_reason(report) is not None
     assert component_from_tablet_report("Calee tablet", report).status == STATUS_BLOCKED
 

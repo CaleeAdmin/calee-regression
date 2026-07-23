@@ -148,14 +148,38 @@ fi
 # where this fallback always read the legacy file even for a schema-v2 release).
 # An omitted/malformed feature defaults to mandatory=true (never silently
 # optional); a malformed scope makes `release-feature-scope` exit non-zero.
-if [ -z "${CALEE_RELEASE_FEATURE_MEALS:-}" ]; then
-    eval "$(python -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"
+#
+# Workstream 8: consume the scope from the environment ONLY when the COMPLETE
+# set of feature variables is already present (a "06 Test Full Calee Solution"
+# run exports all of them together). Never infer that because one variable
+# (e.g. MEALS) is set, the others are too -- a partial environment must
+# re-resolve, not silently default. And capture the resolver's OUTPUT and EXIT
+# STATUS separately BEFORE eval, so a resolver crash/BLOCK is never swallowed by
+# command substitution followed by :-true defaults.
+_scope_complete=true
+for _feat in SYNCHRONIZATION MEALS ONBOARDING GOOGLE_CALENDAR KIOSK_ADMIN; do
+    eval "_feat_val=\${CALEE_RELEASE_FEATURE_${_feat}:-}"
+    if [ -z "$_feat_val" ]; then
+        _scope_complete=false
+    fi
+done
+if [ "$_scope_complete" != true ]; then
+    _scope_output="$(python -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"
+    _scope_status=$?
+    if [ "$_scope_status" -ne 0 ]; then
+        echo ""
+        echo "BLOCKED: could not resolve the release-feature scope (exit $_scope_status) — refusing to run the mobile checks with an unknown or malformed scope."
+        echo "$_scope_output" >&2
+        exit "$_scope_status"
+    fi
+    eval "$_scope_output"
 fi
+export CALEE_RELEASE_FEATURE_SYNCHRONIZATION="${CALEE_RELEASE_FEATURE_SYNCHRONIZATION:-true}"
 export CALEE_RELEASE_FEATURE_MEALS="${CALEE_RELEASE_FEATURE_MEALS:-true}"
 export CALEE_RELEASE_FEATURE_ONBOARDING="${CALEE_RELEASE_FEATURE_ONBOARDING:-true}"
 export CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR="${CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR:-true}"
 export CALEE_RELEASE_FEATURE_KIOSK_ADMIN="${CALEE_RELEASE_FEATURE_KIOSK_ADMIN:-true}"
-echo "[OK] Release-feature scope: meals=$CALEE_RELEASE_FEATURE_MEALS onboarding=$CALEE_RELEASE_FEATURE_ONBOARDING google_calendar=$CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR kiosk_admin=$CALEE_RELEASE_FEATURE_KIOSK_ADMIN (source: ${CALEE_RELEASE_FEATURE_SOURCE:-default})"
+echo "[OK] Release-feature scope: sync=$CALEE_RELEASE_FEATURE_SYNCHRONIZATION meals=$CALEE_RELEASE_FEATURE_MEALS onboarding=$CALEE_RELEASE_FEATURE_ONBOARDING google_calendar=$CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR kiosk_admin=$CALEE_RELEASE_FEATURE_KIOSK_ADMIN (source: ${CALEE_RELEASE_FEATURE_SOURCE:-default})"
 
 # Default both suites to BLOCKED (exit 3): if the Prepare gate below refuses
 # to let them run, that is exactly the state they must be recorded in --
@@ -304,6 +328,22 @@ else
                     export CALEE_UI_DEVICE_ID="$UI_DEVICE_ID"
                     UI_DEVICE_ARGS=(--device-id "$UI_DEVICE_ID")
                 fi
+                # Guided-handoff evidence (Workstream 5): discover ONLY THIS
+                # run's canonical same-run evidence paths (never a "latest"
+                # file), and pass them to the serial orchestrator so the
+                # aggregate binds and gates on them. A missing mandatory
+                # feature's evidence is blocked downstream, never inferred.
+                # ${arr[@]+"${arr[@]}"} keeps an empty array safe under `set -u`
+                # on macOS bash 3.2.
+                HANDOFF_ARGS=()
+                ONBOARDING_EVIDENCE="$RUN_DIR/handoff/onboarding/evidence.json"
+                GOOGLE_EVIDENCE="$RUN_DIR/handoff/google-calendar/evidence.json"
+                if [ -f "$ONBOARDING_EVIDENCE" ]; then
+                    HANDOFF_ARGS+=(--onboarding-handoff-evidence "$ONBOARDING_EVIDENCE")
+                fi
+                if [ -f "$GOOGLE_EVIDENCE" ]; then
+                    HANDOFF_ARGS+=(--google-handoff-evidence "$GOOGLE_EVIDENCE")
+                fi
                 # Serial per-file orchestration (Workstream 3/4): run_ui_manifest.py
                 # runs each integration-test FILE in its OWN Flutter process (a
                 # physical iPhone stalls when the whole integration_test directory
@@ -332,6 +372,7 @@ else
                 (cd "$SIBLING/ui" && python3 run_ui_manifest.py \
                     --platform "$PLATFORM" \
                     ${UI_DEVICE_ARGS[@]+"${UI_DEVICE_ARGS[@]}"} \
+                    ${HANDOFF_ARGS[@]+"${HANDOFF_ARGS[@]}"} \
                     --report "$UI_REPORT" \
                     --work-dir "$UI_DIR" \
                     --feature "meals=$CALEE_RELEASE_FEATURE_MEALS" \
@@ -350,13 +391,21 @@ fi
 # keeps an auditable attempt history and never lets a recorded result improve
 # across recordings (see calee_regression/run_context.py), so even a stray
 # second recording can't launder an earlier FAIL into a PASS.
+# Each recording is snapshotted into an IMMUTABLE per-invocation directory
+# (Workstream 4): re-invoking the same platform in the same run preserves every
+# invocation's evidence -- a later PASS can never erase an earlier FAIL, on disk
+# or in the manifest (worst-wins). The invocation id is unique per invocation
+# (timestamp + this process id).
+_INVOCATION_STAMP="$(date +%Y%m%dT%H%M%S)-$$"
 if [ "$RUN_API" = true ]; then
     python -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component mobile-api \
-        --report-path "$API_REPORT" --exit-code "$API_STATUS" || true
+        --report-path "$API_REPORT" --exit-code "$API_STATUS" \
+        --invocation-id "api-$_INVOCATION_STAMP" || true
 fi
 if [ "$RUN_UI" = true ]; then
     python -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component "mobile-$PLATFORM" \
-        --report-path "$UI_REPORT" --exit-code "$UI_STATUS" || true
+        --report-path "$UI_REPORT" --exit-code "$UI_STATUS" \
+        --invocation-id "$PLATFORM-$_INVOCATION_STAMP" || true
 fi
 
 echo ""

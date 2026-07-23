@@ -16,6 +16,7 @@ import pytest
 from click.testing import CliRunner
 
 from calee_regression import release_platforms, run_context
+from tablet_fixtures import TABLET_CERTIFYING_ENVELOPE as _TABLET_CERTIFYING_ENVELOPE
 from calee_regression.cli import main
 from calee_regression.consolidated_report import (
     STATUS_BLOCKED,
@@ -224,7 +225,7 @@ def _write(workspace, component, data):
 
 def _write_passing_base(workspace):
     _write(workspace, "environment", {"runId": RUN_ID, "status": "pass", "detail": []})
-    _write(workspace, "tablet", {"runId": RUN_ID, "passed_count": 1, "failed_count": 0,
+    _write(workspace, "tablet", {**_TABLET_CERTIFYING_ENVELOPE, "runId": RUN_ID, "passed_count": 1, "failed_count": 0,
                                  "blocked_count": 0, "skipped_count": 0,
                                  "scenarios": [{"name": "a", "status": "passed"}]})
     _write(workspace, "mobile-api", {"runId": RUN_ID, "counts": {"PASS": 1}, "steps": [{"name": "x", "status": "PASS"}]})

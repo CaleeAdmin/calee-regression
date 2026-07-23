@@ -284,11 +284,22 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     # mobile checks, so every mobile leg below (api-only, android/ios --ui-only)
     # is told the exact scope the release composed -- not a legacy re-parse. The
     # resolver prefers schema-v2 and falls back to config/release-platforms.yaml
-    # only when there is genuinely no schema-v2 bundle. A malformed scope exits
-    # non-zero (fail-closed); the mobile legs then inherit the exported vars.
-    if ! eval "$(python3 -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"; then
-        echo "BLOCKED: could not resolve this run's release-feature scope — refusing to run the mobile checks with an unknown scope." >&2
+    # only when there is genuinely no schema-v2 bundle. A malformed/tampered/
+    # unsupported same-run scope exits non-zero (fail-closed).
+    #
+    # Workstream 8: capture the resolver's OUTPUT and EXIT STATUS separately,
+    # BEFORE eval, so a resolver failure BLOCKS the whole release run and is
+    # never swallowed by command substitution (a crashed resolver would leave
+    # empty output, `eval ""` succeeds, and the mobile legs would otherwise run
+    # with an unknown scope).
+    FEATURE_SCOPE_OUT="$(python3 -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"
+    FEATURE_SCOPE_RC=$?
+    if [ "$FEATURE_SCOPE_RC" -ne 0 ]; then
+        echo "BLOCKED: could not resolve this run's release-feature scope (exit $FEATURE_SCOPE_RC) — refusing to run the mobile checks with an unknown or malformed scope." >&2
+        echo "$FEATURE_SCOPE_OUT" >&2
+        exit "$FEATURE_SCOPE_RC"
     fi
+    eval "$FEATURE_SCOPE_OUT"
     echo ""
     echo "--- Step 3: CaleeMobile Client API (device-independent — run once) ---"
     # The Client API suite is device-independent, so it runs EXACTLY ONCE for the
