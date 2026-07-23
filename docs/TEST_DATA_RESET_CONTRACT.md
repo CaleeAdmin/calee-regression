@@ -29,7 +29,10 @@ technical owner (or the `01 Prepare Test Environment` launcher) runs, from a che
 
 ```bash
 cd ../CaleeMobile-Regression/api
-python3 manage_fixture.py reset --base-url <env> --email <test-account> --password <...>
+# Credentials come from the environment (or the macOS Keychain) — never the command line.
+export CALEE_TEST_EMAIL=<test-account>
+export CALEE_TEST_PASSWORD=<...>
+python3 manage_fixture.py reset --base-url <env>
 ```
 
 This is idempotent — re-running it deletes only the fixture's own `REG-FIXTURE-*` collections
