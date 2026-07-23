@@ -16,6 +16,7 @@ import pytest
 from click.testing import CliRunner
 
 from calee_regression import cli, run_context
+from tablet_fixtures import TABLET_CERTIFYING_ENVELOPE as _TABLET_CERTIFYING_ENVELOPE
 from calee_regression.consolidated_report import (
     STATUS_BLOCKED,
     STATUS_NOT_RUN,
@@ -147,7 +148,8 @@ def _seed_minimal_passing_run(ws, *, subscribed_status=None):
         path.write_text(json.dumps({"runId": RUN_ID, **data}))
 
     _w("environment", {"status": "pass", "detail": []})
-    _w("tablet", {"passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
+    _w("tablet", {**_TABLET_CERTIFYING_ENVELOPE,
+                  "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
                   "scenarios": [{"name": "REG", "status": "passed"}]})
     _w("mobile-api", {"counts": {"PASS": 1}, "steps": [{"name": "api", "status": "PASS"}]})
     _w("manual-checks", {"checks": [

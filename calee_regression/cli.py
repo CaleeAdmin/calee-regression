@@ -501,6 +501,37 @@ def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suit
     )
 
 
+def _snapshot_mobile_invocation(workspace, component, report_path, invocation_id):
+    """Preserve a mobile component's evidence for THIS invocation immutably
+    (Workstream 4): copy the canonical report (and its per-file evidence dir)
+    into ``<component-dir>/invocations/<invocation-id>/`` so a later invocation
+    that overwrites the canonical report path can never erase or improve an
+    earlier one. Returns the invocation directory path (str) or None when there
+    is nothing to snapshot. Refuses to overwrite an existing invocation dir."""
+    if not report_path:
+        return None
+    report = Path(report_path)
+    component_dir = workspace.component_dir(component)
+    inv_dir = component_dir / "invocations" / _sanitize_component_name(invocation_id)
+    if inv_dir.exists():
+        raise FileExistsError(
+            f"invocation directory already exists ({inv_dir}); refusing to overwrite immutable evidence."
+        )
+    inv_dir.mkdir(parents=True, exist_ok=False)
+    if report.is_file():
+        shutil.copy2(report, inv_dir / "results.json")
+    # Preserve the per-file attempt evidence the serial orchestrator wrote next
+    # to the report (run_ui_manifest writes attempts under files/).
+    files_dir = report.parent / "files"
+    if files_dir.is_dir():
+        shutil.copytree(files_dir, inv_dir / "files", dirs_exist_ok=False)
+    return str(inv_dir)
+
+
+def _sanitize_component_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(value))
+
+
 @main.command("record-component")
 @click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True)
 @click.option("--component", "component", required=True, type=click.Choice(run_context.COMPONENT_NAMES))
@@ -509,13 +540,24 @@ def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suit
 @click.option("--device-id", default=None)
 @click.option("--build-version", default=None)
 @click.option("--git-sha", default=None)
-def record_component_cmd(run_id_opt, component, report_path, exit_code, device_id, build_version, git_sha):
+@click.option(
+    "--invocation-id", "invocation_id", default=None,
+    help="Immutable invocation id (Workstream 4). When given (or generated), this "
+         "component's report + per-file evidence is snapshotted under "
+         "<component>/invocations/<id>/ so a later invocation cannot erase it.",
+)
+def record_component_cmd(run_id_opt, component, report_path, exit_code, device_id, build_version, git_sha, invocation_id):
     """Records one component's outcome into an existing run's manifest.
 
     For components not driven directly through this CLI (e.g. CaleeMobile's
     mobile-api/mobile-android/mobile-ios checks, run from
     CaleeMobile-Regression's own scripts) -- see scripts/test_caleemobile.sh.
     Requires the run workspace to already exist (created by `prepare`).
+
+    Mobile components are snapshotted into an IMMUTABLE per-invocation directory
+    (Workstream 4), so re-invoking the same platform with the same run id
+    preserves every invocation's evidence -- a later PASS can never erase an
+    earlier FAIL/BLOCKED, in the manifest (worst-wins) OR on disk.
     """
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
@@ -524,10 +566,24 @@ def record_component_cmd(run_id_opt, component, report_path, exit_code, device_i
     if not workspace.root.is_dir():
         click.echo(f"No run workspace found for run ID {run_id_opt!r} at {workspace.root}.", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
+
+    invocation_path = None
+    # Only the mobile components carry re-invocable per-file evidence worth
+    # snapshotting; other components record their result path as-is.
+    if component in ("mobile-api", "mobile-android", "mobile-ios"):
+        invocation_id = invocation_id or _utc_now_iso().replace(":", "").replace("+", "-")
+        try:
+            invocation_path = _snapshot_mobile_invocation(workspace, component, report_path, invocation_id)
+        except FileExistsError as exc:
+            click.echo(str(exc), err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+
     manifest = _load_or_init_manifest(workspace)
     manifest.record_component(
         component, report_path=report_path, exit_code=exit_code,
         device_id=device_id, build_version=build_version, git_sha=git_sha,
+        invocation_id=invocation_id if invocation_path else None,
+        invocation_path=invocation_path,
     )
     manifest.write(workspace.manifest_path)
     raise SystemExit(EXIT_SUCCESS)
@@ -762,6 +818,30 @@ def suite(config_path, suite_name, confirm_technical, run_id_opt, device_initial
     raise SystemExit(_exit_code_for(result))
 
 
+def _sha256_file_or_none(path) -> "str | None":
+    """A ``sha256:``-prefixed digest of a file's bytes, or None when the path is
+    unset/missing/unreadable (best-effort provenance, offline-safe)."""
+    if not path:
+        return None
+    import hashlib
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        h = hashlib.sha256()
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return "sha256:" + h.hexdigest()
+    except OSError:
+        return None
+
+
+def _utc_now_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
 def _targeted_out_dir(run_id_opt: "str | None", cfg) -> "tuple[Path, str | None]":
     """The directory the aggregate targeted-repeat report is written to. Always
     SEPARATE from the normal tablet component so a determinism re-run can never
@@ -818,10 +898,15 @@ def run_repeat(config_path, scenario_args, profile_path, repeat_count, stop_on_f
         raise SystemExit(EXIT_INVALID_CONFIG)
 
     scenarios = list(scenario_args)
+    resolved_profile = None
+    profile_digest = None
     if profile_path or not scenarios:
         resolved_profile = profile_path or str(REPO_ROOT / targeted_repeat_mod.DEFAULT_TARGETED_PROFILE)
         try:
             scenarios = scenarios + targeted_repeat_mod.load_profile(resolved_profile)
+            profile_digest = targeted_repeat_mod.digest_text(
+                Path(resolved_profile).read_text(encoding="utf-8")
+            )
         except (OSError, ValueError) as exc:
             click.echo(f"Could not load profile {resolved_profile!r}: {exc}", err=True)
             raise SystemExit(EXIT_INVALID_CONFIG)
@@ -831,6 +916,23 @@ def run_repeat(config_path, scenario_args, profile_path, repeat_count, stop_on_f
 
     out_dir, run_id = _targeted_out_dir(run_id_opt, cfg)
     variables = _load_run_scenario_variables(run_id)
+
+    # Full provenance for the immutable targeted report (Workstream 6). Captured
+    # best-effort and offline: the tablet package/apk identity from config, an
+    # apk sha256 hashed from the apk file, and the release/backend/fixture
+    # identity from the environment. Absent values are recorded as None.
+    provenance = {
+        "deviceId": getattr(cfg, "udid", None) or getattr(cfg, "device_name", None),
+        "backend": os.environ.get("CALEE_API_BASE"),
+        "fixtureVersion": os.environ.get("CALEE_FIXTURE_VERSION"),
+        "tabletBuildIdentity": {
+            "applicationId": getattr(cfg, "app_package", None),
+            "apkPath": getattr(cfg, "apk_path", None),
+        },
+        "apkSha256": _sha256_file_or_none(getattr(cfg, "apk_path", None)),
+    }
+    invocation_id = targeted_repeat_mod.new_invocation_id()
+    started_at = _utc_now_iso()
 
     def _run_once(scenario_str, attempt_dir):
         scenario_path = _resolve_scenario_path(scenario_str)
@@ -851,6 +953,12 @@ def run_repeat(config_path, scenario_args, profile_path, repeat_count, stop_on_f
         stop_on_failure=stop_on_failure,
         device_initialization_mode=cfg.device_initialization_mode,
         run_id=run_id,
+        invocation_id=invocation_id,
+        release_id=os.environ.get("CALEE_RELEASE_ID"),
+        profile_path=resolved_profile,
+        profile_digest=profile_digest,
+        provenance=provenance,
+        started_at=started_at,
     )
     counts = report["attemptCounts"]
     click.echo(
@@ -1383,25 +1491,130 @@ def release_platforms_cmd():
     raise SystemExit(EXIT_SUCCESS)
 
 
-def _resolve_run_release_features(run_id: "str | None"):
-    """This run's authoritative feature scope, as (ReleaseFeatures, source).
+# The release-config report schema versions the feature-scope resolver
+# understands (Workstream 8). A schema-v2 same-run report is authoritative for
+# feature scope; a valid schema-v1 report legitimately defers to the legacy
+# release-platforms feature profile (v1 has no self-contained feature
+# selections). A same-run report of ANY OTHER (unsupported/future) version, or
+# one that is unreadable, malformed, non-dict, or digest-tampered, must BLOCK --
+# never silently fall back to legacy.
+SUPPORTED_RELEASE_CONFIG_SCHEMA_VERSIONS = frozenset({1, 2})
+
+
+class FeatureScopeBlocked(Exception):
+    """A same-run release-config report EXISTS but cannot authoritatively
+    resolve the feature scope (unreadable/malformed/unsupported/tampered). The
+    run must BLOCK -- it must never fall back to the legacy profile merely
+    because a same-run report failed validation (Workstream 8)."""
+
+
+def _strict_same_run_release_config(path) -> dict:
+    """Read + strictly validate this run's release-config report, returning the
+    validated dict. Raises FeatureScopeBlocked when the file exists but is
+    unreadable, malformed JSON, not an object, an unsupported schema version, or
+    digest-tampered. A same-run report is authoritative: it is NEVER downgraded
+    to a legacy fallback on a validation failure (Workstream 8)."""
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise FeatureScopeBlocked(f"same-run release-config report is unreadable: {exc}") from exc
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise FeatureScopeBlocked(f"same-run release-config report is malformed JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise FeatureScopeBlocked("same-run release-config report is not a JSON object.")
+    schema = data.get("schemaVersion")
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema not in SUPPORTED_RELEASE_CONFIG_SCHEMA_VERSIONS:
+        raise FeatureScopeBlocked(
+            f"same-run release-config schemaVersion {schema!r} is unsupported "
+            f"(supported: {sorted(SUPPORTED_RELEASE_CONFIG_SCHEMA_VERSIONS)}) -- refusing to infer scope."
+        )
+    # Tamper check: when the report carries its own selections digest, recompute
+    # it independently and refuse a mismatch (never trust the stored digest).
+    recorded_digest = data.get("releaseConfigDigest")
+    if recorded_digest is not None:
+        from . import release_config as release_config_mod
+        selections = data.get("releaseSelections")
+        if not isinstance(selections, dict):
+            raise FeatureScopeBlocked("same-run release-config report has a digest but no releaseSelections object.")
+        recomputed = release_config_mod.release_selections_digest(selections)
+        if recomputed != recorded_digest:
+            raise FeatureScopeBlocked(
+                "same-run release-config report digest does not match its releaseSelections "
+                "(tampered/corrupt) -- refusing to certify."
+            )
+    return data
+
+
+def _resolve_run_feature_scope(run_id: "str | None") -> dict:
+    """This run's authoritative feature scope as a metadata dict:
+    ``{features, source, schema, digest, featureMap}``.
 
     Prefers THIS run's own already-composed schema-v2 release-config evidence
     (reports/runs/<run-id>/release-config/results.json) -- the same scope the
-    consolidator gates on -- so the mobile UI suite is told exactly what the
-    release composed (Workstream 5 KNOWN GAP fix). Falls back to the legacy
-    config/release-platforms.yaml feature profile ONLY when there is genuinely
-    no schema-v2 release-config for this run (a standalone/dev invocation).
-    Never re-derives the scope by re-parsing YAML in bash.
+    consolidator gates on. FAILS CLOSED (Workstream 8): if a same-run
+    release-config report EXISTS but is unreadable/malformed/unsupported/
+    digest-tampered, it raises FeatureScopeBlocked instead of silently falling
+    back to the legacy profile. Legacy fallback happens ONLY when there is
+    genuinely no same-run release-config report (a standalone/dev invocation) --
+    a valid schema-v1 report legitimately defers to the legacy feature profile
+    by design (v1 has no self-contained feature selections).
     """
     if run_id and run_context.is_valid_run_id(run_id):
         workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
-        release_config_dict = _load_release_config_dict(workspace)
-        if release_config_dict is not None and release_config_dict.get("schemaVersion") == 2:
-            _, v2_features, _ = _v2_platforms_features_expected(release_config_dict)
-            return v2_features, "schema-v2 release-config (same run)"
-    # Documented legacy fallback: no schema-v2 bundle composed for this run.
-    return release_platforms.load_release_features(), "legacy config/release-platforms.yaml"
+        path = workspace.component_report_path("release-config")
+        if path.is_file():
+            data = _strict_same_run_release_config(path)  # raises FeatureScopeBlocked on any problem
+            schema = data.get("schemaVersion")
+            digest = data.get("releaseConfigDigest")
+            if schema == 2:
+                _, v2_features, _ = _v2_platforms_features_expected(data)
+                return {
+                    "features": v2_features,
+                    "source": "schema-v2 release-config (same run)",
+                    "schema": schema,
+                    "digest": digest,
+                    "featureMap": _feature_map(v2_features),
+                }
+            # A valid schema-v1 composition defers to the legacy feature profile
+            # by design (documented, not a failure fallback).
+            legacy = release_platforms.load_release_features()
+            return {
+                "features": legacy,
+                "source": "schema-v1 release-config (same run); legacy feature profile by design",
+                "schema": schema,
+                "digest": digest,
+                "featureMap": _feature_map(legacy),
+            }
+    # Documented legacy fallback: no same-run release-config report at all.
+    legacy = release_platforms.load_release_features()
+    return {
+        "features": legacy,
+        "source": "legacy config/release-platforms.yaml",
+        "schema": None,
+        "digest": None,
+        "featureMap": _feature_map(legacy),
+    }
+
+
+def _feature_map(features) -> dict:
+    """The complete resolved feature map -- ALL feature variables together
+    (Workstream 8), so a consumer never infers one from another."""
+    return {
+        "synchronization": bool(features.synchronization),
+        "meals": bool(features.meals),
+        "onboarding": bool(features.onboarding),
+        "google_calendar": bool(features.google_calendar),
+        "kiosk_admin": bool(features.kiosk_admin),
+    }
+
+
+def _resolve_run_release_features(run_id: "str | None"):
+    """This run's authoritative feature scope as (ReleaseFeatures, source).
+    Thin wrapper over _resolve_run_feature_scope; fails closed the same way."""
+    scope = _resolve_run_feature_scope(run_id)
+    return scope["features"], scope["source"]
 
 
 @main.command("release-feature-scope")
@@ -1415,23 +1628,101 @@ def release_feature_scope_cmd(run_id_opt):
     ``eval "$(python -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"``
     BEFORE invoking scripts/test_caleemobile.sh, so the mobile checks consume
     the exact scope the release composed, never a second bash/legacy re-parse.
-    A malformed/absent scope defaults to mandatory (never silently optional):
-    every feature ReleaseFeatures can't confirm off stays True.
+    A same-run release-config report that EXISTS but is malformed/unsupported/
+    tampered BLOCKS -- it is never downgraded to the legacy profile (Workstream
+    8). A truly absent scope defaults to mandatory (never silently optional).
+
+    The emitted exports record the FULL scope provenance -- source, release-config
+    schema version, source digest, and the complete resolved feature map (all
+    five feature variables emitted together) -- so a consumer never infers one
+    feature's applicability from another, and the consolidator can compare
+    source+digest+map, not just booleans.
     """
     try:
-        features, source = _resolve_run_release_features(run_id_opt)
-    except release_platforms.ReleasePlatformsError as exc:
-        # Malformed feature scope must BLOCK, never silently become optional.
-        click.echo(f"echo 'release feature scope is malformed: {exc}' >&2; exit {EXIT_BLOCKED}")
+        scope = _resolve_run_feature_scope(run_id_opt)
+    except (FeatureScopeBlocked, release_platforms.ReleasePlatformsError) as exc:
+        # A malformed/tampered/unsupported same-run scope must BLOCK, never
+        # silently become optional or fall back to legacy. The emitted line
+        # itself exits non-zero when eval'd, AND the command exits non-zero so a
+        # caller that captures the exit status (before eval) also blocks.
+        message = str(exc).replace("'", "'\"'\"'")
+        click.echo(f"echo 'release feature scope is blocked: {message}' >&2; exit {EXIT_BLOCKED}")
         raise SystemExit(EXIT_BLOCKED)
-    click.echo(f"# release feature scope source: {source}")
-    click.echo(f"export CALEE_RELEASE_FEATURE_SOURCE={shlex.quote(source)}")
-    click.echo(f"export CALEE_RELEASE_FEATURE_SYNCHRONIZATION={'true' if features.synchronization else 'false'}")
-    click.echo(f"export CALEE_RELEASE_FEATURE_MEALS={'true' if features.meals else 'false'}")
-    click.echo(f"export CALEE_RELEASE_FEATURE_ONBOARDING={'true' if features.onboarding else 'false'}")
-    click.echo(f"export CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR={'true' if features.google_calendar else 'false'}")
-    click.echo(f"export CALEE_RELEASE_FEATURE_KIOSK_ADMIN={'true' if features.kiosk_admin else 'false'}")
+    features = scope["features"]
+    feature_map = scope["featureMap"]
+    click.echo(f"# release feature scope source: {scope['source']}")
+    click.echo(f"export CALEE_RELEASE_FEATURE_SOURCE={shlex.quote(scope['source'])}")
+    click.echo(f"export CALEE_RELEASE_FEATURE_SCHEMA={shlex.quote(str(scope['schema']) if scope['schema'] is not None else '')}")
+    click.echo(f"export CALEE_RELEASE_FEATURE_DIGEST={shlex.quote(scope['digest'] or '')}")
+    # The complete resolved feature map, emitted together.
+    for name in ("synchronization", "meals", "onboarding", "google_calendar", "kiosk_admin"):
+        click.echo(f"export CALEE_RELEASE_FEATURE_{name.upper()}={'true' if feature_map[name] else 'false'}")
+    _ = features  # (feature_map is derived from features; kept explicit above)
     raise SystemExit(EXIT_SUCCESS)
+
+
+@main.command("finalize-release-handoff")
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", required=True)
+def finalize_release_handoff_cmd(run_id_opt):
+    """Finalize a release's guided-handoff evidence WITHOUT re-running devices
+    (Workstream 5).
+
+    Reads THIS run's already-produced IMMUTABLE automated mobile aggregate(s),
+    verifies each in-scope guided-checkpoint feature's same-run evidence binds
+    to the device/build/backend the automated run actually exercised (reusing
+    CaleeMobile-Regression's authoritative verifier -- never a duplicated
+    schema), and writes a NEW immutable finalized aggregate recording both the
+    automated and checkpoint verdicts. The original automated evidence is never
+    mutated. A tester can therefore record the external checkpoint AFTER the
+    automated run and finalize the release without rerunning any physical-device
+    test.
+    """
+    if not run_context.is_valid_run_id(run_id_opt):
+        click.echo(f"Invalid --run-id {run_id_opt!r}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    from . import handoff_bridge
+
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id_opt)
+    if not workspace.root.is_dir():
+        click.echo(f"No run workspace found for run ID {run_id_opt!r}.", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    # In-scope handoff features for this run (fail-closed resolver).
+    try:
+        scope = _resolve_run_feature_scope(run_id_opt)
+    except (FeatureScopeBlocked, release_platforms.ReleasePlatformsError) as exc:
+        click.echo(f"BLOCKED: could not resolve feature scope: {exc}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+    feature_map = scope["featureMap"]
+    release_features = {
+        "onboarding": "true" if feature_map.get("onboarding") else "false",
+        "google_calendar": "true" if feature_map.get("google_calendar") else "false",
+    }
+
+    # The immutable automated aggregates this run produced.
+    aggregates = {}
+    for platform, component in (("android", "mobile-android"), ("ios", "mobile-ios")):
+        path = workspace.component_report_path(component)
+        if path.is_file():
+            try:
+                aggregates[platform] = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                click.echo(f"BLOCKED: automated {component} report is unreadable: {exc}", err=True)
+                raise SystemExit(EXIT_BLOCKED)
+
+    try:
+        finalized, status = handoff_bridge.finalize_release_handoff(
+            workspace, release_features=release_features, aggregates=aggregates, repo_root=REPO_ROOT,
+        )
+    except handoff_bridge.HandoffBridgeError as exc:
+        click.echo(f"BLOCKED: {exc}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    click.echo(f"Release handoff finalized -> {status.upper()}")
+    for feature, entry in finalized["features"].items():
+        click.echo(f"  [{entry['checkpointResult'].upper()}] {feature}: {entry['detail']}")
+    click.echo(f"Finalized report: {handoff_bridge.run_handoff_dir(workspace) / 'finalized' / 'results.json'}")
+    raise SystemExit(_STATUS_TO_EXIT_CODE.get(status, EXIT_BLOCKED))
 
 
 @main.command("verify-selector-evidence")

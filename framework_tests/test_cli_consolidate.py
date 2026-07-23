@@ -4,6 +4,7 @@ import pytest
 from click.testing import CliRunner
 
 from calee_regression import run_context
+from tablet_fixtures import TABLET_CERTIFYING_ENVELOPE as _TABLET_CERTIFYING_ENVELOPE
 from calee_regression.cli import main
 from calee_regression.models import (
     EXIT_BLOCKED,
@@ -53,6 +54,7 @@ def test_consolidate_blocks_without_manual_checks(tmp_path):
     workspace = _make_workspace(tmp_path)
     _write_component(workspace, "environment", {"runId": RUN_ID, "status": "pass", "detail": []})
     _write_component(workspace, "tablet", {
+        **_TABLET_CERTIFYING_ENVELOPE,
         "runId": RUN_ID,
         "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
         "scenarios": [{"name": "a", "status": "passed"}],
@@ -74,6 +76,7 @@ def test_consolidate_passes_when_everything_is_provided_and_clean(tmp_path):
     workspace = _make_workspace(tmp_path)
     _write_component(workspace, "environment", {"runId": RUN_ID, "status": "pass", "detail": []})
     _write_component(workspace, "tablet", {
+        **_TABLET_CERTIFYING_ENVELOPE,
         "runId": RUN_ID,
         "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
         "scenarios": [{"name": "a", "status": "passed"}],
@@ -137,6 +140,7 @@ def test_consolidate_passes_when_everything_is_provided_and_clean(tmp_path):
 def _write_full_tablet_only_components(workspace, run_id=RUN_ID):
     _write_component(workspace, "environment", {"runId": run_id, "status": "pass", "detail": []})
     _write_component(workspace, "tablet", {
+        **_TABLET_CERTIFYING_ENVELOPE,
         "runId": run_id,
         "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
         "scenarios": [{"name": "a", "status": "passed"}],

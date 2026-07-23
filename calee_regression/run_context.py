@@ -279,6 +279,8 @@ class RunManifest:
         device_id: "str | None" = None,
         build_version: "str | None" = None,
         git_sha: "str | None" = None,
+        invocation_id: "str | None" = None,
+        invocation_path: "str | None" = None,
     ) -> None:
         if report_path is not None:
             self.report_paths[component] = report_path
@@ -287,9 +289,17 @@ class RunManifest:
             # worst-wins effective exit code, so recording the same component
             # twice can never *improve* its result (an initial FAIL survives a
             # later PASS). Duplicate recordings are retained, never silently
-            # overwritten. See worst_exit_code and Phase 3.
+            # overwritten. See worst_exit_code and Phase 3. Each attempt also
+            # records the IMMUTABLE invocation snapshot it came from (Workstream
+            # 4), so an overwritten canonical report path can always be traced
+            # back to the exact per-invocation evidence it summarized.
             attempts = self.component_attempts.setdefault(component, [])
-            attempts.append({"exitCode": exit_code, "reportPath": report_path})
+            entry = {"exitCode": exit_code, "reportPath": report_path}
+            if invocation_id is not None:
+                entry["invocationId"] = invocation_id
+            if invocation_path is not None:
+                entry["invocationPath"] = invocation_path
+            attempts.append(entry)
             self.exit_codes[component] = worst_exit_code(
                 [a["exitCode"] for a in attempts]
             )

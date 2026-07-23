@@ -29,6 +29,19 @@ from calee_regression.consolidated_report import (
     write_junit,
     write_release_bundle,
 )
+from calee_regression.models import DEVICE_INIT_STANDARD, certification_block
+from calee_regression.reporting import TABLET_REPORT_SCHEMA_VERSION, TABLET_REPORT_TYPE
+
+# The certifying envelope every real tablet report carries (Workstream 7): a
+# supported reportType + schema version and an explicit standard certification
+# block. A tablet report missing any of this is diagnostic-only and never
+# certifies -- so a fixture that intends to model a PASSing tablet run must
+# include it.
+_TABLET_CERTIFYING_ENVELOPE = {
+    "reportType": TABLET_REPORT_TYPE,
+    "reportSchemaVersion": TABLET_REPORT_SCHEMA_VERSION,
+    **certification_block(DEVICE_INIT_STANDARD),
+}
 
 PASSING_ENVIRONMENT_REPORT = {
     "runId": "release-20260716-000000-abc123",
@@ -42,11 +55,13 @@ BLOCKED_ENVIRONMENT_REPORT = {
 }
 
 PASSING_TABLET_REPORT = {
+    **_TABLET_CERTIFYING_ENVELOPE,
     "passed_count": 10, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
     "scenarios": [{"name": f"s{i}", "status": "passed"} for i in range(10)],
 }
 
 FAILING_TABLET_REPORT = {
+    **_TABLET_CERTIFYING_ENVELOPE,
     "passed_count": 8, "failed_count": 2, "blocked_count": 0, "skipped_count": 0,
     "scenarios": (
         [{"name": f"s{i}", "status": "passed"} for i in range(8)]
@@ -55,6 +70,7 @@ FAILING_TABLET_REPORT = {
 }
 
 BLOCKED_TABLET_REPORT = {
+    **_TABLET_CERTIFYING_ENVELOPE,
     "passed_count": 0, "failed_count": 0, "blocked_count": 3, "skipped_count": 0,
     "scenarios": [
         {"name": f"s{i}", "status": "blocked", "blocked_reason": "Appium unreachable"} for i in range(3)

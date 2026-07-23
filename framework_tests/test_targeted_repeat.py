@@ -179,6 +179,91 @@ def test_run_targeted_embeds_diagnostic_certification(tmp_path):
     assert report["certificationEligible"] is False
 
 
+def test_same_stem_scenarios_do_not_collide(tmp_path):
+    # Two scenarios sharing a filename stem in different dirs must get DISTINCT
+    # attempt directories (Workstream 6).
+    planned = tr.plan_attempts(["scenarios/a/home.yaml", "scenarios/b/home.yaml"], 2)
+    assert len({p["dirName"] for p in planned}) == 4
+    run_once, _ = make_run_once({})
+    report, _ = tr.run_targeted(
+        scenarios=["scenarios/a/home.yaml", "scenarios/b/home.yaml"],
+        repeat_count=2, out_dir=tmp_path, run_once=run_once,
+    )
+    attempt_dirs = {Path(a["attemptDir"]) for a in report["attempts"]}
+    assert len(attempt_dirs) == 4  # no collision
+    assert all(d.exists() for d in attempt_dirs)
+
+
+def test_second_invocation_cannot_overwrite_first(tmp_path):
+    run_once, _ = make_run_once({})
+    r1, _ = tr.run_targeted(
+        scenarios=["scenarios/a.yaml"], repeat_count=1, out_dir=tmp_path, run_once=run_once,
+        invocation_id="inv-A",
+    )
+    r2, _ = tr.run_targeted(
+        scenarios=["scenarios/a.yaml"], repeat_count=1, out_dir=tmp_path, run_once=run_once,
+        invocation_id="inv-B",
+    )
+    # Both invocations' immutable evidence survives.
+    assert (tmp_path / "invocations" / "inv-A" / "results.json").exists()
+    assert (tmp_path / "invocations" / "inv-B" / "results.json").exists()
+    # The canonical index records BOTH invocations, and re-using an id is refused.
+    index = json.loads((tmp_path / "results.json").read_text())
+    ids = {e["invocationId"] for e in index["invocations"]}
+    assert ids == {"inv-A", "inv-B"}
+    assert index["selectedInvocationId"] == "inv-B"
+    with pytest.raises(FileExistsError):
+        tr.run_targeted(
+            scenarios=["scenarios/a.yaml"], repeat_count=1, out_dir=tmp_path, run_once=run_once,
+            invocation_id="inv-A",
+        )
+
+
+def test_interrupted_attempt_is_blocked_and_aggregate_preserved(tmp_path):
+    calls = {"n": 0}
+
+    def run_once(scenario, attempt_dir):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("device wedged mid-run")
+        (Path(attempt_dir) / "results.json").write_text(json.dumps(_suite()), encoding="utf-8")
+        return _suite()
+
+    report, status = tr.run_targeted(
+        scenarios=["scenarios/a.yaml", "scenarios/b.yaml"],
+        repeat_count=1, out_dir=tmp_path, run_once=run_once,
+    )
+    # The aggregate is still written despite the interruption.
+    assert (tmp_path / "results.json").exists()
+    assert report["interrupted"] is True
+    # The interrupted attempt is BLOCKED (never a missing report), so the run blocks.
+    assert status == "blocked"
+    interrupted = [a for a in report["attempts"] if a.get("interrupted")]
+    assert len(interrupted) == 1
+    assert interrupted[0]["status"] == "blocked"
+    assert "wedged" in interrupted[0]["error"]
+
+
+def test_report_carries_full_provenance(tmp_path):
+    run_once, _ = make_run_once({})
+    report, _ = tr.run_targeted(
+        scenarios=["scenarios/a.yaml"], repeat_count=1, out_dir=tmp_path, run_once=run_once,
+        invocation_id="inv-1", release_id="2026.07.20-rc1", profile_path="p.yaml",
+        profile_digest="sha256:deadbeef",
+        provenance={"deviceId": "TAB123", "backend": "https://hub", "fixtureVersion": "f7",
+                    "tabletBuildIdentity": {"applicationId": "com.viso.calee"}, "apkSha256": "sha256:abc"},
+    )
+    for field in ("producer", "producerGitSha", "invocationId", "releaseId", "profilePath",
+                  "profileDigest", "deviceId", "tabletBuildIdentity", "apkSha256", "backend",
+                  "fixtureVersion", "startedAt", "finishedAt", "scenarios", "repeatCount",
+                  "deviceInitializationMode", "attempts"):
+        assert field in report, f"missing provenance field {field!r}"
+    assert report["invocationId"] == "inv-1"
+    assert report["releaseId"] == "2026.07.20-rc1"
+    assert report["deviceId"] == "TAB123"
+    assert report["attempts"][0]["reportPath"].endswith("results.json")
+
+
 def test_run_targeted_does_not_touch_a_sibling_full_report(tmp_path):
     # Simulate the full-suite report living next to the targeted output.
     full = tmp_path / "tablet"

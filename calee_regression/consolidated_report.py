@@ -34,6 +34,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from .models import DEVICE_INIT_STANDARD
+from .reporting import (
+    SUPPORTED_TABLET_REPORT_SCHEMA_VERSIONS,
+    TABLET_REPORT_TYPE,
+)
+
 
 def _sanitize_for_filename(value: str) -> str:
     """Matches reporting.py's ReportBuilder sanitization so build labels
@@ -408,41 +414,81 @@ def component_from_build_identity(
     return ComponentResult(name=name, status=STATUS_PASS, mandatory=True, detail=[note + "."], evidence=evidence)
 
 
-def diagnostic_tablet_block_reason(suite_dict: "dict[str, Any] | None") -> "str | None":
-    """Why a tablet report must NOT be treated as release-certifying evidence
-    (Workstream 6 + 9), or None when it is a legitimate certification-eligible
-    (standard) run.
+def _has_skip_device_init_capability(suite_dict: "dict[str, Any]") -> bool:
+    """True if the report advertises a skipDeviceInitialization Appium capability
+    (top-level or under a capabilities/appiumCapabilities block). Such a
+    capability in otherwise-standard metadata is inconsistent and must block --
+    the run did not fully initialize the device (Workstream 7)."""
+    if suite_dict.get("skipDeviceInitialization"):
+        return True
+    for key in ("capabilities", "appiumCapabilities", "caps"):
+        caps = suite_dict.get(key)
+        if isinstance(caps, dict) and caps.get("skipDeviceInitialization"):
+            return True
+        if isinstance(caps, dict) and caps.get("appium:skipDeviceInitialization"):
+            return True
+    return False
 
-    Rules:
-      * A report with NEITHER certification field is a legacy, pre-diagnostic
-        report (the only mode that existed then was standard) -- allowed.
-      * An explicit standard run (``diagnosticMode==False`` AND
-        ``certificationEligible==True``) -- allowed.
-      * An explicit diagnostic run (``diagnosticMode==True`` OR
-        ``certificationEligible==False``) -- BLOCKED, never certifying.
-      * Any partial/inconsistent certification metadata -- BLOCKED: eligibility
-        is never INFERRED for an ambiguous report; it must block, never pass.
+
+def diagnostic_tablet_block_reason(suite_dict: "dict[str, Any] | None") -> "str | None":
+    """Why a tablet report must NOT certify a release (Workstreams 1/7), or None
+    ONLY for an explicit, current-schema, standard-mode, certification-eligible
+    run. This FAILS CLOSED: anything short of a full, explicit standard proof
+    blocks -- a report may still be DISPLAYED diagnostically, but never certifies.
+
+    A release-certifying tablet report must explicitly prove ALL of:
+      * ``reportType == 'tablet-scenario-suite'``;
+      * a supported ``reportSchemaVersion``;
+      * ``deviceInitializationMode == 'standard'``;
+      * ``diagnosticMode == False``;
+      * ``certificationEligible == True``;
+    and must NOT carry a ``skipDeviceInitialization`` capability.
+
+    A legacy/unversioned report, partial/ambiguous certification metadata, an
+    unsupported schema, an explicit diagnostic run, or a skipDeviceInitialization
+    capability all BLOCK -- eligibility is NEVER inferred from an incomplete or
+    unversioned report.
     """
     if not isinstance(suite_dict, dict):
+        # Not a dict at all -- the caller (component_from_tablet_report) treats a
+        # None report as NOT_RUN; this returns no *extra* block reason.
         return None
-    has_diag = "diagnosticMode" in suite_dict
-    has_elig = "certificationEligible" in suite_dict
-    if not has_diag and not has_elig:
-        return None
+    report_type = suite_dict.get("reportType")
+    schema_version = suite_dict.get("reportSchemaVersion")
+    mode = suite_dict.get("deviceInitializationMode")
     diag = suite_dict.get("diagnosticMode")
     elig = suite_dict.get("certificationEligible")
-    if diag is False and elig is True:
-        return None
-    mode = suite_dict.get("deviceInitializationMode")
+
+    # 1. Envelope: the report must declare the certifying type and a supported
+    #    schema version. An unversioned/legacy tablet report is diagnostic only.
+    if report_type != TABLET_REPORT_TYPE or schema_version not in SUPPORTED_TABLET_REPORT_SCHEMA_VERSIONS:
+        return (
+            f"tablet report is not a supported certifying report "
+            f"(reportType={report_type!r}, reportSchemaVersion={schema_version!r}; expected "
+            f"{TABLET_REPORT_TYPE!r} + one of {sorted(SUPPORTED_TABLET_REPORT_SCHEMA_VERSIONS)}) -- "
+            f"an unversioned/legacy tablet report is diagnostic-only historical evidence and never certifies."
+        )
+    # 2. Explicit diagnostic run.
     if diag is True or elig is False:
         return (
             f"tablet run is DIAGNOSTIC (deviceInitializationMode={mode!r}, diagnosticMode={diag!r}, "
             f"certificationEligible={elig!r}) -- diagnostic runs are never release-certifying evidence."
         )
-    return (
-        f"tablet run has ambiguous/incomplete certification metadata (diagnosticMode={diag!r}, "
-        f"certificationEligible={elig!r}) -- refusing to infer release eligibility; blocking."
-    )
+    # 3. The full, explicit standard proof is required -- never inferred.
+    if not (diag is False and elig is True and mode == DEVICE_INIT_STANDARD):
+        return (
+            f"tablet report does not explicitly prove a standard, certification-eligible run "
+            f"(deviceInitializationMode={mode!r}, diagnosticMode={diag!r}, certificationEligible={elig!r}; "
+            f"a certifying run requires deviceInitializationMode={DEVICE_INIT_STANDARD!r}, diagnosticMode=False, "
+            f"certificationEligible=True) -- refusing to infer eligibility; blocking."
+        )
+    # 4. A skipDeviceInitialization capability contradicts standard mode.
+    if _has_skip_device_init_capability(suite_dict):
+        return (
+            "tablet report claims standard mode but carries a skipDeviceInitialization capability -- "
+            "the device was not fully initialized; refusing to certify inconsistent metadata."
+        )
+    return None
 
 
 def component_from_tablet_report(name: str, suite_dict: "dict[str, Any] | None", *, mandatory: bool = True) -> ComponentResult:
@@ -485,11 +531,53 @@ def component_from_tablet_report(name: str, suite_dict: "dict[str, Any] | None",
     )
 
 
-def component_from_api_report(name: str, report_dict: "dict[str, Any] | None", *, mandatory: bool = True) -> ComponentResult:
+# The mobile report types/schema versions the consolidator understands
+# (Workstream 1). A report whose DECLARED type does not match the component it
+# is read as, or whose declared schema version is unsupported, is BLOCKED --
+# never folded in as if it matched. Legacy (unversioned) reports carry no type
+# to mismatch on; the mobile producers now always version their reports.
+MOBILE_API_REPORT_TYPES = frozenset({"mobile-api-suite"})
+# A platform (android/ios) component is the serial aggregate; a single-file run
+# is accepted too (both are valid mobile-UI evidence shapes).
+MOBILE_UI_REPORT_TYPES = frozenset({"mobile-serial-aggregate", "mobile-ui-file"})
+SUPPORTED_MOBILE_REPORT_SCHEMA_VERSIONS = frozenset({1})
+
+
+def _mobile_report_envelope_problem(report_dict, accepted_types) -> "str | None":
+    """A reason the report's declared envelope disqualifies it from being read
+    as this component, or None (Workstream 1). Validates only what is DECLARED:
+    a wrong reportType, or an unsupported reportSchemaVersion, blocks; an absent
+    (legacy) envelope is not itself a mismatch here."""
+    report_type = report_dict.get("reportType")
+    schema = report_dict.get("reportSchemaVersion")
+    if accepted_types is not None and report_type is not None and report_type not in accepted_types:
+        return (
+            f"reportType {report_type!r} does not match this component "
+            f"(expected one of {sorted(accepted_types)}) -- refusing to consume a mismatched report."
+        )
+    if schema is not None and schema not in SUPPORTED_MOBILE_REPORT_SCHEMA_VERSIONS:
+        return (
+            f"reportSchemaVersion {schema!r} is unsupported "
+            f"(supported: {sorted(SUPPORTED_MOBILE_REPORT_SCHEMA_VERSIONS)}) -- refusing to consume it."
+        )
+    return None
+
+
+def component_from_api_report(
+    name: str,
+    report_dict: "dict[str, Any] | None",
+    *,
+    mandatory: bool = True,
+    accepted_types: "frozenset[str] | None" = None,
+) -> ComponentResult:
     """Build a ComponentResult from CaleeMobile-Regression's --report json
     shape (shared by the Client API suite and the mobile Android/iPhone UI
     suites -- see api/caleemobile_regression/reporting.py and
     ui/run_ui_suite.py in that repo).
+
+    ``accepted_types`` (when given) is the set of reportTypes valid for this
+    component: a report DECLARING a different type, or an unsupported schema
+    version, is BLOCKED rather than consumed (Workstream 1).
 
     Each step may carry "mandatory" (bool, default True when absent -- the
     API report's steps don't have this concept at all yet, so absence must
@@ -503,6 +591,12 @@ def component_from_api_report(name: str, report_dict: "dict[str, Any] | None", *
     """
     if report_dict is None:
         return ComponentResult(name=name, status=STATUS_NOT_RUN, mandatory=mandatory, detail=["Not executed."])
+    envelope_problem = _mobile_report_envelope_problem(report_dict, accepted_types)
+    if envelope_problem:
+        return ComponentResult(
+            name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=1,
+            detail=[envelope_problem], evidence=report_dict,
+        )
     counts = report_dict.get("counts", {})
     passed = counts.get("PASS", 0)
     failed = counts.get("FAIL", 0)
@@ -1881,15 +1975,24 @@ def build_release_report(
         component_from_environment_report("Test environment and regression fixture", environment, mandatory=True),
         component_from_tablet_report("Calee tablet", tablet, mandatory=True),
         _apply_exit_floor(
-            component_from_api_report("CaleeMobile Client API", mobile_api, mandatory=True),
+            component_from_api_report(
+                "CaleeMobile Client API", mobile_api, mandatory=True,
+                accepted_types=MOBILE_API_REPORT_TYPES,
+            ),
             floors.get("mobile-api"),
         ),
         _apply_exit_floor(
-            component_from_api_report("CaleeMobile Android UI", mobile_android_ui, mandatory=android_mandatory),
+            component_from_api_report(
+                "CaleeMobile Android UI", mobile_android_ui, mandatory=android_mandatory,
+                accepted_types=MOBILE_UI_REPORT_TYPES,
+            ),
             floors.get("mobile-android"),
         ),
         _apply_exit_floor(
-            component_from_api_report("CaleeMobile iPhone UI", mobile_ios_ui, mandatory=ios_mandatory),
+            component_from_api_report(
+                "CaleeMobile iPhone UI", mobile_ios_ui, mandatory=ios_mandatory,
+                accepted_types=MOBILE_UI_REPORT_TYPES,
+            ),
             floors.get("mobile-ios"),
         ),
         component_from_manual_checks(manual_checks or []),

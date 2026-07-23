@@ -39,6 +39,7 @@ import yaml
 from click.testing import CliRunner
 
 from calee_regression import cli, run_context
+from tablet_fixtures import TABLET_CERTIFYING_ENVELOPE as _TABLET_CERTIFYING_ENVELOPE
 from calee_regression.models import EXIT_REGRESSION, EXIT_SUCCESS
 from calee_regression.suites import REPO_ROOT
 
@@ -91,7 +92,7 @@ def _seed_full_run(tmp_path, *, run_id, tablet_status="passed", installation_sta
         ]},
     })
     _w("environment", {"status": "pass", "detail": []})
-    _w("tablet", {"passed_count": 1 if tablet_status == "passed" else 0,
+    _w("tablet", {**_TABLET_CERTIFYING_ENVELOPE, "passed_count": 1 if tablet_status == "passed" else 0,
                   "failed_count": 1 if tablet_status == "failed" else 0,
                   "blocked_count": 0, "skipped_count": 0,
                   "scenarios": [{"name": "REG-TABLET", "status": tablet_status}]})
@@ -306,7 +307,10 @@ if len(argv) >= 3 and argv[0] == "-m" and argv[1] == "calee_regression":
         wc("selector-contract", {{"status": "pass" if exit_code == 0 else "blocked"}})
         sys.exit(exit_code)
     if cmd == "suite":
-        wc("tablet", {{"passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
+        wc("tablet", {{"reportType": "tablet-scenario-suite", "reportSchemaVersion": 1,
+                       "deviceInitializationMode": "standard", "diagnosticMode": False,
+                       "certificationEligible": True,
+                       "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
                        "scenarios": [{{"name": "REG", "status": "passed"}}]}})
         sys.exit(0)
     if cmd == "sync-smoke":

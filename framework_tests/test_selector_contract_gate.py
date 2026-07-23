@@ -19,6 +19,7 @@ import pytest
 from click.testing import CliRunner
 
 from calee_regression import run_context
+from tablet_fixtures import TABLET_CERTIFYING_ENVELOPE as _TABLET_CERTIFYING_ENVELOPE
 from calee_regression.cli import main
 from calee_regression.models import EXIT_BLOCKED, EXIT_SUCCESS
 
@@ -364,6 +365,7 @@ def _seed_release(tmp_path, run_id=RUN_ID, *, selector_report="valid", selector_
 
     write("environment", {"runId": run_id, "status": "pass", "detail": []})
     write("tablet", {
+        **_TABLET_CERTIFYING_ENVELOPE,
         "runId": run_id, "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
         "scenarios": [{"name": "a", "status": "passed"}],
     })

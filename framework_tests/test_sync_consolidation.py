@@ -21,6 +21,7 @@ import pytest
 from click.testing import CliRunner
 
 from calee_regression import run_context
+from tablet_fixtures import TABLET_CERTIFYING_ENVELOPE as _TABLET_CERTIFYING_ENVELOPE
 from calee_regression.cli import main
 from calee_regression.consolidated_report import (
     STATUS_BLOCKED,
@@ -106,6 +107,7 @@ def test_marker_with_unrecognized_status_is_blocked_not_trusted():
 # ── build_release_report: sync as a gating component ─────────────────────────
 
 PASSING_TABLET = {
+    **_TABLET_CERTIFYING_ENVELOPE,
     "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
     "scenarios": [{"name": "a", "status": "passed"}],
 }

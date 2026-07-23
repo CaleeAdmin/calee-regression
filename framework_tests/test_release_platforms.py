@@ -21,6 +21,7 @@ import pytest
 from click.testing import CliRunner
 
 from calee_regression import release_platforms, run_context
+from tablet_fixtures import certifying
 from calee_regression.cli import main
 from calee_regression.models import EXIT_BLOCKED, EXIT_SUCCESS
 
@@ -162,11 +163,11 @@ def test_expected_build_identity_non_mapping_raises(tmp_path):
 
 
 PASSING_ENVIRONMENT = {"runId": RUN_ID, "status": "pass", "detail": ["Environment and fixture ready."]}
-PASSING_TABLET = {
+PASSING_TABLET = certifying({
     "runId": RUN_ID,
     "passed_count": 1, "failed_count": 0, "blocked_count": 0, "skipped_count": 0,
     "scenarios": [{"name": "a", "status": "passed"}],
-}
+})
 PASSING_API = {"runId": RUN_ID, "counts": {"PASS": 1}, "steps": [{"name": "x", "status": "PASS"}]}
 PASSING_MOBILE_UI = {"runId": RUN_ID, "counts": {"PASS": 3}, "steps": [{"name": "y", "status": "PASS"}] * 3}
 PASSING_MANUAL = {
