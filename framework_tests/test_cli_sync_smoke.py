@@ -24,7 +24,12 @@ def _isolate_repo_root(tmp_path, monkeypatch):
 
 def test_rejects_invalid_run_id():
     runner = CliRunner()
-    result = runner.invoke(main, ["sync-smoke", "--run-id", "bad run id!", "--base-url", "x", "--email", "a", "--password", "p"])
+    # The password reaches the command via its environment -- an argv secret
+    # is rejected outright now (see test_secret_argv_policy.py).
+    result = runner.invoke(
+        main, ["sync-smoke", "--run-id", "bad run id!", "--base-url", "x", "--email", "a"],
+        env={"CALEE_TEST_PASSWORD": "p"},
+    )
     assert result.exit_code == EXIT_INVALID_CONFIG
     assert "Invalid --run-id" in result.output
 

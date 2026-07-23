@@ -122,6 +122,10 @@ class FocusedResult:
     validation_problems: "list[str]" = field(default_factory=list)
     supervision: "dict | None" = None
     blocked_by: "str | None" = None
+    # How this step's evidence came to be in THIS invocation's summary:
+    # "executed" (ran now) or "reused" (a prior invocation's immutable report,
+    # referenced by original path + digest -- see focused_resume.py).
+    evidence: str = "executed"
 
     def to_dict(self) -> dict:
         return {
@@ -136,6 +140,7 @@ class FocusedResult:
             "validationProblems": list(self.validation_problems),
             "supervision": self.supervision,
             "blockedBy": self.blocked_by,
+            "evidence": self.evidence,
         }
 
 

@@ -177,3 +177,44 @@ with exactly the scope the release composed — never a second bash/legacy parse
 ```bash
 eval "$(python -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"
 ```
+
+### `release-remediation-plan` — plan release remediation from a focused run
+
+Compares a `focused-verify` run's newest validated summary against a blocked
+release run's manifest (and consolidated report where present), classifies
+every expected release component (framework-fixed and resumable, still
+untested, must be rerun, Android unqualified, kiosk authorization required,
+or fresh-run-required on a hard input mismatch), and writes ONE immutable
+plan to `reports/runs/<release-run>/remediation/<focused-invocation>/remediation.json`.
+The plan is **diagnostic planning evidence only** — it never modifies any
+release component/report, and `NO_RELEASE_PROMOTION_ALLOWED` is always among
+its decisions. Exit codes: 0 plan produced, 2 invalid invocation, 3 inputs
+could not be validated (missing summary/manifest, digest mismatch).
+
+```bash
+python3 -m calee_regression release-remediation-plan \
+  --focused-run focused-20260723-101500-abc123 \
+  --release-run release-20260720-090000-def456
+```
+
+### `focused-verify --resume-run-id` — safe focused resume
+
+Continues an existing focused run under the SAME run id with a NEW invocation
+directory, reusing prior PASS evidence (referenced by original path + sha256
+digest, marked `"evidence": "reused"` in the new summary) ONLY when every
+resume criterion is positively verified: framework/product SHAs, backend,
+fixture version, fixture ownership and generation identity, device id,
+installed build identity, execution purpose, feature scope, child report
+digests, and report schema. Any single unprovable criterion refuses the WHOLE
+resume with the failed criteria named. BLOCKED/not-run/invalid-config steps
+are re-executed; a prior product FAIL is retained as-is unless `--retry-failed`
+reruns it as a NEW attempt (old evidence is never deleted).
+
+```bash
+python3 -m calee_regression focused-verify --config config/tester.local.yaml \
+  --resume-run-id run-20260723-101500-abc123   # add --retry-failed to rerun FAILs
+```
+
+Every `focused-verify` invocation also writes a plain-language `summary.txt`
+next to the machine `summary.json` (same immutability), including the exact
+next command to run.

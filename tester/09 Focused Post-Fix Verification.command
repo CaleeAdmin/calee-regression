@@ -8,6 +8,11 @@ echo "recurring-calendar tablet scenarios (standard + diagnostic), the focused"
 echo "stop-repeating API scenario twice, and a focused iPhone environment check."
 echo "This is a diagnostic check — it is NOT a release certification."
 echo ""
+echo "Each run produces TWO summaries next to each other:"
+echo "  summary.json — the machine summary (immutable, digest-bound)"
+echo "  summary.txt  — the plain-language summary (what passed/failed/blocked,"
+echo "                 the identity tested, and the exact next command to run)"
+echo ""
 
 # shellcheck source=../scripts/ensure_environment.sh
 source scripts/ensure_environment.sh

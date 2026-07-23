@@ -351,3 +351,256 @@ def test_missing_backend_blocks_before_any_mutation(harness, monkeypatch):
     assert result.exit_code == models.EXIT_BLOCKED
     assert harness.children.calls == []
     assert "production default" in result.output
+
+
+# ── fixture ownership lock (fixture_ownership.py integration) ──────────────
+def _lock_scope():
+    from calee_regression import fixture_ownership as fo
+
+    return fo.LockScope(
+        backend=BACKEND, account_fingerprint=fo.account_fingerprint(EMAIL),
+        fixture_version="unknown",
+    )
+
+
+def test_summary_records_fixture_ownership_acquired_and_released(harness):
+    result = harness.invoke()
+    assert result.exit_code == models.EXIT_SUCCESS, result.output
+    summary, _ = _summary(harness)
+    ownership = summary["fixtureOwnership"]
+    assert ownership["exclusivityScope"] == "host-local"
+    assert "cross-host" in ownership["limitation"].lower()
+    assert ownership["acquisition"]["state"] == "acquired"
+    assert ownership["acquisition"]["owner"]["runId"] == summary["runId"]
+    assert ownership["release"]["state"] == "released"
+    # the lock is gone after the run
+    from calee_regression import fixture_ownership as fo
+
+    lock_root = harness.report_root / "reports" / "locks"
+    assert fo.status(lock_root, _lock_scope()).state == fo.STATE_NOT_HELD
+    # and the fingerprint never exposes the email
+    assert EMAIL not in json.dumps(ownership)
+
+
+def test_active_owner_lock_blocks_before_any_mutation(harness):
+    from calee_regression import fixture_ownership as fo
+
+    lock_root = harness.report_root / "reports" / "locks"
+    held = fo.acquire(lock_root, _lock_scope(), run_id="other-run", now=lambda: "t")
+    assert held.state == fo.STATE_ACQUIRED  # this pid is alive -> active owner
+    result = harness.invoke()
+    assert result.exit_code == models.EXIT_BLOCKED
+    assert "active_owner" in result.output
+    assert harness.children.calls == []  # nothing product-mutating ran
+    assert not list(harness.report_root.glob("reports/runs/*/focused-verify/*/summary.json"))
+    # the other run's lock is untouched
+    assert fo.status(lock_root, _lock_scope()).owner["runId"] == "other-run"
+
+
+def test_stale_lock_blocks_and_names_the_recovery_command(harness, monkeypatch):
+    from calee_regression import fixture_ownership as fo
+
+    lock_root = harness.report_root / "reports" / "locks"
+    fo.acquire(lock_root, _lock_scope(), run_id="dead-run", pid=2, now=lambda: "t")
+    monkeypatch.setattr(fo, "default_pid_alive", lambda pid: False)
+    result = harness.invoke()
+    assert result.exit_code == models.EXIT_BLOCKED
+    assert "stale_lock" in result.output
+    assert "fixture-lock recover-stale" in result.output
+    assert harness.children.calls == []
+
+
+# ── installed-artifact identity attestation (installed_artifact.py) ────────
+def test_summary_records_unproven_attestation_without_blocking(harness):
+    # The harness cfg has no apk_path -> attestation is unproven; focused-verify
+    # is non-certifying, so every step still runs.
+    result = harness.invoke()
+    assert result.exit_code == models.EXIT_SUCCESS, result.output
+    summary, _ = _summary(harness)
+    attestation = summary["installedArtifactIdentity"]
+    assert attestation["status"] == "unproven"
+    assert attestation["reason"]
+    by_id = {s["id"]: s for s in summary["steps"]}
+    assert by_id["tablet-standard"]["status"] == "pass"
+
+
+def test_identity_mismatch_blocks_tablet_steps_but_not_api_or_ios(harness, monkeypatch):
+    from calee_regression import installed_artifact as ia
+
+    monkeypatch.setattr(
+        cli, "_reconcile_installed_artifact",
+        lambda cfg, repo: ia.ReconcileResult(
+            status=ia.STATUS_MISMATCH, mismatched_fields=["versionCode"],
+            expected={"versionCode": "25"}, installed={"versionCode": "24"},
+            reason="installed app identity differs from the configured APK.",
+        ).to_dict(),
+    )
+    result = harness.invoke()
+    keys = [harness.children.key_for(c) for c, *_ in harness.children.calls]
+    assert keys == ["fixture", "api-1", "api-2", "ios"]  # tablet never started
+    summary, _ = _summary(harness)
+    by_id = {s["id"]: s for s in summary["steps"]}
+    for step_id in ("tablet-standard", "tablet-diagnostic"):
+        assert by_id[step_id]["status"] == "blocked"
+        assert by_id[step_id]["blockedBy"] == "installed-artifact-identity"
+        assert "versionCode" in by_id[step_id]["detail"]
+    assert by_id["api-1"]["status"] == "pass"
+    assert summary["installedArtifactIdentity"]["mismatchedFields"] == ["versionCode"]
+    assert result.exit_code == models.EXIT_BLOCKED
+
+
+# ── plain-language summary companion (focused_human_summary.py) ────────────
+def test_summary_txt_written_alongside_machine_summary(harness):
+    result = harness.invoke()
+    assert result.exit_code == models.EXIT_SUCCESS, result.output
+    summary, summary_path = _summary(harness)
+    txt_path = summary_path.parent / "summary.txt"
+    assert txt_path.is_file()
+    assert str(txt_path) in result.output
+    text = txt_path.read_text()
+    from calee_regression import focused_human_summary
+
+    assert text == focused_human_summary.render(json.loads(summary_path.read_text()))
+    assert focused_human_summary.NON_CERTIFICATION_STATEMENT in text
+    for step in summary["steps"]:
+        assert step["title"] in text
+    assert PASSWORD not in text and EMAIL not in text
+    assert not (txt_path.stat().st_mode & stat.S_IWUSR)  # immutable like the JSON
+
+
+# ── safe resume (--resume-run-id, focused_resume.py) ───────────────────────
+@pytest.fixture
+def resume_harness(harness, monkeypatch):
+    """The orchestration harness with a fully verifiable identity: stable git
+    SHAs and a VERIFIED installed-artifact attestation, so every resume
+    criterion can be positively verified across invocations."""
+    monkeypatch.setattr(cli, "_repo_head_sha", lambda path: "fake-sha")
+    monkeypatch.setattr(cli, "_repo_dirty", lambda path: False)
+    monkeypatch.setattr(
+        cli, "_reconcile_installed_artifact",
+        lambda cfg, repo: {"status": "verified",
+                           "installed": {"versionName": "2.5.0", "versionCode": "25"}})
+    return harness
+
+
+def _run_id(harness):
+    runs = list(harness.report_root.glob("reports/runs/*"))
+    assert len(runs) == 1
+    return runs[0].name
+
+
+def _summaries(harness):
+    paths = sorted(
+        harness.report_root.glob("reports/runs/*/focused-verify/*/summary.json"),
+        key=lambda p: p.parent.name)
+    return [(json.loads(p.read_text()), p) for p in paths]
+
+
+def test_resume_reuses_every_prior_pass_without_rerunning(resume_harness):
+    first = resume_harness.invoke()
+    assert first.exit_code == models.EXIT_SUCCESS, first.output
+    run_id = _run_id(resume_harness)
+    first_summary, first_path = _summary(resume_harness)
+    resume_harness.children.calls.clear()
+    second = resume_harness.invoke("--resume-run-id", run_id)
+    assert second.exit_code == models.EXIT_SUCCESS, second.output
+    assert resume_harness.children.calls == []  # nothing re-executed, not even fixture
+    summaries = _summaries(resume_harness)
+    assert len(summaries) == 2  # SAME run id, NEW invocation dir
+    resumed, resumed_path = summaries[-1]
+    assert resumed["runId"] == run_id
+    assert resumed_path.parent != first_path.parent
+    by_id = {s["id"]: s for s in resumed["steps"]}
+    for step in by_id.values():
+        assert step["evidence"] == "reused", step
+        assert step["status"] == "pass"
+    # reused steps reference the ORIGINAL reports by path + digest
+    first_by_id = {s["id"]: s for s in first_summary["steps"]}
+    for step_id in ("tablet-standard", "api-1", "ios"):
+        assert by_id[step_id]["reportPath"] == first_by_id[step_id]["reportPath"]
+        assert by_id[step_id]["reportSha256"] == first_by_id[step_id]["reportSha256"]
+    assert resumed["resume"]["resumedRunId"] == run_id
+    assert resumed["resume"]["executedSteps"] == []
+    # prior evidence is untouched
+    assert json.loads(first_path.read_text()) == first_summary
+
+
+def test_resume_refuses_when_identity_cannot_be_verified(resume_harness, monkeypatch):
+    first = resume_harness.invoke()
+    assert first.exit_code == models.EXIT_SUCCESS, first.output
+    run_id = _run_id(resume_harness)
+    # the installed artifact can no longer be positively verified
+    monkeypatch.setattr(
+        cli, "_reconcile_installed_artifact",
+        lambda cfg, repo: {"status": "unproven", "reason": "adb unavailable"})
+    resume_harness.children.calls.clear()
+    result = resume_harness.invoke("--resume-run-id", run_id)
+    assert result.exit_code == models.EXIT_BLOCKED
+    assert "installed build identity" in result.output
+    assert "focused-verify --config config/tester.local.yaml" in result.output
+    assert "<" not in result.output.split("focused-verify --config")[1].splitlines()[0]
+    assert resume_harness.children.calls == []  # nothing ran
+    assert len(_summaries(resume_harness)) == 1  # no new summary was written
+
+
+def test_resume_retains_prior_fail_unless_retry_failed(resume_harness):
+    resume_harness.children.behavior["api-1"] = {
+        "exit_code": 1, "report": {"status": "FAIL", "counts": {"FAIL": 1}}}
+    first = resume_harness.invoke()
+    assert first.exit_code == models.EXIT_REGRESSION
+    run_id = _run_id(resume_harness)
+    resume_harness.children.calls.clear()
+    second = resume_harness.invoke("--resume-run-id", run_id)
+    assert second.exit_code == models.EXIT_REGRESSION  # retained FAIL stays visible
+    assert resume_harness.children.calls == []  # NOT rerun by default
+    resumed, _ = _summaries(resume_harness)[-1]
+    by_id = {s["id"]: s for s in resumed["steps"]}
+    assert by_id["api-1"]["status"] == "fail"
+    assert by_id["api-1"]["evidence"] == "reused"
+    assert "never automatically rerun" in by_id["api-1"]["detail"]
+    # --retry-failed reruns it as a NEW attempt (old evidence preserved)
+    resume_harness.children.behavior["api-1"] = {}
+    third = resume_harness.invoke("--resume-run-id", run_id, "--retry-failed")
+    assert third.exit_code == models.EXIT_SUCCESS, third.output
+    keys = [resume_harness.children.key_for(c) for c, *_ in resume_harness.children.calls]
+    assert keys == ["api-1"]
+    retried, _ = _summaries(resume_harness)[-1]
+    by_id = {s["id"]: s for s in retried["steps"]}
+    assert by_id["api-1"]["status"] == "pass"
+    assert by_id["api-1"]["evidence"] == "executed"
+
+
+def test_resume_reexecutes_blocked_steps_only(resume_harness, monkeypatch):
+    monkeypatch.setattr(
+        cli, "_ensure_appium_for_command",
+        lambda cfg, **k: cli.AppiumLifecycleState(False, "unavailable", "u"))
+    first = resume_harness.invoke()
+    assert first.exit_code == models.EXIT_BLOCKED  # tablet steps blocked
+    run_id = _run_id(resume_harness)
+    monkeypatch.setattr(
+        cli, "_ensure_appium_for_command",
+        lambda cfg, **k: cli.AppiumLifecycleState(True, "started", "u"))
+    resume_harness.children.calls.clear()
+    second = resume_harness.invoke("--resume-run-id", run_id)
+    assert second.exit_code == models.EXIT_SUCCESS, second.output
+    keys = sorted(resume_harness.children.key_for(c) for c, *_ in resume_harness.children.calls)
+    assert keys == ["tablet-diagnostic", "tablet-standard"]  # only the blocked steps
+    resumed, _ = _summaries(resume_harness)[-1]
+    by_id = {s["id"]: s for s in resumed["steps"]}
+    assert by_id["tablet-standard"]["evidence"] == "executed"
+    assert by_id["api-1"]["evidence"] == "reused"
+
+
+def test_resume_without_prior_summary_refuses(resume_harness):
+    result = resume_harness.invoke("--resume-run-id", "run-that-never-existed")
+    assert result.exit_code == models.EXIT_BLOCKED
+    assert "no prior focused-verify summary" in result.output
+    assert resume_harness.children.calls == []
+
+
+def test_invalid_resume_options_are_invalid_invocation(resume_harness):
+    result = resume_harness.invoke("--resume-run-id", "bad id!")
+    assert result.exit_code == models.EXIT_INVALID_CONFIG
+    result = resume_harness.invoke("--retry-failed")
+    assert result.exit_code == models.EXIT_INVALID_CONFIG
+    assert resume_harness.children.calls == []
