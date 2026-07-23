@@ -18,11 +18,16 @@ from . import build_identity as build_identity_mod
 from . import build_provenance as build_provenance_mod
 from . import config as config_mod
 from . import credentials as credentials_mod
+from . import fixture_ownership as fixture_ownership_mod
 from . import focused_context
 from . import focused_contract as focused_contract_mod
+from . import installed_artifact as installed_artifact_mod
+from . import focused_human_summary
 from . import focused_report_validation
+from . import focused_resume as focused_resume_mod
 from . import focused_supervision
 from . import focused_workflow
+from . import remediation_plan as remediation_plan_mod
 from . import distributed_build_acceptance as distributed_build_acceptance_mod
 from . import manual_checks as manual_checks_mod
 from . import provider_evidence as provider_evidence_mod
@@ -402,6 +407,33 @@ def _write_environment_report(
     return path
 
 
+def _enforce_secret_argv_policy(param_name: str, option: str, *, orchestrated: bool) -> None:
+    """Secret-on-argv policy: environment/Keychain remain the supported paths
+    (the envvar fallback stays); a secret literally placed ON THE COMMAND LINE
+    is visible in shell history and process listings, so it is REJECTED
+    (BLOCKED) for orchestrated/strict commands and DEPRECATED (warn-but-work)
+    for the standalone ones. The secret value is never echoed either way."""
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return
+    if ctx.get_parameter_source(param_name) != click.core.ParameterSource.COMMANDLINE:
+        return
+    if orchestrated:
+        click.echo(
+            f"BLOCKED: {option} must not be passed on the command line for this command "
+            f"(it would be visible in shell history and process listings). Use "
+            f"CALEE_TEST_PASSWORD or the macOS Keychain instead. The value was not echoed "
+            f"and nothing was run.",
+            err=True,
+        )
+        raise SystemExit(EXIT_BLOCKED)
+    click.echo(
+        f"WARNING: {option} on the command line is deprecated and will be removed; "
+        f"use CALEE_TEST_PASSWORD or the macOS Keychain.",
+        err=True,
+    )
+
+
 def _fill_credentials_from_providers(email, password):
     """Fill a missing regression email/password from the environment and then the
     macOS Keychain (credentials.default_resolver's chain: injected CLI value ->
@@ -470,6 +502,7 @@ def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suit
     Prepare step is always traceable even when it fails before reaching
     the fixture-reset stage.
     """
+    _enforce_secret_argv_policy("fixture_password", "--fixture-password", orchestrated=False)
     cfg = _load_config_or_exit(config_path)
     run_id = _resolve_run_id(run_id_opt)
     workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
@@ -546,6 +579,7 @@ def prepare_fixture(config_path, fixture_base_url, fixture_email, fixture_passwo
     checks depend only on this; `prepare` (full release) stays strict by
     running Appium + device preflight FIRST and then this same flow.
     """
+    _enforce_secret_argv_policy("fixture_password", "--fixture-password", orchestrated=False)
     run_id = _resolve_run_id(run_id_opt)
     workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
     workspace.ensure_created()
@@ -1330,6 +1364,33 @@ def _repo_dirty(path: Path) -> "bool | None":
     return bool(result.stdout.strip())
 
 
+def _reconcile_installed_artifact(cfg, mobile_repo: Path) -> dict:
+    """Best-effort installed-artifact identity attestation for focused-verify
+    (installed_artifact.py): reconcile the configured APK's expected identity
+    against the app actually installed on the tablet, and record the cheaply
+    observable iPhone-side identity (CaleeMobile checkout git SHA/dirty +
+    pubspec version, read-only). NEVER crashes the run -- any failure is an
+    `unproven` result with the reason."""
+    try:
+        result = installed_artifact_mod.reconcile(
+            apk_path=getattr(cfg, "apk_path", None),
+            app_package=getattr(cfg, "app_package", None),
+            serial=getattr(cfg, "udid", None),
+        )
+    except Exception as exc:  # noqa: BLE001 -- attestation is evidence, never a crash
+        result = installed_artifact_mod.ReconcileResult(
+            status=installed_artifact_mod.STATUS_UNPROVEN,
+            reason=f"attestation raised: {exc}",
+        )
+    try:
+        result.iphone_observed = installed_artifact_mod.iphone_observed_identity(
+            mobile_repo.parent / "CaleeMobile", head_sha=_repo_head_sha, dirty=_repo_dirty,
+        )
+    except Exception:  # noqa: BLE001 -- optional evidence only
+        pass
+    return result.to_dict()
+
+
 def _build_focused_verify_steps(
     *, context: focused_context.FocusedVerifiedContext, config_path, tablet_scenario, tablet_repeat,
     api_suite, ios_target, mobile_repo: Path, focused_dir: Path, workspace,
@@ -1483,9 +1544,17 @@ def _focused_dependency_graph(skip_api: bool, skip_ios: bool) -> dict:
 @click.option("--preflight-only", "preflight_only", is_flag=True, default=False,
               help="Validate paths/credentials/backend/contract/toolchain readiness and exit -- "
                    "never resets the fixture, mutates an API, or starts a product test.")
+@click.option("--resume-run-id", "resume_run_id", default=None,
+              help="Resume an existing focused run: reuse prior PASS evidence (by original "
+                   "path + digest) ONLY when every resume criterion is positively verified; "
+                   "any doubt refuses the whole resume. Continues the SAME run id with a NEW "
+                   "invocation directory.")
+@click.option("--retry-failed", "retry_failed", is_flag=True, default=False,
+              help="With --resume-run-id: rerun prior product FAILs as NEW attempts (old "
+                   "evidence is never deleted). Without it, prior FAILs are retained as-is.")
 def focused_verify(config_path, tablet_scenario, tablet_repeat, api_suite, ios_target,
                    mobile_regression_repo, skip_api, skip_ios, step_timeouts_opt,
-                   plan_only, preflight_only):
+                   plan_only, preflight_only, resume_run_id, retry_failed):
     """Permanent focused post-fix verification.
 
     One command, one fresh run id: credential preflight, Appium-independent
@@ -1505,6 +1574,12 @@ def focused_verify(config_path, tablet_scenario, tablet_repeat, api_suite, ios_t
     # ---- Static invocation validation (exit 2 BEFORE any product work). ----
     if tablet_repeat < 1:
         click.echo(f"--tablet-repeat must be >= 1, got {tablet_repeat}", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    if resume_run_id is not None and not run_context.is_valid_run_id(resume_run_id):
+        click.echo(f"Invalid --resume-run-id {resume_run_id!r} (expected letters/digits/._- only).", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    if retry_failed and not resume_run_id:
+        click.echo("--retry-failed requires --resume-run-id.", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
     timeouts = _parse_step_timeouts(step_timeouts_opt)
     mobile_repo = Path(mobile_regression_repo) if mobile_regression_repo else _default_mobile_regression_repo()
@@ -1603,172 +1678,372 @@ def focused_verify(config_path, tablet_scenario, tablet_repeat, api_suite, ios_t
 
     cfg = _load_config_or_exit(config_path)
     started_at = _utc_now_iso()
-    run_id = _resolve_run_id(None)  # a fresh, REAL run id -- never a placeholder
-    release_id = f"focused-diagnostic-{run_id}"
-    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
-    workspace.ensure_created()
-    invocation_id = targeted_repeat_mod.new_invocation_id()
-    focused_dir = workspace.root / "focused-verify" / _sanitize_component_name(invocation_id)
-    focused_dir.mkdir(parents=True, exist_ok=False)  # immutable per-invocation dir
-    click.echo(f"Focused-verify run ID: {run_id} (invocation {invocation_id})")
-
-    # Secrets flow to children through their ENVIRONMENT only (never argv);
-    # the temporary parent dict is scrubbed after orchestration.
-    resolved_secrets = {
-        credentials_mod.REGRESSION_USERNAME.name: email,
-        credentials_mod.REGRESSION_PASSWORD.name: password,
-    }
-    secret_env_map = {
-        credentials_mod.REGRESSION_USERNAME.name: "CALEE_TEST_EMAIL",
-        credentials_mod.REGRESSION_PASSWORD.name: "CALEE_TEST_PASSWORD",
-    }
-
-    def _child_env(extra: dict) -> dict:
-        env = credentials_mod.build_env(None, resolved_secrets, secret_env_map)
-        for key, value in extra.items():
-            if value is None:
-                env.pop(key, None)
-            else:
-                env[key] = value
-        return env
-
-    def _run_supervised(step: "focused_workflow.FocusedStep", extra_env: dict):
-        return _supervised_runner(
-            step.command,
-            env=_child_env(extra_env),
-            cwd=step.metadata.get("cwd"),
-            timeout_seconds=step.timeout_seconds or _FOCUSED_STEP_TIMEOUTS["api"],
-        )
-
-    # ---- Fixture preparation FIRST (Appium-independent), then the verified
-    # context every later child command is built from (Workstream 1/3). ----
-    py = sys.executable
-    config_args = ["--config", config_path] if config_path else []
-    fixture_step = focused_workflow.FocusedStep(
-        id="fixture", title="Fixture preparation (Appium-independent)",
-        requires_appium=False, timeout_seconds=timeouts["fixture"],
-        command=[py, "-m", "calee_regression", "prepare-fixture", *config_args,
-                 "--run-id", run_id, "--suite", "calendar"],
-    )
-    click.echo(f"-> {fixture_step.title}")
-    fixture_outcome = _run_supervised(fixture_step, {"CALEE_RUN_ID": run_id, "CALEE_API_BASE": backend_requested})
-    fixture_report_path = workspace.component_report_path("environment")
-    fixture_validation = focused_report_validation.validate_child_report(
-        fixture_report_path,
-        expected_type="fixture-preparation",
-        child_exit_code=fixture_outcome.exit_code,
-        expected_run_id=run_id,
-        expected_backend=backend_requested,
-    )
-    fixture_status = focused_workflow.classify_exit_code(fixture_outcome.exit_code) \
-        if fixture_outcome.exit_code is not None else focused_workflow.STATUS_BLOCKED
-    fixture_detail = ""
-    if fixture_status == focused_workflow.STATUS_PASS and not fixture_validation.ok:
-        fixture_status = focused_workflow.STATUS_BLOCKED
-        fixture_detail = "fixture report failed validation: " + "; ".join(fixture_validation.problems)
-    elif fixture_outcome.exit_code is None:
-        fixture_detail = "fixture preparation produced no exit code (timeout/kill)"
-    fixture_result = focused_workflow.FocusedResult(
-        id="fixture", title=fixture_step.title, status=fixture_status,
-        exit_code=fixture_outcome.exit_code, detail=fixture_detail,
-        report_path=str(fixture_report_path), report_sha256=fixture_validation.digest,
-        validation_problems=list(fixture_validation.problems),
-        supervision=fixture_outcome.to_dict(),
-    )
-    click.echo(f"   {fixture_step.title}: {fixture_status.upper()} (exit {fixture_outcome.exit_code})")
-
-    context = None
-    context_error = None
-    if fixture_status == focused_workflow.STATUS_PASS:
-        try:
-            context = focused_context.build_verified_context(
-                fixture_validation.report,
-                run_id=run_id,
-                release_id=release_id,
-                regression_shas={
-                    "calee-regression": _repo_head_sha(REPO_ROOT) or "unknown",
-                    "caleemobile-regression": _repo_head_sha(mobile_repo) or "unknown",
-                },
-                product_build={
-                    "caleeMobileRepo": str(mobile_repo.parent / "CaleeMobile"),
-                    "caleeMobileSha": _repo_head_sha(mobile_repo.parent / "CaleeMobile"),
-                    "caleeMobileDirty": _repo_dirty(mobile_repo.parent / "CaleeMobile"),
-                },
-                tablet_device_id=getattr(cfg, "udid", None) or getattr(cfg, "device_name", None),
-                ios_device_id=os.environ.get("CALEE_UI_DEVICE_ID"),
-            )
-        except focused_context.FocusedContextError as exc:
-            context_error = str(exc)
-            fixture_result.status = focused_workflow.STATUS_BLOCKED
-            fixture_result.detail = f"verified context could not be constructed: {exc}"
-
-    if context is not None:
-        steps = _build_focused_verify_steps(
-            context=context, config_path=config_path, tablet_scenario=tablet_scenario,
-            tablet_repeat=tablet_repeat, api_suite=api_suite, ios_target=ios_target,
-            mobile_repo=mobile_repo, focused_dir=focused_dir, workspace=workspace,
-            skip_api=skip_api, skip_ios=skip_ios, timeouts=timeouts,
-        )
-
-        def _ensure():
-            return _ensure_appium_for_command(cfg)
-
-        def _run_step(step):
-            purpose = _FOCUSED_IOS_PURPOSE if step.id == "ios" else _FOCUSED_API_PURPOSE
-            return _run_supervised(step, {
-                "CALEE_RUN_ID": run_id,
-                "CALEE_RELEASE_ID": context.release_id,
-                "CALEE_API_BASE": context.backend,
-                "CALEE_FIXTURE_VERSION": context.fixture_version,
-                "CALEE_EXECUTION_PURPOSE": purpose,
-            })
-
-        def _stop():
-            appium_lifecycle.stop_appium_from_pid_file(_appium_pid_path())
-
-        def _validate(step, exit_code):
-            report_path = step.metadata.get("reportPath")
-            expected_type = step.metadata.get("expectedType")
-            if not report_path or not expected_type:
-                return None
-            return focused_report_validation.validate_child_report(
-                Path(report_path), expected_type=expected_type, child_exit_code=exit_code,
-                **step.metadata.get("expect", {}),
-            )
-
-        summary, exit_code = focused_workflow.run_focused_verify(
-            steps=steps, ensure_appium=_ensure, run_step=_run_step, stop_appium=_stop,
-            validate_step=_validate, initial_results=[fixture_result], log=click.echo,
-        )
+    if resume_run_id:
+        # Resume continues the SAME run id (a prior PASS is never copied into
+        # a different run) -- only the invocation directory below is new.
+        run_id = resume_run_id
     else:
-        # Fixture preparation failed (or its verified context could not be
-        # built): every dependent step is an explicit blocked_not_run naming
-        # the prerequisite -- no silent skip, no product mutation.
-        results = [fixture_result]
-        detail = (
-            f"prerequisite step 'fixture' did not pass (status: {fixture_result.status}, "
-            f"report: {fixture_report_path})"
-            + (f"; {context_error}" if context_error else "")
-            + " -- step not started."
+        run_id = _resolve_run_id(None)  # a fresh, REAL run id -- never a placeholder
+    release_id = f"focused-diagnostic-{run_id}"
+
+    # ---- Host-local fixture ownership lock (fixture_ownership.py): one run
+    # per backend+account+fixture ON THIS HOST. The focused contract exposes
+    # no fixture version before preparation runs, so the scope records
+    # "unknown". A non-acquired state BLOCKS before anything product-mutating
+    # is written; the lock is held through every child step and released in a
+    # finally. It is NEVER auto-broken -- stale recovery is the explicit
+    # `fixture-lock recover-stale` command only.
+    lock_root = _resolved_report_root() / "reports" / "locks"
+    lock_scope = fixture_ownership_mod.LockScope(
+        backend=backend_requested,
+        account_fingerprint=fixture_ownership_mod.account_fingerprint(email),
+        fixture_version="unknown",
+    )
+    lock_acquisition = fixture_ownership_mod.acquire(
+        lock_root, lock_scope, run_id=run_id, now=_utc_now_iso
+    )
+    if not lock_acquisition.acquired:
+        click.echo(
+            f"BLOCKED: fixture ownership lock not acquired "
+            f"(state: {lock_acquisition.state}). {lock_acquisition.detail}",
+            err=True,
         )
-        planned = [s for s in dependency_graph if s not in ("credential-preflight", "fixture")]
-        for step_id in planned:
-            results.append(focused_workflow.FocusedResult(
-                id=step_id, title=step_id, status=focused_workflow.STATUS_BLOCKED_NOT_RUN,
-                exit_code=None, detail=detail, blocked_by="fixture",
-            ))
-        overall = focused_workflow.aggregate_status([r.status for r in results])
-        summary = {
-            "reportType": focused_workflow.SUMMARY_REPORT_TYPE,
-            "reportSchemaVersion": focused_workflow.SUMMARY_SCHEMA_VERSION,
-            "appiumLifecycle": {"state": "not-attempted", "available": False},
-            "steps": [r.to_dict() for r in results],
-            "counts": {},
-            "status": overall,
-            "certificationEligible": False,
-            "certification": "not-a-release-certification (focused post-fix verification only)",
+        if lock_acquisition.state == fixture_ownership_mod.STATE_STALE_LOCK:
+            click.echo(
+                "Recover the provably stale lock explicitly with:\n"
+                f"  python3 -m calee_regression fixture-lock recover-stale "
+                f"--backend {backend_requested} --fixture-version unknown",
+                err=True,
+            )
+        click.echo(
+            "Nothing product-mutating was written. Note: this lock's exclusivity "
+            "scope is host-local only (see fixture_ownership.py).", err=True,
+        )
+        raise SystemExit(EXIT_BLOCKED)
+    lock_release_evidence = None
+    resume_evidence = None
+
+    try:
+        workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
+        workspace.ensure_created()
+        invocation_id = targeted_repeat_mod.new_invocation_id()
+        focused_dir = workspace.root / "focused-verify" / _sanitize_component_name(invocation_id)
+        focused_dir.mkdir(parents=True, exist_ok=False)  # immutable per-invocation dir
+        click.echo(f"Focused-verify run ID: {run_id} (invocation {invocation_id})")
+
+        # ---- Safe resume (focused_resume.py): load the run's NEWEST prior
+        # invocation summary. Every prior invocation's evidence stays
+        # immutable; this invocation only ever ADDS a new directory.
+        prior_summary = None
+        if resume_run_id:
+            prior_paths = sorted(
+                (p for p in (workspace.root / "focused-verify").glob("*/summary.json")
+                 if p.parent != focused_dir),
+                key=lambda p: p.parent.name,
+            )
+            if not prior_paths:
+                click.echo(
+                    "BLOCKED: focused resume refused -- no prior focused-verify summary "
+                    f"exists under {workspace.root / 'focused-verify'}. Start a fresh "
+                    "focused run instead:\n  " + focused_resume_mod.FRESH_RUN_COMMAND,
+                    err=True,
+                )
+                raise SystemExit(EXIT_BLOCKED)
+            prior_validation = focused_report_validation.validate_child_report(
+                prior_paths[-1], expected_type="focused-verify-summary",
+                expected_run_id=run_id,
+            )
+            if not prior_validation.ok:
+                click.echo(
+                    "BLOCKED: focused resume refused -- the prior summary failed "
+                    "validation: " + "; ".join(prior_validation.problems)
+                    + ".\nPrior evidence is untouched. Start a fresh focused run instead:\n  "
+                    + focused_resume_mod.FRESH_RUN_COMMAND,
+                    err=True,
+                )
+                raise SystemExit(EXIT_BLOCKED)
+            prior_summary = prior_validation.report
+
+        # Secrets flow to children through their ENVIRONMENT only (never argv);
+        # the temporary parent dict is scrubbed after orchestration.
+        resolved_secrets = {
+            credentials_mod.REGRESSION_USERNAME.name: email,
+            credentials_mod.REGRESSION_PASSWORD.name: password,
         }
-        exit_code = focused_workflow.status_to_exit_code(overall)
+        secret_env_map = {
+            credentials_mod.REGRESSION_USERNAME.name: "CALEE_TEST_EMAIL",
+            credentials_mod.REGRESSION_PASSWORD.name: "CALEE_TEST_PASSWORD",
+        }
+
+        def _child_env(extra: dict) -> dict:
+            env = credentials_mod.build_env(None, resolved_secrets, secret_env_map)
+            for key, value in extra.items():
+                if value is None:
+                    env.pop(key, None)
+                else:
+                    env[key] = value
+            return env
+
+        def _run_supervised(step: "focused_workflow.FocusedStep", extra_env: dict):
+            return _supervised_runner(
+                step.command,
+                env=_child_env(extra_env),
+                cwd=step.metadata.get("cwd"),
+                timeout_seconds=step.timeout_seconds or _FOCUSED_STEP_TIMEOUTS["api"],
+            )
+
+        # ---- Fixture preparation FIRST (Appium-independent), then the verified
+        # context every later child command is built from (Workstream 1/3). ----
+        py = sys.executable
+        config_args = ["--config", config_path] if config_path else []
+        fixture_report_path = workspace.component_report_path("environment")
+        if resume_run_id:
+            # Never re-reset on resume: the prior invocation's fixture-
+            # preparation report must still exist and re-validate as-is. If
+            # the fixture would need a re-reset, all fixture-dependent prior
+            # evidence is invalid -- the whole resume is refused.
+            fixture_validation = focused_report_validation.validate_child_report(
+                fixture_report_path, expected_type="fixture-preparation",
+                expected_run_id=run_id, expected_backend=backend_requested,
+            )
+            prior_fixture = next(
+                (s for s in prior_summary.get("steps") or []
+                 if isinstance(s, dict) and s.get("id") == "fixture"), {})
+            if prior_fixture.get("status") != focused_workflow.STATUS_PASS or not fixture_validation.ok:
+                click.echo(
+                    "BLOCKED: focused resume refused -- fixture generation/reset "
+                    "identity could not be positively verified: "
+                    + ("; ".join(fixture_validation.problems)
+                       or f"prior fixture status was {prior_fixture.get('status')!r}")
+                    + ".\nPrior evidence is untouched. Start a fresh focused run instead:\n  "
+                    + focused_resume_mod.FRESH_RUN_COMMAND,
+                    err=True,
+                )
+                raise SystemExit(EXIT_BLOCKED)
+            fixture_status = focused_workflow.STATUS_PASS
+            fixture_result = focused_workflow.FocusedResult(
+                id="fixture", title="Fixture preparation (reused from prior invocation)",
+                status=fixture_status, exit_code=None,
+                detail="reused: prior fixture-preparation report re-validated and digest-bound",
+                report_path=str(fixture_report_path), report_sha256=fixture_validation.digest,
+                evidence=focused_resume_mod.EVIDENCE_REUSED,
+            )
+            click.echo(f"   {fixture_result.title}: PASS (reused)")
+        else:
+            fixture_step = focused_workflow.FocusedStep(
+                id="fixture", title="Fixture preparation (Appium-independent)",
+                requires_appium=False, timeout_seconds=timeouts["fixture"],
+                command=[py, "-m", "calee_regression", "prepare-fixture", *config_args,
+                         "--run-id", run_id, "--suite", "calendar"],
+            )
+            click.echo(f"-> {fixture_step.title}")
+            fixture_outcome = _run_supervised(fixture_step, {"CALEE_RUN_ID": run_id, "CALEE_API_BASE": backend_requested})
+            fixture_validation = focused_report_validation.validate_child_report(
+                fixture_report_path,
+                expected_type="fixture-preparation",
+                child_exit_code=fixture_outcome.exit_code,
+                expected_run_id=run_id,
+                expected_backend=backend_requested,
+            )
+            fixture_status = focused_workflow.classify_exit_code(fixture_outcome.exit_code) \
+                if fixture_outcome.exit_code is not None else focused_workflow.STATUS_BLOCKED
+            fixture_detail = ""
+            if fixture_status == focused_workflow.STATUS_PASS and not fixture_validation.ok:
+                fixture_status = focused_workflow.STATUS_BLOCKED
+                fixture_detail = "fixture report failed validation: " + "; ".join(fixture_validation.problems)
+            elif fixture_outcome.exit_code is None:
+                fixture_detail = "fixture preparation produced no exit code (timeout/kill)"
+            fixture_result = focused_workflow.FocusedResult(
+                id="fixture", title=fixture_step.title, status=fixture_status,
+                exit_code=fixture_outcome.exit_code, detail=fixture_detail,
+                report_path=str(fixture_report_path), report_sha256=fixture_validation.digest,
+                validation_problems=list(fixture_validation.problems),
+                supervision=fixture_outcome.to_dict(),
+            )
+            click.echo(f"   {fixture_step.title}: {fixture_status.upper()} (exit {fixture_outcome.exit_code})")
+
+        context = None
+        context_error = None
+        if fixture_status == focused_workflow.STATUS_PASS:
+            try:
+                context = focused_context.build_verified_context(
+                    fixture_validation.report,
+                    run_id=run_id,
+                    release_id=release_id,
+                    regression_shas={
+                        "calee-regression": _repo_head_sha(REPO_ROOT) or "unknown",
+                        "caleemobile-regression": _repo_head_sha(mobile_repo) or "unknown",
+                    },
+                    product_build={
+                        "caleeMobileRepo": str(mobile_repo.parent / "CaleeMobile"),
+                        "caleeMobileSha": _repo_head_sha(mobile_repo.parent / "CaleeMobile"),
+                        "caleeMobileDirty": _repo_dirty(mobile_repo.parent / "CaleeMobile"),
+                    },
+                    tablet_device_id=getattr(cfg, "udid", None) or getattr(cfg, "device_name", None),
+                    ios_device_id=os.environ.get("CALEE_UI_DEVICE_ID"),
+                )
+            except focused_context.FocusedContextError as exc:
+                context_error = str(exc)
+                fixture_result.status = focused_workflow.STATUS_BLOCKED
+                fixture_result.detail = f"verified context could not be constructed: {exc}"
+
+        # ---- Installed-artifact identity attestation (installed_artifact.py):
+        # best-effort, read-only, never crashes the run. focused-verify is
+        # already non-certifying, so `unproven` is recorded without blocking
+        # the diagnostic-purpose steps; a proven MISMATCH still blocks the
+        # tablet steps (the device would exercise a different build).
+        artifact_attestation = _reconcile_installed_artifact(cfg, mobile_repo)
+
+        if resume_run_id and context is None:
+            click.echo(
+                "BLOCKED: focused resume refused -- the verified context could not be "
+                f"reconstructed from the prior fixture evidence ({context_error}).\n"
+                "Prior evidence is untouched. Start a fresh focused run instead:\n  "
+                + focused_resume_mod.FRESH_RUN_COMMAND,
+                err=True,
+            )
+            raise SystemExit(EXIT_BLOCKED)
+
+        if context is not None:
+            steps = _build_focused_verify_steps(
+                context=context, config_path=config_path, tablet_scenario=tablet_scenario,
+                tablet_repeat=tablet_repeat, api_suite=api_suite, ios_target=ios_target,
+                mobile_repo=mobile_repo, focused_dir=focused_dir, workspace=workspace,
+                skip_api=skip_api, skip_ios=skip_ios, timeouts=timeouts,
+            )
+
+            initial_results = [fixture_result]
+
+            if resume_run_id:
+                resume_ctx = focused_resume_mod.ResumeContext(
+                    run_id=run_id,
+                    backend=context.backend,
+                    fixture_version=context.fixture_version,
+                    regression_shas=dict(context.regression_shas),
+                    product_sha=(context.product_build or {}).get("caleeMobileSha"),
+                    device_ids={"tablet": context.tablet_device_id, "ios": context.ios_device_id},
+                    installed_artifact=artifact_attestation,
+                    execution_purpose="focused-post-fix-verification",
+                    step_ids=[s.id for s in steps],
+                    # Host-local proof: we HOLD the lock right now, and the
+                    # prior summary must itself show a clean acquire/release
+                    # (checked inside evaluate_resume).
+                    lock_history_clean=(
+                        True if lock_acquisition.state == fixture_ownership_mod.STATE_ACQUIRED else None
+                    ),
+                )
+                resume_decision = focused_resume_mod.evaluate_resume(
+                    prior_summary, resume_ctx, retry_failed=retry_failed,
+                )
+                if not resume_decision.eligible:
+                    click.echo(resume_decision.refusal_message(), err=True)
+                    raise SystemExit(EXIT_BLOCKED)
+                initial_results.extend(
+                    r.to_result() for r in
+                    (resume_decision.reused + resume_decision.retained_failures)
+                )
+                execute_ids = set(resume_decision.execute_step_ids)
+                steps = [s for s in steps if s.id in execute_ids]
+                resume_evidence = {
+                    "resumedRunId": resume_run_id,
+                    "retryFailed": retry_failed,
+                    "reusedSteps": [r.id for r in resume_decision.reused],
+                    "retainedFailures": [r.id for r in resume_decision.retained_failures],
+                    "executedSteps": sorted(execute_ids),
+                }
+                click.echo(
+                    "Resume: reusing "
+                    + (", ".join(resume_evidence["reusedSteps"]) or "nothing")
+                    + "; executing "
+                    + (", ".join(resume_evidence["executedSteps"]) or "nothing")
+                )
+
+            if artifact_attestation.get("status") == installed_artifact_mod.STATUS_MISMATCH:
+                mismatch_detail = (
+                    "installed app identity mismatches the configured APK "
+                    f"(fields: {', '.join(artifact_attestation.get('mismatchedFields', []))}) "
+                    "-- tablet step not started. See installedArtifactIdentity in this summary."
+                )
+                for blocked_step in [s for s in steps if s.id.startswith("tablet-")]:
+                    initial_results.append(focused_workflow.FocusedResult(
+                        id=blocked_step.id, title=blocked_step.title,
+                        status=focused_workflow.STATUS_BLOCKED, exit_code=None,
+                        mode=blocked_step.mode, detail=mismatch_detail,
+                        blocked_by="installed-artifact-identity",
+                    ))
+                steps = [s for s in steps if not s.id.startswith("tablet-")]
+                click.echo(f"BLOCKED (tablet steps): {mismatch_detail}", err=True)
+
+            def _ensure():
+                return _ensure_appium_for_command(cfg)
+
+            def _run_step(step):
+                purpose = _FOCUSED_IOS_PURPOSE if step.id == "ios" else _FOCUSED_API_PURPOSE
+                return _run_supervised(step, {
+                    "CALEE_RUN_ID": run_id,
+                    "CALEE_RELEASE_ID": context.release_id,
+                    "CALEE_API_BASE": context.backend,
+                    "CALEE_FIXTURE_VERSION": context.fixture_version,
+                    "CALEE_EXECUTION_PURPOSE": purpose,
+                })
+
+            def _stop():
+                appium_lifecycle.stop_appium_from_pid_file(_appium_pid_path())
+
+            def _validate(step, exit_code):
+                report_path = step.metadata.get("reportPath")
+                expected_type = step.metadata.get("expectedType")
+                if not report_path or not expected_type:
+                    return None
+                return focused_report_validation.validate_child_report(
+                    Path(report_path), expected_type=expected_type, child_exit_code=exit_code,
+                    **step.metadata.get("expect", {}),
+                )
+
+            summary, exit_code = focused_workflow.run_focused_verify(
+                steps=steps, ensure_appium=_ensure, run_step=_run_step, stop_appium=_stop,
+                validate_step=_validate, initial_results=initial_results, log=click.echo,
+            )
+        else:
+            # Fixture preparation failed (or its verified context could not be
+            # built): every dependent step is an explicit blocked_not_run naming
+            # the prerequisite -- no silent skip, no product mutation.
+            results = [fixture_result]
+            detail = (
+                f"prerequisite step 'fixture' did not pass (status: {fixture_result.status}, "
+                f"report: {fixture_report_path})"
+                + (f"; {context_error}" if context_error else "")
+                + " -- step not started."
+            )
+            planned = [s for s in dependency_graph if s not in ("credential-preflight", "fixture")]
+            for step_id in planned:
+                results.append(focused_workflow.FocusedResult(
+                    id=step_id, title=step_id, status=focused_workflow.STATUS_BLOCKED_NOT_RUN,
+                    exit_code=None, detail=detail, blocked_by="fixture",
+                ))
+            overall = focused_workflow.aggregate_status([r.status for r in results])
+            summary = {
+                "reportType": focused_workflow.SUMMARY_REPORT_TYPE,
+                "reportSchemaVersion": focused_workflow.SUMMARY_SCHEMA_VERSION,
+                "appiumLifecycle": {"state": "not-attempted", "available": False},
+                "steps": [r.to_dict() for r in results],
+                "counts": {},
+                "status": overall,
+                "certificationEligible": False,
+                "certification": "not-a-release-certification (focused post-fix verification only)",
+            }
+            exit_code = focused_workflow.status_to_exit_code(overall)
+
+    finally:
+        # Release the fixture ownership lock exactly once, whatever happened
+        # above. Only this run's own lock is ever removed (release refuses a
+        # non-owner) -- see fixture_ownership.release.
+        _lock_release = fixture_ownership_mod.release(lock_root, lock_scope, run_id=run_id)
+        lock_release_evidence = {
+            "state": _lock_release.state,
+            "detail": _lock_release.detail,
+            "releasedAt": _utc_now_iso(),
+        }
 
     # ---- Immutable, evidence-bound aggregate summary (Workstream 8). ----
     finished_at = _utc_now_iso()
@@ -1790,9 +2065,25 @@ def focused_verify(config_path, tablet_scenario, tablet_repeat, api_suite, ios_t
             "caleemobile-regression": _repo_head_sha(mobile_repo) or "unknown",
         },
         "productBuild": dict(context.product_build) if context else {},
+        # The thin declared identity, kept for existing readers; the full
+        # expected-vs-installed reconciliation lives in
+        # installedArtifactIdentity below (installed_artifact.py): verified /
+        # mismatch (blocks tablet steps) / unproven (recorded only --
+        # focused-verify is already non-certifying).
         "tabletBuildIdentity": {
             "applicationId": getattr(cfg, "app_package", None),
             "apkPath": getattr(cfg, "apk_path", None),
+        },
+        "installedArtifactIdentity": artifact_attestation,
+        # Host-local fixture ownership evidence: exclusivity is guaranteed on
+        # THIS HOST ONLY -- no backend-side lease exists, so cross-host
+        # exclusivity for the shared production account is NOT established.
+        "fixtureOwnership": {
+            "acquisition": lock_acquisition.to_dict(),
+            "release": lock_release_evidence,
+            "lockPath": lock_acquisition.lock_path,
+            "exclusivityScope": fixture_ownership_mod.EXCLUSIVITY_SCOPE,
+            "limitation": fixture_ownership_mod.EXCLUSIVITY_LIMITATION,
         },
         "deviceIds": {
             "tablet": context.tablet_device_id if context else None,
@@ -1801,6 +2092,10 @@ def focused_verify(config_path, tablet_scenario, tablet_repeat, api_suite, ios_t
         "dependencyGraph": dependency_graph,
         "focusedContractVersion": contract.get("focusedContractVersion"),
         "stepTimeoutsSeconds": timeouts,
+        # Safe-resume provenance (focused_resume.py): None for a fresh run;
+        # for a resume, which prior steps were reused (by original path +
+        # digest in their step entries), retained as FAIL, or re-executed.
+        "resume": resume_evidence,
     })
     # Belt-and-braces: no resolved secret value may appear anywhere in the
     # summary (validated by tests; redact scrubs any accidental inclusion).
@@ -1814,6 +2109,14 @@ def focused_verify(config_path, tablet_scenario, tablet_repeat, api_suite, ios_t
         os.chmod(summary_path, 0o444)  # immutable-by-convention: read-only on disk
     except OSError:
         pass
+    # Plain-language companion (focused_human_summary.py): rendered EXCLUSIVELY
+    # from the validated, already-redacted summary -- same immutability rules.
+    human_path = focused_dir / "summary.txt"
+    try:
+        focused_human_summary.write(json.loads(summary_text), human_path)
+    except FileExistsError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_BLOCKED)
     # The run manifest preserves EVERY focused invocation (worst-wins history);
     # a later run can never overwrite or improve an earlier result. Diagnostic
     # evidence only -- "focused-verify" is not a release-certification
@@ -1836,7 +2139,219 @@ def focused_verify(config_path, tablet_scenario, tablet_repeat, api_suite, ios_t
         click.echo(f"  {step['status'].upper():<15} {step['title']}{mode}")
     click.echo(f"Overall: {summary['status'].upper()}")
     click.echo(f"Summary: {summary_path}")
+    click.echo(f"Plain-language summary: {human_path}")
     raise SystemExit(exit_code)
+
+
+@main.command("release-remediation-plan")
+@click.option("--focused-run", "focused_run", required=True,
+              help="The focused-verify run id whose diagnostic evidence the plan is built from.")
+@click.option("--release-run", "release_run", required=True,
+              help="The blocked release run id the plan is FOR (its results are never modified).")
+def release_remediation_plan(focused_run, release_run):
+    """Plan release remediation from a focused post-fix verification run.
+
+    Compares the focused run's newest validated summary against the release
+    run's manifest (and consolidated report where present), classifies every
+    expected release component, and writes ONE immutable typed plan under the
+    RELEASE run's workspace. Diagnostic planning evidence only: a focused run
+    never promotes to a release PASS, never rewrites any release result, and
+    NO_RELEASE_PROMOTION_ALLOWED is always among the decisions.
+    """
+    for label, rid in (("--focused-run", focused_run), ("--release-run", release_run)):
+        if not run_context.is_valid_run_id(rid):
+            click.echo(f"Invalid {label} {rid!r} (expected letters/digits/._- only).", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+    root = _resolved_report_root()
+    focused_ws = run_context.RunWorkspace(root, focused_run)
+    release_ws = run_context.RunWorkspace(root, release_run)
+
+    def _blocked(msg: str):
+        click.echo(f"BLOCKED: {msg}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    summary_paths = sorted(
+        (focused_ws.root / "focused-verify").glob("*/summary.json"),
+        key=lambda p: p.parent.name,
+    )
+    if not summary_paths:
+        _blocked(f"no focused-verify summary exists under {focused_ws.root / 'focused-verify'}.")
+    # Every invocation's summary must validate against the focused run's
+    # identity; the plan itself is built from the NEWEST one.
+    validations = []
+    for path in summary_paths:
+        validation = focused_report_validation.validate_child_report(
+            path, expected_type="focused-verify-summary", expected_run_id=focused_run,
+        )
+        if not validation.ok:
+            _blocked(f"focused summary {path} failed validation: " + "; ".join(validation.problems))
+        validations.append(validation)
+    newest = validations[-1]
+    newest_path = summary_paths[-1]
+    focused_summary = newest.report
+
+    # Cross-check the summary against the focused run's own manifest where
+    # present: the newest summary path must be one this run actually recorded.
+    if focused_ws.manifest_path.is_file():
+        focused_manifest = run_context.RunManifest.load(focused_ws.manifest_path)
+        recorded_paths = {
+            a.get("reportPath")
+            for a in focused_manifest.component_attempts.get("focused-verify", [])
+        }
+        if recorded_paths and str(newest_path) not in recorded_paths:
+            _blocked(
+                f"focused summary {newest_path} is not recorded in the focused run's "
+                "manifest -- refusing to plan from unrecorded evidence."
+            )
+
+    # Every supporting focused report is linked by path AND recomputed sha256;
+    # a digest that no longer matches the summary's recorded one BLOCKS.
+    supporting = [{"role": "focused-verify-summary", "path": str(newest_path), "sha256": newest.digest}]
+    for step in focused_summary.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        report_path, recorded = step.get("reportPath"), step.get("reportSha256")
+        if not report_path or not recorded:
+            continue
+        actual = focused_report_validation.sha256_of_file(Path(report_path))
+        if actual != recorded:
+            _blocked(
+                f"focused step {step.get('id')!r} report {report_path} digest mismatch "
+                f"(recorded {recorded}, got {actual}) -- evidence cannot be validated."
+            )
+        supporting.append({"role": f"step:{step.get('id')}", "path": report_path, "sha256": recorded})
+
+    if not release_ws.manifest_path.is_file():
+        _blocked(f"release run manifest {release_ws.manifest_path} does not exist.")
+    release_manifest = run_context.RunManifest.load(release_ws.manifest_path)
+    consolidated_status = None
+    consolidated_path = release_ws.consolidated_dir / "consolidated-report.json"
+    if consolidated_path.is_file():
+        try:
+            consolidated = json.loads(consolidated_path.read_text(encoding="utf-8"))
+            consolidated_status = consolidated.get("overallStatus") or consolidated.get("status")
+        except (OSError, json.JSONDecodeError):
+            consolidated_status = None
+
+    invocation_id = focused_summary.get("invocationId") or newest_path.parent.name
+    plan = remediation_plan_mod.build_plan(
+        focused_summary=focused_summary,
+        release_manifest=release_manifest.to_dict(),
+        focused_run_id=focused_run,
+        release_run_id=release_run,
+        planned_from_invocation=invocation_id,
+        all_invocations=[p.parent.name for p in summary_paths],
+        supporting_reports=supporting,
+        consolidated_status=consolidated_status,
+        generated_at=_utc_now_iso(),
+        producer_git_sha=_repo_head_sha(REPO_ROOT),
+    )
+
+    # Immutable, typed output under the RELEASE run workspace. Never touches
+    # any existing release component/report.
+    out_dir = release_ws.root / "remediation" / _sanitize_component_name(invocation_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "remediation.json"
+    if out_path.exists():
+        _blocked(f"refusing to overwrite immutable remediation plan {out_path}.")
+    out_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(out_path, 0o444)
+    except OSError:
+        pass
+    release_manifest.record_component(
+        "remediation-plan", report_path=str(out_path), exit_code=EXIT_SUCCESS,
+        invocation_id=invocation_id, invocation_path=str(out_dir),
+    )
+    release_manifest.write(release_ws.manifest_path)
+
+    click.echo(f"Remediation plan: {out_path}")
+    click.echo(f"({remediation_plan_mod.DIAGNOSTIC_ONLY_STATEMENT})")
+    click.echo("Decisions:")
+    for decision in plan["decisions"]:
+        click.echo(f"  - {decision}")
+    raise SystemExit(remediation_plan_mod.plan_exit_code(plan))
+
+
+@main.group("fixture-lock")
+def fixture_lock_group():
+    """Inspect/recover the HOST-LOCAL fixture ownership lock.
+
+    The lock (fixture_ownership.py) keeps two runs on this host from sharing
+    the deterministic REG-* fixture on the same backend + regression account.
+    Its exclusivity scope is host-local ONLY -- no backend-side lease exists,
+    so a run on another machine is invisible to it.
+    """
+
+
+def _fixture_lock_scope_or_exit(backend: "str | None", fixture_version: str):
+    """Resolve the lock scope (backend + account fingerprint + fixture
+    version) from the credential provider chain WITHOUT printing any secret.
+    BLOCKS when the backend or the regression email cannot be resolved."""
+    if not backend:
+        click.echo(
+            "BLOCKED: no backend configured -- pass --backend or set CALEE_API_BASE.", err=True
+        )
+        raise SystemExit(EXIT_BLOCKED)
+    email, _password, _resolver = _fill_credentials_from_providers(None, None)
+    if not email:
+        click.echo(
+            "BLOCKED: the regression email could not be resolved (environment or macOS "
+            "Keychain) -- the lock scope's account fingerprint needs it. No secret is "
+            "ever printed or stored.",
+            err=True,
+        )
+        raise SystemExit(EXIT_BLOCKED)
+    return fixture_ownership_mod.LockScope(
+        backend=backend,
+        account_fingerprint=fixture_ownership_mod.account_fingerprint(email),
+        fixture_version=fixture_version,
+    )
+
+
+@fixture_lock_group.command("status")
+@click.option("--backend", envvar="CALEE_API_BASE", default=None, help="Calee Client API base URL.")
+@click.option("--fixture-version", default="unknown", show_default=True)
+def fixture_lock_status(backend, fixture_version):
+    """Show the lock's current state for this backend/account/fixture scope.
+
+    Read-only; prints the secret-free lock evidence (owner metadata carries a
+    non-reversible account fingerprint only, never the email or password).
+    """
+    scope = _fixture_lock_scope_or_exit(backend, fixture_version)
+    result = fixture_ownership_mod.status(
+        _resolved_report_root() / "reports" / "locks", scope
+    )
+    click.echo(json.dumps(result.to_dict(), indent=2))
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@fixture_lock_group.command("recover-stale")
+@click.option("--backend", envvar="CALEE_API_BASE", default=None, help="Calee Client API base URL.")
+@click.option("--fixture-version", default="unknown", show_default=True)
+@click.option(
+    "--reason", default="manual recover-stale via the fixture-lock CLI", show_default=True,
+    help="Recorded verbatim in the recovery audit record.",
+)
+def fixture_lock_recover_stale(backend, fixture_version, reason):
+    """EXPLICITLY recover a provably stale lock (same host, owner pid dead).
+
+    Refuses (BLOCKED) every other state: an active owner, a foreign-host lock
+    (liveness unprovable), or an interrupted owner (ownership unprovable).
+    Writes an audit record documenting the removed owner BEFORE removal and
+    prints its path.
+    """
+    scope = _fixture_lock_scope_or_exit(backend, fixture_version)
+    result = fixture_ownership_mod.recover_stale(
+        _resolved_report_root() / "reports" / "locks", scope,
+        recovering_run_id=run_context.generate_run_id("recovery"),
+        reason=reason, now=_utc_now_iso,
+    )
+    if result.state != fixture_ownership_mod.STATE_RECOVERED:
+        click.echo(f"BLOCKED: {result.detail}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+    click.echo(f"Stale lock recovered. Audit record: {result.audit_path}")
+    raise SystemExit(EXIT_SUCCESS)
 
 
 def _verified_backend_from_environment(
@@ -1942,6 +2457,7 @@ def sync_smoke_cmd(config_path, run_id_opt, base_url, email, password, platform,
     false PASS) until the tablet-mutation gap closes and a real device verifies
     it -- which is the intended safety property, not a silent non-gate.
     """
+    _enforce_secret_argv_policy("password", "--password", orchestrated=True)
     if not run_context.is_valid_run_id(run_id_opt):
         click.echo(f"Invalid --run-id {run_id_opt!r} (expected letters/digits/._- only).", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
