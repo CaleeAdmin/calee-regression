@@ -1,6 +1,12 @@
-from types import SimpleNamespace
+"""Tests for the pure Appium Settings helper functions.
 
-import pytest
+The old import-time monkey-patch (`install_appium_settings_recovery`) has been
+removed; its behaviour now lives in the explicit `session_bootstrap` component
+(see test_session_bootstrap.py). Only the reusable, side-effect-free helpers are
+tested here.
+"""
+
+from types import SimpleNamespace
 
 from calee_regression import appium_recovery
 
@@ -20,76 +26,21 @@ def test_reset_uninstalls_only_settings_package():
         return SimpleNamespace(returncode=0)
 
     config = SimpleNamespace(udid="tablet-1")
-    appium_recovery.reset_settings_package(config, runner=runner)
+    result = appium_recovery.reset_settings_package(config, runner=runner)
 
     command, kwargs = calls[0]
     assert command[-2:] == ["uninstall", "io.appium.settings"]
     assert command[1:3] == ["-s", "tablet-1"]
     assert kwargs["check"] is False
+    # The uninstall CompletedProcess is now returned so session_bootstrap can
+    # record its return code.
+    assert result.returncode == 0
 
 
-def test_install_retries_once_for_settings_failure(monkeypatch):
-    attempts = []
-    recoveries = []
+def test_reset_is_best_effort_when_runner_raises():
+    def runner(command, **kwargs):
+        raise OSError("adb not found")
 
-    class FakeDriver:
-        config = SimpleNamespace(udid="tablet-1")
-
-        def start_session(self):
-            attempts.append("start")
-            if len(attempts) == 1:
-                raise RuntimeError("Appium Settings app is not running after 5000ms")
-
-    monkeypatch.setattr(
-        appium_recovery,
-        "reset_settings_package",
-        lambda config: recoveries.append(config.udid),
-    )
-
-    appium_recovery.install_appium_settings_recovery(FakeDriver)
-    FakeDriver().start_session()
-
-    assert attempts == ["start", "start"]
-    assert recoveries == ["tablet-1"]
-
-
-def test_non_settings_failure_is_not_retried(monkeypatch):
-    attempts = []
-
-    class FakeDriver:
-        config = SimpleNamespace(udid="tablet-1")
-
-        def start_session(self):
-            attempts.append("start")
-            raise RuntimeError("connection refused")
-
-    monkeypatch.setattr(
-        appium_recovery,
-        "reset_settings_package",
-        lambda config: pytest.fail("recovery must not run"),
-    )
-
-    appium_recovery.install_appium_settings_recovery(FakeDriver)
-    with pytest.raises(RuntimeError, match="connection refused"):
-        FakeDriver().start_session()
-
-    assert attempts == ["start"]
-
-
-def test_second_settings_failure_propagates_after_one_retry(monkeypatch):
-    attempts = []
-
-    class FakeDriver:
-        config = SimpleNamespace(udid="tablet-1")
-
-        def start_session(self):
-            attempts.append("start")
-            raise RuntimeError("Appium Settings app is not running after 5000ms")
-
-    monkeypatch.setattr(appium_recovery, "reset_settings_package", lambda config: None)
-    appium_recovery.install_appium_settings_recovery(FakeDriver)
-
-    with pytest.raises(RuntimeError, match="Appium Settings"):
-        FakeDriver().start_session()
-
-    assert attempts == ["start", "start"]
+    # A failed uninstall must never raise (an absent package is already the
+    # desired recovery state); it returns None.
+    assert appium_recovery.reset_settings_package(SimpleNamespace(udid=None), runner=runner) is None

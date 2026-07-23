@@ -60,15 +60,23 @@ def test_calendar_scenarios_target_deterministic_fixture_titles():
 
 
 def test_calendar_scenarios_use_hard_tap_not_tap_if_present_for_fixture_events():
+    # A fixture event must be tapped by a HARD tap -- never `tap_if_present`,
+    # which can silently no-op. `tap` (by exact text) and `tap_unique_text`
+    # (Workstream 3: bounded-scroll, exact, fails on zero/multiple matches --
+    # strictly stronger than a plain tap) both qualify.
+    hard_tap_actions = {"tap", "tap_unique_text"}
     for relative_path in RELEASE_CRITICAL_CALENDAR_SCENARIOS:
         steps = _load_steps(relative_path)
-        tap_steps = [s for s in steps if s.get("action") in ("tap", "tap_if_present") and "text" in s]
+        tap_steps = [
+            s for s in steps
+            if s.get("action") in ("tap", "tap_if_present", "tap_unique_text") and "text" in s
+        ]
         assert tap_steps, f"{relative_path} should tap into its fixture event by exact title"
         for step in tap_steps:
-            assert step["action"] == "tap", (
+            assert step["action"] in hard_tap_actions, (
                 f"{relative_path} step {step['name']!r} taps a fixture event via "
-                f"{step['action']!r} — this must be a hard 'tap', not 'tap_if_present', "
-                f"since the fixture guarantees the event exists."
+                f"{step['action']!r} — this must be a hard 'tap'/'tap_unique_text', not "
+                f"'tap_if_present', since the fixture guarantees the event exists."
             )
 
 

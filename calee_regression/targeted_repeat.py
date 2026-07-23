@@ -34,10 +34,17 @@ from pathlib import Path
 import yaml
 
 from .consolidated_report import decide_status
-from .models import DEVICE_INIT_STANDARD, certification_block
+from .models import DEVICE_INIT_SKIP, DEVICE_INIT_STANDARD, certification_block
 
 TARGETED_REPORT_SCHEMA_VERSION = 1
 TARGETED_REPORT_TYPE = "tablet-targeted-repeat"
+TARGETED_TOP_INDEX_TYPE = "tablet-targeted-index"
+
+# The immutable per-mode subdirectory labels (Workstream 4). Standard is the
+# only certification-eligible mode; diagnostic (skipDeviceInitialization) is
+# investigation-only and never release-certifying.
+MODE_STANDARD = "standard"
+MODE_DIAGNOSTIC = "diagnostic"
 
 PRODUCER = "targeted_repeat.py"
 
@@ -350,6 +357,105 @@ def run_targeted(
         report = _write_reports(finished_at)
 
     return report, report["status"]
+
+
+def mode_label(device_initialization_mode: str) -> str:
+    """The immutable per-mode subdir label for a targeted run (Workstream 4):
+    ``standard`` or ``diagnostic``. A diagnostic (skipDeviceInitialization) run
+    is never release-certifying, so it is kept in its own subtree and never
+    written where it could overwrite the standard result."""
+    return MODE_DIAGNOSTIC if device_initialization_mode == DEVICE_INIT_SKIP else MODE_STANDARD
+
+
+def update_targeted_top_index(base_dir, mode: str, report: dict) -> dict:
+    """Maintain the top-level ``tablet-targeted/index.json`` that references BOTH
+    the standard and diagnostic mode results and every invocation of each
+    (Workstream 4).
+
+    Invariants this preserves:
+      * standard and diagnostic results are addressable independently and never
+        overwrite each other (each lives under its own ``<mode>/`` subtree);
+      * the top-level index references EVERY invocation of every mode
+        (append-only -- a later invocation never drops an earlier one);
+      * certification eligibility is explicit per invocation and per mode;
+      * the canonical CERTIFYING result is ALWAYS the standard mode's latest
+        result -- a diagnostic run is recorded for investigation but can never
+        become the certifying result nor improve standard's certification status.
+    """
+    base_dir = Path(base_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    index_path = base_dir / "index.json"
+    doc = {}
+    if index_path.is_file():
+        try:
+            doc = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+    modes = doc.get("modes")
+    if not isinstance(modes, dict):
+        modes = {}
+
+    prior = modes.get(mode)
+    mode_entry = prior if isinstance(prior, dict) else {}
+    invocation_id = report.get("invocationId")
+    invocations = [
+        e for e in mode_entry.get("invocations", [])
+        if isinstance(e, dict) and e.get("invocationId") != invocation_id
+    ]
+    invocations.append(
+        {
+            "invocationId": invocation_id,
+            "status": report.get("status"),
+            "certificationEligible": report.get("certificationEligible"),
+            "diagnosticMode": report.get("diagnosticMode"),
+            "deviceInitializationMode": report.get("deviceInitializationMode"),
+            "startedAt": report.get("startedAt"),
+            "finishedAt": report.get("finishedAt"),
+            "reportPath": str(
+                base_dir / mode / "invocations" / _sanitize(invocation_id or "") / "results.json"
+            ),
+        }
+    )
+    mode_entry.update(
+        {
+            "mode": mode,
+            "resultPath": str(base_dir / mode / "results.json"),
+            "latestInvocationId": invocation_id,
+            "latestStatus": report.get("status"),
+            "certificationEligible": report.get("certificationEligible"),
+            "diagnosticMode": report.get("diagnosticMode"),
+            "invocations": invocations,
+        }
+    )
+    modes[mode] = mode_entry
+
+    standard = modes.get(MODE_STANDARD) if isinstance(modes.get(MODE_STANDARD), dict) else None
+    canonical = {
+        "certifyingMode": MODE_STANDARD,
+        "certifyingResultPath": standard.get("resultPath") if standard else None,
+        "certifyingStatus": standard.get("latestStatus") if standard else None,
+        # Only the standard mode can certify; a diagnostic result never can.
+        "certificationEligible": bool(standard) and bool(standard.get("certificationEligible")),
+        "hasStandard": standard is not None,
+        "hasDiagnostic": isinstance(modes.get(MODE_DIAGNOSTIC), dict),
+    }
+    doc = {
+        "reportType": TARGETED_TOP_INDEX_TYPE,
+        "modes": modes,
+        "canonical": canonical,
+        "note": (
+            "Standard and diagnostic targeted results are recorded separately and "
+            "immutably. Diagnostic (skipDeviceInitialization) results are for "
+            "investigation only and are NEVER release-certifying; the canonical "
+            "certifying result is always the standard mode's latest result."
+        ),
+    }
+    with index_path.open("w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+        f.write("\n")
+    return doc
 
 
 def _write_canonical_index(out_dir: Path, invocation_id: str, report: dict) -> None:
