@@ -53,3 +53,48 @@ treat a BLOCKED result as evidence of a product bug.
 | `acquire-release-evidence` reports "matching ... ambiguous" or "expired" | More than one run/artifact matches the exact identity, or the only match's artifact has expired | Re-run the CI workflow for the exact SHA (expiry), or identify the intended run and pass it as a diagnostic override after verifying it (ambiguity) — acquisition never picks "the latest" for you |
 | `acquire-release-evidence` reports App Store Connect / Play Console evidence unavailable | Distributed-build provider evidence can't be collected automatically with the available approved credentials | Record it with `record-distributed-build-acceptance` (or configure the provider credentials via the approved credential policy); the item is BLOCKED, never a fabricated PASS |
 | `resume-release` reruns Prepare and it's still BLOCKED | The environment/fixture problem that originally blocked Prepare hasn't actually been fixed | Fix the underlying problem (see the Prepare-related rows above), then resume again — a repeated BLOCKED Prepare is recorded as its own attempt, never silently discarded |
+
+## Serial mobile UI, diagnostic tablet mode, and resuming physical testing
+
+**A mobile UI file reports BLOCKED with a launch/tooling indicator.** The serial
+orchestrator (`run_ui_manifest.py`) already retried it once automatically if the
+failure matched a recognized launch indicator (`Dart VM Service was not
+discovered`, `Unable to start the app on the device`, `No application found for
+TargetPlatform.ios`, `timed out waiting for the Dart VM Service`). If it still
+BLOCKED, the tooling could not launch the app — check the preserved per-file logs
+under `reports/runs/<run-id>/mobile-<platform>/files/<file>/attempt-N/flutter.log`.
+A product FAIL, a fixture-missing skip, a backend/selector mismatch, or an
+onboarding-state assertion is intentionally **not** retried.
+
+**Investigating a tablet that will not initialize under Appium.** Run a focused
+diagnostic pass with `--device-initialization skip` (sets
+`appium:skipDeviceInitialization=true`). This is **diagnostic only** — the report
+is marked `diagnosticMode: true`, `certificationEligible: false`, and can never
+certify a release. There is no automatic fallback from standard to skip; a
+standard-mode initialization failure stays BLOCKED.
+
+```bash
+python -m calee_regression run --config config/machine.local.yaml \
+  --scenario scenarios/tasks_smoke.yaml --device-initialization skip
+```
+
+**Determinism re-runs** of the recently-corrected scenarios: use
+`run-repeat --profile scenarios/profiles/corrected_scenarios.yaml
+--repeat-count N` — every attempt is preserved and the targeted report never
+overwrites the full-suite report.
+
+**Resuming physical certification later.** From a Mac with the tablet + iPhone
+attached and the tester config set:
+
+```bash
+cd calee-regression
+open "tester/01 Prepare Test Environment.command"     # or: python -m calee_regression prepare ...
+open "tester/06 Test Full Calee Solution.command"     # tablet + serial iOS/Android + consolidate
+```
+
+`06` composes this run's release-config, exports the same-run feature scope, runs
+the tablet suite and the serial mobile UI legs (iOS one file per process), and
+consolidates. **Google OAuth and complete onboarding still require guided
+evidence** (`record_handoff_evidence.py`) — the browser sign-in and the
+mobile→tablet approval legs leave the app, so automation cannot observe them;
+without that evidence those mandatory features BLOCK by design.

@@ -6,6 +6,13 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from .models import DEVICE_INIT_STANDARD, certification_block
+
+# Bump when the tablet results.json shape changes in a way a consumer (the
+# consolidator, the schema tests) must know about (Workstream 8/9).
+TABLET_REPORT_SCHEMA_VERSION = 1
+TABLET_REPORT_TYPE = "tablet-scenario-suite"
+
 
 def default_run_name(kind: str, name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "-", name)
@@ -171,7 +178,20 @@ class ReportBuilder:
 
     def _write_results_json(self, suite_result) -> None:
         with (self.dir / "results.json").open("w", encoding="utf-8") as f:
-            json.dump(suite_result.to_dict(), f, indent=2)
+            json.dump(self._results_payload(suite_result), f, indent=2)
+
+    def _results_payload(self, suite_result) -> dict:
+        """The full tablet results.json: the suite result plus the canonical
+        certification/execution-mode block (Workstream 6) and a schema version
+        (Workstream 8/9). Standard mode is certification-eligible; skip mode is
+        diagnostic and never certifying -- the consolidator gates on these two
+        fields so a diagnostic run can never be mistaken for release evidence."""
+        payload = dict(suite_result.to_dict())
+        payload["reportSchemaVersion"] = TABLET_REPORT_SCHEMA_VERSION
+        payload["reportType"] = TABLET_REPORT_TYPE
+        mode = getattr(self.config, "device_initialization_mode", DEVICE_INIT_STANDARD)
+        payload.update(certification_block(mode))
+        return payload
 
     def _write_junit_xml(self, suite_result) -> None:
         total_time = sum(s.duration_seconds for s in suite_result.scenarios)

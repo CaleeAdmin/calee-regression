@@ -46,8 +46,10 @@ def test_iphone_device_id_reaches_run_ui_suite(tmp_path):
     sibling = tmp_path / "CaleeMobile-Regression"
     (sibling / "api").mkdir(parents=True)
     (sibling / "ui").mkdir(parents=True)
-    recorded = tmp_path / "run_ui_suite_invocation.json"
-    (sibling / "ui" / "run_ui_suite.py").write_text(
+    # Workstream 3/4: the launcher now delegates the UI run to the serial
+    # orchestrator run_ui_manifest.py, so the configured device id must reach IT.
+    recorded = tmp_path / "run_ui_manifest_invocation.json"
+    (sibling / "ui" / "run_ui_manifest.py").write_text(
         "import sys, os, json\n"
         f"json.dump({{'argv': sys.argv, 'uiDeviceId': os.environ.get('CALEE_UI_DEVICE_ID')}}, open({str(recorded)!r}, 'w'))\n"
     )
@@ -77,7 +79,7 @@ def test_iphone_device_id_reaches_run_ui_suite(tmp_path):
         ["bash", str(repo / "scripts" / "test_caleemobile.sh"), "ios", "--ui-only"],
         cwd=str(repo), env=env, capture_output=True, text=True, timeout=60,
     )
-    assert recorded.is_file(), f"run_ui_suite.py was not invoked.\nstdout={proc.stdout}\nstderr={proc.stderr}"
+    assert recorded.is_file(), f"run_ui_manifest.py was not invoked.\nstdout={proc.stdout}\nstderr={proc.stderr}"
     got = json.loads(recorded.read_text())
     # The configured iPhone reached the UI suite both ways.
     assert "--device-id" in got["argv"]

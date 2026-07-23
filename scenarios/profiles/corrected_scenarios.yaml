@@ -1,0 +1,18 @@
+# Targeted-repeat profile (Workstream 7) -- a CHECKED-IN example, not wired
+# into any core logic. Lists the four recently corrected tablet scenarios
+# (calee-regression PR #37: tablet Tasks uses taskView; Settings uses
+# tvProfileHeader; the recurring-event scenario anchors to today and refreshes;
+# failed tablet steps record richer diagnostics) so a tester can re-run them
+# repeatedly for determinism without hand-duplicating files in a shell script:
+#
+#   python -m calee_regression run-repeat \
+#     --config config/machine.local.yaml \
+#     --profile scenarios/profiles/corrected_scenarios.yaml \
+#     --repeat-count 3
+#
+# Edit this list freely -- the targeted-repeat runner accepts any scenarios.
+scenarios:
+  - scenarios/home_navigation.yaml
+  - scenarios/tasks_smoke.yaml
+  - scenarios/settings_smoke.yaml
+  - scenarios/calendar_recurring_events.yaml

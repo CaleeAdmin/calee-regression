@@ -7,6 +7,41 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .models import DEVICE_INIT_SKIP, DEVICE_INIT_STANDARD
+
+
+def build_appium_capabilities(config) -> dict:
+    """The W3C Appium capabilities for a tablet session, built as a plain dict
+    so it is unit-testable WITHOUT the appium package or a device (Workstream 6).
+
+    ``device_initialization_mode`` is a first-class, validated framework option
+    (config.py), never a runtime monkey-patch of ``start_session``:
+
+      * ``standard`` (default) -- full, normal device initialization; the only
+        certification-eligible mode.
+      * ``skip`` -- adds ``appium:skipDeviceInitialization=true``, a DIAGNOSTIC
+        escape hatch for a device that will not initialize. Explicitly requested
+        only; there is no automatic standard->skip fallback here or anywhere.
+    """
+    mode = getattr(config, "device_initialization_mode", DEVICE_INIT_STANDARD)
+    caps: dict = {
+        "platformName": "Android",
+        "appium:automationName": "UiAutomator2",
+        "appium:deviceName": config.device_name,
+        "appium:noReset": config.no_reset,
+        "appium:newCommandTimeout": config.new_command_timeout_seconds,
+        "appium:autoGrantPermissions": True,
+    }
+    if config.udid:
+        caps["appium:udid"] = config.udid
+    if config.launch_strategy == "normal_launcher":
+        caps["appium:appPackage"] = config.app_package
+        caps["appium:appActivity"] = config.app_activity
+    if mode == DEVICE_INIT_SKIP:
+        # Diagnostic mode only: bypass Appium's device-initialization step.
+        caps["appium:skipDeviceInitialization"] = True
+    return caps
+
 
 class AdbError(Exception):
     pass
@@ -174,20 +209,12 @@ class CaleeDriver:
         from appium import webdriver
         from appium.options.android.uiautomator2.base import UiAutomator2Options
 
-        options = UiAutomator2Options()
-        options.platform_name = "Android"
-        options.automation_name = "UiAutomator2"
-        if self.config.udid:
-            options.udid = self.config.udid
-        options.device_name = self.config.device_name
-        options.no_reset = self.config.no_reset
-        options.new_command_timeout = self.config.new_command_timeout_seconds
-        options.auto_grant_permissions = True
-
-        if self.config.launch_strategy == "normal_launcher":
-            options.app_package = self.config.app_package
-            options.app_activity = self.config.app_activity
-
+        # Capabilities are built by the pure, unit-tested build_appium_capabilities
+        # (Workstream 6) -- including the diagnostic skipDeviceInitialization
+        # capability when device_initialization_mode == "skip" -- so the
+        # diagnostic mode is a validated framework option, never a runtime
+        # monkey-patch of this method.
+        options = UiAutomator2Options().load_capabilities(build_appium_capabilities(self.config))
         self.driver = webdriver.Remote(self.config.appium_url, options=options)
 
     def quit(self) -> None:

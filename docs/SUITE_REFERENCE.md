@@ -12,8 +12,8 @@ meaningful; use the duration *category* instead.
 | `tablet-smoke` (alias of `smoke-tablet`) | `calee-regression` | `python -m calee_regression suite --suite tablet-smoke` | Quick | Prepared, logged-in demo account | None | No | No |
 | `tablet-full` (alias of `full-tester`) | `calee-regression` | `02 Test Calee Tablet.command` | Standard | Prepared, logged-in demo account | Yes — REG-* fixture (calendar scenarios require it) | No | Yes |
 | `mobile-api` | `CaleeMobile-Regression` | `python3 run_regression.py` in `api/` | Standard | None — hits the backend directly | Auto-managed per run (run-tagged `RT ...` records + best-effort cleanup); can also target the shared REG-* fixture | No | Yes |
-| `mobile-android` | `CaleeMobile-Regression` | `ui/run_ui_suite.py --platform android` (auto-resolves the device, passes credentials via `--dart-define`), or `03 Test CaleeMobile Android.command` | Standard | Signed-in CaleeMobile session on an Android device/emulator; `CALEE_TEST_EMAIL`/`CALEE_TEST_PASSWORD` configured | Recommended (REG-* fixture) — the calendar/tasks flow tests assert against it | Yes (or an Android emulator) | Driven by this run's schema-v2 release-config when composed, else `config/release-platforms.yaml`'s `mobile_android` — defaults to Yes either way (see `docs/RELEASE_POLICY.md`). Format/analyze/unit-tests pass; device execution depends on an Android emulator/device being available where this runs — see the session's final report for what was and wasn't actually executed |
-| `mobile-ios` | `CaleeMobile-Regression` | `ui/run_ui_suite.py --platform ios`, or `04 Test CaleeMobile iPhone.command` | Standard | Signed-in CaleeMobile session on an iPhone/simulator; same credentials as above | Same as `mobile-android` | Yes (a Mac with Xcode; simulator counts) | Driven by this run's schema-v2 release-config when composed, else `config/release-platforms.yaml`'s `mobile_ios` — defaults to Yes either way. iOS device/simulator execution requires a real Mac; never executable on Linux |
+| `mobile-android` | `CaleeMobile-Regression` | `ui/run_ui_manifest.py --platform android` (the serial orchestrator: one Flutter process per test file, one bounded retry only for a confirmed launch/tooling failure, every attempt preserved, one aggregate report), or `03 Test CaleeMobile Android.command` | Standard | Signed-in CaleeMobile session on an Android device/emulator; `CALEE_TEST_EMAIL`/`CALEE_TEST_PASSWORD` configured | Recommended (REG-* fixture) — the calendar/tasks flow tests assert against it | Yes (or an Android emulator) | Driven by this run's schema-v2 release-config when composed, else `config/release-platforms.yaml`'s `mobile_android` — defaults to Yes either way (see `docs/RELEASE_POLICY.md`). Format/analyze/unit-tests pass; device execution depends on an Android emulator/device being available where this runs — see the session's final report for what was and wasn't actually executed |
+| `mobile-ios` | `CaleeMobile-Regression` | `ui/run_ui_manifest.py --platform ios` (serial, one file per Flutter process — a physical iPhone stalls if the whole `integration_test` directory runs in one process), or `04 Test CaleeMobile iPhone.command` | Standard | Signed-in CaleeMobile session on an iPhone/simulator; same credentials as above | Same as `mobile-android` | Yes (a Mac with Xcode; simulator counts) | Driven by this run's schema-v2 release-config when composed, else `config/release-platforms.yaml`'s `mobile_ios` — defaults to Yes either way. iOS device/simulator execution requires a real Mac; never executable on Linux |
 | `sync-smoke` | Both (orchestrated) | `python -m calee_regression sync-smoke --run-id <id> --base-url ... --email ... --password ...` | Standard | Prepared tablet + a CaleeMobile session, both on the same household | Yes — REG-* fixture | Yes | Not yet — see "Partially implemented" below |
 | `full-release` (alias of `full-tester`) / full solution | Both (orchestrated) | `06 Test Full Calee Solution.command` (prepare incl. Appium auto-start, tablet, CaleeMobile API+UI per this run's composed release scope, guided manual checks, consolidate) | Extended | Prepared tablet; CaleeMobile if attached | Yes | Tablet+API always mandatory; mobile UI mandatory-ness follows this run's schema-v2 release-config when composed, else `config/release-platforms.yaml` (default Yes per platform, not hard-coded optional) | Yes — see `docs/RELEASE_POLICY.md` |
 | `release-technical` | `calee-regression` | `tester/technical/Run Release Technical.command` | Extended | Real physical tablet, admin/kiosk access | No | Yes — refuses to run on an emulator | Yes, for kiosk/admin/system-receiver coverage specifically |
@@ -122,3 +122,58 @@ Its orchestration logic is nonetheless fully exercised with fakes, same as the o
 - "Release-gating" here means "a real release should not ship without this profile having run and
   passed" — it does not mean every commit must run it (see `docs/RELEASE_POLICY.md` for exactly
   which components are mandatory for an overall PASS).
+
+## Permanent framework commands (release orchestration)
+
+These are permanent repository commands — no downloaded or temporary scripts are
+needed to launch a certification run.
+
+### `run-repeat` — targeted scenario repeats (determinism checks)
+
+Runs one or more scenarios repeatedly, preserving **every** attempt's evidence
+(screenshots, page source, activity/package, locator, elapsed time, scenario,
+step) and writing a dedicated targeted-run report that **never overwrites** the
+normal full-suite report. Default does not stop on the first failure, so later
+failures are never hidden. Carries standard/diagnostic certification metadata.
+
+```bash
+python -m calee_regression run-repeat \
+  --config config/machine.local.yaml \
+  --profile scenarios/profiles/corrected_scenarios.yaml \
+  --repeat-count 3            # each scenario runs 3× into distinct report dirs
+# --stop-on-failure           # optional: stop after the first FAILing attempt
+# --scenario scenarios/tasks_smoke.yaml   # or pass individual scenarios
+```
+
+The four recently-corrected scenarios live in the checked-in profile
+`scenarios/profiles/corrected_scenarios.yaml` (data, not hardcoded in core
+logic) — edit it freely; the runner accepts any scenarios.
+
+### `run --device-initialization` — first-class tablet diagnostic mode
+
+`standard` (default) is normal, certification-eligible Appium initialization.
+`skip` sets `appium:skipDeviceInitialization=true` — a **diagnostic-only**
+escape hatch for a device that will not initialize. A skip-mode run is marked
+`diagnosticMode: true` / `certificationEligible: false` and the consolidator
+**never** treats it as release-certifying evidence. There is no automatic
+standard→skip fallback — `skip` must be requested explicitly.
+
+```bash
+python -m calee_regression run \
+  --config config/machine.local.yaml \
+  --scenario scenarios/tasks_smoke.yaml \
+  --device-initialization skip     # DIAGNOSTIC — non-certifying
+```
+
+### `release-feature-scope` — same-run feature-scope export
+
+Emits this run's authoritative mobile feature scope as exported
+`CALEE_RELEASE_FEATURE_*` shell variables, preferring THIS run's already-composed
+schema-v2 release-config over the legacy `config/release-platforms.yaml` (falling
+back to legacy only when there is genuinely no schema-v2 bundle). The full-
+solution launcher `eval`s it before the mobile checks, so the mobile suite is run
+with exactly the scope the release composed — never a second bash/legacy parse.
+
+```bash
+eval "$(python -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"
+```

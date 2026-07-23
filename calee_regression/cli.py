@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from . import github_artifact as github_artifact_mod
 from . import selector_evidence as selector_evidence_mod
 from . import selector_provenance as selector_provenance_mod
 from . import sync_smoke
+from . import targeted_repeat as targeted_repeat_mod
 from . import toolchain_verify as toolchain_verify_mod
 from .appium_driver import CaleeDriver
 from .consolidated_report import (
@@ -43,6 +45,7 @@ from .consolidated_report import (
     decide_status,
     write_release_bundle,
 )
+from . import models
 from .fixture_bridge import FixtureBridgeError, run_fixture_action
 from .models import EXIT_BLOCKED, EXIT_INVALID_CONFIG, EXIT_REGRESSION, EXIT_SUCCESS
 from .runner import ScenarioRunner
@@ -67,6 +70,30 @@ def _load_config_or_exit(config_path):
     except config_mod.ConfigError as exc:
         click.echo(str(exc), err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
+
+
+def _apply_device_initialization(cfg, device_initialization: "str | None"):
+    """Apply an explicit --device-initialization override onto a loaded config
+    (Workstream 6). ``skip`` is DIAGNOSTIC-ONLY -- it is never selected
+    automatically, only by this explicit, validated request. Emits a clear
+    banner so a diagnostic run is unmistakable in the console."""
+    if not device_initialization:
+        return cfg
+    if device_initialization not in models.VALID_DEVICE_INIT_MODES:
+        click.echo(
+            f"Invalid --device-initialization {device_initialization!r}. Must be one of: "
+            f"{', '.join(sorted(models.VALID_DEVICE_INIT_MODES))}.",
+            err=True,
+        )
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    cfg.device_initialization_mode = device_initialization
+    if device_initialization == models.DEVICE_INIT_SKIP:
+        click.echo(
+            "DIAGNOSTIC MODE: device_initialization=skip "
+            "(appium:skipDeviceInitialization=true). This run is NOT release-certifying.",
+            err=True,
+        )
+    return cfg
 
 
 _STATUS_TO_EXIT_CODE = {
@@ -612,9 +639,19 @@ def list_suites_cmd():
          "workspace (reports/runs/<run-id>/tablet/results.json) instead of a standalone "
          "timestamped report directory.",
 )
-def run(config_path, scenario_arg, run_id_opt):
+@click.option(
+    "--device-initialization", "device_initialization",
+    type=click.Choice([models.DEVICE_INIT_STANDARD, models.DEVICE_INIT_SKIP]), default=None,
+    help="Tablet device-initialization mode (Workstream 6). 'standard' (default) is normal, "
+         "certification-eligible initialization. 'skip' sets appium:skipDeviceInitialization=true "
+         "for DIAGNOSTIC investigation of a device that will not initialize -- the run is marked "
+         "diagnosticMode/certificationEligible=false and is never release-certifying. Overrides "
+         "the config's device_initialization_mode; there is no automatic standard->skip fallback.",
+)
+def run(config_path, scenario_arg, run_id_opt, device_initialization):
     """Run a single scenario YAML file."""
     cfg = _load_config_or_exit(config_path)
+    cfg = _apply_device_initialization(cfg, device_initialization)
     scenario_path = _resolve_scenario_path(scenario_arg)
     out_dir, run_id = _tablet_out_dir(run_id_opt)
     rb = reporting.ReportBuilder(cfg, run_name=scenario_path.stem, out_dir=out_dir)
@@ -683,9 +720,17 @@ def _record_tablet_component(run_id: "str | None", report_dir: Path, result) -> 
          "workspace (reports/runs/<run-id>/tablet/results.json) instead of a standalone "
          "timestamped report directory.",
 )
-def suite(config_path, suite_name, confirm_technical, run_id_opt):
+@click.option(
+    "--device-initialization", "device_initialization",
+    type=click.Choice([models.DEVICE_INIT_STANDARD, models.DEVICE_INIT_SKIP]), default=None,
+    help="Tablet device-initialization mode (Workstream 6). 'skip' is a DIAGNOSTIC-ONLY, "
+         "non-certifying mode (appium:skipDeviceInitialization=true); 'standard' is the default. "
+         "No automatic standard->skip fallback.",
+)
+def suite(config_path, suite_name, confirm_technical, run_id_opt, device_initialization):
     """Run a named suite of scenarios."""
     cfg = _load_config_or_exit(config_path)
+    cfg = _apply_device_initialization(cfg, device_initialization)
     try:
         scenario_paths = suites.resolve_suite(suite_name)
     except suites.SuiteError as exc:
@@ -715,6 +760,108 @@ def suite(config_path, suite_name, confirm_technical, run_id_opt):
     )
     click.echo(f"Report: {report_dir}")
     raise SystemExit(_exit_code_for(result))
+
+
+def _targeted_out_dir(run_id_opt: "str | None", cfg) -> "tuple[Path, str | None]":
+    """The directory the aggregate targeted-repeat report is written to. Always
+    SEPARATE from the normal tablet component so a determinism re-run can never
+    overwrite the full-suite report (Workstream 7). For a shared release run it
+    is reports/runs/<run-id>/tablet-targeted/ (a non-component subdir); for a
+    standalone run, a timestamped <report_dir>/tablet-targeted-<ts>/."""
+    if run_id_opt:
+        run_id = _resolve_run_id(run_id_opt)
+        workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
+        workspace.ensure_created()
+        out = workspace.component_dir("tablet-targeted")
+        out.mkdir(parents=True, exist_ok=True)
+        return out, run_id
+    out = Path(cfg.report_dir) / f"tablet-targeted-{time.strftime('%Y%m%d-%H%M%S')}"
+    out.mkdir(parents=True, exist_ok=True)
+    return out, None
+
+
+@main.command(name="run-repeat")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
+@click.option(
+    "--scenario", "scenario_args", multiple=True,
+    help="Scenario YAML file to repeat. Repeatable. Combined with --profile.",
+)
+@click.option(
+    "--profile", "profile_path", default=None, type=click.Path(),
+    help="Checked-in profile file listing scenarios (e.g. "
+         "scenarios/profiles/corrected_scenarios.yaml). Used when given, or when no --scenario "
+         "is passed. The four corrected scenarios live in that profile, never in code.",
+)
+@click.option("--repeat-count", "repeat_count", type=int, default=2, help="Times to run each scenario.")
+@click.option(
+    "--stop-on-failure/--no-stop-on-failure", "stop_on_failure", default=False,
+    help="Stop after the first FAILing attempt. Default OFF, so later failures are never hidden.",
+)
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None)
+@click.option(
+    "--device-initialization", "device_initialization",
+    type=click.Choice([models.DEVICE_INIT_STANDARD, models.DEVICE_INIT_SKIP]), default=None,
+    help="Tablet device-initialization mode (Workstream 6); 'skip' is DIAGNOSTIC-only.",
+)
+def run_repeat(config_path, scenario_args, profile_path, repeat_count, stop_on_failure, run_id_opt, device_initialization):
+    """Run one or more scenarios repeatedly, preserving every attempt.
+
+    Produces a dedicated targeted-repeat report that NEVER overwrites the normal
+    full-suite report (Workstream 7). Useful for determinism checks on the
+    recently-corrected scenarios.
+    """
+    cfg = _load_config_or_exit(config_path)
+    cfg = _apply_device_initialization(cfg, device_initialization)
+
+    if repeat_count < 1:
+        click.echo(f"--repeat-count must be >= 1, got {repeat_count}", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    scenarios = list(scenario_args)
+    if profile_path or not scenarios:
+        resolved_profile = profile_path or str(REPO_ROOT / targeted_repeat_mod.DEFAULT_TARGETED_PROFILE)
+        try:
+            scenarios = scenarios + targeted_repeat_mod.load_profile(resolved_profile)
+        except (OSError, ValueError) as exc:
+            click.echo(f"Could not load profile {resolved_profile!r}: {exc}", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+    if not scenarios:
+        click.echo("No scenarios given (pass --scenario and/or --profile).", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    out_dir, run_id = _targeted_out_dir(run_id_opt, cfg)
+    variables = _load_run_scenario_variables(run_id)
+
+    def _run_once(scenario_str, attempt_dir):
+        scenario_path = _resolve_scenario_path(scenario_str)
+        rb = reporting.ReportBuilder(cfg, run_name=scenario_path.stem, out_dir=attempt_dir)
+        result = ScenarioRunner(cfg, report_builder=rb, variables=variables).run_scenarios(
+            [scenario_path], suite_name=scenario_path.stem
+        )
+        if run_id:
+            result.run_id = run_id
+        rb.write(result)
+        return result.to_dict()
+
+    report, status = targeted_repeat_mod.run_targeted(
+        scenarios=scenarios,
+        repeat_count=repeat_count,
+        out_dir=out_dir,
+        run_once=_run_once,
+        stop_on_failure=stop_on_failure,
+        device_initialization_mode=cfg.device_initialization_mode,
+        run_id=run_id,
+    )
+    counts = report["attemptCounts"]
+    click.echo(
+        f"Targeted repeat: {len(report['attempts'])} attempt(s) over {len(scenarios)} scenario(s) "
+        f"x{repeat_count} -> {status.upper()}  "
+        f"(pass={counts.get('pass', 0)} fail={counts.get('fail', 0)} blocked={counts.get('blocked', 0)})"
+    )
+    if report.get("diagnosticMode"):
+        click.echo("NOTE: diagnostic mode -- this targeted run is NOT release-certifying.")
+    click.echo(f"Report: {out_dir / 'results.json'}")
+    raise SystemExit(_STATUS_TO_EXIT_CODE[status])
 
 
 def _verified_backend_from_environment(
@@ -1228,6 +1375,57 @@ def release_platforms_cmd():
     # run_ui_suite.py and the Dart process all inherit it. Consolidation reads
     # the same feature profile directly from the YAML, so the report and the
     # executed scope can never disagree about which features were in scope.
+    click.echo(f"export CALEE_RELEASE_FEATURE_SYNCHRONIZATION={'true' if features.synchronization else 'false'}")
+    click.echo(f"export CALEE_RELEASE_FEATURE_MEALS={'true' if features.meals else 'false'}")
+    click.echo(f"export CALEE_RELEASE_FEATURE_ONBOARDING={'true' if features.onboarding else 'false'}")
+    click.echo(f"export CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR={'true' if features.google_calendar else 'false'}")
+    click.echo(f"export CALEE_RELEASE_FEATURE_KIOSK_ADMIN={'true' if features.kiosk_admin else 'false'}")
+    raise SystemExit(EXIT_SUCCESS)
+
+
+def _resolve_run_release_features(run_id: "str | None"):
+    """This run's authoritative feature scope, as (ReleaseFeatures, source).
+
+    Prefers THIS run's own already-composed schema-v2 release-config evidence
+    (reports/runs/<run-id>/release-config/results.json) -- the same scope the
+    consolidator gates on -- so the mobile UI suite is told exactly what the
+    release composed (Workstream 5 KNOWN GAP fix). Falls back to the legacy
+    config/release-platforms.yaml feature profile ONLY when there is genuinely
+    no schema-v2 release-config for this run (a standalone/dev invocation).
+    Never re-derives the scope by re-parsing YAML in bash.
+    """
+    if run_id and run_context.is_valid_run_id(run_id):
+        workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
+        release_config_dict = _load_release_config_dict(workspace)
+        if release_config_dict is not None and release_config_dict.get("schemaVersion") == 2:
+            _, v2_features, _ = _v2_platforms_features_expected(release_config_dict)
+            return v2_features, "schema-v2 release-config (same run)"
+    # Documented legacy fallback: no schema-v2 bundle composed for this run.
+    return release_platforms.load_release_features(), "legacy config/release-platforms.yaml"
+
+
+@main.command("release-feature-scope")
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None)
+def release_feature_scope_cmd(run_id_opt):
+    """Emit this run's authoritative mobile feature scope as exported shell vars.
+
+    Prefers THIS run's already-composed schema-v2 release-config feature scope
+    over the legacy config/release-platforms.yaml -- the KNOWN GAP fix
+    (Workstream 5). A full-solution launcher runs
+    ``eval "$(python -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"``
+    BEFORE invoking scripts/test_caleemobile.sh, so the mobile checks consume
+    the exact scope the release composed, never a second bash/legacy re-parse.
+    A malformed/absent scope defaults to mandatory (never silently optional):
+    every feature ReleaseFeatures can't confirm off stays True.
+    """
+    try:
+        features, source = _resolve_run_release_features(run_id_opt)
+    except release_platforms.ReleasePlatformsError as exc:
+        # Malformed feature scope must BLOCK, never silently become optional.
+        click.echo(f"echo 'release feature scope is malformed: {exc}' >&2; exit {EXIT_BLOCKED}")
+        raise SystemExit(EXIT_BLOCKED)
+    click.echo(f"# release feature scope source: {source}")
+    click.echo(f"export CALEE_RELEASE_FEATURE_SOURCE={shlex.quote(source)}")
     click.echo(f"export CALEE_RELEASE_FEATURE_SYNCHRONIZATION={'true' if features.synchronization else 'false'}")
     click.echo(f"export CALEE_RELEASE_FEATURE_MEALS={'true' if features.meals else 'false'}")
     click.echo(f"export CALEE_RELEASE_FEATURE_ONBOARDING={'true' if features.onboarding else 'false'}")
