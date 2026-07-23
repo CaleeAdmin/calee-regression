@@ -32,6 +32,32 @@ VALID_REQUIRES_STATES = {
 
 LAUNCH_STRATEGIES = {"direct_activity", "start_action", "calee_shell", "normal_launcher"}
 
+# ── Tablet device-initialization mode (Workstream 6) ───────────────────────
+# How the Appium session initializes the device. `standard` is full, normal
+# Appium initialization -- the ONLY mode whose results can certify a release.
+# `skip` sets appium:skipDeviceInitialization=true, a DIAGNOSTIC-ONLY escape
+# hatch for investigating a device that will not initialize; a skip-mode run is
+# never release-certifying. There is no automatic fallback from standard to
+# skip -- skip must be explicitly requested (see docs/TROUBLESHOOTING.md).
+DEVICE_INIT_STANDARD = "standard"
+DEVICE_INIT_SKIP = "skip"
+VALID_DEVICE_INIT_MODES = {DEVICE_INIT_STANDARD, DEVICE_INIT_SKIP}
+
+
+def certification_block(device_initialization_mode: str) -> dict:
+    """The canonical certification/execution-mode block every tablet report
+    embeds (Workstream 6 + 8). Standard mode is certification-eligible and not
+    diagnostic; skip mode is diagnostic and NEVER certification-eligible. A run
+    the consolidator can treat as release evidence must have
+    ``certificationEligible == True`` AND ``diagnosticMode == False``.
+    """
+    diagnostic = device_initialization_mode == DEVICE_INIT_SKIP
+    return {
+        "deviceInitializationMode": device_initialization_mode,
+        "diagnosticMode": diagnostic,
+        "certificationEligible": not diagnostic,
+    }
+
 STATE_MISMATCH_HINT = (
     "Calee launched, but the screen is not the logged-in home screen. "
     "This scenario requires a prepared tablet or test account."

@@ -278,6 +278,17 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     SELECTOR_GATE_STATUS=$?
 
     if [ "$SELECTOR_GATE_STATUS" -eq 0 ]; then
+    # Release-feature scope propagation (Workstream 5): export THIS run's
+    # authoritative feature scope from its already-composed schema-v2
+    # release-config result (never the legacy file, once composed) BEFORE the
+    # mobile checks, so every mobile leg below (api-only, android/ios --ui-only)
+    # is told the exact scope the release composed -- not a legacy re-parse. The
+    # resolver prefers schema-v2 and falls back to config/release-platforms.yaml
+    # only when there is genuinely no schema-v2 bundle. A malformed scope exits
+    # non-zero (fail-closed); the mobile legs then inherit the exported vars.
+    if ! eval "$(python3 -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"; then
+        echo "BLOCKED: could not resolve this run's release-feature scope — refusing to run the mobile checks with an unknown scope." >&2
+    fi
     echo ""
     echo "--- Step 3: CaleeMobile Client API (device-independent — run once) ---"
     # The Client API suite is device-independent, so it runs EXACTLY ONCE for the

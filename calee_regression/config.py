@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import LAUNCH_STRATEGIES
+from .models import DEVICE_INIT_STANDARD, LAUNCH_STRATEGIES, VALID_DEVICE_INIT_MODES
 
 REQUIRED_STRING_FIELDS = [
     "appium_url",
@@ -53,6 +53,10 @@ class Config:
     is_physical_device: "bool | None" = None
     no_reset: bool = True
     new_command_timeout_seconds: int = 120
+    # Tablet device-initialization mode (Workstream 6): "standard" (default,
+    # certification-eligible) or "skip" (diagnostic-only). Never falls back
+    # from standard to skip automatically.
+    device_initialization_mode: str = DEVICE_INIT_STANDARD
     config_path: "Path | None" = None
 
     def is_emulator(self) -> bool:
@@ -116,6 +120,13 @@ def load_config(path) -> Config:
             f"{', '.join(sorted(VALID_EXPECTED_STATES))}."
         )
 
+    device_initialization_mode = raw.get("device_initialization_mode", DEVICE_INIT_STANDARD)
+    if device_initialization_mode not in VALID_DEVICE_INIT_MODES:
+        errors.append(
+            f"Invalid device_initialization_mode: {device_initialization_mode!r}. Must be one of: "
+            f"{', '.join(sorted(VALID_DEVICE_INIT_MODES))}."
+        )
+
     if errors:
         raise ConfigError(
             f"Config file at {path} has {len(errors)} problem(s):\n" + "\n".join(f"  - {e}" for e in errors)
@@ -143,5 +154,6 @@ def load_config(path) -> Config:
         is_physical_device=raw.get("is_physical_device"),
         no_reset=bool(raw.get("no_reset", True)),
         new_command_timeout_seconds=int(raw.get("new_command_timeout_seconds", 120)),
+        device_initialization_mode=device_initialization_mode,
         config_path=path.resolve(),
     )

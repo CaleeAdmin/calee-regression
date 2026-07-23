@@ -408,6 +408,43 @@ def component_from_build_identity(
     return ComponentResult(name=name, status=STATUS_PASS, mandatory=True, detail=[note + "."], evidence=evidence)
 
 
+def diagnostic_tablet_block_reason(suite_dict: "dict[str, Any] | None") -> "str | None":
+    """Why a tablet report must NOT be treated as release-certifying evidence
+    (Workstream 6 + 9), or None when it is a legitimate certification-eligible
+    (standard) run.
+
+    Rules:
+      * A report with NEITHER certification field is a legacy, pre-diagnostic
+        report (the only mode that existed then was standard) -- allowed.
+      * An explicit standard run (``diagnosticMode==False`` AND
+        ``certificationEligible==True``) -- allowed.
+      * An explicit diagnostic run (``diagnosticMode==True`` OR
+        ``certificationEligible==False``) -- BLOCKED, never certifying.
+      * Any partial/inconsistent certification metadata -- BLOCKED: eligibility
+        is never INFERRED for an ambiguous report; it must block, never pass.
+    """
+    if not isinstance(suite_dict, dict):
+        return None
+    has_diag = "diagnosticMode" in suite_dict
+    has_elig = "certificationEligible" in suite_dict
+    if not has_diag and not has_elig:
+        return None
+    diag = suite_dict.get("diagnosticMode")
+    elig = suite_dict.get("certificationEligible")
+    if diag is False and elig is True:
+        return None
+    mode = suite_dict.get("deviceInitializationMode")
+    if diag is True or elig is False:
+        return (
+            f"tablet run is DIAGNOSTIC (deviceInitializationMode={mode!r}, diagnosticMode={diag!r}, "
+            f"certificationEligible={elig!r}) -- diagnostic runs are never release-certifying evidence."
+        )
+    return (
+        f"tablet run has ambiguous/incomplete certification metadata (diagnosticMode={diag!r}, "
+        f"certificationEligible={elig!r}) -- refusing to infer release eligibility; blocking."
+    )
+
+
 def component_from_tablet_report(name: str, suite_dict: "dict[str, Any] | None", *, mandatory: bool = True) -> ComponentResult:
     """Build a ComponentResult from calee-regression's SuiteResult.to_dict() shape."""
     if suite_dict is None:
@@ -432,6 +469,16 @@ def component_from_tablet_report(name: str, suite_dict: "dict[str, Any] | None",
         for s in suite_dict.get("scenarios", [])
         if s.get("status") in ("failed", "blocked") or s.get("blocked_reason") or (s.get("status") == "skipped" and s.get("skip_reason"))
     ]
+    # A diagnostic (skipDeviceInitialization) tablet run is never release-
+    # certifying: a would-be PASS is downgraded to BLOCKED (an ambiguous legacy
+    # report blocks the same way). A real FAIL/BLOCKED still stands -- failing
+    # closed is safe, only a false PASS is dangerous.
+    diagnostic_reason = diagnostic_tablet_block_reason(suite_dict)
+    if diagnostic_reason and status == STATUS_PASS:
+        status = STATUS_BLOCKED
+        detail = [diagnostic_reason] + detail
+    elif diagnostic_reason:
+        detail = [diagnostic_reason] + detail
     return ComponentResult(
         name=name, status=status, mandatory=mandatory,
         passed=passed, failed=failed, blocked=blocked, skipped=skipped, detail=detail,
@@ -1672,6 +1719,77 @@ def component_from_release_intent(
     )
 
 
+def detect_feature_scope_mismatch(
+    feature_profile: "dict[str, bool] | None",
+    mobile_reports: "list[dict[str, Any] | None]",
+) -> list:
+    """Mismatches between the release configuration's feature scope
+    (``feature_profile`` = {feature: mandatory_bool}, the same scope
+    ``consolidate`` gates on) and the scope each mobile report records having
+    been RUN with (``releaseFeatures`` = {feature: 'true'|'false'}, written by
+    run_ui_suite.py / the serial orchestrator -- Workstream 5). Only features
+    present in BOTH are compared. A non-empty list means the mobile suite was
+    told a different scope than the release composed."""
+    mismatches: list = []
+    if not feature_profile:
+        return mismatches
+    for report in mobile_reports:
+        if not isinstance(report, dict):
+            continue
+        release_features = report.get("releaseFeatures")
+        if not isinstance(release_features, dict) or not release_features:
+            continue
+        platform = report.get("platform") or "?"
+        for feature, mandatory in feature_profile.items():
+            if feature not in release_features:
+                continue
+            reported = str(release_features.get(feature)).strip().lower() == "true"
+            if bool(mandatory) != reported:
+                mismatches.append(
+                    f"{platform}: release scope has {feature!r} mandatory={bool(mandatory)}, but the "
+                    f"mobile report was run with {feature}={release_features.get(feature)!r}"
+                )
+    return mismatches
+
+
+FEATURE_SCOPE_CONSISTENCY_COMPONENT_NAME = "Release feature-scope consistency (config vs mobile report)"
+
+
+def component_from_feature_scope_consistency(
+    feature_profile: "dict[str, bool] | None",
+    mobile_reports: "list[dict[str, Any] | None]",
+    *,
+    name: str = FEATURE_SCOPE_CONSISTENCY_COMPONENT_NAME,
+    mandatory: bool = True,
+) -> ComponentResult:
+    """Release-gating cross-check (Workstream 5): the feature scope the mobile
+    suite was actually run with MUST match the release configuration's scope.
+
+    A detected mismatch BLOCKS (a mandatory component). When there is nothing to
+    cross-check (no feature profile, or no mobile report carries a
+    ``releaseFeatures`` block), this passes -- it never manufactures a block out
+    of absent evidence; the per-feature components already gate missing
+    evidence."""
+    mismatches = detect_feature_scope_mismatch(feature_profile, mobile_reports)
+    have_scope = any(
+        isinstance(r, dict) and isinstance(r.get("releaseFeatures"), dict) and r.get("releaseFeatures")
+        for r in mobile_reports
+    )
+    if mismatches:
+        return ComponentResult(
+            name=name, status=STATUS_BLOCKED, mandatory=mandatory, blocked=len(mismatches), detail=mismatches
+        )
+    if not feature_profile or not have_scope:
+        return ComponentResult(
+            name=name, status=STATUS_PASS, mandatory=mandatory,
+            detail=["No mobile feature-scope evidence to cross-check."],
+        )
+    return ComponentResult(
+        name=name, status=STATUS_PASS, mandatory=mandatory,
+        detail=["Mobile suite was run with the same feature scope the release composed."],
+    )
+
+
 def build_release_report(
     *,
     environment: "dict[str, Any] | None" = None,
@@ -1884,6 +2002,16 @@ def build_release_report(
                 ),
             )
             insert_at += 1
+
+        # Cross-check that the mobile suite was actually RUN with the same
+        # feature scope the release composed (Workstream 5). A mismatch BLOCKS.
+        components.insert(
+            insert_at,
+            component_from_feature_scope_consistency(
+                feature_profile, [mobile_android_ui, mobile_ios_ui]
+            ),
+        )
+        insert_at += 1
 
     # Build identity (Phase 3). When an app's identity is required (in scope
     # for this release) it must be known, or the release BLOCKS -- a PASS must

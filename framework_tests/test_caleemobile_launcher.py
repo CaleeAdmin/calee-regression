@@ -43,11 +43,15 @@ def test_script_does_not_pass_credentials_as_bare_cli_arguments():
     assert "CALEE_TEST_PASSWORD" in text
 
 
-def test_script_delegates_ui_run_to_the_structured_report_wrapper():
+def test_script_delegates_ui_run_to_the_serial_orchestrator():
+    # Workstream 3/4: the UI run is delegated to run_ui_manifest.py (the serial
+    # per-file orchestrator), which writes the ONE canonical aggregate report
+    # (--report) and preserves per-file attempt evidence under --work-dir. The
+    # launcher never enumerates test files or runs `flutter test` itself.
     text = _read_script()
-    assert "run_ui_suite.py" in text
+    assert "run_ui_manifest.py" in text
     assert "--report" in text
-    assert "--log" in text
+    assert "--work-dir" in text
 
 
 def test_script_wires_fixture_and_backend_status_into_the_ui_run():
@@ -102,12 +106,13 @@ def _make_fake_sibling(workspace, ui_recorder=False):
     ui_dir = sibling / "ui"
     ui_dir.mkdir(parents=True)
     if ui_recorder:
-        # A stand-in run_ui_suite.py that records the backend/fixture env vars
-        # the launcher exported for it, and writes a PASS report -- so a test
-        # can confirm the verified backend actually reached the UI step. It
-        # also appends "UI" to FAKE_ORDER_LOG (when set) so a test can assert
-        # the API suite ran strictly before it.
-        (ui_dir / "run_ui_suite.py").write_text(
+        # A stand-in run_ui_manifest.py (the serial orchestrator the launcher now
+        # invokes -- Workstream 3/4) that records the backend/fixture env vars the
+        # launcher exported for it, and writes a PASS aggregate report -- so a
+        # test can confirm the verified backend actually reached the UI step. It
+        # also appends "UI" to FAKE_ORDER_LOG (when set) so a test can assert the
+        # API suite ran strictly before it.
+        (ui_dir / "run_ui_manifest.py").write_text(
             "import sys, os, json\n"
             "report = ''\n"
             "for i, a in enumerate(sys.argv):\n"
@@ -747,16 +752,17 @@ def test_ui_only_mode_runs_ui_and_never_runs_or_writes_the_api_report(tmp_path):
 
 def test_script_populates_and_forwards_release_feature_flags():
     text = _read_script()
-    # No YAML parsing in bash: the scope is sourced from the release-platforms
-    # command (its exported CALEE_RELEASE_FEATURE_* lines), defaulting to
-    # mandatory (true) when the parent launcher didn't already export it.
-    assert "release-platforms" in text
+    # No YAML parsing in bash: the scope is sourced from the release-feature-scope
+    # command (Workstream 5 -- prefers THIS run's schema-v2 release-config over
+    # the legacy file), defaulting to mandatory (true) when the parent launcher
+    # didn't already export it.
+    assert "release-feature-scope" in text
     for var in (
         "CALEE_RELEASE_FEATURE_MEALS", "CALEE_RELEASE_FEATURE_ONBOARDING",
         "CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR", "CALEE_RELEASE_FEATURE_KIOSK_ADMIN",
     ):
         assert var in text
-    # The three mobile features are forwarded to run_ui_suite.py as --feature.
+    # The three mobile features are forwarded to the orchestrator as --feature.
     assert "--feature" in text
     assert 'meals=$CALEE_RELEASE_FEATURE_MEALS' in text
     assert 'onboarding=$CALEE_RELEASE_FEATURE_ONBOARDING' in text

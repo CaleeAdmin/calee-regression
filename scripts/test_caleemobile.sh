@@ -132,32 +132,30 @@ if [ "$RUN_UI" = true ]; then
     mkdir -p "$UI_DIR"
 fi
 
-# --- Release-feature scope (Workstream 1) --------------------------------
-# KNOWN GAP (found during a Priority 8 documentation-drift audit, not yet
-# fixed): unlike "06"'s OWN --meals/--onboarding/--google-calendar/
-# --kiosk-admin-mandatory flags passed to `consolidate` (which correctly
-# prefer this run's schema-v2 release-config feature scope when one was
-# composed), this fallback -- reached both from a standalone "03/04 Test
-# CaleeMobile ..." run AND from "06" itself, since "06" never exports
-# CALEE_RELEASE_FEATURE_* before invoking this script -- ALWAYS reads
-# meals/onboarding/google_calendar/kiosk_admin from legacy
-# config/release-platforms.yaml (via the `release-platforms` command's
-# exported lines, never a second YAML parse in bash), even for a schema-v2
-# release whose bundle declares a different feature scope. This only affects
-# whether the Flutter UI suite treats a missing feature mid-run as a benign
-# optional skip vs. an ENVIRONMENT_BLOCKED failure; `consolidate`'s own final
-# release-gating decision for these features is unaffected (it resolves
-# separately and correctly, see above). An omitted feature defaults to
-# mandatory=true (see release_platforms.py and the "omitted requirement must
-# never silently become optional" rule).
+# --- Release-feature scope (Workstream 1 + 5) ----------------------------
+# The mobile checks must consume the EXACT feature scope this release run
+# already composed. "06 Test Full Calee Solution" exports CALEE_RELEASE_FEATURE_*
+# from THIS run's schema-v2 release-config result before invoking this script
+# (see scripts/run_release_technical.sh / the 06 launcher), so those values are
+# already in the environment here and are used as-is. When they are NOT set --
+# a standalone "03/04 Test CaleeMobile ..." run, or any run with no schema-v2
+# release-config -- this resolves them via the `release-feature-scope` command,
+# which prefers THIS run's schema-v2 release-config feature scope and falls back
+# to the legacy config/release-platforms.yaml profile ONLY when there is
+# genuinely no schema-v2 release bundle for the run. The scope is NEVER
+# re-parsed from YAML in bash: it comes from that one Python resolver, the same
+# one `consolidate` gates on (Workstream 5 -- this closes the former KNOWN GAP
+# where this fallback always read the legacy file even for a schema-v2 release).
+# An omitted/malformed feature defaults to mandatory=true (never silently
+# optional); a malformed scope makes `release-feature-scope` exit non-zero.
 if [ -z "${CALEE_RELEASE_FEATURE_MEALS:-}" ]; then
-    eval "$(python -m calee_regression release-platforms)"
+    eval "$(python -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"
 fi
 export CALEE_RELEASE_FEATURE_MEALS="${CALEE_RELEASE_FEATURE_MEALS:-true}"
 export CALEE_RELEASE_FEATURE_ONBOARDING="${CALEE_RELEASE_FEATURE_ONBOARDING:-true}"
 export CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR="${CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR:-true}"
 export CALEE_RELEASE_FEATURE_KIOSK_ADMIN="${CALEE_RELEASE_FEATURE_KIOSK_ADMIN:-true}"
-echo "[OK] Release-feature scope: meals=$CALEE_RELEASE_FEATURE_MEALS onboarding=$CALEE_RELEASE_FEATURE_ONBOARDING google_calendar=$CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR kiosk_admin=$CALEE_RELEASE_FEATURE_KIOSK_ADMIN"
+echo "[OK] Release-feature scope: meals=$CALEE_RELEASE_FEATURE_MEALS onboarding=$CALEE_RELEASE_FEATURE_ONBOARDING google_calendar=$CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR kiosk_admin=$CALEE_RELEASE_FEATURE_KIOSK_ADMIN (source: ${CALEE_RELEASE_FEATURE_SOURCE:-default})"
 
 # Default both suites to BLOCKED (exit 3): if the Prepare gate below refuses
 # to let them run, that is exactly the state they must be recorded in --
@@ -306,20 +304,36 @@ else
                     export CALEE_UI_DEVICE_ID="$UI_DEVICE_ID"
                     UI_DEVICE_ARGS=(--device-id "$UI_DEVICE_ID")
                 fi
+                # Serial per-file orchestration (Workstream 3/4): run_ui_manifest.py
+                # runs each integration-test FILE in its OWN Flutter process (a
+                # physical iPhone stalls when the whole integration_test directory
+                # is launched in one process), retries ONLY a confirmed
+                # launch/tooling failure once, preserves EVERY attempt under
+                # "$UI_DIR/files/", and writes ONE canonical aggregate platform
+                # report to "$UI_REPORT" -- shaped so the consolidator consumes it
+                # exactly like a single-suite report (per-file reports are
+                # subordinate evidence). The ordered manifest lives in
+                # CaleeMobile-Regression (run_ui_manifest.DEFAULT_MANIFEST); this
+                # launcher NEVER enumerates test files itself. Both platforms use
+                # the same orchestrator, so a standalone "03/04" run and "06" share
+                # one implementation and iOS/Android reports can never collide.
+                #
                 # CALEE_MOBILE_BACKEND / CALEE_EXPECTED_BACKEND / CALEE_FIXTURE_STATUS
-                # are exported above and read by run_ui_suite.py from the environment.
-                # The mobile release features (Workstream 1) are passed explicitly
-                # so run_ui_suite.py forwards them to the Dart process as
-                # --dart-define=CALEE_RELEASE_FEATURE_* and tags each step with the
-                # feature it exercised (kiosk/admin is a tablet feature, handled by
-                # the kiosk-admin command, not the mobile UI suite).
+                # / CALEE_RELEASE_ID / CALEE_RUN_ID / CALEE_FIXTURE_VERSION are
+                # exported above/by the launcher and read from the environment;
+                # run_ui_manifest forwards the SAME identity + feature scope to every
+                # per-file run_ui_suite.py process, which reads credentials from the
+                # environment (never argv) -- the secure-credential boundary is
+                # unchanged. The mobile release features (Workstream 1/5) are passed
+                # explicitly (kiosk/admin is a tablet feature, handled by the
+                # kiosk-admin command, not the mobile UI suite).
                 # ${arr[@]+"${arr[@]}"} keeps an empty array safe under `set -u`
                 # on the bash 3.2 that ships with macOS.
-                (cd "$SIBLING/ui" && python3 run_ui_suite.py \
+                (cd "$SIBLING/ui" && python3 run_ui_manifest.py \
                     --platform "$PLATFORM" \
                     ${UI_DEVICE_ARGS[@]+"${UI_DEVICE_ARGS[@]}"} \
                     --report "$UI_REPORT" \
-                    --log "$UI_DIR/flutter.log" \
+                    --work-dir "$UI_DIR" \
                     --feature "meals=$CALEE_RELEASE_FEATURE_MEALS" \
                     --feature "onboarding=$CALEE_RELEASE_FEATURE_ONBOARDING" \
                     --feature "google_calendar=$CALEE_RELEASE_FEATURE_GOOGLE_CALENDAR")

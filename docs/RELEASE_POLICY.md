@@ -356,3 +356,46 @@ release or immutable input set is rejected by the same exact-tuple matching.
   `test_mandatory_skip_handling.py`, `test_cli_prepare.py`, `test_cli_consolidate.py`,
   `test_run_context.py` — self-test this policy against synthetic pass/fail/blocked/missing/stale/
   mismatched-run-ID inputs (no real device or backend needed).
+
+## Serial iPhone execution, feature-scope authority, and diagnostic non-certification
+
+**Serial iOS by default.** The physical iPhone stalls when the whole
+`integration_test` directory is launched in one Flutter process, so the release
+path runs each integration-test **file** in its own process via
+`CaleeMobile-Regression/ui/run_ui_manifest.py` (invoked by
+`scripts/test_caleemobile.sh` for both platforms). Every file has independent
+evidence under `mobile-<platform>/files/<file>/attempt-N/`; the ONE canonical
+platform report is `reports/runs/<run-id>/mobile-<platform>/results.json`, and
+per-file reports are subordinate evidence. The full-directory physical-iOS
+invocation is no longer a release path.
+
+**Retry policy.** At most one bounded retry, and only for a *confirmed*
+launch/tooling failure (a recognized launch indicator in the structured result
+and/or preserved log). A product FAIL, a fixture-missing skip, an onboarding-
+state assertion, a backend mismatch, or a selector mismatch is **never**
+retried. A recovered tooling block can make a file's final result PASS but never
+erases the initial block from the auditable attempt history; a product failure
+is never improved by rerunning.
+
+**Aggregate status precedence.** Any product FAIL → platform FAIL; else any
+mandatory BLOCKED → BLOCKED; else a mandatory unexplained skip → BLOCKED; else
+PASS.
+
+**Feature-scope authority.** The mobile suite is run with exactly the feature
+scope THIS release run composed. `06` `eval`s
+`python -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID"`
+before the mobile checks; it prefers this run's schema-v2 release-config feature
+scope over the legacy `config/release-platforms.yaml` (falling back to legacy
+only when there is genuinely no schema-v2 bundle), and never re-parses the scope
+in bash. A missing/malformed scope defaults to mandatory (never silently
+optional). Consolidation additionally BLOCKS on any mismatch between the release
+configuration's feature scope and the scope the mobile report was actually run
+with (`releaseFeatures`).
+
+**Diagnostic tablet runs never certify.** `device_initialization_mode: skip`
+(`--device-initialization skip`) is a diagnostic-only mode: its report is marked
+`diagnosticMode: true` / `certificationEligible: false`, and the consolidator
+never treats it as release-certifying evidence (a would-be PASS is downgraded to
+BLOCKED). Standard mode is `certificationEligible: true`. A legacy report with no
+certification fields is treated as standard; an ambiguous/partial certification
+metadata blocks rather than being inferred eligible.
