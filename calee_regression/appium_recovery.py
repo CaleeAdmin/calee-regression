@@ -1,15 +1,23 @@
-"""Bounded recovery for a known Appium UiAutomator2 bootstrap failure."""
+"""Pure, reusable helpers for the Appium UiAutomator2 Settings-helper failure.
+
+Historical note: this module used to install an import-time monkey-patch of
+``CaleeDriver.start_session`` (``install_appium_settings_recovery``), applied
+from ``calee_regression/__init__.py``. That implicit, package-import-time change
+of class behaviour has been REMOVED in favour of an explicit, testable
+session-bootstrap component (see ``session_bootstrap.bootstrap_session``), which
+the runner calls directly. Only the narrowly-scoped, side-effect-free helpers
+below remain here; ``session_bootstrap`` reuses them.
+"""
 
 from __future__ import annotations
 
 import subprocess
 from typing import Callable
 
-from .appium_driver import CaleeDriver, find_adb_path
+from .appium_driver import find_adb_path
 
 _SETTINGS_PACKAGE = "io.appium.settings"
 _SETTINGS_FAILURE = "appium settings app is not running"
-_PATCH_MARKER = "_calee_appium_settings_recovery_installed"
 
 
 def is_settings_startup_failure(exc: BaseException) -> bool:
@@ -17,40 +25,26 @@ def is_settings_startup_failure(exc: BaseException) -> bool:
     return _SETTINGS_FAILURE in str(exc).lower()
 
 
-def reset_settings_package(config, *, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> None:
+def reset_settings_package(
+    config, *, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run
+) -> "subprocess.CompletedProcess | None":
     """Remove the stale helper package so UiAutomator2 can reinstall it.
 
     Uninstall is intentionally best-effort: an absent package is already the
-    desired recovery state. The subsequent Appium session retry is the actual
-    readiness check and remains fail-closed.
+    desired recovery state, and the subsequent Appium session retry is the
+    actual readiness check (which remains fail-closed). Returns the uninstall's
+    CompletedProcess so a caller (session_bootstrap) can record its return code,
+    or None if the uninstall could not even be spawned.
+
+    Only ``io.appium.settings`` is ever uninstalled -- never an arbitrary
+    package chosen by a broad search.
     """
     adb = find_adb_path()
     command = [adb]
     if getattr(config, "udid", None):
         command.extend(["-s", config.udid])
     command.extend(["uninstall", _SETTINGS_PACKAGE])
-    runner(command, capture_output=True, text=True, timeout=30, check=False)
-
-
-def install_appium_settings_recovery(driver_class=CaleeDriver) -> None:
-    """Patch CaleeDriver with one exact-error recovery attempt, idempotently."""
-    if getattr(driver_class, _PATCH_MARKER, False):
-        return
-
-    original = driver_class.start_session
-
-    def start_session_with_recovery(self) -> None:
-        try:
-            original(self)
-            return
-        except Exception as exc:
-            if not is_settings_startup_failure(exc):
-                raise
-            reset_settings_package(self.config)
-
-        # Exactly one retry. A second failure propagates to ScenarioRunner,
-        # which correctly classifies session/tooling failures as BLOCKED.
-        original(self)
-
-    driver_class.start_session = start_session_with_recovery
-    setattr(driver_class, _PATCH_MARKER, True)
+    try:
+        return runner(command, capture_output=True, text=True, timeout=30, check=False)
+    except Exception:
+        return None

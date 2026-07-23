@@ -49,19 +49,34 @@ steps:
     action: sleep
     seconds: 3
 
-  - name: Wait for the recurring fixture event to appear
-    action: wait_for_text
+  # Non-mutating, bounded-scrolling resolution (Workstream 3): resolve EXACTLY
+  # ONE row whose text/content-description equals REG-EVENT-RECURRING-001,
+  # scrolling the Agenda RecyclerView into view if the row is below the current
+  # accessibility viewport. This replaces the old non-scrolling wait_for_text,
+  # which false-failed whenever the event rendered outside the viewport. Zero
+  # matches wait until the deadline then FAIL with a screenshot + page source;
+  # more than one exact match FAILs as ambiguity (never taps an arbitrary
+  # occurrence). This step does NOT tap.
+  - name: Wait for the recurring fixture event to appear (scrolling, no tap)
+    action: wait_for_unique_text
     text: REG-EVENT-RECURRING-001
     timeout_seconds: 25
+    scroll: true
+    max_swipes: 12
 
   - name: Capture agenda view with recurring fixture event
     action: screenshot
     screenshot_name: 00_agenda_recurring_visible
     compare: false
 
+  # Tap the uniquely-resolved event through a SEPARATE explicit step, which
+  # re-resolves the one exact match (with the same bounded scrolling + stale
+  # recovery) before clicking -- never an arbitrary first match.
   - name: Open the recurring fixture event
-    action: tap
+    action: tap_unique_text
     text: REG-EVENT-RECURRING-001
+    scroll: true
+    max_swipes: 12
 
   - name: Wait for event detail dialog to render
     action: wait_for_id
@@ -85,14 +100,20 @@ steps:
     action: tap
     id: btnEventDetailClose
 
-  - name: Wait for the exception occurrence to appear
-    action: wait_for_text
+  # Same non-mutating, bounded-scrolling resolution for the detached exception
+  # occurrence's overridden title (Workstream 3).
+  - name: Wait for the exception occurrence to appear (scrolling, no tap)
+    action: wait_for_unique_text
     text: REG-EVENT-EXCEPTION-001
     timeout_seconds: 20
+    scroll: true
+    max_swipes: 12
 
   - name: Open the exception occurrence
-    action: tap
+    action: tap_unique_text
     text: REG-EVENT-EXCEPTION-001
+    scroll: true
+    max_swipes: 12
 
   - name: Wait for event detail dialog to render again
     action: wait_for_id

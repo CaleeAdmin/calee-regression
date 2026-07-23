@@ -18,6 +18,7 @@ from . import build_identity as build_identity_mod
 from . import build_provenance as build_provenance_mod
 from . import config as config_mod
 from . import credentials as credentials_mod
+from . import focused_workflow
 from . import distributed_build_acceptance as distributed_build_acceptance_mod
 from . import manual_checks as manual_checks_mod
 from . import provider_evidence as provider_evidence_mod
@@ -238,24 +239,112 @@ def _appium_pid_path() -> Path:
     return _resolved_report_root() / "reports" / "appium.pid"
 
 
-def _ensure_appium_or_echo_blocked(cfg, *, ready_timeout_seconds: float = 60) -> bool:
-    """Auto-starts Appium if the configured endpoint isn't already
-    healthy, so the tester never has to open a separate Terminal (see
-    Workstream 8). Returns True if Appium is (now) reachable."""
-    click.echo(f"\nChecking Appium at {cfg.appium_url} ...")
+class AppiumLifecycleState(NamedTuple):
+    """The disposition of the configured Appium endpoint after a command
+    ensured it (Workstream 1). ``state`` is one of: ``already_running`` (someone
+    else's server was healthy and left untouched), ``started`` (this framework
+    started it fresh), ``restarted`` (a framework-started server had gone away --
+    e.g. an external/diagnostic step stopped it -- and was started again), or
+    ``unavailable`` (could not be started/reached)."""
+
+    available: bool
+    state: str
+    base_url: str
+    detail: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "available": self.available,
+            "state": self.state,
+            "baseUrl": self.base_url,
+            "detail": self.detail,
+        }
+
+
+def _ensure_appium_for_command(cfg, *, ready_timeout_seconds: float = 60, ensure=None, is_healthy=None) -> AppiumLifecycleState:
+    """Ensure the configured Appium endpoint is available BEFORE this command
+    creates a session (Workstream 1).
+
+    Every tablet command -- ``run``, ``suite``, ``run-repeat`` and ``prepare`` --
+    calls this itself, so NONE of them depends on a prior ``prepare`` in the same
+    shell having left Appium running. If an external or diagnostic step stopped a
+    framework-started server between two commands, the next command simply
+    restarts it here. Reuses the single ``appium_lifecycle`` implementation (no
+    duplicated shell-level startup logic).
+
+    This NEVER stops Appium: a framework-started server is left running for the
+    tester's following command; only the explicit ``stop-appium`` command and the
+    focused orchestration's own ``finally`` cleanup stop it. So one command can
+    never accidentally stop a server the next command needs.
+    """
+    ensure = ensure or appium_lifecycle.ensure_appium_running
+    is_healthy = is_healthy or appium_lifecycle.is_appium_healthy
+    base_url = cfg.appium_url
+    pid_file = _appium_pid_path()
+    # A framework-written pid file plus an unhealthy endpoint means a server we
+    # started earlier is gone (an external repair/diagnostic step stopped it and
+    # did not restart it -- the exact focused-run failure being fixed). ensure
+    # will start a fresh one, recorded as a RESTART rather than a first start.
+    had_stale_pid = pid_file.is_file() and not is_healthy(base_url)
+    click.echo(f"\nEnsuring Appium at {base_url} ...")
     try:
-        handle = appium_lifecycle.ensure_appium_running(
-            base_url=cfg.appium_url, log_path=_appium_log_path(), pid_file=_appium_pid_path(),
+        handle = ensure(
+            base_url=base_url, log_path=_appium_log_path(), pid_file=pid_file,
             ready_timeout_seconds=ready_timeout_seconds,
         )
     except appium_lifecycle.AppiumLifecycleError as exc:
-        click.echo(f"BLOCKED: could not start Appium automatically: {exc}", err=True)
-        return False
-    if handle.started_by_us:
-        click.echo(f"[OK] Appium started automatically (log: {_appium_log_path()})")
-    else:
+        click.echo(f"BLOCKED: could not ensure Appium is running: {exc}", err=True)
+        return AppiumLifecycleState(False, "unavailable", base_url, str(exc))
+    if not handle.started_by_us:
         click.echo("[OK] Appium was already running")
-    return True
+        return AppiumLifecycleState(True, "already_running", base_url)
+    if had_stale_pid:
+        click.echo(f"[OK] Appium was restarted by the framework (log: {_appium_log_path()})")
+        return AppiumLifecycleState(True, "restarted", base_url)
+    click.echo(f"[OK] Appium started automatically (log: {_appium_log_path()})")
+    return AppiumLifecycleState(True, "started", base_url)
+
+
+def _ensure_appium_or_echo_blocked(cfg, *, ready_timeout_seconds: float = 60) -> bool:
+    """Backwards-compatible boolean wrapper used by ``prepare``. Delegates to
+    the single ``_ensure_appium_for_command`` implementation (Workstream 1)."""
+    return _ensure_appium_for_command(cfg, ready_timeout_seconds=ready_timeout_seconds).available
+
+
+def _blocked_tablet_suite_result(run_name: str, reason: str, lifecycle: AppiumLifecycleState):
+    """A one-scenario BLOCKED SuiteResult recording an unavailable Appium
+    endpoint, so a tablet command that can't even reach Appium still writes a
+    traceable report (never a silent skip) and consolidates as BLOCKED."""
+    step = models.StepResult(
+        name="ensure_appium", action="launch", status=models.STATUS_BLOCKED, message=reason,
+    )
+    step.diagnostics = {"appiumLifecycle": lifecycle.to_dict()}
+    scenario = models.ScenarioResult(
+        name=run_name, file=run_name, status=models.STATUS_BLOCKED, blocked_reason=reason, steps=[step],
+    )
+    result = models.SuiteResult(name=run_name)
+    result.scenarios.append(scenario)
+    return result
+
+
+def _ensure_appium_or_block_tablet(cfg, run_id, out_dir, run_name) -> AppiumLifecycleState:
+    """Ensure Appium for a ``run``/``suite`` command; on failure write a BLOCKED
+    tablet report, record the component, and exit BLOCKED so no product scenario
+    is ever started against an unavailable endpoint (Workstream 1)."""
+    lifecycle = _ensure_appium_for_command(cfg)
+    if lifecycle.available:
+        return lifecycle
+    reason = (
+        f"Appium endpoint {lifecycle.base_url} is unavailable and could not be started "
+        f"automatically: {lifecycle.detail}. No tablet scenario was started -- this is an "
+        f"environment/tooling problem, not a product failure."
+    )
+    result = _blocked_tablet_suite_result(run_name, reason, lifecycle)
+    rb = reporting.ReportBuilder(cfg, run_name=run_name, out_dir=out_dir)
+    report_dir = rb.write(result)
+    _record_tablet_component(run_id, report_dir, result)
+    click.echo(f"Report: {report_dir}")
+    raise SystemExit(EXIT_BLOCKED)
 
 
 def _write_environment_report(
@@ -710,6 +799,10 @@ def run(config_path, scenario_arg, run_id_opt, device_initialization):
     cfg = _apply_device_initialization(cfg, device_initialization)
     scenario_path = _resolve_scenario_path(scenario_arg)
     out_dir, run_id = _tablet_out_dir(run_id_opt)
+    # This command owns its Appium lifecycle (Workstream 1): ensure the endpoint
+    # is up before creating any session, independent of whether `prepare` ran in
+    # this shell. Blocks (never a product FAIL) if it can't be reached.
+    _ensure_appium_or_block_tablet(cfg, run_id, out_dir, scenario_path.stem)
     rb = reporting.ReportBuilder(cfg, run_name=scenario_path.stem, out_dir=out_dir)
     variables = _load_run_scenario_variables(run_id)
     result = ScenarioRunner(cfg, report_builder=rb, variables=variables).run_scenarios([scenario_path], suite_name=scenario_path.stem)
@@ -803,6 +896,8 @@ def suite(config_path, suite_name, confirm_technical, run_id_opt, device_initial
         raise SystemExit(EXIT_INVALID_CONFIG)
 
     out_dir, run_id = _tablet_out_dir(run_id_opt)
+    # This command owns its Appium lifecycle (Workstream 1).
+    _ensure_appium_or_block_tablet(cfg, run_id, out_dir, suite_name)
     rb = reporting.ReportBuilder(cfg, run_name=suite_name, out_dir=out_dir)
     variables = _load_run_scenario_variables(run_id)
     result = ScenarioRunner(cfg, report_builder=rb, variables=variables).run_scenarios(scenario_paths, suite_name=suite_name)
@@ -842,22 +937,47 @@ def _utc_now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
-def _targeted_out_dir(run_id_opt: "str | None", cfg) -> "tuple[Path, str | None]":
-    """The directory the aggregate targeted-repeat report is written to. Always
-    SEPARATE from the normal tablet component so a determinism re-run can never
-    overwrite the full-suite report (Workstream 7). For a shared release run it
-    is reports/runs/<run-id>/tablet-targeted/ (a non-component subdir); for a
-    standalone run, a timestamped <report_dir>/tablet-targeted-<ts>/."""
+def _targeted_out_dir(run_id_opt: "str | None", cfg, device_initialization_mode: str) -> "tuple[Path, str | None]":
+    """The directory the aggregate targeted-repeat report is written to.
+
+    Always SEPARATE from the normal tablet component so a determinism re-run can
+    never overwrite the full-suite report (Workstream 7), AND now split by
+    execution MODE so a diagnostic run can never overwrite a standard one and
+    vice versa (Workstream 4): for a shared release run it is
+    reports/runs/<run-id>/tablet-targeted/<standard|diagnostic>/ (a non-component
+    subtree); for a standalone run, <report_dir>/tablet-targeted-<ts>/<mode>/.
+    Returns (mode_out_dir, run_id)."""
+    mode = targeted_repeat_mod.mode_label(device_initialization_mode)
     if run_id_opt:
         run_id = _resolve_run_id(run_id_opt)
         workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
         workspace.ensure_created()
-        out = workspace.component_dir("tablet-targeted")
+        out = workspace.component_dir("tablet-targeted") / mode
         out.mkdir(parents=True, exist_ok=True)
         return out, run_id
-    out = Path(cfg.report_dir) / f"tablet-targeted-{time.strftime('%Y%m%d-%H%M%S')}"
+    out = Path(cfg.report_dir) / f"tablet-targeted-{time.strftime('%Y%m%d-%H%M%S')}" / mode
     out.mkdir(parents=True, exist_ok=True)
     return out, None
+
+
+def _record_targeted_component(run_id: str, device_initialization_mode: str, out_dir: Path, report: dict, status: str) -> None:
+    """Record a targeted-repeat invocation into the run manifest under a
+    mode-scoped key (Workstream 4), so the manifest records BOTH the standard and
+    diagnostic results, each pointing at its own immutable invocation. Worst-wins
+    is per-key, so a diagnostic result can never improve the standard one."""
+    mode = targeted_repeat_mod.mode_label(device_initialization_mode)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
+    manifest = _load_or_init_manifest(workspace)
+    invocation_id = report.get("invocationId")
+    invocation_path = str(out_dir / "invocations" / _sanitize_component_name(invocation_id or ""))
+    manifest.record_component(
+        f"tablet-targeted-{mode}",
+        report_path=str(out_dir / "results.json"),
+        exit_code=_STATUS_TO_EXIT_CODE.get(status, EXIT_BLOCKED),
+        invocation_id=invocation_id,
+        invocation_path=invocation_path,
+    )
+    manifest.write(workspace.manifest_path)
 
 
 @main.command(name="run-repeat")
@@ -914,7 +1034,20 @@ def run_repeat(config_path, scenario_args, profile_path, repeat_count, stop_on_f
         click.echo("No scenarios given (pass --scenario and/or --profile).", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
 
-    out_dir, run_id = _targeted_out_dir(run_id_opt, cfg)
+    # This command owns its Appium lifecycle (Workstream 1): ensure the endpoint
+    # before any attempt, so a determinism re-run started after an external or
+    # diagnostic step stopped Appium restarts it here rather than blocking every
+    # attempt for a server/session reason unrelated to the tested product.
+    lifecycle = _ensure_appium_for_command(cfg)
+    if not lifecycle.available:
+        click.echo(
+            f"BLOCKED: Appium endpoint {lifecycle.base_url} is unavailable ({lifecycle.detail}); "
+            f"no targeted attempt was started.",
+            err=True,
+        )
+        raise SystemExit(EXIT_BLOCKED)
+
+    out_dir, run_id = _targeted_out_dir(run_id_opt, cfg, cfg.device_initialization_mode)
     variables = _load_run_scenario_variables(run_id)
 
     # Full provenance for the immutable targeted report (Workstream 6). Captured
@@ -960,16 +1093,170 @@ def run_repeat(config_path, scenario_args, profile_path, repeat_count, stop_on_f
         provenance=provenance,
         started_at=started_at,
     )
+    # Workstream 4: refresh the top-level targeted index (references BOTH the
+    # standard and diagnostic mode results + every invocation; the standard
+    # result stays the canonical certifying one) and record this mode into the
+    # run manifest so both modes are traceable and a diagnostic run can never
+    # erase or improve the standard result.
+    top_index = targeted_repeat_mod.update_targeted_top_index(
+        out_dir.parent, targeted_repeat_mod.mode_label(cfg.device_initialization_mode), report
+    )
+    if run_id:
+        _record_targeted_component(run_id, cfg.device_initialization_mode, out_dir, report, status)
+
     counts = report["attemptCounts"]
     click.echo(
-        f"Targeted repeat: {len(report['attempts'])} attempt(s) over {len(scenarios)} scenario(s) "
+        f"Targeted repeat [{targeted_repeat_mod.mode_label(cfg.device_initialization_mode)}]: "
+        f"{len(report['attempts'])} attempt(s) over {len(scenarios)} scenario(s) "
         f"x{repeat_count} -> {status.upper()}  "
         f"(pass={counts.get('pass', 0)} fail={counts.get('fail', 0)} blocked={counts.get('blocked', 0)})"
     )
     if report.get("diagnosticMode"):
         click.echo("NOTE: diagnostic mode -- this targeted run is NOT release-certifying.")
     click.echo(f"Report: {out_dir / 'results.json'}")
+    click.echo(f"Targeted index (standard + diagnostic): {out_dir.parent / 'index.json'}")
     raise SystemExit(_STATUS_TO_EXIT_CODE[status])
+
+
+def _default_mobile_regression_repo() -> Path:
+    """The sibling CaleeMobile-Regression checkout (default layout)."""
+    return REPO_ROOT.parent / "CaleeMobile-Regression"
+
+
+def _build_focused_verify_steps(
+    *, config_path, run_id, tablet_scenario, tablet_repeat, api_suite, ios_target,
+    mobile_repo: Path, focused_dir: Path, skip_api: bool, skip_ios: bool,
+) -> list:
+    """Build the ordered FocusedStep list. Credentials are NEVER placed on any
+    child's argv -- each child resolves them from the inherited environment /
+    Keychain (Workstream 9)."""
+    py = sys.executable
+    config_args = ["--config", config_path] if config_path else []
+    steps = [
+        focused_workflow.FocusedStep(
+            id="prepare", title="Environment + fixture preparation",
+            command=[py, "-m", "calee_regression", "prepare", *config_args, "--run-id", run_id, "--suite", "calendar"],
+        ),
+        focused_workflow.FocusedStep(
+            id="tablet-standard", title=f"Standard recurring-calendar scenario x{tablet_repeat}", mode="standard",
+            command=[py, "-m", "calee_regression", "run-repeat", *config_args, "--scenario", tablet_scenario,
+                     "--repeat-count", str(tablet_repeat), "--run-id", run_id,
+                     "--device-initialization", models.DEVICE_INIT_STANDARD],
+        ),
+        focused_workflow.FocusedStep(
+            id="tablet-diagnostic", title=f"Diagnostic recurring-calendar scenario x{tablet_repeat}", mode="diagnostic",
+            command=[py, "-m", "calee_regression", "run-repeat", *config_args, "--scenario", tablet_scenario,
+                     "--repeat-count", str(tablet_repeat), "--run-id", run_id,
+                     "--device-initialization", models.DEVICE_INIT_SKIP],
+        ),
+    ]
+    if not skip_api:
+        api_dir = mobile_repo / "api"
+        for attempt in (1, 2):
+            report_path = focused_dir / "api" / f"attempt-{attempt}" / "results.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            steps.append(
+                focused_workflow.FocusedStep(
+                    id=f"api-{attempt}", title=f"Focused stop-repeating API scenario (attempt {attempt})",
+                    requires_appium=False,
+                    command=[py, "-m", "caleemobile_regression", "--suite", api_suite,
+                             "--report", str(report_path),
+                             "--bundle-dir", str(focused_dir / "api" / "bundles")],
+                    metadata={"cwd": str(api_dir)},
+                )
+            )
+    if not skip_ios:
+        ios_report = focused_dir / "ios" / "results.json"
+        ios_report.parent.mkdir(parents=True, exist_ok=True)
+        ios_cmd = [py, "ui/run_ui_suite.py", "--platform", "ios", "--target", ios_target,
+                   "--report", str(ios_report), "--log", str(focused_dir / "ios" / "flutter.log")]
+        mobile_backend = os.environ.get("CALEE_API_BASE")
+        if mobile_backend:
+            ios_cmd.extend(["--mobile-backend", mobile_backend])
+        steps.append(
+            focused_workflow.FocusedStep(
+                id="ios", title="Focused iPhone environment / app-boot check",
+                requires_appium=False, command=ios_cmd, metadata={"cwd": str(mobile_repo)},
+            )
+        )
+    return steps
+
+
+@main.command("focused-verify")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
+@click.option("--tablet-scenario", default="scenarios/calendar_recurring_events.yaml", show_default=True)
+@click.option("--tablet-repeat", type=int, default=2, show_default=True)
+@click.option("--api-suite", default="chores-stop-repeating", show_default=True)
+@click.option("--ios-target", default="integration_test/app_boot_test.dart", show_default=True)
+@click.option(
+    "--mobile-regression-repo", default=None, type=click.Path(),
+    help="Path to the CaleeMobile-Regression checkout (default: sibling ../CaleeMobile-Regression).",
+)
+@click.option("--skip-api/--no-skip-api", default=False, help="Skip the focused API steps.")
+@click.option("--skip-ios/--no-skip-ios", default=False, help="Skip the focused iPhone step.")
+def focused_verify(config_path, tablet_scenario, tablet_repeat, api_suite, ios_target,
+                   mobile_regression_repo, skip_api, skip_ios):
+    """Permanent focused post-fix verification (Workstream 9).
+
+    One command, one fresh run id: environment+fixture prep, the standard
+    recurring-calendar scenario twice, the diagnostic recurring-calendar scenario
+    twice, the focused stop-repeating API scenario twice, a focused iPhone
+    environment/app-boot check, and one aggregate summary. The framework OWNS the
+    Appium lifecycle -- ensured once, stopped once at the end (never between the
+    standard and diagnostic attempts). This makes NO full-release claim.
+
+    Credentials are read from the environment / macOS Keychain by each child and
+    are never placed on any argv; this never prompts on a TTY.
+    """
+    cfg = _load_config_or_exit(config_path)
+    if tablet_repeat < 1:
+        click.echo(f"--tablet-repeat must be >= 1, got {tablet_repeat}", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    # A fresh, REAL run id -- never a literal placeholder like <RUN_ID>.
+    run_id = _resolve_run_id(None)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
+    workspace.ensure_created()
+    focused_dir = workspace.root / "focused-verify"
+    focused_dir.mkdir(parents=True, exist_ok=True)
+    click.echo(f"Focused-verify run ID: {run_id}")
+
+    mobile_repo = Path(mobile_regression_repo) if mobile_regression_repo else _default_mobile_regression_repo()
+    steps = _build_focused_verify_steps(
+        config_path=config_path, run_id=run_id, tablet_scenario=tablet_scenario,
+        tablet_repeat=tablet_repeat, api_suite=api_suite, ios_target=ios_target,
+        mobile_repo=mobile_repo, focused_dir=focused_dir, skip_api=skip_api, skip_ios=skip_ios,
+    )
+
+    def _ensure():
+        return _ensure_appium_for_command(cfg)
+
+    def _run_step(step):
+        env = os.environ.copy()
+        env["CALEE_RUN_ID"] = run_id
+        # Non-interactive: stdin is /dev/null so a child can never wedge on a TTY
+        # read (no suspended-shell-job hazard).
+        with open(os.devnull, "rb") as devnull:
+            return subprocess.call(
+                step.command, env=env, cwd=step.metadata.get("cwd"), stdin=devnull
+            )
+
+    def _stop():
+        appium_lifecycle.stop_appium_from_pid_file(_appium_pid_path())
+
+    summary, exit_code = focused_workflow.run_focused_verify(
+        steps=steps, ensure_appium=_ensure, run_step=_run_step, stop_appium=_stop, log=click.echo,
+    )
+    summary["runId"] = run_id
+    summary_path = focused_dir / "summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+
+    click.echo("\n=== Focused-verify summary (NOT a release certification) ===")
+    for step in summary["steps"]:
+        mode = f" [{step['mode']}]" if step.get("mode") else ""
+        click.echo(f"  {step['status'].upper():<7} {step['title']}{mode}")
+    click.echo(f"Overall: {summary['status'].upper()}")
+    click.echo(f"Summary: {summary_path}")
+    raise SystemExit(exit_code)
 
 
 def _verified_backend_from_environment(

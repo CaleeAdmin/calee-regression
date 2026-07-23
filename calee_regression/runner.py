@@ -7,6 +7,7 @@ from pathlib import Path
 
 import yaml
 
+from . import session_bootstrap
 from .appium_driver import CaleeDriver
 from .models import (
     STATE_MISMATCH_HINT,
@@ -23,7 +24,10 @@ from .models import (
 )
 from .preflight import explain_exception
 
-STATE_SENSITIVE_ACTIONS = {"assert_text", "assert_any_text", "wait_for_text", "wait_for_id", "assert_current_activity"}
+STATE_SENSITIVE_ACTIONS = {
+    "assert_text", "assert_any_text", "wait_for_text", "wait_for_id", "assert_current_activity",
+    "wait_for_unique_text", "assert_unique_text",
+}
 
 
 class ScenarioError(Exception):
@@ -210,6 +214,62 @@ def _step_tap_unique_text(ctx, step, result: StepResult):
         kwargs["max_swipes"] = int(step["max_swipes"])
     resolution = ctx["driver"].tap_unique_text(step["text"], **kwargs)
     result.message = f"tapped the unique element with exact text {step['text']!r}" + _row_metrics_suffix(resolution)
+
+
+def _unique_text_kwargs(step: dict, default_timeout: float) -> "tuple[str, dict]":
+    """Shared parsing for the non-mutating unique-text actions (Workstream 3).
+    Accepts ``timeout_seconds`` (the wait_for_* convention) or ``timeout``,
+    ``scroll`` and ``max_swipes``. A missing ``text`` is an authoring error."""
+    text = step.get("text")
+    if not text:
+        raise ScenarioError(
+            "wait_for_unique_text/assert_unique_text requires a 'text' (the exact, unique "
+            "title/content-description to resolve)."
+        )
+    timeout = float(step.get("timeout_seconds", step.get("timeout", default_timeout)))
+    kwargs: dict = {"timeout": timeout}
+    if step.get("scroll"):
+        kwargs["scroll"] = True
+    if "max_swipes" in step:
+        kwargs["max_swipes"] = int(step["max_swipes"])
+    return text, kwargs
+
+
+def _resolve_unique_text_present(ctx, step, result: StepResult, *, default_timeout: float) -> None:
+    """Assert that EXACTLY ONE element whose text/content-description exactly
+    equals ``text`` is present, WITHOUT tapping it (Workstream 3).
+
+    Reuses the driver's exact-text resolver (re-querying, bounded bidirectional
+    scrolling, stale-element recovery, ambiguity detection, screenshot + page
+    source and scroll metrics on failure). Zero matches wait until the bounded
+    deadline then FAIL with evidence; more than one exact match FAILs as
+    ambiguity; a single match PASSes. Never taps, never falls back to a generic
+    substring match, never scrolls unbounded. The success metrics (attempts,
+    elapsed, scroll count/directions, whether scrolling was exhausted, final
+    match count) are attached so the report records how hard the resolve worked
+    even on a pass."""
+    text, kwargs = _unique_text_kwargs(step, default_timeout)
+    resolution = ctx["driver"].resolve_unique_text(text, **kwargs)
+    try:
+        result.row_metrics = resolution.to_dict()
+    except AttributeError:
+        result.row_metrics = None
+    result.message = (
+        f"exactly one element with exact text {text!r} present (non-mutating, no tap)"
+        + _row_metrics_suffix(resolution)
+    )
+
+
+def _step_wait_for_unique_text(ctx, step, result: StepResult):
+    # Waits up to timeout_seconds (default: the scenario's default timeout) for
+    # the one exact match to appear, scrolling if the step opts in.
+    _resolve_unique_text_present(ctx, step, result, default_timeout=ctx["scenario"].default_timeout_seconds)
+
+
+def _step_assert_unique_text(ctx, step, result: StepResult):
+    # A snapshot assertion (default timeout 0): exactly one exact match must be
+    # present now, optionally after bounded scrolling.
+    _resolve_unique_text_present(ctx, step, result, default_timeout=0.0)
 
 
 def _step_is_optional(step: dict) -> bool:
@@ -445,6 +505,8 @@ ACTIONS = {
     "assert_id": _step_assert_id,
     "tap": _step_tap,
     "tap_unique_text": _step_tap_unique_text,
+    "wait_for_unique_text": _step_wait_for_unique_text,
+    "assert_unique_text": _step_assert_unique_text,
     "tap_if_present": _step_tap_if_present,
     "tap_if_absent": _step_tap_if_absent,
     "type_text": _step_type_text,
@@ -467,6 +529,9 @@ VERIFYING_ACTIONS = {
     "assert_text", "assert_any_text", "assert_id", "wait_for_id", "wait_for_text",
     "fail_if_text", "fail_if_id", "assert_current_activity",
     "assert_in_row", "fail_if_in_row",
+    # The non-mutating unique-text assertions verify presence (exactly one exact
+    # match) without tapping (Workstream 3).
+    "wait_for_unique_text", "assert_unique_text",
 }
 
 
@@ -691,19 +756,35 @@ class ScenarioRunner:
                 except Exception:  # noqa: BLE001 - diagnostics location is best-effort
                     pass
             try:
-                driver.start_session()
-            except Exception as exc:
-                # Appium unreachable, device disconnected, wrong appium_url, etc.
-                # are test-environment problems, never a product regression —
-                # see docs/TEST_DATA_RESET_CONTRACT.md and the core design
-                # requirement that a disconnected device or unavailable Appium
-                # server must never be reported as a product failure.
+                # Explicit, testable session bootstrap with bounded Appium
+                # Settings-helper recovery (Workstream 2). Replaces the old
+                # import-time monkey-patch of CaleeDriver.start_session; the
+                # recovery is now a first-class component that returns a
+                # structured report and never loops or silently switches modes.
+                session_bootstrap.bootstrap_session(driver)
+            except session_bootstrap.SessionBootstrapError as exc:
+                # Appium unreachable, UiAutomator2/Settings-helper problems,
+                # device disconnected, wrong appium_url, etc. are all
+                # test-environment problems, never a product regression — see
+                # docs/TEST_DATA_RESET_CONTRACT.md and the core requirement that
+                # a disconnected device or unavailable Appium server must never
+                # be reported as a product failure. The structured bootstrap
+                # report (outcome code, first/second failure, recovery actions,
+                # command return codes, Settings-helper evidence) is attached to
+                # the BLOCKED step so it enters the JSON/HTML/ZIP evidence.
+                report = exc.report
                 hint = explain_exception(exc)
                 blocked_reason = (
-                    f"Could not start an Appium session: {exc}. This blocks every scenario "
-                    f"in this run — it is an environment/tooling problem, not a product failure."
+                    f"Could not start an Appium session [{report.outcome}]: {exc}. This blocks "
+                    f"every scenario in this run — it is an environment/tooling problem, not a "
+                    f"product failure."
                 )
                 for scenario in runnable:
+                    step = StepResult(
+                        name="start_session", action="launch", status=STATUS_BLOCKED,
+                        message=str(exc), hint=hint,
+                    )
+                    step.diagnostics = {"sessionBootstrap": report.to_dict()}
                     suite_result.scenarios.append(
                         ScenarioResult(
                             name=scenario.name,
@@ -711,12 +792,7 @@ class ScenarioRunner:
                             status=STATUS_BLOCKED,
                             blocked_reason=blocked_reason,
                             tags=scenario.tags,
-                            steps=[
-                                StepResult(
-                                    name="start_session", action="launch", status=STATUS_BLOCKED,
-                                    message=str(exc), hint=hint,
-                                )
-                            ],
+                            steps=[step],
                         )
                     )
                 runnable = []
