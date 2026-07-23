@@ -184,6 +184,16 @@ class InjectedProvider:
         return value if value else None
 
 
+def _provider_category(provider) -> str:
+    if isinstance(provider, InjectedProvider):
+        return "injected"
+    if isinstance(provider, EnvironmentProvider):
+        return "environment"
+    if isinstance(provider, KeychainProvider):
+        return "keychain"
+    return type(provider).__name__
+
+
 class CredentialResolver:
     """Resolves credentials by trying an ordered chain of providers. The first
     provider that returns a value wins. Resolved secret values are cached so
@@ -195,14 +205,22 @@ class CredentialResolver:
             raise ValueError("CredentialResolver needs at least one provider.")
         self._providers = list(providers)
         self._resolved: "dict[str, str]" = {}
+        self._sources: "dict[str, str]" = {}
 
     def get(self, request: CredentialRequest) -> "str | None":
         for provider in self._providers:
             value = provider.get(request)
             if value:
                 self._resolved[request.name] = value
+                self._sources[request.name] = _provider_category(provider)
                 return value
         return None
+
+    def source_of(self, name: str) -> "str | None":
+        """The CATEGORY of the provider that supplied a resolved secret
+        ("injected"/"environment"/"keychain") -- never the value. Safe to
+        record in reports/summaries (Workstream 8's credentialSource)."""
+        return self._sources.get(name)
 
     def require(self, request: CredentialRequest) -> str:
         """Resolve a required secret or raise CredentialError (BLOCKED)."""
