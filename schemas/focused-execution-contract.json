@@ -1,0 +1,71 @@
+{
+  "contractType": "focused-execution-contract",
+  "focusedContractVersion": 1,
+  "executionPurposes": [
+    "focused-environment-check",
+    "focused-post-fix-verification"
+  ],
+  "apiSuites": [
+    "full",
+    "chores-stop-repeating"
+  ],
+  "uiTargets": {
+    "app-boot": "integration_test/app_boot_test.dart"
+  },
+  "reportTypes": {
+    "mobile-api-suite": {
+      "schemaVersions": [
+        1
+      ]
+    },
+    "mobile-api-stop-repeating-transition": {
+      "schemaVersions": [
+        1
+      ]
+    },
+    "mobile-ui-file": {
+      "schemaVersions": [
+        1
+      ]
+    }
+  },
+  "requiredFocusedApiReportFields": [
+    "reportType",
+    "reportSchemaVersion",
+    "producer",
+    "producerGitSha",
+    "runId",
+    "releaseRunId",
+    "releaseId",
+    "backend",
+    "counts",
+    "steps",
+    "status",
+    "executionContext"
+  ],
+  "focusedApiContextOptions": [
+    "--base-url",
+    "--suite",
+    "--report",
+    "--bundle-dir",
+    "--release-run-id",
+    "--release-id",
+    "--fixture-version",
+    "--execution-purpose",
+    "--require-explicit-context"
+  ],
+  "focusedUiContextOptions": [
+    "--platform",
+    "--target",
+    "--report",
+    "--log",
+    "--device-id",
+    "--fixture-status",
+    "--expected-backend",
+    "--mobile-backend",
+    "--release-run-id",
+    "--release-id",
+    "--fixture-version",
+    "--execution-purpose"
+  ]
+}

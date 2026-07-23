@@ -26,6 +26,29 @@ jobs:
       - name: Run pytest
         run: python -m pytest
 
+      # This session: the vendored cross-repository focused-execution contract
+      # must load and be a version this orchestrator supports, and the focused
+      # invocation it builds must be entirely within that contract -- a renamed
+      # mobile suite or retired purpose fails here, not on a tester's Mac.
+      - name: Focused-execution contract is vendored, supported, and drift-free
+        run: |
+          python -c "
+          from calee_regression import focused_contract
+          contract = focused_contract.load_contract()
+          problems = focused_contract.validate_focused_invocation(
+              contract,
+              api_suite='chores-stop-repeating',
+              execution_purposes=['focused-environment-check', 'focused-post-fix-verification'],
+              ui_target='integration_test/app_boot_test.dart',
+          )
+          if problems:
+              print('Focused contract drift:')
+              for p in problems: print(' -', p)
+              raise SystemExit(1)
+          print('Vendored focused-execution contract version',
+                contract['focusedContractVersion'], 'is supported and drift-free.')
+          "
+
       - name: Release-metadata consistency (coverage manifest + promotion state machine)
         run: python -m calee_regression coverage-report --check
 

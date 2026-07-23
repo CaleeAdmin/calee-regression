@@ -18,6 +18,10 @@ from . import build_identity as build_identity_mod
 from . import build_provenance as build_provenance_mod
 from . import config as config_mod
 from . import credentials as credentials_mod
+from . import focused_context
+from . import focused_contract as focused_contract_mod
+from . import focused_report_validation
+from . import focused_supervision
 from . import focused_workflow
 from . import distributed_build_acceptance as distributed_build_acceptance_mod
 from . import manual_checks as manual_checks_mod
@@ -357,6 +361,8 @@ def _write_environment_report(
     fixture_reset_status: str,
     fixture_verification_status: str,
     suite_name: "str | None",
+    preparation_scope: str = "full-release",
+    credential_source: "dict | None" = None,
 ) -> Path:
     """Records fixture/environment status as this run's mandatory "Test
     environment and regression fixture" component (see
@@ -370,6 +376,18 @@ def _write_environment_report(
     path = workspace.component_report_path("environment")
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        # Typed/versioned envelope (this session's Workstream 1): fixture
+        # preparation is a first-class report producer focused-verify validates
+        # by type + schema version, never an untyped dict. Additive -- existing
+        # consumers keep reading the same fields below.
+        "reportType": "fixture-preparation",
+        "reportSchemaVersion": 1,
+        "producer": "calee_regression.prepare",
+        "producerGitSha": targeted_repeat_mod._producer_git_sha(),
+        "preparationScope": preparation_scope,
+        # The CATEGORY each credential resolved from (environment/keychain/
+        # injected) -- never a value.
+        "credentialSource": credential_source or {},
         "runId": workspace.run_id,
         "status": status,
         "detail": detail,
@@ -495,6 +513,136 @@ def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suit
             fixture_reset_status="not_run", fixture_verification_status="not_run", suite_name=suite_name,
         )
 
+    _fixture_preparation_flow(
+        _finish,
+        fixture_base_url=fixture_base_url,
+        fixture_email=fixture_email,
+        fixture_password=fixture_password,
+        suite_name=suite_name,
+        skip_fixture=skip_fixture,
+        report_path_hint=str(workspace.component_report_path("environment")),
+    )
+
+
+@main.command("prepare-fixture")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
+@click.option("--fixture-base-url", envvar="CALEE_API_BASE", default=None)
+@click.option("--fixture-email", envvar="CALEE_TEST_EMAIL", default=None)
+@click.option("--fixture-password", envvar="CALEE_TEST_PASSWORD", default=None)
+@click.option("--suite", "suite_name", default=None)
+@click.option(
+    "--skip-fixture", "--allow-no-fixture", "skip_fixture", is_flag=True, default=False,
+    help="Explicit technical-owner opt-out; refused (BLOCKED) for a suite that needs the fixture.",
+)
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None)
+@click.option("--tester", "tester_opt", envvar="CALEE_TESTER_ID", default=None)
+def prepare_fixture(config_path, fixture_base_url, fixture_email, fixture_password, suite_name,
+                    skip_fixture, run_id_opt, tester_opt):
+    """Appium-independent fixture preparation (this session's Workstream 1).
+
+    Validates backend + credentials, resets and verifies the deterministic
+    REG-* fixture, and records the typed fixture-preparation report -- WITHOUT
+    requiring Appium, ADB, a tablet, or an APK. The API and iPhone focused
+    checks depend only on this; `prepare` (full release) stays strict by
+    running Appium + device preflight FIRST and then this same flow.
+    """
+    run_id = _resolve_run_id(run_id_opt)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
+    workspace.ensure_created()
+    manifest = _load_or_init_manifest(workspace, suite_name=suite_name, tester=tester_opt)
+    if fixture_base_url:
+        manifest.target_backend = fixture_base_url
+    manifest.write(workspace.manifest_path)
+    click.echo(f"Run ID: {run_id}")
+    click.echo("Fixture-only preparation: no Appium/tablet tooling is required or checked.")
+
+    def _finish(*, status: str, detail: "list[str]", exit_code: int, **status_kwargs) -> "None":
+        _write_environment_report(
+            workspace, status=status, detail=detail, preparation_scope="fixture-only", **status_kwargs
+        )
+        manifest.record_component(
+            "environment", report_path=str(workspace.component_report_path("environment")), exit_code=exit_code
+        )
+        manifest.fixture_version = status_kwargs.get("fixture_version") or manifest.fixture_version
+        manifest.write(workspace.manifest_path)
+        raise SystemExit(exit_code)
+
+    _fixture_preparation_flow(
+        _finish,
+        fixture_base_url=fixture_base_url,
+        fixture_email=fixture_email,
+        fixture_password=fixture_password,
+        suite_name=suite_name,
+        skip_fixture=skip_fixture,
+        report_path_hint=str(workspace.component_report_path("environment")),
+    )
+
+
+@main.command("prepare-tablet-environment")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path())
+@click.option("--run-id", "run_id_opt", envvar="CALEE_RUN_ID", default=None)
+def prepare_tablet_environment(config_path, run_id_opt):
+    """Tablet-environment preparation (this session's Workstream 1): validates
+    Appium, ADB, the connected device, and the APK -- WITHOUT touching the
+    fixture or any backend. Writes a typed tablet-environment-preparation
+    report so tablet steps can gate on it explicitly."""
+    cfg = _load_config_or_exit(config_path)
+    run_id = _resolve_run_id(run_id_opt)
+    workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
+    workspace.ensure_created()
+    report_path = workspace.component_dir("tablet-environment") / "results.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    click.echo(f"Run ID: {run_id}")
+
+    def _finish(status: str, detail: "list[str]", checks_payload: list, exit_code: int) -> None:
+        payload = {
+            "reportType": "tablet-environment-preparation",
+            "reportSchemaVersion": 1,
+            "producer": "calee_regression.prepare-tablet-environment",
+            "producerGitSha": targeted_repeat_mod._producer_git_sha(),
+            "runId": run_id,
+            "status": status,
+            "detail": detail,
+            "checks": checks_payload,
+            "preparedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        manifest = _load_or_init_manifest(workspace)
+        manifest.record_component("tablet-environment", report_path=str(report_path), exit_code=exit_code)
+        manifest.write(workspace.manifest_path)
+        click.echo(f"Tablet-environment report: {report_path}")
+        raise SystemExit(exit_code)
+
+    if not _ensure_appium_or_echo_blocked(cfg):
+        _finish(STATUS_BLOCKED, ["Appium could not be started or reached."], [], EXIT_BLOCKED)
+
+    checks = preflight.run_doctor(cfg)
+    for check in checks:
+        label = _LABEL.get(check.status, f"[{check.status.upper()}]")
+        color = _STYLE.get(check.status, None)
+        line = f"{label} {check.name}: {check.message}"
+        click.echo(click.style(line, fg=color) if color else line)
+    checks_payload = [{"name": c.name, "status": c.status, "message": c.message} for c in checks]
+    if preflight.has_errors(checks):
+        _finish(
+            STATUS_BLOCKED,
+            [f"{c.name}: {c.message}" for c in checks if c.status == "error"],
+            checks_payload, EXIT_BLOCKED,
+        )
+    _finish(STATUS_PASS, ["Tablet environment ready (Appium/ADB/device/APK)."], checks_payload, EXIT_SUCCESS)
+
+
+def _fixture_preparation_flow(
+    _finish, *, fixture_base_url, fixture_email, fixture_password, suite_name, skip_fixture,
+    report_path_hint: "str | None" = None,
+) -> None:
+    """The Appium-independent fixture preparation flow (this session's
+    Workstream 1): credentials -> reset -> verify -> report. Shared verbatim by
+    the strict full-release `prepare` (which runs it AFTER Appium + device
+    preflight) and by the standalone `prepare-fixture` command (which runs it
+    with no tablet tooling at all). ``_finish`` writes the typed report,
+    records the component, and raises SystemExit -- this function never
+    returns normally except through it."""
     suite_requires_fixture = False
     if suite_name:
         try:
@@ -582,7 +730,8 @@ def prepare(config_path, fixture_base_url, fixture_email, fixture_password, suit
 
     fixture_version = _extract_fixture_version(verify_output) or _extract_fixture_version(reset_output)
     click.echo(f"\nEnvironment ready. Fixture version: {fixture_version or 'unknown'}.")
-    click.echo(f"Environment report: {workspace.component_report_path('environment')}")
+    if report_path_hint:
+        click.echo(f"Environment report: {report_path_hint}")
     _finish(
         status=STATUS_PASS, detail=["Environment and fixture ready."], exit_code=EXIT_SUCCESS,
         target_environment=fixture_base_url, fixture_version=fixture_version,
@@ -1123,31 +1272,100 @@ def _default_mobile_regression_repo() -> Path:
     return REPO_ROOT.parent / "CaleeMobile-Regression"
 
 
+# Sensible per-step-class supervision deadlines (this session's Workstream 9),
+# overridable per class with --step-timeout class=seconds.
+_FOCUSED_STEP_TIMEOUTS = {"fixture": 900.0, "tablet": 3600.0, "api": 600.0, "ios": 1800.0}
+
+# The execution purposes the focused children are bound to (Workstream 5/11).
+_FOCUSED_API_PURPOSE = focused_contract_mod.EXECUTION_PURPOSE_FOCUSED_POST_FIX
+_FOCUSED_IOS_PURPOSE = focused_contract_mod.EXECUTION_PURPOSE_FOCUSED_ENV_CHECK
+
+# Injectable seam for tests (fake supervised children).
+_supervised_runner = focused_supervision.run_supervised
+
+
+def _parse_step_timeouts(pairs) -> dict:
+    """Merge repeated ``--step-timeout class=seconds`` values over the
+    defaults. Invalid syntax/class/value is an invalid invocation (exit 2)."""
+    timeouts = dict(_FOCUSED_STEP_TIMEOUTS)
+    for pair in pairs or ():
+        name, sep, value = str(pair).partition("=")
+        if not sep or name not in timeouts:
+            click.echo(
+                f"--step-timeout must be one of {sorted(timeouts)}=<seconds>, got {pair!r}", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        try:
+            seconds = float(value)
+        except ValueError:
+            seconds = -1.0
+        if seconds <= 0:
+            click.echo(f"--step-timeout {name} must be a positive number of seconds, got {value!r}", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        timeouts[name] = seconds
+    return timeouts
+
+
+def _repo_head_sha(path: Path) -> "str | None":
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = result.stdout.strip()
+    return sha if result.returncode == 0 and sha else None
+
+
+def _repo_dirty(path: Path) -> "bool | None":
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
 def _build_focused_verify_steps(
-    *, config_path, run_id, tablet_scenario, tablet_repeat, api_suite, ios_target,
-    mobile_repo: Path, focused_dir: Path, skip_api: bool, skip_ios: bool,
+    *, context: focused_context.FocusedVerifiedContext, config_path, tablet_scenario, tablet_repeat,
+    api_suite, ios_target, mobile_repo: Path, focused_dir: Path, workspace,
+    skip_api: bool, skip_ios: bool, timeouts: dict,
 ) -> list:
-    """Build the ordered FocusedStep list. Credentials are NEVER placed on any
-    child's argv -- each child resolves them from the inherited environment /
-    Keychain (Workstream 9)."""
+    """Build the FocusedStep list FROM the same-run verified context
+    (Workstream 3) -- only callable after fixture verification passed. Every
+    child is explicitly bound (argv for non-secret context, environment for
+    secrets -- a credential is NEVER placed on any argv)."""
     py = sys.executable
     config_args = ["--config", config_path] if config_path else []
+    run_id = context.run_id
     steps = [
         focused_workflow.FocusedStep(
-            id="prepare", title="Environment + fixture preparation",
-            command=[py, "-m", "calee_regression", "prepare", *config_args, "--run-id", run_id, "--suite", "calendar"],
-        ),
-        focused_workflow.FocusedStep(
             id="tablet-standard", title=f"Standard recurring-calendar scenario x{tablet_repeat}", mode="standard",
+            requires=("fixture",), requires_appium=True, timeout_seconds=timeouts["tablet"],
             command=[py, "-m", "calee_regression", "run-repeat", *config_args, "--scenario", tablet_scenario,
                      "--repeat-count", str(tablet_repeat), "--run-id", run_id,
                      "--device-initialization", models.DEVICE_INIT_STANDARD],
+            metadata={
+                "reportPath": str(workspace.component_dir("tablet-targeted") / "standard" / "results.json"),
+                "expectedType": "tablet-targeted-repeat",
+                "expect": {"expected_run_id": run_id},
+            },
         ),
         focused_workflow.FocusedStep(
             id="tablet-diagnostic", title=f"Diagnostic recurring-calendar scenario x{tablet_repeat}", mode="diagnostic",
+            requires=("fixture",), requires_appium=True, timeout_seconds=timeouts["tablet"],
             command=[py, "-m", "calee_regression", "run-repeat", *config_args, "--scenario", tablet_scenario,
                      "--repeat-count", str(tablet_repeat), "--run-id", run_id,
                      "--device-initialization", models.DEVICE_INIT_SKIP],
+            metadata={
+                "reportPath": str(workspace.component_dir("tablet-targeted") / "diagnostic" / "results.json"),
+                "expectedType": "tablet-targeted-repeat",
+                "expect": {"expected_run_id": run_id},
+            },
         ),
     ]
     if not skip_api:
@@ -1158,28 +1376,89 @@ def _build_focused_verify_steps(
             steps.append(
                 focused_workflow.FocusedStep(
                     id=f"api-{attempt}", title=f"Focused stop-repeating API scenario (attempt {attempt})",
-                    requires_appium=False,
+                    requires=("fixture",), requires_appium=False, timeout_seconds=timeouts["api"],
+                    # Strict explicit context (Workstream 11): the same-run
+                    # verified backend/fixture/run identity, never the API
+                    # CLI's production default.
                     command=[py, "-m", "caleemobile_regression", "--suite", api_suite,
+                             "--require-explicit-context",
+                             "--base-url", context.backend,
+                             "--release-run-id", run_id,
+                             "--release-id", context.release_id,
+                             "--fixture-version", context.fixture_version,
+                             "--execution-purpose", _FOCUSED_API_PURPOSE,
                              "--report", str(report_path),
                              "--bundle-dir", str(focused_dir / "api" / "bundles")],
-                    metadata={"cwd": str(api_dir)},
+                    metadata={
+                        "cwd": str(api_dir),
+                        "reportPath": str(report_path),
+                        "expectedType": "mobile-api-suite",
+                        "expect": {
+                            "expected_run_id": run_id,
+                            "expected_release_id": context.release_id,
+                            "expected_backend": context.backend,
+                            "expected_fixture_version": context.fixture_version,
+                            "expected_purpose": _FOCUSED_API_PURPOSE,
+                        },
+                    },
                 )
             )
     if not skip_ios:
         ios_report = focused_dir / "ios" / "results.json"
         ios_report.parent.mkdir(parents=True, exist_ok=True)
+        # The COMPLETE focused iPhone context (Workstream 5): verified backend
+        # (as both the fixture expectation and the build override), run/release
+        # identity, fixture status/version, and the explicit execution purpose
+        # that makes the handoff gates recorded-not-applicable -- never a bare
+        # --no-handoff-gate.
         ios_cmd = [py, "ui/run_ui_suite.py", "--platform", "ios", "--target", ios_target,
-                   "--report", str(ios_report), "--log", str(focused_dir / "ios" / "flutter.log")]
-        mobile_backend = os.environ.get("CALEE_API_BASE")
-        if mobile_backend:
-            ios_cmd.extend(["--mobile-backend", mobile_backend])
+                   "--report", str(ios_report), "--log", str(focused_dir / "ios" / "flutter.log"),
+                   "--fixture-status", context.fixture_status,
+                   "--expected-backend", context.backend,
+                   "--mobile-backend", context.backend,
+                   "--release-run-id", run_id,
+                   "--release-id", context.release_id,
+                   "--fixture-version", context.fixture_version,
+                   "--execution-purpose", _FOCUSED_IOS_PURPOSE]
+        expect = {
+            "expected_run_id": run_id,
+            "expected_release_id": context.release_id,
+            "expected_backend": context.backend,
+            "expected_fixture_version": context.fixture_version,
+            "expected_purpose": _FOCUSED_IOS_PURPOSE,
+        }
+        if context.ios_device_id:
+            ios_cmd.extend(["--device-id", context.ios_device_id])
+            expect["expected_device_id"] = context.ios_device_id
         steps.append(
             focused_workflow.FocusedStep(
                 id="ios", title="Focused iPhone environment / app-boot check",
-                requires_appium=False, command=ios_cmd, metadata={"cwd": str(mobile_repo)},
+                requires=("fixture",), requires_appium=False, timeout_seconds=timeouts["ios"],
+                command=ios_cmd,
+                metadata={
+                    "cwd": str(mobile_repo),
+                    "reportPath": str(ios_report),
+                    "expectedType": "mobile-ui-file",
+                    "expect": expect,
+                },
             )
         )
     return steps
+
+
+def _focused_dependency_graph(skip_api: bool, skip_ios: bool) -> dict:
+    graph = {
+        "credential-preflight": [],
+        "fixture": ["credential-preflight"],
+        "tablet-standard": ["fixture", "appium"],
+        "tablet-diagnostic": ["fixture", "appium"],
+    }
+    if not skip_api:
+        graph["api-1"] = ["fixture"]
+        graph["api-2"] = ["fixture"]
+    if not skip_ios:
+        graph["ios"] = ["fixture"]
+    return graph
 
 
 @main.command("focused-verify")
@@ -1194,66 +1473,367 @@ def _build_focused_verify_steps(
 )
 @click.option("--skip-api/--no-skip-api", default=False, help="Skip the focused API steps.")
 @click.option("--skip-ios/--no-skip-ios", default=False, help="Skip the focused iPhone step.")
+@click.option(
+    "--step-timeout", "step_timeouts_opt", multiple=True, metavar="CLASS=SECONDS",
+    help=f"Override a step-class supervision deadline ({sorted(_FOCUSED_STEP_TIMEOUTS)}).",
+)
+@click.option("--plan", "plan_only", is_flag=True, default=False,
+              help="Print the secret-free execution plan (components, dependencies, timeouts, "
+                   "report destinations) and exit without touching anything.")
+@click.option("--preflight-only", "preflight_only", is_flag=True, default=False,
+              help="Validate paths/credentials/backend/contract/toolchain readiness and exit -- "
+                   "never resets the fixture, mutates an API, or starts a product test.")
 def focused_verify(config_path, tablet_scenario, tablet_repeat, api_suite, ios_target,
-                   mobile_regression_repo, skip_api, skip_ios):
-    """Permanent focused post-fix verification (Workstream 9).
+                   mobile_regression_repo, skip_api, skip_ios, step_timeouts_opt,
+                   plan_only, preflight_only):
+    """Permanent focused post-fix verification.
 
-    One command, one fresh run id: environment+fixture prep, the standard
-    recurring-calendar scenario twice, the diagnostic recurring-calendar scenario
-    twice, the focused stop-repeating API scenario twice, a focused iPhone
-    environment/app-boot check, and one aggregate summary. The framework OWNS the
-    Appium lifecycle -- ensured once, stopped once at the end (never between the
-    standard and diagnostic attempts). This makes NO full-release claim.
+    One command, one fresh run id: credential preflight, Appium-independent
+    fixture preparation, the standard + diagnostic recurring-calendar scenarios,
+    the focused stop-repeating API scenario twice, a focused iPhone
+    environment/app-boot check, and one immutable aggregate summary. Every
+    child command is built ONLY from the same-run verified fixture context;
+    every child report is validated (type/schema/run/backend/fixture vs exit
+    code); children run under bounded supervision in their own process groups.
+    The framework OWNS the Appium lifecycle -- ensured once, stopped once at
+    the end. This makes NO release-certification claim.
 
-    Credentials are read from the environment / macOS Keychain by each child and
-    are never placed on any argv; this never prompts on a TTY.
+    Credentials resolve ONCE through the environment/macOS-Keychain provider
+    chain and reach children through their environment only -- never argv,
+    never any report/log.
     """
-    cfg = _load_config_or_exit(config_path)
+    # ---- Static invocation validation (exit 2 BEFORE any product work). ----
     if tablet_repeat < 1:
         click.echo(f"--tablet-repeat must be >= 1, got {tablet_repeat}", err=True)
         raise SystemExit(EXIT_INVALID_CONFIG)
-    # A fresh, REAL run id -- never a literal placeholder like <RUN_ID>.
-    run_id = _resolve_run_id(None)
+    timeouts = _parse_step_timeouts(step_timeouts_opt)
+    mobile_repo = Path(mobile_regression_repo) if mobile_regression_repo else _default_mobile_regression_repo()
+    static_problems = []
+    if not (mobile_repo / "api" / "caleemobile_regression").is_dir():
+        static_problems.append(f"CaleeMobile-Regression API package not found under {mobile_repo}")
+    if not (mobile_repo / "ui" / "run_ui_suite.py").is_file():
+        static_problems.append(f"run_ui_suite.py not found under {mobile_repo}/ui")
+    try:
+        contract = focused_contract_mod.load_contract()
+    except focused_contract_mod.FocusedContractError as exc:
+        click.echo(f"BLOCKED: {exc}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+    static_problems.extend(
+        focused_contract_mod.validate_focused_invocation(
+            contract, api_suite=api_suite,
+            execution_purposes=[_FOCUSED_API_PURPOSE, _FOCUSED_IOS_PURPOSE],
+            ui_target=ios_target,
+        )
+    )
+    if static_problems:
+        for problem in static_problems:
+            click.echo(f"Invalid invocation: {problem}", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    backend_requested = os.environ.get("CALEE_API_BASE")
+    dependency_graph = _focused_dependency_graph(skip_api, skip_ios)
+
+    if plan_only:
+        plan = {
+            "purpose": "focused post-fix verification (never a release certification)",
+            "components": sorted(dependency_graph),
+            "dependencies": dependency_graph,
+            "backendSource": "environment (CALEE_API_BASE)" if backend_requested else "UNCONFIGURED -- run would block",
+            "repositoryPaths": {"calee-regression": str(REPO_ROOT), "caleemobile-regression": str(mobile_repo)},
+            "deviceRequirements": {
+                "tablet": "Appium + ADB device (tablet steps only)",
+                "iphone": "visible iOS device (ios step only)",
+            },
+            "timeoutsSeconds": timeouts,
+            "reportDestinations": {
+                "fixture": "reports/runs/<run-id>/environment/results.json",
+                "tablet": "reports/runs/<run-id>/tablet-targeted/<mode>/results.json",
+                "api": "reports/runs/<run-id>/focused-verify/<invocation>/api/attempt-N/results.json",
+                "ios": "reports/runs/<run-id>/focused-verify/<invocation>/ios/results.json",
+                "summary": "reports/runs/<run-id>/focused-verify/<invocation>/summary.json",
+            },
+            "focusedContractVersion": contract.get("focusedContractVersion"),
+        }
+        click.echo(json.dumps(plan, indent=2))
+        raise SystemExit(EXIT_SUCCESS)
+
+    # ---- Credential preflight: resolve ONCE, before any product mutation. ----
+    email, password, resolver = _fill_credentials_from_providers(None, None)
+    credential_source = {
+        "regression_username": resolver.source_of(credentials_mod.REGRESSION_USERNAME.name),
+        "regression_password": resolver.source_of(credentials_mod.REGRESSION_PASSWORD.name),
+    }
+
+    if preflight_only:
+        failures = []
+        def _check(name, ok, detail=""):
+            click.echo(f"[{'OK' if ok else 'BLOCKED'}] {name}" + (f": {detail}" if detail else ""))
+            if not ok:
+                failures.append(name)
+        _check("regression credentials resolvable", bool(email and password),
+               "resolved from " + ", ".join(sorted({v for v in credential_source.values() if v}))
+               if email and password else "set CALEE_TEST_EMAIL/CALEE_TEST_PASSWORD or the macOS Keychain")
+        _check("backend configured (CALEE_API_BASE)", bool(backend_requested),
+               backend_requested or "never defaults to production")
+        _check("focused contract supported", True, f"version {contract.get('focusedContractVersion')}")
+        _check("mobile regression checkout", True, str(mobile_repo))
+        _check("mobile regression revision", True,
+               f"{_repo_head_sha(mobile_repo) or 'unknown (not a git checkout)'} "
+               f"dirty={_repo_dirty(mobile_repo)}")
+        _check("calee-regression revision", True, _repo_head_sha(REPO_ROOT) or "unknown (not a git checkout)")
+        scenario_ok = _resolve_scenario_path(tablet_scenario).is_file()
+        _check("tablet scenario exists", scenario_ok, tablet_scenario)
+        cfg = _load_config_or_exit(config_path)
+        _check("tablet config loads", True, "")
+        lifecycle = _ensure_appium_for_command(cfg)
+        _check("appium endpoint ready", bool(lifecycle.available), lifecycle.state)
+        click.echo("Preflight complete -- no fixture reset, no API mutation, no product test was run.")
+        raise SystemExit(EXIT_SUCCESS if not failures else EXIT_BLOCKED)
+
+    if not (email and password):
+        click.echo(
+            "BLOCKED: regression credentials could not be resolved (environment or macOS "
+            "Keychain). Nothing was mutated.", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+    if not backend_requested:
+        click.echo(
+            "BLOCKED: no backend is configured (CALEE_API_BASE). A focused run never silently "
+            "falls back to a production default. Nothing was mutated.", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    cfg = _load_config_or_exit(config_path)
+    started_at = _utc_now_iso()
+    run_id = _resolve_run_id(None)  # a fresh, REAL run id -- never a placeholder
+    release_id = f"focused-diagnostic-{run_id}"
     workspace = run_context.RunWorkspace(_resolved_report_root(), run_id)
     workspace.ensure_created()
-    focused_dir = workspace.root / "focused-verify"
-    focused_dir.mkdir(parents=True, exist_ok=True)
-    click.echo(f"Focused-verify run ID: {run_id}")
+    invocation_id = targeted_repeat_mod.new_invocation_id()
+    focused_dir = workspace.root / "focused-verify" / _sanitize_component_name(invocation_id)
+    focused_dir.mkdir(parents=True, exist_ok=False)  # immutable per-invocation dir
+    click.echo(f"Focused-verify run ID: {run_id} (invocation {invocation_id})")
 
-    mobile_repo = Path(mobile_regression_repo) if mobile_regression_repo else _default_mobile_regression_repo()
-    steps = _build_focused_verify_steps(
-        config_path=config_path, run_id=run_id, tablet_scenario=tablet_scenario,
-        tablet_repeat=tablet_repeat, api_suite=api_suite, ios_target=ios_target,
-        mobile_repo=mobile_repo, focused_dir=focused_dir, skip_api=skip_api, skip_ios=skip_ios,
+    # Secrets flow to children through their ENVIRONMENT only (never argv);
+    # the temporary parent dict is scrubbed after orchestration.
+    resolved_secrets = {
+        credentials_mod.REGRESSION_USERNAME.name: email,
+        credentials_mod.REGRESSION_PASSWORD.name: password,
+    }
+    secret_env_map = {
+        credentials_mod.REGRESSION_USERNAME.name: "CALEE_TEST_EMAIL",
+        credentials_mod.REGRESSION_PASSWORD.name: "CALEE_TEST_PASSWORD",
+    }
+
+    def _child_env(extra: dict) -> dict:
+        env = credentials_mod.build_env(None, resolved_secrets, secret_env_map)
+        for key, value in extra.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
+        return env
+
+    def _run_supervised(step: "focused_workflow.FocusedStep", extra_env: dict):
+        return _supervised_runner(
+            step.command,
+            env=_child_env(extra_env),
+            cwd=step.metadata.get("cwd"),
+            timeout_seconds=step.timeout_seconds or _FOCUSED_STEP_TIMEOUTS["api"],
+        )
+
+    # ---- Fixture preparation FIRST (Appium-independent), then the verified
+    # context every later child command is built from (Workstream 1/3). ----
+    py = sys.executable
+    config_args = ["--config", config_path] if config_path else []
+    fixture_step = focused_workflow.FocusedStep(
+        id="fixture", title="Fixture preparation (Appium-independent)",
+        requires_appium=False, timeout_seconds=timeouts["fixture"],
+        command=[py, "-m", "calee_regression", "prepare-fixture", *config_args,
+                 "--run-id", run_id, "--suite", "calendar"],
     )
+    click.echo(f"-> {fixture_step.title}")
+    fixture_outcome = _run_supervised(fixture_step, {"CALEE_RUN_ID": run_id, "CALEE_API_BASE": backend_requested})
+    fixture_report_path = workspace.component_report_path("environment")
+    fixture_validation = focused_report_validation.validate_child_report(
+        fixture_report_path,
+        expected_type="fixture-preparation",
+        child_exit_code=fixture_outcome.exit_code,
+        expected_run_id=run_id,
+        expected_backend=backend_requested,
+    )
+    fixture_status = focused_workflow.classify_exit_code(fixture_outcome.exit_code) \
+        if fixture_outcome.exit_code is not None else focused_workflow.STATUS_BLOCKED
+    fixture_detail = ""
+    if fixture_status == focused_workflow.STATUS_PASS and not fixture_validation.ok:
+        fixture_status = focused_workflow.STATUS_BLOCKED
+        fixture_detail = "fixture report failed validation: " + "; ".join(fixture_validation.problems)
+    elif fixture_outcome.exit_code is None:
+        fixture_detail = "fixture preparation produced no exit code (timeout/kill)"
+    fixture_result = focused_workflow.FocusedResult(
+        id="fixture", title=fixture_step.title, status=fixture_status,
+        exit_code=fixture_outcome.exit_code, detail=fixture_detail,
+        report_path=str(fixture_report_path), report_sha256=fixture_validation.digest,
+        validation_problems=list(fixture_validation.problems),
+        supervision=fixture_outcome.to_dict(),
+    )
+    click.echo(f"   {fixture_step.title}: {fixture_status.upper()} (exit {fixture_outcome.exit_code})")
 
-    def _ensure():
-        return _ensure_appium_for_command(cfg)
+    context = None
+    context_error = None
+    if fixture_status == focused_workflow.STATUS_PASS:
+        try:
+            context = focused_context.build_verified_context(
+                fixture_validation.report,
+                run_id=run_id,
+                release_id=release_id,
+                regression_shas={
+                    "calee-regression": _repo_head_sha(REPO_ROOT) or "unknown",
+                    "caleemobile-regression": _repo_head_sha(mobile_repo) or "unknown",
+                },
+                product_build={
+                    "caleeMobileRepo": str(mobile_repo.parent / "CaleeMobile"),
+                    "caleeMobileSha": _repo_head_sha(mobile_repo.parent / "CaleeMobile"),
+                    "caleeMobileDirty": _repo_dirty(mobile_repo.parent / "CaleeMobile"),
+                },
+                tablet_device_id=getattr(cfg, "udid", None) or getattr(cfg, "device_name", None),
+                ios_device_id=os.environ.get("CALEE_UI_DEVICE_ID"),
+            )
+        except focused_context.FocusedContextError as exc:
+            context_error = str(exc)
+            fixture_result.status = focused_workflow.STATUS_BLOCKED
+            fixture_result.detail = f"verified context could not be constructed: {exc}"
 
-    def _run_step(step):
-        env = os.environ.copy()
-        env["CALEE_RUN_ID"] = run_id
-        # Non-interactive: stdin is /dev/null so a child can never wedge on a TTY
-        # read (no suspended-shell-job hazard).
-        with open(os.devnull, "rb") as devnull:
-            return subprocess.call(
-                step.command, env=env, cwd=step.metadata.get("cwd"), stdin=devnull
+    if context is not None:
+        steps = _build_focused_verify_steps(
+            context=context, config_path=config_path, tablet_scenario=tablet_scenario,
+            tablet_repeat=tablet_repeat, api_suite=api_suite, ios_target=ios_target,
+            mobile_repo=mobile_repo, focused_dir=focused_dir, workspace=workspace,
+            skip_api=skip_api, skip_ios=skip_ios, timeouts=timeouts,
+        )
+
+        def _ensure():
+            return _ensure_appium_for_command(cfg)
+
+        def _run_step(step):
+            purpose = _FOCUSED_IOS_PURPOSE if step.id == "ios" else _FOCUSED_API_PURPOSE
+            return _run_supervised(step, {
+                "CALEE_RUN_ID": run_id,
+                "CALEE_RELEASE_ID": context.release_id,
+                "CALEE_API_BASE": context.backend,
+                "CALEE_FIXTURE_VERSION": context.fixture_version,
+                "CALEE_EXECUTION_PURPOSE": purpose,
+            })
+
+        def _stop():
+            appium_lifecycle.stop_appium_from_pid_file(_appium_pid_path())
+
+        def _validate(step, exit_code):
+            report_path = step.metadata.get("reportPath")
+            expected_type = step.metadata.get("expectedType")
+            if not report_path or not expected_type:
+                return None
+            return focused_report_validation.validate_child_report(
+                Path(report_path), expected_type=expected_type, child_exit_code=exit_code,
+                **step.metadata.get("expect", {}),
             )
 
-    def _stop():
-        appium_lifecycle.stop_appium_from_pid_file(_appium_pid_path())
+        summary, exit_code = focused_workflow.run_focused_verify(
+            steps=steps, ensure_appium=_ensure, run_step=_run_step, stop_appium=_stop,
+            validate_step=_validate, initial_results=[fixture_result], log=click.echo,
+        )
+    else:
+        # Fixture preparation failed (or its verified context could not be
+        # built): every dependent step is an explicit blocked_not_run naming
+        # the prerequisite -- no silent skip, no product mutation.
+        results = [fixture_result]
+        detail = (
+            f"prerequisite step 'fixture' did not pass (status: {fixture_result.status}, "
+            f"report: {fixture_report_path})"
+            + (f"; {context_error}" if context_error else "")
+            + " -- step not started."
+        )
+        planned = [s for s in dependency_graph if s not in ("credential-preflight", "fixture")]
+        for step_id in planned:
+            results.append(focused_workflow.FocusedResult(
+                id=step_id, title=step_id, status=focused_workflow.STATUS_BLOCKED_NOT_RUN,
+                exit_code=None, detail=detail, blocked_by="fixture",
+            ))
+        overall = focused_workflow.aggregate_status([r.status for r in results])
+        summary = {
+            "reportType": focused_workflow.SUMMARY_REPORT_TYPE,
+            "reportSchemaVersion": focused_workflow.SUMMARY_SCHEMA_VERSION,
+            "appiumLifecycle": {"state": "not-attempted", "available": False},
+            "steps": [r.to_dict() for r in results],
+            "counts": {},
+            "status": overall,
+            "certificationEligible": False,
+            "certification": "not-a-release-certification (focused post-fix verification only)",
+        }
+        exit_code = focused_workflow.status_to_exit_code(overall)
 
-    summary, exit_code = focused_workflow.run_focused_verify(
-        steps=steps, ensure_appium=_ensure, run_step=_run_step, stop_appium=_stop, log=click.echo,
-    )
-    summary["runId"] = run_id
+    # ---- Immutable, evidence-bound aggregate summary (Workstream 8). ----
+    finished_at = _utc_now_iso()
+    summary.update({
+        "producer": "calee_regression.focused-verify",
+        "producerGitSha": _repo_head_sha(REPO_ROOT),
+        "runId": run_id,
+        "invocationId": invocation_id,
+        "releaseId": release_id,
+        "startedAt": started_at,
+        "finishedAt": finished_at,
+        "executionPurpose": "focused-post-fix-verification",
+        "verifiedBackend": context.backend if context else None,
+        "fixtureVersion": context.fixture_version if context else None,
+        # Categories only -- never a credential value.
+        "credentialSource": credential_source,
+        "regressionShas": dict(context.regression_shas) if context else {
+            "calee-regression": _repo_head_sha(REPO_ROOT) or "unknown",
+            "caleemobile-regression": _repo_head_sha(mobile_repo) or "unknown",
+        },
+        "productBuild": dict(context.product_build) if context else {},
+        "tabletBuildIdentity": {
+            "applicationId": getattr(cfg, "app_package", None),
+            "apkPath": getattr(cfg, "apk_path", None),
+        },
+        "deviceIds": {
+            "tablet": context.tablet_device_id if context else None,
+            "ios": context.ios_device_id if context else None,
+        },
+        "dependencyGraph": dependency_graph,
+        "focusedContractVersion": contract.get("focusedContractVersion"),
+        "stepTimeoutsSeconds": timeouts,
+    })
+    # Belt-and-braces: no resolved secret value may appear anywhere in the
+    # summary (validated by tests; redact scrubs any accidental inclusion).
+    summary_text = credentials_mod.redact(json.dumps(summary, indent=2), resolver.secret_values())
     summary_path = focused_dir / "summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    if summary_path.exists():
+        click.echo(f"Refusing to overwrite immutable summary {summary_path}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+    summary_path.write_text(summary_text + "\n", encoding="utf-8")
+    try:
+        os.chmod(summary_path, 0o444)  # immutable-by-convention: read-only on disk
+    except OSError:
+        pass
+    # The run manifest preserves EVERY focused invocation (worst-wins history);
+    # a later run can never overwrite or improve an earlier result. Diagnostic
+    # evidence only -- "focused-verify" is not a release-certification
+    # component and can never satisfy one.
+    manifest = _load_or_init_manifest(workspace)
+    manifest.record_component(
+        "focused-verify", report_path=str(summary_path), exit_code=exit_code,
+        invocation_id=invocation_id, invocation_path=str(focused_dir),
+    )
+    manifest.write(workspace.manifest_path)
+
+    # Scrub secrets from the temporary parent dicts as soon as orchestration
+    # is done (Workstream 2).
+    resolved_secrets.clear()
+    email = password = None  # noqa: F841 -- deliberate scrub
 
     click.echo("\n=== Focused-verify summary (NOT a release certification) ===")
     for step in summary["steps"]:
         mode = f" [{step['mode']}]" if step.get("mode") else ""
-        click.echo(f"  {step['status'].upper():<7} {step['title']}{mode}")
+        click.echo(f"  {step['status'].upper():<15} {step['title']}{mode}")
     click.echo(f"Overall: {summary['status'].upper()}")
     click.echo(f"Summary: {summary_path}")
     raise SystemExit(exit_code)
