@@ -14,7 +14,7 @@ meaningful; use the duration *category* instead.
 | `mobile-api` | `CaleeMobile-Regression` | `python3 run_regression.py` in `api/` | Standard | None — hits the backend directly | Auto-managed per run (run-tagged `RT ...` records + best-effort cleanup); can also target the shared REG-* fixture | No | Yes |
 | `mobile-android` | `CaleeMobile-Regression` | `ui/run_ui_manifest.py --platform android` (the serial orchestrator: one Flutter process per test file, one bounded retry only for a confirmed launch/tooling failure, every attempt preserved, one aggregate report), or `03 Test CaleeMobile Android.command` | Standard | Signed-in CaleeMobile session on an Android device/emulator; `CALEE_TEST_EMAIL`/`CALEE_TEST_PASSWORD` configured | Recommended (REG-* fixture) — the calendar/tasks flow tests assert against it | Yes (or an Android emulator) | Driven by this run's schema-v2 release-config when composed, else `config/release-platforms.yaml`'s `mobile_android` — defaults to Yes either way (see `docs/RELEASE_POLICY.md`). Format/analyze/unit-tests pass; device execution depends on an Android emulator/device being available where this runs — see the session's final report for what was and wasn't actually executed |
 | `mobile-ios` | `CaleeMobile-Regression` | `ui/run_ui_manifest.py --platform ios` (serial, one file per Flutter process — a physical iPhone stalls if the whole `integration_test` directory runs in one process), or `04 Test CaleeMobile iPhone.command` | Standard | Signed-in CaleeMobile session on an iPhone/simulator; same credentials as above | Same as `mobile-android` | Yes (a Mac with Xcode; simulator counts) | Driven by this run's schema-v2 release-config when composed, else `config/release-platforms.yaml`'s `mobile_ios` — defaults to Yes either way. iOS device/simulator execution requires a real Mac; never executable on Linux |
-| `sync-smoke` | Both (orchestrated) | `CALEE_TEST_EMAIL=... CALEE_TEST_PASSWORD=... python -m calee_regression sync-smoke --run-id <id> --base-url ...` (credentials come from the environment or the macOS Keychain — a password on the command line is rejected) | Standard | Prepared tablet + a CaleeMobile session, both on the same household | Yes — REG-* fixture | Yes | Not yet — see "Partially implemented" below |
+| `sync-smoke` | Both (orchestrated) | `CALEE_TEST_EMAIL=... CALEE_TEST_PASSWORD=... python -m calee_regression sync-smoke --run-id <id> --base-url ...` (credentials come from the environment or the macOS Keychain — a password on the command line is rejected) | Standard | Prepared tablet + a CaleeMobile session, both on the same household | Yes — REG-* fixture | Yes | Yes — `synchronization` is mandatory by default (Workstream 1); until a real device run reaches a clean `ok` it resolves to `BLOCKED`, which itself blocks a full-solution release. See "Partially implemented" below |
 | `full-release` (alias of `full-tester`) / full solution | Both (orchestrated) | `06 Test Full Calee Solution.command` (prepare incl. Appium auto-start, tablet, CaleeMobile API+UI per this run's composed release scope, guided manual checks, consolidate) | Extended | Prepared tablet; CaleeMobile if attached | Yes | Tablet+API always mandatory; mobile UI mandatory-ness follows this run's schema-v2 release-config when composed, else `config/release-platforms.yaml` (default Yes per platform, not hard-coded optional) | Yes — see `docs/RELEASE_POLICY.md` |
 | `release-technical` | `calee-regression` | `tester/technical/Run Release Technical.command` | Extended | Real physical tablet, admin/kiosk access | No | Yes — refuses to run on an emulator | Yes, for kiosk/admin/system-receiver coverage specifically |
 
@@ -30,11 +30,13 @@ Each is `mandatory: false` in its own scenario file and deliberately absent from
 
 ## Draft, non-canonical suite: `calendar_appearance`
 
-Like `subscribed_calendar` below, `calendar_appearance` (three scenario files —
+Like `subscribed_calendar` below, `calendar_appearance` (four scenario files —
 `calendar_appearance_subscription.yaml` / `calendar_appearance_owned.yaml` /
-`calendar_appearance_shared_readonly.yaml`) is **not** among the ten canonical profiles and is **not**
+`calendar_appearance_shared_readonly.yaml` / `calendar_appearance_external.yaml`) is **not** among the
+ten canonical profiles and is **not**
 release-gating: source-confirmed selectors (Calee PR CaleeAdmin/Calee#977) but physically unverified,
-and two of the three files additionally need a fixture calendar that does not exist in this repo yet.
+and three of the four files (`owned` / `shared_readonly` / `external`) additionally need a fixture
+calendar that does not exist in this repo yet (`subscription` maps onto the existing REG-SUB feed).
 Each file is `mandatory: false`, tagged `draft-unverified`, and absent from every `COMPOSITE_SUITES`
 entry. See `docs/CALENDAR_APPEARANCE_REGRESSION.md` and `test_calendar_appearance_scenarios.py`.
 The genuinely cross-device half of this same contract (rename on one surface, verify on another;
