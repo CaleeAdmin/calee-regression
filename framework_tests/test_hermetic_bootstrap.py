@@ -89,7 +89,11 @@ def test_resolver_falls_back_to_system_when_no_venv(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     got = _resolve(repo)
-    assert got and Path(got).name.startswith("python") and ".venv" not in got
+    # With no repo .venv and no preset, it resolves a PATH python (whatever that
+    # is -- possibly an ambient venv). What it must NOT do is invent the repo's
+    # own nonexistent .venv interpreter.
+    assert got and Path(got).name.startswith("python")
+    assert got != str(repo / ".venv" / "bin" / "python")
 
 
 def test_resolver_path_with_spaces(tmp_path):
