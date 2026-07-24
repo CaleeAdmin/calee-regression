@@ -73,6 +73,43 @@ STATUS_SCORE = {
     STATUS_NOT_IMPLEMENTED: 0.0,
 }
 
+# ── Workstream 2: three orthogonal measures ─────────────────────────────────
+# The single ``status`` above conflates "is it built?" with "is it physically
+# qualified?". These axes separate the two, and a third top-level verdict
+# (release readiness) is derived from the mandatory release scope + evidence.
+# The legacy ``status``/``weightedCompletionPercent`` are retained verbatim for
+# backward compatibility; consumers should migrate to the axes below (see
+# docs/COMPLETENESS_MODEL.md).
+#
+# A) Implementation completeness -- built, offline-tested, wired. IGNORES
+#    physical evidence: a capability can be implementation-complete with no
+#    physical run, and a physical blocker is NEVER counted as missing code.
+IMPL_COMPLETE = "complete"
+IMPL_PARTIAL = "partial"
+IMPL_NOT_IMPLEMENTED = "not-implemented"
+IMPL_STATUSES = (IMPL_COMPLETE, IMPL_PARTIAL, IMPL_NOT_IMPLEMENTED)
+IMPL_SCORE = {IMPL_COMPLETE: 1.0, IMPL_PARTIAL: 0.5, IMPL_NOT_IMPLEMENTED: 0.0}
+
+# B) Qualification completeness -- validated physical/backend evidence that is
+#    certification-eligible AND current for the build/platform. Distinguishes
+#    STALE evidence from MISSING evidence, and NOT-APPLICABLE (offline-internal
+#    dimensions never need a physical run). Offline tests are NEVER counted here.
+QUAL_QUALIFIED = "qualified"
+QUAL_IMPLEMENTED_UNQUALIFIED = "implemented-unqualified"
+QUAL_BLOCKED = "blocked"
+QUAL_NOT_APPLICABLE = "not-applicable"
+QUAL_STATUSES = (QUAL_QUALIFIED, QUAL_IMPLEMENTED_UNQUALIFIED, QUAL_BLOCKED, QUAL_NOT_APPLICABLE)
+# not-applicable is EXCLUDED from the qualification-percentage denominator.
+QUAL_SCORE = {QUAL_QUALIFIED: 1.0, QUAL_IMPLEMENTED_UNQUALIFIED: 0.5, QUAL_BLOCKED: 0.0}
+
+# C) Release readiness -- NOT a percentage. Derived from the mandatory release
+#    scope (release-gating dimensions) + validated release evidence. A
+#    percentage is NEVER turned into a release PASS.
+READINESS_PASS = "pass"
+READINESS_FAIL = "fail"
+READINESS_BLOCKED = "blocked"
+READINESS_NOT_APPLICABLE = "not-applicable"
+
 # Dimension "kinds" -- decide how status is derived from the backing metadata.
 KIND_INTERNAL = "internal"        # framework-internal; validated offline, no device needed to be complete
 KIND_COVERAGE = "coverage"        # a product surface; needs a physical pass to be complete
@@ -269,6 +306,9 @@ class PhysicalEvidence:
     run_id: "str | None"
     device_id: "str | None"
     status: "str | None"
+    build: "str | None" = None
+    platform: "str | None" = None
+    stale: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -278,6 +318,9 @@ class PhysicalEvidence:
             "runId": self.run_id,
             "deviceId": self.device_id,
             "status": self.status,
+            "qualificationBuild": self.build,
+            "qualificationPlatform": self.platform,
+            "stale": self.stale,
         }
 
 
@@ -287,6 +330,10 @@ class Dimension:
     title: str
     status: str
     release_gating: bool
+    # Workstream 2: two orthogonal axes derived alongside the legacy status.
+    implementation_status: str = IMPL_COMPLETE
+    qualification_status: str = QUAL_NOT_APPLICABLE
+    qualification_stale: bool = False
     implementation_evidence: "list[str]" = field(default_factory=list)
     physical_evidence: "list[dict]" = field(default_factory=list)
     blockers: "list[str]" = field(default_factory=list)
@@ -297,18 +344,32 @@ class Dimension:
     def score(self) -> float:
         return STATUS_SCORE[self.status]
 
+    @property
+    def implementation_score(self) -> float:
+        return IMPL_SCORE[self.implementation_status]
+
+    @property
+    def qualification_score(self) -> "float | None":
+        # not-applicable is excluded from the qualification percentage.
+        return QUAL_SCORE.get(self.qualification_status)
+
     def to_dict(self) -> dict:
         return {
             "key": self.key,
             "title": self.title,
             "status": self.status,
             "releaseGating": self.release_gating,
+            "implementationStatus": self.implementation_status,
+            "qualificationStatus": self.qualification_status,
+            "qualificationEvidenceStale": self.qualification_stale,
             "implementationEvidence": list(self.implementation_evidence),
             "physicalEvidence": list(self.physical_evidence),
             "blockers": list(self.blockers),
             "nextAction": self.next_action,
             "weight": self.weight,
             "statusScore": self.score,
+            "implementationScore": self.implementation_score,
+            "qualificationScore": self.qualification_score,
         }
 
 
@@ -318,6 +379,7 @@ class CompletenessReport:
     physical_session: bool
     feature_scope_source: str
     platform_scope_source: str
+    failed_evidence_keys: "set" = field(default_factory=set)
 
     def dimension(self, key: str) -> "Dimension | None":
         for d in self.dimensions:
@@ -348,9 +410,88 @@ class CompletenessReport:
             counts[d.status] += 1
         return counts
 
+    # ── Workstream 2: three orthogonal measures ─────────────────────────────
+    def implementation_summary(self) -> dict:
+        """Axis A weighted percentage -- how much of the framework is BUILT +
+        offline-tested + wired, independent of any physical run."""
+        total_weight = sum(d.weight for d in self.dimensions)
+        earned = sum(d.weight * d.implementation_score for d in self.dimensions)
+        pct = round(100.0 * earned / total_weight, 1) if total_weight else 0.0
+        counts = {s: 0 for s in IMPL_STATUSES}
+        for d in self.dimensions:
+            counts[d.implementation_status] += 1
+        return {
+            "implementationCompletionPercent": pct,
+            "totalWeight": round(total_weight, 3),
+            "earnedWeight": round(earned, 3),
+            "statusScoring": dict(IMPL_SCORE),
+            "statusCounts": counts,
+            "note": "Implementation only: a physical blocker is never counted as missing code.",
+        }
+
+    def qualification_summary(self) -> dict:
+        """Axis B weighted percentage -- how much is backed by validated,
+        current physical/backend evidence. not-applicable dimensions are
+        EXCLUDED from the denominator; offline tests are never counted here."""
+        scored = [d for d in self.dimensions if d.qualification_score is not None]
+        total_weight = sum(d.weight for d in scored)
+        earned = sum(d.weight * d.qualification_score for d in scored)
+        pct = round(100.0 * earned / total_weight, 1) if total_weight else 0.0
+        counts = {s: 0 for s in QUAL_STATUSES}
+        for d in self.dimensions:
+            counts[d.qualification_status] += 1
+        stale = [d.key for d in self.dimensions if d.qualification_stale]
+        return {
+            "qualificationCompletionPercent": pct,
+            "scoredWeight": round(total_weight, 3),
+            "earnedWeight": round(earned, 3),
+            "statusScoring": dict(QUAL_SCORE),
+            "statusCounts": counts,
+            "staleEvidenceDimensions": stale,
+            "note": "Qualification only: stale evidence is distinct from missing evidence; not-applicable is excluded.",
+        }
+
+    def release_readiness(self) -> dict:
+        """Measure C -- NOT a percentage. Derived from the mandatory release
+        scope (release-gating dimensions) + validated evidence. A percentage is
+        never turned into a PASS."""
+        gating = [d for d in self.dimensions if d.release_gating]
+        if not gating:
+            return {"status": READINESS_NOT_APPLICABLE, "gatingDimensions": [],
+                    "blocking": [], "note": "No release-gating dimensions in the current scope."}
+        blocking = []
+        failed = []
+        for d in gating:
+            if d.key in self.failed_evidence_keys:
+                failed.append(d.key)
+            elif d.qualification_status == QUAL_QUALIFIED:
+                continue
+            elif d.qualification_status == QUAL_NOT_APPLICABLE and d.implementation_status == IMPL_COMPLETE:
+                # An internal gating dimension is satisfied by being built +
+                # offline-validated; it needs no physical run.
+                continue
+            else:
+                blocking.append(d.key)
+        if failed:
+            status = READINESS_FAIL
+        elif blocking:
+            status = READINESS_BLOCKED
+        else:
+            status = READINESS_PASS
+        return {
+            "status": status,
+            "gatingDimensions": [d.key for d in gating],
+            "failing": failed,
+            "blocking": blocking,
+            "note": (
+                "Release readiness is derived from the release-gating dimensions' qualification "
+                "status and validated evidence -- never from a completion percentage."
+            ),
+        }
+
     def to_dict(self) -> dict:
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "report": "framework-completeness",
             "derivedFrom": {
                 "coverageManifest": "coverage/coverage-manifest.yaml",
@@ -362,14 +503,29 @@ class CompletenessReport:
             },
             "physicalDeviceSession": self.physical_session,
             "statusVocabulary": list(VALID_STATUSES),
+            "implementationStatusVocabulary": list(IMPL_STATUSES),
+            "qualificationStatusVocabulary": list(QUAL_STATUSES),
+            "releaseReadinessVocabulary": [
+                READINESS_PASS, READINESS_FAIL, READINESS_BLOCKED, READINESS_NOT_APPLICABLE,
+            ],
             "statusCounts": self.status_counts(),
             "dimensions": [d.to_dict() for d in self.dimensions],
+            # Legacy conflated measure (retained for backward compatibility).
             "summary": self.weighted_summary(),
+            # Workstream 2: three orthogonal, un-conflated measures.
+            "implementationCompleteness": self.implementation_summary(),
+            "qualificationCompleteness": self.qualification_summary(),
+            "releaseReadiness": self.release_readiness(),
         }
 
 
 # ── physical-evidence discovery ────────────────────────────────────────────
-def scan_physical_evidence(reports_root: "Path | str | None" = None) -> "dict[str, PhysicalEvidence]":
+def scan_physical_evidence(
+    reports_root: "Path | str | None" = None,
+    *,
+    current_build: "str | None" = None,
+    current_platforms: "dict[str, str] | None" = None,
+) -> "dict[str, PhysicalEvidence]":
     """Discover the latest VALIDATED physical evidence under ``reports/``.
 
     A report counts as physical evidence only when it is a JSON object that a
@@ -379,6 +535,13 @@ def scan_physical_evidence(reports_root: "Path | str | None" = None) -> "dict[st
     Anything short of that (diagnostic, faked, unkeyed) is ignored -- this is
     the honest reason an offline checkout, whose ``reports/`` is empty, leaves
     every physical-qualification dimension ``blocked``.
+
+    Staleness (Workstream 2): when ``current_build`` (and/or ``current_platforms``
+    keyed by completenessKey) is supplied, an otherwise-valid report whose
+    recorded ``qualificationBuild``/``platform`` no longer matches is marked
+    ``stale`` -- qualification currency, kept DISTINCT from missing evidence.
+    When no current identity is supplied, currency cannot be judged and
+    evidence is treated as current (never falsely stale).
     """
     root = Path(reports_root) if reports_root else (REPO_ROOT / "reports")
     runs_dir = root / "runs"
@@ -403,6 +566,13 @@ def scan_physical_evidence(reports_root: "Path | str | None" = None) -> "dict[st
         device_id = report.get("deviceId") or (report.get("provenance") or {}).get("deviceId")
         if not device_id:
             continue
+        build = report.get("qualificationBuild") or report.get("buildSha") or (report.get("provenance") or {}).get("buildSha")
+        platform = report.get("qualificationPlatform") or report.get("platform")
+        stale = False
+        if current_build and build and str(build) != str(current_build):
+            stale = True
+        if current_platforms and key in current_platforms and platform and str(platform) != str(current_platforms[key]):
+            stale = True
         # Last writer for a key wins (sorted() makes this deterministic).
         found[key] = PhysicalEvidence(
             key=key,
@@ -411,8 +581,40 @@ def scan_physical_evidence(reports_root: "Path | str | None" = None) -> "dict[st
             run_id=report.get("releaseRunId") or report.get("runId"),
             device_id=device_id,
             status="pass",
+            build=str(build) if build else None,
+            platform=str(platform) if platform else None,
+            stale=stale,
         )
     return found
+
+
+def scan_failed_evidence(reports_root: "Path | str | None" = None) -> "set":
+    """Completeness keys with a validated, certification-eligible report whose
+    ``status`` is a hard FAIL (a product regression), as opposed to a pass or a
+    non-certifying diagnostic. Used to derive releaseReadiness == 'fail'. An
+    offline checkout has none, so release readiness there is 'blocked', never
+    'fail'."""
+    root = Path(reports_root) if reports_root else (REPO_ROOT / "reports")
+    runs_dir = root / "runs"
+    failed: "set" = set()
+    if not runs_dir.is_dir():
+        return failed
+    for path in sorted(runs_dir.rglob("*.json")):
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(report, dict):
+            continue
+        key = report.get("completenessKey")
+        if not (isinstance(key, str) and key):
+            continue
+        if report.get("certificationEligible") is not True:
+            continue
+        status = report.get("status")
+        if isinstance(status, str) and status.strip().lower() in ("fail", "failed"):
+            failed.add(key)
+    return failed
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -450,6 +652,50 @@ def _coverage_status(components, *, requires_physical: bool, physical_present: b
     if not requires_physical:
         return STATUS_COMPLETE
     return STATUS_COMPLETE if physical_present else STATUS_IMPLEMENTED_UNQUALIFIED
+
+
+def _implementation_status(spec: DimensionSpec, components) -> str:
+    """Axis A -- is the capability BUILT + offline-tested + wired? Ignores
+    physical evidence entirely, so a physical blocker is never counted as
+    missing implementation work. A ``draft`` scenario is implemented,
+    offline-tested automation pending physical PROMOTION -- that is a
+    qualification concern, so it still counts as complete implementation."""
+    if spec.kind == KIND_FIXTURE:
+        # host-local lock is implemented + offline-tested; distributed
+        # exclusivity is an unsolved design gap, not missing code -> partial.
+        return IMPL_PARTIAL
+    autos = [c.automated for c in components]
+    if not autos:
+        # No manifest component: a pure physical gate (android/ios/tablet
+        # standard) runs through the release-framework harness, which is
+        # implemented; an internal dimension with no component is implemented.
+        return IMPL_COMPLETE
+    if all(a == "false" for a in autos):
+        return IMPL_NOT_IMPLEMENTED
+    if any(a == "partial" for a in autos) or any(a == "false" for a in autos):
+        return IMPL_PARTIAL
+    # remaining are "true"/"draft": require offline-tested to be complete.
+    if any(a in ("true", "draft") and not c.offline_tested for a, c in zip(autos, components)):
+        return IMPL_PARTIAL
+    return IMPL_COMPLETE
+
+
+def _qualification_status(spec: DimensionSpec, impl_status: str, evidence) -> str:
+    """Axis B -- is the capability backed by validated, CURRENT physical/backend
+    evidence? Internal/fixture dimensions never need a physical run
+    (not-applicable). STALE evidence is implemented-unqualified, kept DISTINCT
+    from MISSING evidence. Offline tests are never counted as qualification."""
+    if spec.kind in (KIND_INTERNAL, KIND_FIXTURE):
+        return QUAL_NOT_APPLICABLE
+    if evidence is not None:
+        if getattr(evidence, "stale", False):
+            return QUAL_IMPLEMENTED_UNQUALIFIED
+        return QUAL_QUALIFIED
+    # no evidence at all
+    if spec.kind == KIND_PHYSICAL:
+        return QUAL_BLOCKED
+    # coverage surface: built code awaiting a physical run vs. not-yet-built.
+    return QUAL_IMPLEMENTED_UNQUALIFIED if impl_status == IMPL_COMPLETE else QUAL_BLOCKED
 
 
 def _feature_gating(features: release_platforms_mod.ReleaseFeatures, flags) -> bool:
@@ -500,6 +746,7 @@ def build_report(
     features = release_platforms_mod.load_release_features(release_platforms_path)
     platforms = release_platforms_mod.load_release_platforms(release_platforms_path)
     physical = scan_physical_evidence(reports_root)
+    failed_keys = scan_failed_evidence(reports_root)
     promotions = _promotion_records((repo_root / "scenarios" / "promotion") if repo_root else None)
 
     dimensions: "list[Dimension]" = []
@@ -521,6 +768,7 @@ def build_report(
         physical_session=manifest.physical_session or bool(physical),
         feature_scope_source=features.source,
         platform_scope_source=platforms.source,
+        failed_evidence_keys=failed_keys,
     )
 
 
@@ -564,11 +812,18 @@ def _build_dimension(
             components, requires_physical=requires_physical, physical_present=physical_present
         )
 
+    # ── Workstream 2 axes: implementation (built?) vs qualification (proven?) ─
+    implementation_status = _implementation_status(spec, components)
+    qualification_status = _qualification_status(spec, implementation_status, evidence)
+
     dim = Dimension(
         key=spec.key,
         title=spec.title,
         status=status,
         release_gating=release_gating,
+        implementation_status=implementation_status,
+        qualification_status=qualification_status,
+        qualification_stale=bool(getattr(evidence, "stale", False)) if evidence is not None else False,
         weight=spec.weight,
     )
 
@@ -683,6 +938,19 @@ _STATUS_BADGE = {
     STATUS_NOT_IMPLEMENTED: "⬜ not-implemented",
 }
 
+_IMPL_BADGE = {
+    IMPL_COMPLETE: "✅ complete",
+    IMPL_PARTIAL: "🟠 partial",
+    IMPL_NOT_IMPLEMENTED: "⬜ not-implemented",
+}
+
+_QUAL_BADGE = {
+    QUAL_QUALIFIED: "✅ qualified",
+    QUAL_IMPLEMENTED_UNQUALIFIED: "🟡 implemented-unqualified",
+    QUAL_BLOCKED: "⛔ blocked",
+    QUAL_NOT_APPLICABLE: "➖ not-applicable",
+}
+
 
 def render_markdown(report: CompletenessReport) -> str:
     d = report.to_dict()
@@ -700,29 +968,70 @@ def render_markdown(report: CompletenessReport) -> str:
     lines.append(f"- Release platform scope: `{report.platform_scope_source}`")
     counts = report.status_counts()
     lines.append(
-        "- Status counts: "
+        "- Status counts (legacy conflated status): "
         + ", ".join(f"{k}={counts[k]}" for k in VALID_STATUSES)
     )
     lines.append("")
 
+    impl = d["implementationCompleteness"]
+    qual = d["qualificationCompleteness"]
+    readiness = d["releaseReadiness"]
+    lines.append("## Three measures (implementation ≠ qualification ≠ release readiness)")
+    lines.append("")
+    lines.append(
+        "The legacy `weightedCompletionPercent` conflates *is it built?* with *is it physically "
+        "qualified?*. These three independent measures separate them — see "
+        "`docs/COMPLETENESS_MODEL.md`."
+    )
+    lines.append("")
+    lines.append("| Measure | Value | Meaning |")
+    lines.append("|---|---|---|")
+    lines.append(
+        f"| **Implementation completeness** | **{impl['implementationCompletionPercent']}%** "
+        f"({impl['statusCounts']['complete']} complete, {impl['statusCounts']['partial']} partial, "
+        f"{impl['statusCounts']['not-implemented']} not-implemented) | Built + offline-tested + wired. "
+        "A physical blocker is never counted as missing code. |"
+    )
+    lines.append(
+        f"| **Qualification completeness** | **{qual['qualificationCompletionPercent']}%** "
+        f"({qual['statusCounts']['qualified']} qualified, {qual['statusCounts']['implemented-unqualified']} "
+        f"implemented-unqualified, {qual['statusCounts']['blocked']} blocked, "
+        f"{qual['statusCounts']['not-applicable']} n/a) | Validated, current physical/backend evidence. "
+        "Offline tests are never counted; stale ≠ missing. |"
+    )
+    lines.append(
+        f"| **Release readiness** | **{readiness['status'].upper()}** | Derived from the "
+        "release-gating dimensions + validated evidence. Never a percentage turned into a PASS. |"
+    )
+    lines.append(f"- Legacy `weightedCompletionPercent` (retained for compatibility): **{d['summary']['weightedCompletionPercent']}%**")
+    if qual["staleEvidenceDimensions"]:
+        lines.append("- Stale qualification evidence (distinct from missing): " + ", ".join(qual["staleEvidenceDimensions"]))
+    if readiness["blocking"]:
+        lines.append("- Release-gating dimensions blocking readiness: " + ", ".join(readiness["blocking"]))
+    lines.append("")
+
     lines.append("## Dimensions")
     lines.append("")
-    lines.append("| Dimension | Status | Release-gating | Blockers | Next action |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| Dimension | Implementation | Qualification | Legacy status | Gating | Next action |")
+    lines.append("|---|---|---|---|---|---|")
     for dim in d["dimensions"]:
         badge = _STATUS_BADGE.get(dim["status"], dim["status"])
-        blockers = "; ".join(dim["blockers"]) if dim["blockers"] else "—"
-        blockers = blockers.replace("|", "\\|")
+        impl_badge = _IMPL_BADGE.get(dim["implementationStatus"], dim["implementationStatus"])
+        qual_badge = _QUAL_BADGE.get(dim["qualificationStatus"], dim["qualificationStatus"])
+        if dim["qualificationEvidenceStale"]:
+            qual_badge += " (stale)"
         next_action = dim["nextAction"].replace("|", "\\|") or "—"
         gating = "yes" if dim["releaseGating"] else "no"
-        lines.append(f"| **{dim['key']}** | {badge} | {gating} | {blockers} | {next_action} |")
+        lines.append(f"| **{dim['key']}** | {impl_badge} | {qual_badge} | {badge} | {gating} | {next_action} |")
     lines.append("")
 
     lines.append("## Per-dimension evidence")
     lines.append("")
     for dim in d["dimensions"]:
         lines.append(f"### {dim['key']} — {dim['title']}")
-        lines.append(f"- Status: **{dim['status']}** (score {dim['statusScore']}, weight {dim['weight']})")
+        lines.append(f"- Implementation: **{dim['implementationStatus']}** — Qualification: **{dim['qualificationStatus']}**"
+                     + (" (evidence stale)" if dim["qualificationEvidenceStale"] else ""))
+        lines.append(f"- Legacy status: **{dim['status']}** (score {dim['statusScore']}, weight {dim['weight']})")
         lines.append(f"- Release-gating: **{'yes' if dim['releaseGating'] else 'no'}**")
         if dim["implementationEvidence"]:
             lines.append("- Implementation evidence:")
