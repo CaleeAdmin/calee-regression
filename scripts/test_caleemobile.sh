@@ -44,6 +44,16 @@
 # BOTH suites, and the one verified backend is passed consistently to each.
 set -uo pipefail
 
+# Hermetic interpreter (Workstream 1). This script is invoked directly (by the
+# launcher tests and by "run-with-credentials"), not only after
+# ensure_environment.sh has run, so it resolves the repository-owned
+# interpreter itself: every `-m calee_regression` call below runs through
+# "$CALEE_PYTHON", never a bare python from a stripped PATH or a foreign venv.
+_CALEE_REPO_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
+# shellcheck source=scripts/lib/hermetic_python.sh
+. "$_CALEE_REPO_ROOT/scripts/lib/hermetic_python.sh"
+_calee_resolve_python "$_CALEE_REPO_ROOT"
+
 # --- Argument parsing: a platform and/or an explicit mode ----------------
 # Backward compatible: a bare "android"/"ios" is the full mode. "api-only"
 # needs no platform (the Client API suite is device-independent). "--ui-only"
@@ -164,7 +174,7 @@ for _feat in SYNCHRONIZATION MEALS ONBOARDING GOOGLE_CALENDAR KIOSK_ADMIN; do
     fi
 done
 if [ "$_scope_complete" != true ]; then
-    _scope_output="$(python -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"
+    _scope_output="$("$CALEE_PYTHON" -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"
     _scope_status=$?
     if [ "$_scope_status" -ne 0 ]; then
         echo ""
@@ -209,7 +219,7 @@ if [ ! -f "$ENV_REPORT" ]; then
     elif [ -z "${CALEE_API_BASE:-}" ] || [ -z "${CALEE_TEST_EMAIL:-}" ] || [ -z "${CALEE_TEST_PASSWORD:-}" ]; then
         PREPARE_BLOCK="cannot auto-prepare the test environment: CALEE_API_BASE, CALEE_TEST_EMAIL and CALEE_TEST_PASSWORD must all be configured so the regression fixture can be reset and verified."
     else
-        python -m calee_regression prepare --config "$CALEE_TEST_CONFIG" --run-id "$CALEE_RUN_ID"
+        "$CALEE_PYTHON" -m calee_regression prepare --config "$CALEE_TEST_CONFIG" --run-id "$CALEE_RUN_ID"
         PREPARE_STATUS=$?
         if [ "$PREPARE_STATUS" -ne 0 ]; then
             PREPARE_BLOCK="Prepare did not pass (exit $PREPARE_STATUS) — refusing to run the mobile checks against an unprepared environment."
@@ -398,12 +408,12 @@ fi
 # (timestamp + this process id).
 _INVOCATION_STAMP="$(date +%Y%m%dT%H%M%S)-$$"
 if [ "$RUN_API" = true ]; then
-    python -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component mobile-api \
+    "$CALEE_PYTHON" -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component mobile-api \
         --report-path "$API_REPORT" --exit-code "$API_STATUS" \
         --invocation-id "api-$_INVOCATION_STAMP" || true
 fi
 if [ "$RUN_UI" = true ]; then
-    python -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component "mobile-$PLATFORM" \
+    "$CALEE_PYTHON" -m calee_regression record-component --run-id "$CALEE_RUN_ID" --component "mobile-$PLATFORM" \
         --report-path "$UI_REPORT" --exit-code "$UI_STATUS" \
         --invocation-id "$PLATFORM-$_INVOCATION_STAMP" || true
 fi

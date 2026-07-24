@@ -441,6 +441,10 @@ exit 0
 def _run_launcher(repo, fakebin, *, stdin="", extra_env=None):
     env = dict(os.environ)
     env["PATH"] = f"{fakebin}:{env['PATH']}"
+    # Hermetic interpreter (Workstream 1): pin CALEE_PYTHON to the fakebin
+    # python shim so the launcher's framework calls are still intercepted
+    # (never an inherited CALEE_PYTHON from the caller's shell).
+    env["CALEE_PYTHON"] = str(fakebin / "python3")
     env["FAKE_REPO_ROOT"] = str(repo)
     env["FAKE_ORDER_LOG"] = str(repo / "order.log")
     # Priority 1, requirement 10: every fake-adb invocation this run makes is

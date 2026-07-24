@@ -13,6 +13,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 
 from calee_regression.suites import REPO_ROOT
 
@@ -73,7 +74,7 @@ def _copy_calee_regression(workspace):
     caller's cwd -- so the fake sibling must be a real sibling directory
     of the copied calee-regression, both directly under `workspace`."""
     calee_regression_copy = workspace / "calee-regression"
-    shutil.copytree(REPO_ROOT, calee_regression_copy, ignore=shutil.ignore_patterns(".git", "reports"))
+    shutil.copytree(REPO_ROOT, calee_regression_copy, ignore=shutil.ignore_patterns(".git", "reports", ".venv", "__pycache__"))
     (calee_regression_copy / "reports").mkdir(exist_ok=True)
     return calee_regression_copy
 
@@ -213,6 +214,11 @@ def _run_script(calee_regression_copy, workspace, platform, env_overrides=None):
     env["PATH"] = "/usr/bin:/bin"
     for key in _HERMETIC_ENV_KEYS:
         env.pop(key, None)
+    # Hermetic interpreter (Workstream 1): the launcher must run the framework
+    # through the repo-owned CALEE_PYTHON, not a bare python from PATH. Pinning
+    # it to this test interpreter (which has the deps) while PATH is stripped to
+    # /usr/bin:/bin proves no globally-installed `click`/package is required.
+    env["CALEE_PYTHON"] = sys.executable
     if env_overrides:
         env.update(env_overrides)
 
@@ -234,6 +240,9 @@ def _run_script_fakebin(calee_regression_copy, workspace, platform, *, fakebin, 
     env["PATH"] = f"{fakebin}{os.pathsep}/usr/bin:/bin"
     for key in _HERMETIC_ENV_KEYS:
         env.pop(key, None)
+    # Hermetic interpreter (Workstream 1): pin CALEE_PYTHON to the fakebin
+    # shim so the self-prepare interception still runs through it.
+    env["CALEE_PYTHON"] = str(fakebin / "python")
     env.update(extra_env)
     return subprocess.run(
         ["bash", str(calee_regression_copy / "scripts" / "test_caleemobile.sh"), platform],
@@ -633,6 +642,11 @@ def _run_script_args(calee_regression_copy, workspace, args, env_overrides=None)
     env["PATH"] = "/usr/bin:/bin"
     for key in _HERMETIC_ENV_KEYS:
         env.pop(key, None)
+    # Hermetic interpreter (Workstream 1): the launcher must run the framework
+    # through the repo-owned CALEE_PYTHON, not a bare python from PATH. Pinning
+    # it to this test interpreter (which has the deps) while PATH is stripped to
+    # /usr/bin:/bin proves no globally-installed `click`/package is required.
+    env["CALEE_PYTHON"] = sys.executable
     if env_overrides:
         env.update(env_overrides)
     return subprocess.run(
@@ -646,6 +660,9 @@ def _run_script_fakebin_args(calee_regression_copy, workspace, args, *, fakebin,
     env["PATH"] = f"{fakebin}{os.pathsep}/usr/bin:/bin"
     for key in _HERMETIC_ENV_KEYS:
         env.pop(key, None)
+    # Hermetic interpreter (Workstream 1): pin CALEE_PYTHON to the fakebin
+    # shim so the self-prepare interception still runs through it.
+    env["CALEE_PYTHON"] = str(fakebin / "python")
     env.update(extra_env)
     return subprocess.run(
         ["bash", str(calee_regression_copy / "scripts" / "test_caleemobile.sh"), *args],

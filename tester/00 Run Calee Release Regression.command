@@ -1,6 +1,6 @@
 #!/bin/bash
 # The MACHINE_* variables below are populated at run time by
-# `eval "$(python3 -m calee_regression machine-config-snapshot ...)"`, whose
+# `eval "$("$CALEE_PYTHON" -m calee_regression machine-config-snapshot ...)"`, whose
 # assignment the linter cannot see; SC2154 (referenced but not assigned) is
 # expected here and disabled on the next line.
 # shellcheck disable=SC2154
@@ -60,8 +60,8 @@ needs_owner()  {
 # consolidated PASS/FAIL/BLOCKED status) so the caller exits with it.
 consolidate_gate() {
     # Safe, read-only identity evidence where possible -- never a product test.
-    python3 -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase pre >/dev/null 2>&1 || true
-    python3 -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase post >/dev/null 2>&1 || true
+    "$CALEE_PYTHON" -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase pre >/dev/null 2>&1 || true
+    "$CALEE_PYTHON" -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase post >/dev/null 2>&1 || true
     # Mirror 06's mandatory-component flags for whatever evidence exists, and
     # allow-unknown build identity (an early gate cannot collect the full build
     # identity). The consolidated status is driven by the recorded component(s):
@@ -70,7 +70,7 @@ consolidate_gate() {
     [ -f "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/machine-config/results.json" ] && args+=(--machine-config-mandatory)
     [ -f "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/release-config/results.json" ] && args+=(--release-config-mandatory)
     [ -f "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/installation/results.json" ] && args+=(--installation-mandatory)
-    python3 -m calee_regression consolidate "${args[@]}"
+    "$CALEE_PYTHON" -m calee_regression consolidate "${args[@]}"
     local status=$?
     echo ""
     echo "Opening the final report…"
@@ -103,7 +103,7 @@ fi
 # where evidence lives. An unsafe/unwritable configured root BLOCKS here
 # rather than silently falling back. See calee_regression/report_root.py.
 if [ -z "${CALEE_REPORT_ROOT:-}" ]; then
-    if ! CALEE_REPORT_ROOT="$(python3 -m calee_regression report-root)"; then
+    if ! CALEE_REPORT_ROOT="$("$CALEE_PYTHON" -m calee_regression report-root)"; then
         needs_owner "The configured report root could not be resolved." \
                     "No — this is a setup/configuration problem, not a product failure." \
                     "Ask your technical owner to check config/machine.local.yaml's report_dir (or the CALEE_REPORT_ROOT environment variable)." \
@@ -129,7 +129,7 @@ echo "Workspace: $CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/"
 # ── 2. machine config = the single authoritative source (Priority 4) ─────────
 echo ""
 echo "Reading your machine configuration…"
-if ! MACHINE_VARS="$(python3 -m calee_regression machine-config-snapshot --run-id "$CALEE_RUN_ID" 2>machine_config_error.txt)"; then
+if ! MACHINE_VARS="$("$CALEE_PYTHON" -m calee_regression machine-config-snapshot --run-id "$CALEE_RUN_ID" 2>machine_config_error.txt)"; then
     needs_owner "The machine configuration is missing or invalid (or contains a secret it must not)." \
                 "No — this is a setup problem, not a product failure." \
                 "Ask your technical owner to fix config/machine.local.yaml (see config/machine.local.example.yaml)." \
@@ -169,7 +169,7 @@ state_ready "Machine configuration loaded (authoritative). Backend: ${MACHINE_BA
 # diagnosis instead of surfacing later as an installer or config failure.
 state_doing "Verifying the release bundle (no device touched yet)…" "VERIFYING"
 mkdir -p "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/release-config"
-python3 -m calee_regression verify-release-bundle \
+"$CALEE_PYTHON" -m calee_regression verify-release-bundle \
     --bundle "$MACHINE_RELEASE_BUNDLE_DIR" \
     --report "$CALEE_REPORT_ROOT/reports/runs/$CALEE_RUN_ID/release-config/bundle-verification.json"
 BUNDLE_VERIFY_STATUS=$?
@@ -198,7 +198,7 @@ state_pass "Release bundle verified."
 # results.json. Launcher "06" below CONSUMES this same evidence -- it never
 # recomposes a second, possibly-different configuration for this run.
 state_doing "Composing the effective release configuration…" "CONFIGURING"
-if RELEASE_CFG_OUT="$(python3 -m calee_regression release-config --bundle "$MACHINE_RELEASE_BUNDLE_DIR" --run-id "$CALEE_RUN_ID" 2>release_config_error.txt)"; then
+if RELEASE_CFG_OUT="$("$CALEE_PYTHON" -m calee_regression release-config --bundle "$MACHINE_RELEASE_BUNDLE_DIR" --run-id "$CALEE_RUN_ID" 2>release_config_error.txt)"; then
     RELEASE_CFG_STATUS=0
 else
     RELEASE_CFG_STATUS=$?
@@ -238,7 +238,7 @@ state_doing "Finding exact CI evidence…" "VERIFYING"
 echo "  Authenticating selector evidence…"
 echo "  Authenticating Android build evidence…"
 echo "  Authenticating iOS build evidence…"
-python3 -m calee_regression acquire-release-evidence \
+"$CALEE_PYTHON" -m calee_regression acquire-release-evidence \
     --bundle "$MACHINE_RELEASE_BUNDLE_DIR" \
     --run-id "$CALEE_RUN_ID"
 EVIDENCE_STATUS=$?
@@ -264,7 +264,7 @@ state_pass "Release evidence found and authenticated."
 state_doing "Installing the release on the tablet (your data is preserved)…" "INSTALLING"
 SERIAL_ARG=()
 [ -n "$MACHINE_TABLET_SERIAL" ] && SERIAL_ARG=(--serial "$MACHINE_TABLET_SERIAL")
-python3 -m calee_regression install-tablet-release \
+"$CALEE_PYTHON" -m calee_regression install-tablet-release \
     --bundle "$MACHINE_RELEASE_BUNDLE_DIR" \
     "${SERIAL_ARG[@]}" \
     --run-id "$CALEE_RUN_ID"

@@ -25,7 +25,7 @@ fi
 # Credentials come from the environment or the macOS Keychain via the
 # framework's credential-provider chain — this launcher NEVER prompts for a
 # password and never puts one on a command line.
-python -m calee_regression focused-verify --config "$CALEE_TEST_CONFIG"
+"$CALEE_PYTHON" -m calee_regression focused-verify --config "$CALEE_TEST_CONFIG"
 STATUS=$?
 
 echo ""

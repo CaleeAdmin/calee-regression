@@ -64,7 +64,7 @@ fi
 
 # ── 0.5. report root (must agree with every other launcher) ─────────────────
 if [ -z "${CALEE_REPORT_ROOT:-}" ]; then
-    if ! CALEE_REPORT_ROOT="$(python3 -m calee_regression report-root)"; then
+    if ! CALEE_REPORT_ROOT="$("$CALEE_PYTHON" -m calee_regression report-root)"; then
         needs_owner "The configured report root could not be resolved." \
                     "No — this is a setup/configuration problem, not a product failure." \
                     "Ask your technical owner to check config/machine.local.yaml's report_dir (or the CALEE_REPORT_ROOT environment variable)." \
@@ -78,7 +78,7 @@ export CALEE_REPORT_ROOT
 # ── 1. list every existing run and require an explicit choice ───────────────
 say "Choose a run to resume"
 SELECTION_FILE="$(mktemp)"
-python3 -m calee_regression select-run-to-resume --config "$CALEE_TEST_CONFIG" --out-file "$SELECTION_FILE"
+"$CALEE_PYTHON" -m calee_regression select-run-to-resume --config "$CALEE_TEST_CONFIG" --out-file "$SELECTION_FILE"
 SELECTED_RUN_ID=""
 [ -s "$SELECTION_FILE" ] && SELECTED_RUN_ID="$(cat "$SELECTION_FILE")"
 rm -f "$SELECTION_FILE"
@@ -95,7 +95,7 @@ echo "Selected run: $CALEE_RUN_ID"
 
 # ── 2. read-only resumability check BEFORE touching anything ────────────────
 state_doing "Checking whether this run can be resumed…" "CHECKING"
-python3 -m calee_regression inspect-resume --run-id "$CALEE_RUN_ID" --config "$CALEE_TEST_CONFIG"
+"$CALEE_PYTHON" -m calee_regression inspect-resume --run-id "$CALEE_RUN_ID" --config "$CALEE_TEST_CONFIG"
 INSPECT_STATUS=$?
 if [ $INSPECT_STATUS -ne 0 ]; then
     state_block "This run cannot be resumed."
@@ -111,7 +111,7 @@ state_ready "This run can be resumed."
 # ── 3. resume: reuse what's still valid, rerun Prepare if it was blocked ────
 state_doing "Resuming the run (reusing already-passed evidence where safe)…" "RESUMING"
 RESUME_REPORT="$(mktemp)"
-python3 -m calee_regression resume-release --run-id "$CALEE_RUN_ID" --config "$CALEE_TEST_CONFIG" --report "$RESUME_REPORT"
+"$CALEE_PYTHON" -m calee_regression resume-release --run-id "$CALEE_RUN_ID" --config "$CALEE_TEST_CONFIG" --report "$RESUME_REPORT"
 RESUME_STATUS=$?
 
 if [ $RESUME_STATUS -eq 3 ]; then
@@ -144,7 +144,7 @@ rm -f "$RESUME_REPORT"
 
 if [ "$INSTALL_NEEDED" = "yes" ]; then
     state_doing "Installation must be (re-)verified — this may reinstall/reboot the tablet…" "INSTALLING"
-    if ! MACHINE_VARS="$(python3 -m calee_regression machine-config-snapshot --run-id "$CALEE_RUN_ID" 2>machine_config_error.txt)"; then
+    if ! MACHINE_VARS="$("$CALEE_PYTHON" -m calee_regression machine-config-snapshot --run-id "$CALEE_RUN_ID" 2>machine_config_error.txt)"; then
         needs_owner "The machine configuration is missing or invalid." \
                     "No — this is a setup problem, not a product failure." \
                     "Ask your technical owner to fix config/machine.local.yaml." \
@@ -159,7 +159,7 @@ if [ "$INSTALL_NEEDED" = "yes" ]; then
     SERIAL_ARG=""
     [ -n "$MACHINE_TABLET_SERIAL" ] && SERIAL_ARG="--serial $MACHINE_TABLET_SERIAL"
     # shellcheck disable=SC2086
-    python3 -m calee_regression install-tablet-release \
+    "$CALEE_PYTHON" -m calee_regression install-tablet-release \
         --bundle "$MACHINE_RELEASE_BUNDLE_DIR" \
         $SERIAL_ARG \
         --run-id "$CALEE_RUN_ID"
