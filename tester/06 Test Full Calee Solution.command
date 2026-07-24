@@ -25,7 +25,7 @@ fi
 # configured root BLOCKS rather than silently falling back. See
 # calee_regression/report_root.py.
 if [ -z "${CALEE_REPORT_ROOT:-}" ]; then
-    if ! CALEE_REPORT_ROOT="$(python3 -m calee_regression report-root)"; then
+    if ! CALEE_REPORT_ROOT="$("$CALEE_PYTHON" -m calee_regression report-root)"; then
         echo "$CALEE_REPORT_ROOT" >&2
         echo "BLOCKED: the configured report root could not be resolved."
         read -p "Press Enter to close..."
@@ -78,7 +78,7 @@ echo ""
 # "00" delegation), no such evidence exists yet, so this composes it fresh,
 # exactly as before Priority 1.
 if [ -f config/machine.local.yaml ]; then
-    if RELEASE_CFG_OUT="$(python -m calee_regression release-config --run-id "$CALEE_RUN_ID" 2>/dev/null)"; then
+    if RELEASE_CFG_OUT="$("$CALEE_PYTHON" -m calee_regression release-config --run-id "$CALEE_RUN_ID" 2>/dev/null)"; then
         RELEASE_CFG_STATUS=0
     else
         RELEASE_CFG_STATUS=$?
@@ -97,7 +97,7 @@ else
     # profile alone -- a malformed file here still aborts the launcher, which
     # is correct: schema-v1 (the only possibility with no machine config)
     # must keep using and cross-checking it (Priority 2 requirement 8).
-    eval "$(python -m calee_regression release-platforms)"
+    eval "$("$CALEE_PYTHON" -m calee_regression release-platforms)"
     RELEASE_CFG_STATUS=0
 fi
 
@@ -117,7 +117,7 @@ if [ "$RELEASE_CFG_STATUS" -ne 0 ]; then
     PREPARE_STATUS=$RELEASE_CFG_STATUS
 else
     echo "--- Step 1: Prepare Test Environment (incl. Appium) ---"
-    python -m calee_regression prepare --config "$CALEE_TEST_CONFIG" --suite tablet-full --run-id "$CALEE_RUN_ID"
+    "$CALEE_PYTHON" -m calee_regression prepare --config "$CALEE_TEST_CONFIG" --suite tablet-full --run-id "$CALEE_RUN_ID"
     PREPARE_STATUS=$?
 fi
 
@@ -133,7 +133,7 @@ echo "--- Collecting pre-run build identity ---"
 # is safe to collect even on a fail-fast BLOCKED run, and the consolidated
 # bundle needs BOTH the pre and post snapshot (exactly one is "incomplete
 # capture", which BLOCKS); see consolidated_report.component_from_identity_stability.
-python -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase pre >/dev/null
+"$CALEE_PYTHON" -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase pre >/dev/null
 
 # Phase 1: fail fast when Prepare did not succeed.
 #
@@ -189,11 +189,11 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     fi
 
     if [ -n "$SUBSCRIBED_GATE_ARG" ]; then
-        python -m calee_regression prepare-subscribed-fixture \
+        "$CALEE_PYTHON" -m calee_regression prepare-subscribed-fixture \
             --run-id "$CALEE_RUN_ID" \
             "$SUBSCRIBED_GATE_ARG"
     else
-        python -m calee_regression prepare-subscribed-fixture \
+        "$CALEE_PYTHON" -m calee_regression prepare-subscribed-fixture \
             --run-id "$CALEE_RUN_ID"
     fi
     SUBSCRIBED_FIXTURE_STATUS=$?
@@ -210,7 +210,7 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
 
     echo ""
     echo "--- Step 2: Calee Tablet ---"
-    python -m calee_regression suite --config "$CALEE_TEST_CONFIG" --suite full-tester --run-id "$CALEE_RUN_ID"
+    "$CALEE_PYTHON" -m calee_regression suite --config "$CALEE_TEST_CONFIG" --suite full-tester --run-id "$CALEE_RUN_ID"
 
     echo ""
     echo "--- Step 2.5: CaleeMobile selector-contract gate (BEFORE any mobile functional test) ---"
@@ -274,7 +274,7 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     [ -n "${CALEEMOBILE_SELECTOR_GITHUB_ARTIFACT_ID:-}" ] && SELECTOR_ARGS+=(--github-artifact-id "$CALEEMOBILE_SELECTOR_GITHUB_ARTIFACT_ID")
     [ -n "${CALEEMOBILE_SELECTOR_GITHUB_ARTIFACT_ZIP:-}" ] && SELECTOR_ARGS+=(--github-artifact-zip "$CALEEMOBILE_SELECTOR_GITHUB_ARTIFACT_ZIP")
     [ -n "${CALEEMOBILE_SELECTOR_EVIDENCE:-}" ] && SELECTOR_ARGS+=(--source "$CALEEMOBILE_SELECTOR_EVIDENCE")
-    python -m calee_regression selector-contract "${SELECTOR_ARGS[@]}"
+    "$CALEE_PYTHON" -m calee_regression selector-contract "${SELECTOR_ARGS[@]}"
     SELECTOR_GATE_STATUS=$?
 
     if [ "$SELECTOR_GATE_STATUS" -eq 0 ]; then
@@ -292,7 +292,7 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     # never swallowed by command substitution (a crashed resolver would leave
     # empty output, `eval ""` succeeds, and the mobile legs would otherwise run
     # with an unknown scope).
-    FEATURE_SCOPE_OUT="$(python3 -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"
+    FEATURE_SCOPE_OUT="$("$CALEE_PYTHON" -m calee_regression release-feature-scope --run-id "$CALEE_RUN_ID")"
     FEATURE_SCOPE_RC=$?
     if [ "$FEATURE_SCOPE_RC" -ne 0 ]; then
         echo "BLOCKED: could not resolve this run's release-feature scope (exit $FEATURE_SCOPE_RC) — refusing to run the mobile checks with an unknown or malformed scope." >&2
@@ -314,12 +314,12 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     # from the environment OR the macOS Keychain and placed only in the child
     # environment, never on a command line. A Keychain-only technical owner does
     # not have to export the credentials for the mobile suites to run.
-    python3 -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh api-only
+    "$CALEE_PYTHON" -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh api-only
 
     if [ "$RELEASE_PLATFORM_ANDROID" = "true" ]; then
         echo ""
         echo "--- Step 4: CaleeMobile Android UI ---"
-        python3 -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh android --ui-only
+        "$CALEE_PYTHON" -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh android --ui-only
     else
         echo ""
         echo "--- Step 4: CaleeMobile Android UI — SKIPPED (not part of this release; see this run's release-config, or config/release-platforms.yaml for a schema-v1/bare run) ---"
@@ -328,7 +328,7 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     if [ "$RELEASE_PLATFORM_IOS" = "true" ]; then
         echo ""
         echo "--- Step 5: CaleeMobile iPhone UI ---"
-        python3 -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh ios --ui-only
+        "$CALEE_PYTHON" -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh ios --ui-only
     else
         echo ""
         echo "--- Step 5: CaleeMobile iPhone UI — SKIPPED (not part of this release; see this run's release-config, or config/release-platforms.yaml for a schema-v1/bare run) ---"
@@ -363,7 +363,7 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     else
         SYNC_ARGS+=(--mandatory)
     fi
-    python -m calee_regression sync-smoke "${SYNC_ARGS[@]}"
+    "$CALEE_PYTHON" -m calee_regression sync-smoke "${SYNC_ARGS[@]}"
     elif [ "$SELECTOR_MANDATORY" = "false" ]; then
         # Priority 2: selector evidence was OPTIONAL for this release and did
         # NOT pass. Never silently omitted -- the selector-contract report
@@ -385,7 +385,7 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
 
         echo ""
         echo "--- Step 3: CaleeMobile Client API (device-independent — run once) ---"
-        python3 -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh api-only
+        "$CALEE_PYTHON" -m calee_regression run-with-credentials -- bash scripts/test_caleemobile.sh api-only
     else
         echo ""
         echo "=== CaleeMobile selector contract did not pass (status $SELECTOR_GATE_STATUS) — mobile functional tests SKIPPED ==="
@@ -423,11 +423,11 @@ if [ "$PREPARE_STATUS" -eq 0 ]; then
     if [ "${CALEE_CONFIRM_TECHNICAL:-false}" = "true" ] || [ "${CALEE_CONFIRM_TECHNICAL:-0}" = "1" ]; then
         KIOSK_ARGS+=(--confirm-technical)
     fi
-    python -m calee_regression kiosk-admin "${KIOSK_ARGS[@]}"
+    "$CALEE_PYTHON" -m calee_regression kiosk-admin "${KIOSK_ARGS[@]}"
 
     echo ""
     echo "--- Step 8: Manual Checks ---"
-    python -m calee_regression record-manual-checks --run-id "$CALEE_RUN_ID"
+    "$CALEE_PYTHON" -m calee_regression record-manual-checks --run-id "$CALEE_RUN_ID"
 else
     echo ""
     if [ "$RELEASE_CFG_STATUS" -ne 0 ]; then
@@ -476,7 +476,7 @@ echo "--- Collecting post-run build identity ---"
 # BLOCKS when an in-scope app's identity changed during the run (Phase 4).
 # Like the pre snapshot, this reads local git/adb only and runs no product
 # test, so it is collected on the fail-fast BLOCKED path too.
-eval "$(python -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase post)"
+eval "$("$CALEE_PYTHON" -m calee_regression build-identity --run-id "$CALEE_RUN_ID" --phase post)"
 CALEEMOBILE_BUILD_VERSION="${CALEEMOBILE_BUILD_VERSION:-${AUTO_CALEEMOBILE_BUILD_VERSION:-}}"
 CALEEMOBILE_GIT_SHA="${CALEEMOBILE_GIT_SHA:-${AUTO_CALEEMOBILE_GIT_SHA:-}}"
 CALEEMOBILE_DIRTY="${CALEEMOBILE_DIRTY:-${AUTO_CALEEMOBILE_DIRTY:-false}}"
@@ -577,12 +577,12 @@ fi
 [ "${CALEE_ALLOW_UNKNOWN_BUILD_IDENTITY:-false}" = "true" ] && CONSOLIDATE_ARGS+=(--allow-unknown-build-identity)
 [ -n "${CALEE_TESTER_ID:-}" ] && CONSOLIDATE_ARGS+=(--tester "$CALEE_TESTER_ID")
 
-python -m calee_regression consolidate "${CONSOLIDATE_ARGS[@]}"
+"$CALEE_PYTHON" -m calee_regression consolidate "${CONSOLIDATE_ARGS[@]}"
 STATUS=$?
 
 echo ""
 echo "--- Stopping Appium (only if this run started it) ---"
-python -m calee_regression stop-appium
+"$CALEE_PYTHON" -m calee_regression stop-appium
 
 echo ""
 case $STATUS in

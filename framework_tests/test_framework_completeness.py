@@ -223,7 +223,7 @@ def test_committed_canonical_artifacts_are_up_to_date(report):
 def test_canonical_json_is_valid_and_derives_from_metadata(report):
     data = json.loads(fc.CANONICAL_JSON_PATH.read_text(encoding="utf-8"))
     assert data["report"] == "framework-completeness"
-    assert data["schemaVersion"] == 1
+    assert data["schemaVersion"] == 2
     # It advertises the sources it derives from -- not a hand-kept number.
     assert "coverageManifest" in data["derivedFrom"]
     assert data["summary"]["weightedCompletionPercent"] == report.weighted_summary()["weightedCompletionPercent"]

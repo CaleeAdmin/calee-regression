@@ -6322,6 +6322,271 @@ def framework_completeness_cmd(output_format, json_out, md_out, write_canonical,
     raise SystemExit(EXIT_SUCCESS)
 
 
+@main.command("host-capabilities")
+@click.option(
+    "--format", "output_format", type=click.Choice(["json", "text", "both"]), default="both",
+    help="What to print to stdout (default: both).",
+)
+@click.option("--json-out", "json_out", default=None, type=click.Path(), help="Also write the JSON report to this path.")
+def host_capabilities_cmd(output_format, json_out):
+    """Read-only report of what THIS host can actually do.
+
+    Probes the OS/arch/host, the running interpreter and repo virtualenv, ADB /
+    Appium / Flutter / Xcode availability, visible Android/iOS devices, the
+    macOS Keychain, a configured backend and credential SOURCES (their PRESENCE
+    only -- never a secret value), the tester config, a release bundle and a
+    writable report root; then classifies the host's ``executionCapability``
+    (e.g. ``OFFLINE_FRAMEWORK_ONLY`` in a cloud container, or a physical class
+    on a Mac with the expected devices).
+
+    It performs NO fixture reset, NO app launch and reveals NO secret. Always
+    exits 0 -- the classification is in the report, not the exit code.
+    """
+    import json as _json
+
+    from . import host_capabilities as hc
+
+    report = hc.gather_host_capabilities()
+    json_text = _json.dumps(report, indent=2) + "\n"
+    if json_out:
+        Path(json_out).write_text(json_text, encoding="utf-8")
+
+    if output_format in ("json", "both"):
+        click.echo(json_text, nl=False)
+    if output_format == "both":
+        click.echo("")
+    if output_format in ("text", "both"):
+        click.echo(hc.render_text(report), nl=False)
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@main.command("qualification-plan")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(),
+              help="Tester config referenced in the generated commands (not read for secrets).")
+@click.option("--format", "output_format", type=click.Choice(["json", "markdown", "both"]), default="both",
+              help="What to print to stdout (default: both).")
+@click.option("--json-out", "json_out", default=None, type=click.Path(), help="Also write the JSON plan to this path.")
+@click.option("--md-out", "md_out", default=None, type=click.Path(), help="Also write the Markdown plan to this path.")
+def qualification_plan_cmd(config_path, output_format, json_out, md_out):
+    """Generate a concrete, secret-free Mac qualification plan.
+
+    Derives an ordered, runnable plan from the current completeness report,
+    release scope and host capabilities: host prerequisites, required repo /
+    product SHAs, required devices/credentials (by SOURCE category, never a
+    value), which dimensions each command can advance, which steps mutate the
+    fixture vs are read-only, which need manual guided evidence / kiosk
+    authorisation / an Android device, and the evidence-bundle export to run
+    afterwards. Distinguishes focused DIAGNOSTIC verification from full release
+    CERTIFICATION, and never silently narrows the release scope. Read-only.
+    """
+    import json as _json
+
+    from . import qualification_plan as qp
+
+    plan = qp.build_plan(config_path=config_path)
+    json_text = _json.dumps(plan, indent=2) + "\n"
+    md_text = qp.render_markdown(plan)
+    if json_out:
+        Path(json_out).write_text(json_text, encoding="utf-8")
+    if md_out:
+        Path(md_out).write_text(md_text, encoding="utf-8")
+
+    if output_format in ("json", "both"):
+        click.echo(json_text, nl=False)
+    if output_format == "both":
+        click.echo("")
+    if output_format in ("markdown", "both"):
+        click.echo(md_text, nl=False)
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@main.group("evidence-bundle")
+def evidence_bundle_group():
+    """Export / verify / inspect a portable, sanitized evidence bundle.
+
+    Moves a run's evidence between environments (e.g. Mac -> cloud analysis) as
+    a self-describing, integrity-checked, SECRET-FREE zip. Verify and inspect
+    work entirely offline and never populate a live run directory.
+    """
+
+
+def _resolve_run_dir(reports_root, run_id):
+    import os
+
+    base = Path(reports_root) if reports_root else Path(os.environ.get("CALEE_REPORT_ROOT") or ".") / "reports"
+    return base / "runs" / run_id
+
+
+@evidence_bundle_group.command("export")
+@click.option("--run-id", required=True, help="The run workspace to export (reports/runs/<run-id>).")
+@click.option("--output", required=True, type=click.Path(), help="Destination .zip path.")
+@click.option("--profile", type=click.Choice(["audit", "local-certification-transfer"]), default="audit",
+              help="audit (pseudonymized, non-certifying after import) or local-certification-transfer (exact identities).")
+@click.option("--reports-root", default=None, type=click.Path(), help="Reports root (default: $CALEE_REPORT_ROOT/reports or ./reports).")
+def evidence_bundle_export(run_id, output, profile, reports_root):
+    """Export a run's validated evidence into a sanitized bundle (fail-closed)."""
+    import datetime
+
+    from . import evidence_bundle as eb
+
+    run_dir = _resolve_run_dir(reports_root, run_id)
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        manifest = eb.export_bundle(run_dir, output, profile=profile, timestamp=ts)
+    except eb.EvidenceBundleError as exc:
+        click.echo(f"Evidence-bundle export refused: {exc}", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    click.echo(click.style(
+        f"[OK] Exported {manifest['profile']} bundle for run {manifest['sourceRunId']} "
+        f"-> {output} ({len(manifest['files'])} file(s), "
+        f"{'NON-certifying after import' if manifest['nonCertifyingAfterImport'] else 'identities preserved'}).",
+        fg="green"))
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@evidence_bundle_group.command("verify")
+@click.argument("bundle", type=click.Path(exists=True))
+def evidence_bundle_verify(bundle):
+    """Verify a bundle offline: digest integrity, no traversal, no smuggled or
+    secret-bearing files. Exit 0 if valid, non-zero otherwise."""
+    from . import evidence_bundle as eb
+
+    result = eb.verify_bundle(bundle)
+    if result["valid"]:
+        click.echo(click.style(f"[OK] Bundle verified: {result['summary'].get('sourceRunId')} "
+                               f"({result['summary'].get('profile')}, {result['summary'].get('fileCount')} files).", fg="green"))
+        raise SystemExit(EXIT_SUCCESS)
+    click.echo(click.style("Bundle verification FAILED:", fg="red"), err=True)
+    for p in result["problems"]:
+        click.echo(f"  - {p}", err=True)
+    raise SystemExit(EXIT_INVALID_CONFIG)
+
+
+@evidence_bundle_group.command("inspect")
+@click.argument("bundle", type=click.Path(exists=True))
+def evidence_bundle_inspect(bundle):
+    """Read-only summary of a bundle (never extracts, never touches live runs)."""
+    import json as _json
+
+    from . import evidence_bundle as eb
+
+    try:
+        summary = eb.inspect_bundle(bundle)
+    except eb.EvidenceBundleError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    click.echo(_json.dumps(summary, indent=2))
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@main.group("scenario-promotion")
+def scenario_promotion_group():
+    """Evaluate / propose / apply evidence-backed draft-scenario promotion.
+
+    A draft scenario becomes promotable ONLY on validated, certification-
+    eligible, current physical evidence that satisfies every criterion (>=2
+    standard-init passes, matching build/backend/fixture/selector SHA, no
+    diagnostic mode, cleanup verified, not an audit bundle, no failed/blocked
+    step, scenario-specific authoritative assertions). Fail-closed.
+    """
+
+
+@scenario_promotion_group.command("evaluate")
+@click.option("--scenario", required=True, help="Draft scenario name (e.g. calendar_event_mutation).")
+@click.option("--run-id", required=True, help="Run whose evidence is being evaluated.")
+@click.option("--reports-root", default=None, type=click.Path())
+def scenario_promotion_evaluate(scenario, run_id, reports_root):
+    """Print a typed promotion decision (eligible/ineligible/ambiguous) showing
+    every criterion. Read-only. Exit 0 if eligible, non-zero otherwise."""
+    import json as _json
+
+    from . import scenario_promotion as sp
+
+    try:
+        decision = sp.evaluate(scenario, run_id, reports_root=reports_root)
+    except sp.ScenarioPromotionError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    click.echo(_json.dumps(decision.to_dict(), indent=2))
+    raise SystemExit(EXIT_SUCCESS if decision.decision == sp.DECISION_ELIGIBLE else EXIT_BLOCKED)
+
+
+@scenario_promotion_group.command("propose")
+@click.option("--scenario", required=True)
+@click.option("--run-id", required=True)
+@click.option("--reports-root", default=None, type=click.Path())
+def scenario_promotion_propose(scenario, run_id, reports_root):
+    """Evaluate and print the exact change set promotion WOULD make (never
+    writes)."""
+    import json as _json
+
+    from . import scenario_promotion as sp
+
+    try:
+        decision = sp.evaluate(scenario, run_id, reports_root=reports_root)
+    except sp.ScenarioPromotionError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    click.echo(_json.dumps({"decision": decision.to_dict(), "proposal": sp.propose(decision)}, indent=2))
+    raise SystemExit(EXIT_SUCCESS if decision.decision == sp.DECISION_ELIGIBLE else EXIT_BLOCKED)
+
+
+@scenario_promotion_group.command("apply")
+@click.option("--scenario", required=True)
+@click.option("--run-id", required=True)
+@click.option("--reports-root", default=None, type=click.Path())
+@click.option("--promotion-dir", default=None, type=click.Path())
+@click.option("--confirm", is_flag=True, default=False, help="Actually write the promotion-record update (else dry-run).")
+@click.option("--allow-dirty", is_flag=True, default=False, help="Permit a dirty working tree (default: refuse).")
+def scenario_promotion_apply(scenario, run_id, reports_root, promotion_dir, confirm, allow_dirty):
+    """Record a verified physical PASS into the promotion record. Refuses unless
+    the decision is eligible and (without --allow-dirty) the tree is clean;
+    prints the proposed change first; a dry-run without --confirm; never commits."""
+    import json as _json
+    import subprocess
+
+    from . import scenario_promotion as sp
+
+    try:
+        decision = sp.evaluate(scenario, run_id, reports_root=reports_root, promotion_dir=promotion_dir)
+    except sp.ScenarioPromotionError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    if decision.decision != sp.DECISION_ELIGIBLE:
+        click.echo(click.style(f"Refusing to promote {scenario}: decision is {decision.decision}.", fg="red"), err=True)
+        for c in decision.failing():
+            click.echo(f"  - {c.name}: {c.detail}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    proposal = sp.propose(decision)
+    click.echo("Proposed changes:")
+    for change in proposal["proposedChanges"]:
+        click.echo(f"  - {change}")
+
+    if not allow_dirty:
+        try:
+            dirty = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, timeout=15).stdout.strip()
+        except Exception:  # noqa: BLE001
+            dirty = ""
+        if dirty:
+            click.echo(click.style("Refusing on a dirty working tree (use --allow-dirty to override).", fg="red"), err=True)
+            raise SystemExit(EXIT_BLOCKED)
+
+    if not confirm:
+        click.echo("Dry run (pass --confirm to write the promotion-record update). Nothing was written.")
+        raise SystemExit(EXIT_SUCCESS)
+
+    try:
+        summary = sp.apply_record_update(decision, promotion_dir=promotion_dir)
+    except sp.ScenarioPromotionError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    click.echo(click.style(f"[OK] Recorded physical PASS for {scenario} in {summary['recordPath']}.", fg="green"))
+    click.echo(_json.dumps(summary, indent=2))
+    raise SystemExit(EXIT_SUCCESS)
+
+
 def _write_installer_report(report_path: "Path | None", payload: dict) -> None:
     """Write an installer/inspection report JSON, best-effort. A missing
     --report just means the result is printed, never a hard failure."""

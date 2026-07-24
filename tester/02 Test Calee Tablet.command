@@ -15,7 +15,7 @@ if [ $BOOTSTRAP_STATUS -ne 0 ]; then
     exit $BOOTSTRAP_STATUS
 fi
 
-python -m calee_regression suite --config "$CALEE_TEST_CONFIG" --suite full-tester
+"$CALEE_PYTHON" -m calee_regression suite --config "$CALEE_TEST_CONFIG" --suite full-tester
 STATUS=$?
 
 echo ""

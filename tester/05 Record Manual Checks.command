@@ -16,7 +16,7 @@ if [ $BOOTSTRAP_STATUS -ne 0 ]; then
     exit $BOOTSTRAP_STATUS
 fi
 
-python -m calee_regression record-manual-checks
+"$CALEE_PYTHON" -m calee_regression record-manual-checks
 STATUS=$?
 
 echo ""

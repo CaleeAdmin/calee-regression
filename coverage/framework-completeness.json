@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "report": "framework-completeness",
   "derivedFrom": {
     "coverageManifest": "coverage/coverage-manifest.yaml",
@@ -17,6 +17,23 @@
     "blocked",
     "not-implemented"
   ],
+  "implementationStatusVocabulary": [
+    "complete",
+    "partial",
+    "not-implemented"
+  ],
+  "qualificationStatusVocabulary": [
+    "qualified",
+    "implemented-unqualified",
+    "blocked",
+    "not-applicable"
+  ],
+  "releaseReadinessVocabulary": [
+    "pass",
+    "fail",
+    "blocked",
+    "not-applicable"
+  ],
   "statusCounts": {
     "complete": 2,
     "implemented-unqualified": 3,
@@ -30,6 +47,9 @@
       "title": "Framework architecture & orchestration",
       "status": "complete",
       "releaseGating": true,
+      "implementationStatus": "complete",
+      "qualificationStatus": "not-applicable",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [
         "manifest component report_consolidation: automated=true, offlineTested=True",
         "manifest component machine_config: automated=true, offlineTested=True",
@@ -42,13 +62,18 @@
       "blockers": [],
       "nextAction": "Maintain; no gap. Re-qualify on a Mac release run.",
       "weight": 2.0,
-      "statusScore": 1.0
+      "statusScore": 1.0,
+      "implementationScore": 1.0,
+      "qualificationScore": null
     },
     {
       "key": "mobileApiCoverage",
       "title": "CaleeMobile Client API coverage",
       "status": "implemented-unqualified",
       "releaseGating": true,
+      "implementationStatus": "complete",
+      "qualificationStatus": "implemented-unqualified",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [
         "manifest component mobile_calendar: automated=true, offlineTested=True",
         "manifest component mobile_tasks: automated=true, offlineTested=True",
@@ -59,13 +84,18 @@
       "blockers": [],
       "nextAction": "Run the CaleeMobile Client API legs on a Mac with backend credentials (focused-verify api / mobile-api suite).",
       "weight": 2.0,
-      "statusScore": 0.6
+      "statusScore": 0.6,
+      "implementationScore": 1.0,
+      "qualificationScore": 0.5
     },
     {
       "key": "mobileUiCoverage",
       "title": "CaleeMobile UI coverage (Android + iOS)",
       "status": "implemented-unqualified",
       "releaseGating": true,
+      "implementationStatus": "complete",
+      "qualificationStatus": "implemented-unqualified",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [
         "manifest component mobile_calendar: automated=true, offlineTested=True",
         "manifest component mobile_tasks: automated=true, offlineTested=True",
@@ -76,13 +106,18 @@
       "blockers": [],
       "nextAction": "Run the CaleeMobile Android + iOS UI suites on real devices/simulators via the release framework.",
       "weight": 2.0,
-      "statusScore": 0.6
+      "statusScore": 0.6,
+      "implementationScore": 1.0,
+      "qualificationScore": 0.5
     },
     {
       "key": "tabletReadCoverage",
       "title": "Calee tablet read/navigation coverage",
       "status": "implemented-unqualified",
       "releaseGating": true,
+      "implementationStatus": "complete",
+      "qualificationStatus": "implemented-unqualified",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [
         "manifest component tablet_calendar_view: automated=true, offlineTested=True",
         "manifest component tablet_tasks: automated=true, offlineTested=True",
@@ -95,13 +130,18 @@
       "blockers": [],
       "nextAction": "Run the standard tablet suite on the prepared tablet (full-tester) to qualify the read coverage.",
       "weight": 2.0,
-      "statusScore": 0.6
+      "statusScore": 0.6,
+      "implementationScore": 1.0,
+      "qualificationScore": 0.5
     },
     {
       "key": "tabletMutationCoverage",
       "title": "Calee tablet mutation coverage (create/edit/delete, complete/reopen, skip)",
       "status": "blocked",
       "releaseGating": false,
+      "implementationStatus": "complete",
+      "qualificationStatus": "implemented-unqualified",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [
         "manifest component tablet_calendar_mutation: automated=draft, offlineTested=True",
         "manifest component tablet_task_mutation: automated=draft, offlineTested=True",
@@ -125,13 +165,18 @@
       ],
       "nextAction": "Physically run each mutation scenario twice on the tablet, then promote via scenarios/promotion + suites.py.",
       "weight": 1.0,
-      "statusScore": 0.25
+      "statusScore": 0.25,
+      "implementationScore": 1.0,
+      "qualificationScore": 0.5
     },
     {
       "key": "crossDeviceSyncCoverage",
       "title": "Cross-device synchronization coverage",
       "status": "partial",
       "releaseGating": true,
+      "implementationStatus": "partial",
+      "qualificationStatus": "blocked",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [
         "manifest component cross_device_sync: automated=partial, offlineTested=True",
         "calee_regression/sync_smoke.py",
@@ -143,13 +188,18 @@
       ],
       "nextAction": "Close the tablet-mutation legs and run sync-smoke on real devices; colour-verify + provider-refresh remain external gaps.",
       "weight": 2.0,
-      "statusScore": 0.5
+      "statusScore": 0.5,
+      "implementationScore": 0.5,
+      "qualificationScore": 0.0
     },
     {
       "key": "guidedHandoffCoverage",
       "title": "Guided handoff coverage (onboarding + Google Calendar OAuth)",
       "status": "partial",
       "releaseGating": true,
+      "implementationStatus": "partial",
+      "qualificationStatus": "blocked",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [
         "manifest component onboarding: automated=partial, offlineTested=True",
         "manifest component google_calendar: automated=partial, offlineTested=True",
@@ -162,13 +212,18 @@
       ],
       "nextAction": "Run the guided onboarding + Google OAuth handoffs with the permanent recorder on a device.",
       "weight": 1.0,
-      "statusScore": 0.5
+      "statusScore": 0.5,
+      "implementationScore": 0.5,
+      "qualificationScore": 0.0
     },
     {
       "key": "androidPhysicalQualification",
       "title": "Android physical qualification",
       "status": "blocked",
       "releaseGating": true,
+      "implementationStatus": "complete",
+      "qualificationStatus": "blocked",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [],
       "physicalEvidence": [],
       "blockers": [
@@ -176,13 +231,18 @@
       ],
       "nextAction": "Run the Android serial suite through the release framework on an Android device/emulator.",
       "weight": 2.0,
-      "statusScore": 0.25
+      "statusScore": 0.25,
+      "implementationScore": 1.0,
+      "qualificationScore": 0.0
     },
     {
       "key": "iosPhysicalQualification",
       "title": "iOS physical qualification",
       "status": "blocked",
       "releaseGating": true,
+      "implementationStatus": "complete",
+      "qualificationStatus": "blocked",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [],
       "physicalEvidence": [],
       "blockers": [
@@ -190,13 +250,18 @@
       ],
       "nextAction": "Run the iOS serial suite on a physical iPhone or simulator via a Mac.",
       "weight": 2.0,
-      "statusScore": 0.25
+      "statusScore": 0.25,
+      "implementationScore": 1.0,
+      "qualificationScore": 0.0
     },
     {
       "key": "tabletStandardQualification",
       "title": "Calee tablet standard-suite physical qualification",
       "status": "blocked",
       "releaseGating": true,
+      "implementationStatus": "complete",
+      "qualificationStatus": "blocked",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [
         "suite full-tester: 10 scenario(s)"
       ],
@@ -206,13 +271,18 @@
       ],
       "nextAction": "Run full-tester on the prepared tablet and record certification-eligible evidence.",
       "weight": 2.0,
-      "statusScore": 0.25
+      "statusScore": 0.25,
+      "implementationScore": 1.0,
+      "qualificationScore": 0.0
     },
     {
       "key": "kioskAdminQualification",
       "title": "CaleeShell kiosk/admin physical qualification",
       "status": "blocked",
       "releaseGating": true,
+      "implementationStatus": "partial",
+      "qualificationStatus": "blocked",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [
         "manifest component kiosk_admin: automated=partial, offlineTested=True",
         "suite kiosk_admin_physical: 1 scenario(s)"
@@ -224,13 +294,18 @@
       ],
       "nextAction": "Run the kiosk/admin suite only on an explicitly device-owner-authorised tablet.",
       "weight": 1.0,
-      "statusScore": 0.25
+      "statusScore": 0.25,
+      "implementationScore": 0.5,
+      "qualificationScore": 0.0
     },
     {
       "key": "fixtureExclusivity",
       "title": "Regression fixture exclusivity",
       "status": "partial",
       "releaseGating": false,
+      "implementationStatus": "partial",
+      "qualificationStatus": "not-applicable",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [
         "calee_regression/fixture_ownership.py",
         "docs/DISTRIBUTED_FIXTURE_LEASE_DECISION.md"
@@ -241,13 +316,18 @@
       ],
       "nextAction": "Keep the host-local lock; pursue the distributed-lease design proposal (no product change this session).",
       "weight": 1.0,
-      "statusScore": 0.5
+      "statusScore": 0.5,
+      "implementationScore": 0.5,
+      "qualificationScore": null
     },
     {
       "key": "releaseEvidenceIntegrity",
       "title": "Release evidence integrity",
       "status": "complete",
       "releaseGating": true,
+      "implementationStatus": "complete",
+      "qualificationStatus": "not-applicable",
+      "qualificationEvidenceStale": false,
       "implementationEvidence": [
         "manifest component report_consolidation: automated=true, offlineTested=True",
         "manifest component build_installation: automated=true, offlineTested=True",
@@ -259,7 +339,9 @@
       "blockers": [],
       "nextAction": "Maintain; no gap. Immutable reports + provenance + atomic publish are offline-tested.",
       "weight": 2.0,
-      "statusScore": 1.0
+      "statusScore": 1.0,
+      "implementationScore": 1.0,
+      "qualificationScore": null
     }
   ],
   "summary": {
@@ -274,5 +356,68 @@
       "not-implemented": 0.0
     },
     "note": "This percentage is a weighted convenience only. It never substitutes for the per-dimension statuses above; a release decision is made from the statuses and releaseGating flags, not from this number."
+  },
+  "implementationCompleteness": {
+    "implementationCompletionPercent": 88.6,
+    "totalWeight": 22.0,
+    "earnedWeight": 19.5,
+    "statusScoring": {
+      "complete": 1.0,
+      "partial": 0.5,
+      "not-implemented": 0.0
+    },
+    "statusCounts": {
+      "complete": 9,
+      "partial": 4,
+      "not-implemented": 0
+    },
+    "note": "Implementation only: a physical blocker is never counted as missing code."
+  },
+  "qualificationCompleteness": {
+    "qualificationCompletionPercent": 20.6,
+    "scoredWeight": 17.0,
+    "earnedWeight": 3.5,
+    "statusScoring": {
+      "qualified": 1.0,
+      "implemented-unqualified": 0.5,
+      "blocked": 0.0
+    },
+    "statusCounts": {
+      "qualified": 0,
+      "implemented-unqualified": 4,
+      "blocked": 6,
+      "not-applicable": 3
+    },
+    "staleEvidenceDimensions": [],
+    "note": "Qualification only: stale evidence is distinct from missing evidence; not-applicable is excluded."
+  },
+  "releaseReadiness": {
+    "status": "blocked",
+    "gatingDimensions": [
+      "frameworkArchitecture",
+      "mobileApiCoverage",
+      "mobileUiCoverage",
+      "tabletReadCoverage",
+      "crossDeviceSyncCoverage",
+      "guidedHandoffCoverage",
+      "androidPhysicalQualification",
+      "iosPhysicalQualification",
+      "tabletStandardQualification",
+      "kioskAdminQualification",
+      "releaseEvidenceIntegrity"
+    ],
+    "failing": [],
+    "blocking": [
+      "mobileApiCoverage",
+      "mobileUiCoverage",
+      "tabletReadCoverage",
+      "crossDeviceSyncCoverage",
+      "guidedHandoffCoverage",
+      "androidPhysicalQualification",
+      "iosPhysicalQualification",
+      "tabletStandardQualification",
+      "kioskAdminQualification"
+    ],
+    "note": "Release readiness is derived from the release-gating dimensions' qualification status and validated evidence -- never from a completion percentage."
   }
 }

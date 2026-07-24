@@ -11,11 +11,14 @@ cd "$SCRIPT_DIR"
 # read-only convenience utility, not a release gate, so an unresolvable
 # root falls back to this repo's own reports/ rather than blocking the
 # tester from viewing anything.
+# Hermetic interpreter (Workstream 1): resolve the repository-owned
+# "$CALEE_PYTHON" rather than a bare python from PATH.
+# shellcheck source=scripts/lib/hermetic_python.sh
+. "$SCRIPT_DIR/scripts/lib/hermetic_python.sh"
+_calee_resolve_python "$SCRIPT_DIR"
 if [ -z "${CALEE_REPORT_ROOT:-}" ]; then
-    if [ -f .venv/bin/activate ]; then
-        # shellcheck disable=SC1091
-        source .venv/bin/activate
-        CALEE_REPORT_ROOT="$(python3 -m calee_regression report-root 2>/dev/null || echo "$SCRIPT_DIR")"
+    if [ -n "${CALEE_PYTHON:-}" ]; then
+        CALEE_REPORT_ROOT="$("$CALEE_PYTHON" -m calee_regression report-root 2>/dev/null || echo "$SCRIPT_DIR")"
     else
         CALEE_REPORT_ROOT="$SCRIPT_DIR"
     fi

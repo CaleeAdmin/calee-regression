@@ -96,6 +96,11 @@ command: `0` success, `1` product regression, `2` invalid usage/configuration, `
 | `python -m calee_regression inspect-resume --run-id <id>` | Read-only: report whether a blocked release run can be resumed, and what would happen if it were |
 | `python -m calee_regression resume-release --run-id <id>` | Resume a blocked release run without repeating already-passed destructive/disruptive steps — see [docs/RELEASE_POLICY.md](docs/RELEASE_POLICY.md) |
 | `python -m calee_regression list-resumable-runs` | List every run workspace under `reports/runs/`, for choosing one to resume |
+| `python -m calee_regression host-capabilities` | Read-only: what THIS host can do (OS/devices/toolchains/credential sources — never a secret); classifies `OFFLINE_FRAMEWORK_ONLY` vs physical-capable — see [docs/CLOUD_OFFLINE_WORKFLOW.md](docs/CLOUD_OFFLINE_WORKFLOW.md) |
+| `python -m calee_regression qualification-plan --config <config>` | Generate a concrete, secret-free Mac qualification plan (ordered steps, required identities/devices/credentials, diagnostic vs certification) — the cloud→Mac handoff |
+| `python -m calee_regression evidence-bundle export/verify/inspect ...` | Portable, sanitized, integrity-checked evidence bundles (audit / local-certification-transfer profiles) — see [docs/CLOUD_OFFLINE_WORKFLOW.md](docs/CLOUD_OFFLINE_WORKFLOW.md) |
+| `python -m calee_regression framework-completeness` | Three independent measures — implementation / qualification / release readiness — see [docs/COMPLETENESS_MODEL.md](docs/COMPLETENESS_MODEL.md) |
+| `python -m calee_regression scenario-promotion evaluate/propose/apply ...` | Strict, fail-closed, evidence-backed draft-scenario promotion evaluator (typed eligible/ineligible/ambiguous decision) — never promotes on a diagnostic pass, stale build, missing cleanup, audit bundle, tampered/ambiguous evidence |
 
 ## Suites
 
@@ -137,6 +142,8 @@ don't call directly; `tester/technical/*.command` requires a real physical table
 - [docs/CALENDAR_BIG_CHANGE_COVERAGE.md](docs/CALENDAR_BIG_CHANGE_COVERAGE.md) — how to use the calendar suite around big calendar changes
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — symptom → cause → fix, including exit codes and BLOCKED scenarios
 - [docs/CI_VALIDATION_TIERS.md](docs/CI_VALIDATION_TIERS.md) — PR validation vs. main-commit validation vs. release-candidate certification, and where each is enforced
+- [docs/CLOUD_OFFLINE_WORKFLOW.md](docs/CLOUD_OFFLINE_WORKFLOW.md) — offline framework work vs. physical qualification; the hermetic Python contract; `host-capabilities`, `qualification-plan` and `evidence-bundle`
+- [docs/COMPLETENESS_MODEL.md](docs/COMPLETENESS_MODEL.md) — the three completeness measures (implementation / qualification / release readiness) and the v1→v2 schema migration
 - [docs/sample-report/](docs/sample-report/) — a synthetic example consolidated report (HTML/JSON/JUnit + release bundle)
 
 ## Framework tests
