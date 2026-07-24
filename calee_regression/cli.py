@@ -6479,6 +6479,114 @@ def evidence_bundle_inspect(bundle):
     raise SystemExit(EXIT_SUCCESS)
 
 
+@main.group("scenario-promotion")
+def scenario_promotion_group():
+    """Evaluate / propose / apply evidence-backed draft-scenario promotion.
+
+    A draft scenario becomes promotable ONLY on validated, certification-
+    eligible, current physical evidence that satisfies every criterion (>=2
+    standard-init passes, matching build/backend/fixture/selector SHA, no
+    diagnostic mode, cleanup verified, not an audit bundle, no failed/blocked
+    step, scenario-specific authoritative assertions). Fail-closed.
+    """
+
+
+@scenario_promotion_group.command("evaluate")
+@click.option("--scenario", required=True, help="Draft scenario name (e.g. calendar_event_mutation).")
+@click.option("--run-id", required=True, help="Run whose evidence is being evaluated.")
+@click.option("--reports-root", default=None, type=click.Path())
+def scenario_promotion_evaluate(scenario, run_id, reports_root):
+    """Print a typed promotion decision (eligible/ineligible/ambiguous) showing
+    every criterion. Read-only. Exit 0 if eligible, non-zero otherwise."""
+    import json as _json
+
+    from . import scenario_promotion as sp
+
+    try:
+        decision = sp.evaluate(scenario, run_id, reports_root=reports_root)
+    except sp.ScenarioPromotionError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    click.echo(_json.dumps(decision.to_dict(), indent=2))
+    raise SystemExit(EXIT_SUCCESS if decision.decision == sp.DECISION_ELIGIBLE else EXIT_BLOCKED)
+
+
+@scenario_promotion_group.command("propose")
+@click.option("--scenario", required=True)
+@click.option("--run-id", required=True)
+@click.option("--reports-root", default=None, type=click.Path())
+def scenario_promotion_propose(scenario, run_id, reports_root):
+    """Evaluate and print the exact change set promotion WOULD make (never
+    writes)."""
+    import json as _json
+
+    from . import scenario_promotion as sp
+
+    try:
+        decision = sp.evaluate(scenario, run_id, reports_root=reports_root)
+    except sp.ScenarioPromotionError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    click.echo(_json.dumps({"decision": decision.to_dict(), "proposal": sp.propose(decision)}, indent=2))
+    raise SystemExit(EXIT_SUCCESS if decision.decision == sp.DECISION_ELIGIBLE else EXIT_BLOCKED)
+
+
+@scenario_promotion_group.command("apply")
+@click.option("--scenario", required=True)
+@click.option("--run-id", required=True)
+@click.option("--reports-root", default=None, type=click.Path())
+@click.option("--promotion-dir", default=None, type=click.Path())
+@click.option("--confirm", is_flag=True, default=False, help="Actually write the promotion-record update (else dry-run).")
+@click.option("--allow-dirty", is_flag=True, default=False, help="Permit a dirty working tree (default: refuse).")
+def scenario_promotion_apply(scenario, run_id, reports_root, promotion_dir, confirm, allow_dirty):
+    """Record a verified physical PASS into the promotion record. Refuses unless
+    the decision is eligible and (without --allow-dirty) the tree is clean;
+    prints the proposed change first; a dry-run without --confirm; never commits."""
+    import json as _json
+    import subprocess
+
+    from . import scenario_promotion as sp
+
+    try:
+        decision = sp.evaluate(scenario, run_id, reports_root=reports_root, promotion_dir=promotion_dir)
+    except sp.ScenarioPromotionError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    if decision.decision != sp.DECISION_ELIGIBLE:
+        click.echo(click.style(f"Refusing to promote {scenario}: decision is {decision.decision}.", fg="red"), err=True)
+        for c in decision.failing():
+            click.echo(f"  - {c.name}: {c.detail}", err=True)
+        raise SystemExit(EXIT_BLOCKED)
+
+    proposal = sp.propose(decision)
+    click.echo("Proposed changes:")
+    for change in proposal["proposedChanges"]:
+        click.echo(f"  - {change}")
+
+    if not allow_dirty:
+        try:
+            dirty = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, timeout=15).stdout.strip()
+        except Exception:  # noqa: BLE001
+            dirty = ""
+        if dirty:
+            click.echo(click.style("Refusing on a dirty working tree (use --allow-dirty to override).", fg="red"), err=True)
+            raise SystemExit(EXIT_BLOCKED)
+
+    if not confirm:
+        click.echo("Dry run (pass --confirm to write the promotion-record update). Nothing was written.")
+        raise SystemExit(EXIT_SUCCESS)
+
+    try:
+        summary = sp.apply_record_update(decision, promotion_dir=promotion_dir)
+    except sp.ScenarioPromotionError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    click.echo(click.style(f"[OK] Recorded physical PASS for {scenario} in {summary['recordPath']}.", fg="green"))
+    click.echo(_json.dumps(summary, indent=2))
+    raise SystemExit(EXIT_SUCCESS)
+
+
 def _write_installer_report(report_path: "Path | None", payload: dict) -> None:
     """Write an installer/inspection report JSON, best-effort. A missing
     --report just means the result is printed, never a hard failure."""

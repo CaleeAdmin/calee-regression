@@ -100,6 +100,7 @@ command: `0` success, `1` product regression, `2` invalid usage/configuration, `
 | `python -m calee_regression qualification-plan --config <config>` | Generate a concrete, secret-free Mac qualification plan (ordered steps, required identities/devices/credentials, diagnostic vs certification) — the cloud→Mac handoff |
 | `python -m calee_regression evidence-bundle export/verify/inspect ...` | Portable, sanitized, integrity-checked evidence bundles (audit / local-certification-transfer profiles) — see [docs/CLOUD_OFFLINE_WORKFLOW.md](docs/CLOUD_OFFLINE_WORKFLOW.md) |
 | `python -m calee_regression framework-completeness` | Three independent measures — implementation / qualification / release readiness — see [docs/COMPLETENESS_MODEL.md](docs/COMPLETENESS_MODEL.md) |
+| `python -m calee_regression scenario-promotion evaluate/propose/apply ...` | Strict, fail-closed, evidence-backed draft-scenario promotion evaluator (typed eligible/ineligible/ambiguous decision) — never promotes on a diagnostic pass, stale build, missing cleanup, audit bundle, tampered/ambiguous evidence |
 
 ## Suites
 

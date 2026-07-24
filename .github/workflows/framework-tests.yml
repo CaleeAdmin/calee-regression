@@ -265,10 +265,11 @@ jobs:
           print(f"completeness v2 OK: implementation={impl}% qualification={qual}% readiness={d['releaseReadiness']['status']}")
           PY
 
-      - name: Evidence-bundle path-safety/redaction, qualification-plan, host-capabilities
+      - name: Evidence-bundle, promotion fail-closed, qualification-plan, host-capabilities
         run: |
           ./.venv/bin/python -m pytest -q \
             framework_tests/test_evidence_bundle.py \
+            framework_tests/test_scenario_promotion.py \
             framework_tests/test_qualification_plan.py \
             framework_tests/test_host_capabilities.py \
             framework_tests/test_completeness_axes.py
