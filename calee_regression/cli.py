@@ -6249,6 +6249,79 @@ def coverage_report_cmd(manifest_path, check):
     raise SystemExit(EXIT_SUCCESS)
 
 
+@main.command("framework-completeness")
+@click.option(
+    "--format", "output_format", type=click.Choice(["json", "markdown", "both"]), default="both",
+    help="What to print to stdout (default: both).",
+)
+@click.option("--json-out", "json_out", default=None, type=click.Path(), help="Also write the JSON report to this path.")
+@click.option("--md-out", "md_out", default=None, type=click.Path(), help="Also write the Markdown report to this path.")
+@click.option(
+    "--write", "write_canonical", is_flag=True, default=False,
+    help="Regenerate the committed coverage/framework-completeness.{json,md} artifacts.",
+)
+@click.option(
+    "--check", is_flag=True, default=False,
+    help="Verify the committed artifacts still match a freshly-generated report; exit non-zero on drift (CI).",
+)
+def framework_completeness_cmd(output_format, json_out, md_out, write_canonical, check):
+    """Machine-readable framework release-completeness report.
+
+    Derives one status per required dimension (frameworkArchitecture,
+    mobileApiCoverage, mobileUiCoverage, tabletReadCoverage,
+    tabletMutationCoverage, crossDeviceSyncCoverage, guidedHandoffCoverage,
+    androidPhysicalQualification, iosPhysicalQualification,
+    tabletStandardQualification, kioskAdminQualification, fixtureExclusivity,
+    releaseEvidenceIntegrity) from ACTUAL repository metadata and validated
+    physical reports -- never a manually-maintained percentage. Emits JSON and
+    Markdown. --write regenerates the committed artifacts; --check proves they
+    have not drifted (what CI runs).
+    """
+    from . import framework_completeness as completeness_mod
+
+    try:
+        report = completeness_mod.build_report()
+    except (
+        completeness_mod.FrameworkCompletenessError,
+        coverage_mod.CoverageManifestError,
+        release_platforms.ReleasePlatformsError,
+    ) as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+
+    if check:
+        problems = completeness_mod.canonical_drift(report)
+        if problems:
+            click.echo(click.style("Framework-completeness artifacts are OUT OF DATE:", fg="red"), err=True)
+            for p in problems:
+                click.echo(f"  - {p}", err=True)
+            raise SystemExit(EXIT_INVALID_CONFIG)
+        click.echo(click.style(
+            "[OK] coverage/framework-completeness.{json,md} match the freshly-derived report.", fg="green",
+        ))
+        raise SystemExit(EXIT_SUCCESS)
+
+    if write_canonical:
+        json_path, md_path = completeness_mod.write_canonical_artifacts(report)
+        click.echo(f"Wrote {json_path.relative_to(completeness_mod.REPO_ROOT)} and {md_path.relative_to(completeness_mod.REPO_ROOT)}")
+        raise SystemExit(EXIT_SUCCESS)
+
+    json_text = completeness_mod.render_json(report)
+    md_text = completeness_mod.render_markdown(report)
+    if json_out:
+        Path(json_out).write_text(json_text, encoding="utf-8")
+    if md_out:
+        Path(md_out).write_text(md_text, encoding="utf-8")
+
+    if output_format in ("json", "both"):
+        click.echo(json_text, nl=False)
+    if output_format == "both":
+        click.echo("")
+    if output_format in ("markdown", "both"):
+        click.echo(md_text, nl=False)
+    raise SystemExit(EXIT_SUCCESS)
+
+
 def _write_installer_report(report_path: "Path | None", payload: dict) -> None:
     """Write an installer/inspection report JSON, best-effort. A missing
     --report just means the result is printed, never a hard failure."""

@@ -52,6 +52,14 @@ jobs:
       - name: Release-metadata consistency (coverage manifest + promotion state machine)
         run: python -m calee_regression coverage-report --check
 
+      # The framework-completeness report is derived purely from repository
+      # metadata + validated physical reports. This proves the committed
+      # coverage/framework-completeness.{json,md} artifacts have not drifted
+      # from a freshly-derived report (a scenario tag / suite / feature-scope
+      # change that isn't reflected in the committed report is a red build).
+      - name: Framework-completeness report is drift-free
+        run: python -m calee_regression framework-completeness --check
+
       - name: Machine-config example is valid and secret-free
         run: |
           python -c "

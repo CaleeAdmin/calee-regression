@@ -1,0 +1,278 @@
+{
+  "schemaVersion": 1,
+  "report": "framework-completeness",
+  "derivedFrom": {
+    "coverageManifest": "coverage/coverage-manifest.yaml",
+    "suites": "calee_regression/suites.py",
+    "promotion": "scenarios/promotion/*.yaml",
+    "releaseFeatureScope": "default (no config/release-platforms.yaml found; every feature is mandatory)",
+    "releasePlatformScope": "default (no config/release-platforms.yaml found; every platform is mandatory)",
+    "validatedPhysicalReports": "reports/runs/<run-id>/..."
+  },
+  "physicalDeviceSession": false,
+  "statusVocabulary": [
+    "complete",
+    "implemented-unqualified",
+    "partial",
+    "blocked",
+    "not-implemented"
+  ],
+  "statusCounts": {
+    "complete": 2,
+    "implemented-unqualified": 3,
+    "partial": 3,
+    "blocked": 5,
+    "not-implemented": 0
+  },
+  "dimensions": [
+    {
+      "key": "frameworkArchitecture",
+      "title": "Framework architecture & orchestration",
+      "status": "complete",
+      "releaseGating": true,
+      "implementationEvidence": [
+        "manifest component report_consolidation: automated=true, offlineTested=True",
+        "manifest component machine_config: automated=true, offlineTested=True",
+        "manifest component build_installation: automated=true, offlineTested=True",
+        "calee_regression/consolidated_report.py",
+        "calee_regression/run_context.py",
+        "calee_regression/focused_workflow.py"
+      ],
+      "physicalEvidence": [],
+      "blockers": [],
+      "nextAction": "Maintain; no gap. Re-qualify on a Mac release run.",
+      "weight": 2.0,
+      "statusScore": 1.0
+    },
+    {
+      "key": "mobileApiCoverage",
+      "title": "CaleeMobile Client API coverage",
+      "status": "implemented-unqualified",
+      "releaseGating": true,
+      "implementationEvidence": [
+        "manifest component mobile_calendar: automated=true, offlineTested=True",
+        "manifest component mobile_tasks: automated=true, offlineTested=True",
+        "manifest component mobile_chores: automated=true, offlineTested=True",
+        "CaleeMobile-Regression/api/"
+      ],
+      "physicalEvidence": [],
+      "blockers": [],
+      "nextAction": "Run the CaleeMobile Client API legs on a Mac with backend credentials (focused-verify api / mobile-api suite).",
+      "weight": 2.0,
+      "statusScore": 0.6
+    },
+    {
+      "key": "mobileUiCoverage",
+      "title": "CaleeMobile UI coverage (Android + iOS)",
+      "status": "implemented-unqualified",
+      "releaseGating": true,
+      "implementationEvidence": [
+        "manifest component mobile_calendar: automated=true, offlineTested=True",
+        "manifest component mobile_tasks: automated=true, offlineTested=True",
+        "manifest component mobile_chores: automated=true, offlineTested=True",
+        "CaleeMobile-Regression/ui/integration_test/flows/"
+      ],
+      "physicalEvidence": [],
+      "blockers": [],
+      "nextAction": "Run the CaleeMobile Android + iOS UI suites on real devices/simulators via the release framework.",
+      "weight": 2.0,
+      "statusScore": 0.6
+    },
+    {
+      "key": "tabletReadCoverage",
+      "title": "Calee tablet read/navigation coverage",
+      "status": "implemented-unqualified",
+      "releaseGating": true,
+      "implementationEvidence": [
+        "manifest component tablet_calendar_view: automated=true, offlineTested=True",
+        "manifest component tablet_tasks: automated=true, offlineTested=True",
+        "manifest component tablet_chores: automated=true, offlineTested=True",
+        "suite calendar: 4 scenario(s)",
+        "suite tasks_smoke: 1 scenario(s)",
+        "suite chores_smoke: 1 scenario(s)"
+      ],
+      "physicalEvidence": [],
+      "blockers": [],
+      "nextAction": "Run the standard tablet suite on the prepared tablet (full-tester) to qualify the read coverage.",
+      "weight": 2.0,
+      "statusScore": 0.6
+    },
+    {
+      "key": "tabletMutationCoverage",
+      "title": "Calee tablet mutation coverage (create/edit/delete, complete/reopen, skip)",
+      "status": "blocked",
+      "releaseGating": false,
+      "implementationEvidence": [
+        "manifest component tablet_calendar_mutation: automated=draft, offlineTested=True",
+        "manifest component tablet_task_mutation: automated=draft, offlineTested=True",
+        "manifest component tablet_chore_mutation: automated=draft, offlineTested=True",
+        "suite calendar_event_mutation: 1 scenario(s)",
+        "suite tasks_mutation: 1 scenario(s)",
+        "suite chores_mutation: 1 scenario(s)",
+        "scenarios/calendar_event_mutation.yaml",
+        "scenarios/tasks_mutation.yaml",
+        "scenarios/chores_mutation.yaml",
+        "promotion calendar_event_mutation: eligible=False, physical=pending",
+        "promotion tasks_mutation: eligible=False, physical=pending",
+        "promotion chores_mutation: eligible=False, physical=pending"
+      ],
+      "physicalEvidence": [],
+      "blockers": [
+        "tablet_calendar_mutation: Create/edit(2 fields)/delete; source-confirmed selectors; needs a physical pass to promote.",
+        "tablet_task_mutation: Complete/reopen row-scoped; fixture-absence blocks; needs physical pass.",
+        "tablet_chore_mutation: Skip-this-time row-scoped; needs 'Show chore edit actions' + physical pass.",
+        "promotion pending a recorded physical PASS with evidence for: calendar_event_mutation, tasks_mutation, chores_mutation"
+      ],
+      "nextAction": "Physically run each mutation scenario twice on the tablet, then promote via scenarios/promotion + suites.py.",
+      "weight": 1.0,
+      "statusScore": 0.25
+    },
+    {
+      "key": "crossDeviceSyncCoverage",
+      "title": "Cross-device synchronization coverage",
+      "status": "partial",
+      "releaseGating": true,
+      "implementationEvidence": [
+        "manifest component cross_device_sync: automated=partial, offlineTested=True",
+        "calee_regression/sync_smoke.py",
+        "calee_regression/sync_smoke_bridge.py"
+      ],
+      "physicalEvidence": [],
+      "blockers": [
+        "cross_device_sync: Event/task/chore/appearance flows orchestrated + fully fake-tested; tablet-mutation legs BLOCKED until a physical pass."
+      ],
+      "nextAction": "Close the tablet-mutation legs and run sync-smoke on real devices; colour-verify + provider-refresh remain external gaps.",
+      "weight": 2.0,
+      "statusScore": 0.5
+    },
+    {
+      "key": "guidedHandoffCoverage",
+      "title": "Guided handoff coverage (onboarding + Google Calendar OAuth)",
+      "status": "partial",
+      "releaseGating": true,
+      "implementationEvidence": [
+        "manifest component onboarding: automated=partial, offlineTested=True",
+        "manifest component google_calendar: automated=partial, offlineTested=True",
+        "calee_regression/handoff_bridge.py"
+      ],
+      "physicalEvidence": [],
+      "blockers": [
+        "onboarding: Onboarding lifecycle needs a redeem/activation backend + device.",
+        "google_calendar: App-owned OAuth boundaries; one guided manual real-Google check + Flutter harness."
+      ],
+      "nextAction": "Run the guided onboarding + Google OAuth handoffs with the permanent recorder on a device.",
+      "weight": 1.0,
+      "statusScore": 0.5
+    },
+    {
+      "key": "androidPhysicalQualification",
+      "title": "Android physical qualification",
+      "status": "blocked",
+      "releaseGating": true,
+      "implementationEvidence": [],
+      "physicalEvidence": [],
+      "blockers": [
+        "no validated, certification-eligible physical report found under reports/; requires a physical Android phone or approved emulator."
+      ],
+      "nextAction": "Run the Android serial suite through the release framework on an Android device/emulator.",
+      "weight": 2.0,
+      "statusScore": 0.25
+    },
+    {
+      "key": "iosPhysicalQualification",
+      "title": "iOS physical qualification",
+      "status": "blocked",
+      "releaseGating": true,
+      "implementationEvidence": [],
+      "physicalEvidence": [],
+      "blockers": [
+        "no validated, certification-eligible physical report found under reports/; requires a physical iPhone (or a Mac + iOS simulator)."
+      ],
+      "nextAction": "Run the iOS serial suite on a physical iPhone or simulator via a Mac.",
+      "weight": 2.0,
+      "statusScore": 0.25
+    },
+    {
+      "key": "tabletStandardQualification",
+      "title": "Calee tablet standard-suite physical qualification",
+      "status": "blocked",
+      "releaseGating": true,
+      "implementationEvidence": [
+        "suite full-tester: 10 scenario(s)"
+      ],
+      "physicalEvidence": [],
+      "blockers": [
+        "no validated, certification-eligible physical report found under reports/; requires the prepared Calee tablet."
+      ],
+      "nextAction": "Run full-tester on the prepared tablet and record certification-eligible evidence.",
+      "weight": 2.0,
+      "statusScore": 0.25
+    },
+    {
+      "key": "kioskAdminQualification",
+      "title": "CaleeShell kiosk/admin physical qualification",
+      "status": "blocked",
+      "releaseGating": true,
+      "implementationEvidence": [
+        "manifest component kiosk_admin: automated=partial, offlineTested=True",
+        "suite kiosk_admin_physical: 1 scenario(s)"
+      ],
+      "physicalEvidence": [],
+      "blockers": [
+        "kiosk_admin: Physical-only kiosk/admin suite; needs a disposable device-owner tablet.",
+        "no validated, certification-eligible physical report found under reports/; requires a device-owner-authorised Calee tablet (kiosk/admin)."
+      ],
+      "nextAction": "Run the kiosk/admin suite only on an explicitly device-owner-authorised tablet.",
+      "weight": 1.0,
+      "statusScore": 0.25
+    },
+    {
+      "key": "fixtureExclusivity",
+      "title": "Regression fixture exclusivity",
+      "status": "partial",
+      "releaseGating": false,
+      "implementationEvidence": [
+        "calee_regression/fixture_ownership.py",
+        "docs/DISTRIBUTED_FIXTURE_LEASE_DECISION.md"
+      ],
+      "physicalEvidence": [],
+      "blockers": [
+        "distributed (multi-host, same-account) exclusivity: no atomic backend lease primitive exists in the read-only Client API; see docs/DISTRIBUTED_FIXTURE_LEASE_DECISION.md."
+      ],
+      "nextAction": "Keep the host-local lock; pursue the distributed-lease design proposal (no product change this session).",
+      "weight": 1.0,
+      "statusScore": 0.5
+    },
+    {
+      "key": "releaseEvidenceIntegrity",
+      "title": "Release evidence integrity",
+      "status": "complete",
+      "releaseGating": true,
+      "implementationEvidence": [
+        "manifest component report_consolidation: automated=true, offlineTested=True",
+        "manifest component build_installation: automated=true, offlineTested=True",
+        "calee_regression/atomic_publish.py",
+        "calee_regression/build_provenance.py",
+        "calee_regression/focused_report_validation.py"
+      ],
+      "physicalEvidence": [],
+      "blockers": [],
+      "nextAction": "Maintain; no gap. Immutable reports + provenance + atomic publish are offline-tested.",
+      "weight": 2.0,
+      "statusScore": 1.0
+    }
+  ],
+  "summary": {
+    "weightedCompletionPercent": 52.7,
+    "totalWeight": 22.0,
+    "earnedWeight": 11.6,
+    "statusScoring": {
+      "complete": 1.0,
+      "implemented-unqualified": 0.6,
+      "partial": 0.5,
+      "blocked": 0.25,
+      "not-implemented": 0.0
+    },
+    "note": "This percentage is a weighted convenience only. It never substitutes for the per-dimension statuses above; a release decision is made from the statuses and releaseGating flags, not from this number."
+  }
+}
