@@ -6322,6 +6322,44 @@ def framework_completeness_cmd(output_format, json_out, md_out, write_canonical,
     raise SystemExit(EXIT_SUCCESS)
 
 
+@main.command("host-capabilities")
+@click.option(
+    "--format", "output_format", type=click.Choice(["json", "text", "both"]), default="both",
+    help="What to print to stdout (default: both).",
+)
+@click.option("--json-out", "json_out", default=None, type=click.Path(), help="Also write the JSON report to this path.")
+def host_capabilities_cmd(output_format, json_out):
+    """Read-only report of what THIS host can actually do.
+
+    Probes the OS/arch/host, the running interpreter and repo virtualenv, ADB /
+    Appium / Flutter / Xcode availability, visible Android/iOS devices, the
+    macOS Keychain, a configured backend and credential SOURCES (their PRESENCE
+    only -- never a secret value), the tester config, a release bundle and a
+    writable report root; then classifies the host's ``executionCapability``
+    (e.g. ``OFFLINE_FRAMEWORK_ONLY`` in a cloud container, or a physical class
+    on a Mac with the expected devices).
+
+    It performs NO fixture reset, NO app launch and reveals NO secret. Always
+    exits 0 -- the classification is in the report, not the exit code.
+    """
+    import json as _json
+
+    from . import host_capabilities as hc
+
+    report = hc.gather_host_capabilities()
+    json_text = _json.dumps(report, indent=2) + "\n"
+    if json_out:
+        Path(json_out).write_text(json_text, encoding="utf-8")
+
+    if output_format in ("json", "both"):
+        click.echo(json_text, nl=False)
+    if output_format == "both":
+        click.echo("")
+    if output_format in ("text", "both"):
+        click.echo(hc.render_text(report), nl=False)
+    raise SystemExit(EXIT_SUCCESS)
+
+
 def _write_installer_report(report_path: "Path | None", payload: dict) -> None:
     """Write an installer/inspection report JSON, best-effort. A missing
     --report just means the result is printed, never a hard failure."""
