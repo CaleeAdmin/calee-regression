@@ -189,3 +189,78 @@ jobs:
               sys.exit(1)
           print(f"Merge-commit/main smoke check OK: framework-test evidence embeds {data['commitSha']}.")
           PY
+
+  hermetic:
+    # Workstream 8: prove the tester launchers/bootstrap are hermetically bound
+    # to the repository .venv -- NO globally-installed project dependency is
+    # required for any launcher to work. This is a clean-room job: unlike `test`
+    # above, it installs ONLY into the repo .venv, never into the system python.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create an isolated repository .venv (installed into ONLY the .venv)
+        run: |
+          python -m venv .venv
+          ./.venv/bin/python -m pip install --upgrade pip >/dev/null
+          ./.venv/bin/python -m pip install -e '.[dev]'
+
+      - name: Prove no global project dependency is required
+        run: |
+          # The SYSTEM interpreter must NOT be able to import the framework's
+          # deps -- only the repo .venv can. If it can, a global install leaked
+          # in and the hermetic guarantee is not actually being exercised.
+          if python -c 'import click' 2>/dev/null; then
+            echo "FAIL: click is importable from the system interpreter (global install leaked)."; exit 1
+          fi
+          echo "OK: system interpreter has no project deps; only the repo .venv does."
+
+      - name: Launcher/bootstrap tests under a PATH stripped of the .venv
+        run: |
+          # Strip any venv bin from PATH; the launchers must still bind to the
+          # ABSOLUTE repo interpreter exported by bootstrap. These tests set
+          # PATH=/usr/bin:/bin internally and pin CALEE_PYTHON to the .venv, so
+          # a green run proves no global click/package is needed.
+          env -u VIRTUAL_ENV PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+            ./.venv/bin/python -m pytest -q \
+              framework_tests/test_hermetic_bootstrap.py \
+              framework_tests/test_caleemobile_launcher.py \
+              framework_tests/test_full_solution_fail_fast.py \
+              framework_tests/test_release_launcher_e2e.py
+
+      - name: No tester launcher invokes the framework with a bare python
+        run: |
+          ./.venv/bin/python -m pytest -q framework_tests/test_hermetic_bootstrap.py \
+            -k "bare_python or uses_calee_python"
+
+      - name: host-capabilities classifies this cloud host as OFFLINE_FRAMEWORK_ONLY
+        run: |
+          ./.venv/bin/python -m calee_regression host-capabilities --format json > host-capabilities.json
+          ./.venv/bin/python - <<'PY'
+          import json
+          d = json.load(open("host-capabilities.json"))
+          assert d["report"] == "host-capabilities", d
+          assert d["executionCapability"] == "OFFLINE_FRAMEWORK_ONLY", d["executionCapability"]
+          print("host-capabilities OK:", d["executionCapability"])
+          PY
+
+      - name: "Completeness schema migration (v2 = three independent measures)"
+        run: |
+          ./.venv/bin/python -m calee_regression framework-completeness --check
+          ./.venv/bin/python - <<'PY'
+          from calee_regression import framework_completeness as fc
+          d = fc.build_report().to_dict()
+          assert d["schemaVersion"] == 2, d["schemaVersion"]
+          for k in ("implementationCompleteness", "qualificationCompleteness", "releaseReadiness"):
+              assert k in d, f"missing {k}"
+          impl = d["implementationCompleteness"]["implementationCompletionPercent"]
+          qual = d["qualificationCompleteness"]["qualificationCompletionPercent"]
+          assert impl >= qual, (impl, qual)
+          assert "weightedCompletionPercent" in d["summary"]  # legacy preserved
+          assert d["releaseReadiness"]["status"] in ("pass", "fail", "blocked", "not-applicable")
+          print(f"completeness v2 OK: implementation={impl}% qualification={qual}% readiness={d['releaseReadiness']['status']}")
+          PY
