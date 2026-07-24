@@ -50,9 +50,23 @@ set -uo pipefail
 # interpreter itself: every `-m calee_regression` call below runs through
 # "$CALEE_PYTHON", never a bare python from a stripped PATH or a foreign venv.
 _CALEE_REPO_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
-# shellcheck source=scripts/lib/hermetic_python.sh
-. "$_CALEE_REPO_ROOT/scripts/lib/hermetic_python.sh"
-_calee_resolve_python "$_CALEE_REPO_ROOT"
+if [ -f "$_CALEE_REPO_ROOT/scripts/lib/hermetic_python.sh" ]; then
+    # shellcheck source=scripts/lib/hermetic_python.sh
+    . "$_CALEE_REPO_ROOT/scripts/lib/hermetic_python.sh"
+    _calee_resolve_python "$_CALEE_REPO_ROOT"
+fi
+# Fallback resolution when the shared resolver isn't alongside this script
+# (e.g. a standalone copy): honour an exported CALEE_PYTHON, else the repo
+# .venv, else a system python -- so the script is hermetic in the repo and
+# still runnable when copied out.
+if [ -z "${CALEE_PYTHON:-}" ]; then
+    if [ -x "$_CALEE_REPO_ROOT/.venv/bin/python" ]; then
+        CALEE_PYTHON="$_CALEE_REPO_ROOT/.venv/bin/python"
+    else
+        CALEE_PYTHON="$(command -v python3 || command -v python || echo python3)"
+    fi
+    export CALEE_PYTHON
+fi
 
 # --- Argument parsing: a platform and/or an explicit mode ----------------
 # Backward compatible: a bare "android"/"ios" is the full mode. "api-only"
