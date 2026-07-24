@@ -6400,6 +6400,85 @@ def qualification_plan_cmd(config_path, output_format, json_out, md_out):
     raise SystemExit(EXIT_SUCCESS)
 
 
+@main.group("evidence-bundle")
+def evidence_bundle_group():
+    """Export / verify / inspect a portable, sanitized evidence bundle.
+
+    Moves a run's evidence between environments (e.g. Mac -> cloud analysis) as
+    a self-describing, integrity-checked, SECRET-FREE zip. Verify and inspect
+    work entirely offline and never populate a live run directory.
+    """
+
+
+def _resolve_run_dir(reports_root, run_id):
+    import os
+
+    base = Path(reports_root) if reports_root else Path(os.environ.get("CALEE_REPORT_ROOT") or ".") / "reports"
+    return base / "runs" / run_id
+
+
+@evidence_bundle_group.command("export")
+@click.option("--run-id", required=True, help="The run workspace to export (reports/runs/<run-id>).")
+@click.option("--output", required=True, type=click.Path(), help="Destination .zip path.")
+@click.option("--profile", type=click.Choice(["audit", "local-certification-transfer"]), default="audit",
+              help="audit (pseudonymized, non-certifying after import) or local-certification-transfer (exact identities).")
+@click.option("--reports-root", default=None, type=click.Path(), help="Reports root (default: $CALEE_REPORT_ROOT/reports or ./reports).")
+def evidence_bundle_export(run_id, output, profile, reports_root):
+    """Export a run's validated evidence into a sanitized bundle (fail-closed)."""
+    import datetime
+
+    from . import evidence_bundle as eb
+
+    run_dir = _resolve_run_dir(reports_root, run_id)
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        manifest = eb.export_bundle(run_dir, output, profile=profile, timestamp=ts)
+    except eb.EvidenceBundleError as exc:
+        click.echo(f"Evidence-bundle export refused: {exc}", err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    click.echo(click.style(
+        f"[OK] Exported {manifest['profile']} bundle for run {manifest['sourceRunId']} "
+        f"-> {output} ({len(manifest['files'])} file(s), "
+        f"{'NON-certifying after import' if manifest['nonCertifyingAfterImport'] else 'identities preserved'}).",
+        fg="green"))
+    raise SystemExit(EXIT_SUCCESS)
+
+
+@evidence_bundle_group.command("verify")
+@click.argument("bundle", type=click.Path(exists=True))
+def evidence_bundle_verify(bundle):
+    """Verify a bundle offline: digest integrity, no traversal, no smuggled or
+    secret-bearing files. Exit 0 if valid, non-zero otherwise."""
+    from . import evidence_bundle as eb
+
+    result = eb.verify_bundle(bundle)
+    if result["valid"]:
+        click.echo(click.style(f"[OK] Bundle verified: {result['summary'].get('sourceRunId')} "
+                               f"({result['summary'].get('profile')}, {result['summary'].get('fileCount')} files).", fg="green"))
+        raise SystemExit(EXIT_SUCCESS)
+    click.echo(click.style("Bundle verification FAILED:", fg="red"), err=True)
+    for p in result["problems"]:
+        click.echo(f"  - {p}", err=True)
+    raise SystemExit(EXIT_INVALID_CONFIG)
+
+
+@evidence_bundle_group.command("inspect")
+@click.argument("bundle", type=click.Path(exists=True))
+def evidence_bundle_inspect(bundle):
+    """Read-only summary of a bundle (never extracts, never touches live runs)."""
+    import json as _json
+
+    from . import evidence_bundle as eb
+
+    try:
+        summary = eb.inspect_bundle(bundle)
+    except eb.EvidenceBundleError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(EXIT_INVALID_CONFIG)
+    click.echo(_json.dumps(summary, indent=2))
+    raise SystemExit(EXIT_SUCCESS)
+
+
 def _write_installer_report(report_path: "Path | None", payload: dict) -> None:
     """Write an installer/inspection report JSON, best-effort. A missing
     --report just means the result is printed, never a hard failure."""
