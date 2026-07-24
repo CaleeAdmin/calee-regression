@@ -6360,6 +6360,46 @@ def host_capabilities_cmd(output_format, json_out):
     raise SystemExit(EXIT_SUCCESS)
 
 
+@main.command("qualification-plan")
+@click.option("--config", "config_path", envvar="CALEE_TEST_CONFIG", default=None, type=click.Path(),
+              help="Tester config referenced in the generated commands (not read for secrets).")
+@click.option("--format", "output_format", type=click.Choice(["json", "markdown", "both"]), default="both",
+              help="What to print to stdout (default: both).")
+@click.option("--json-out", "json_out", default=None, type=click.Path(), help="Also write the JSON plan to this path.")
+@click.option("--md-out", "md_out", default=None, type=click.Path(), help="Also write the Markdown plan to this path.")
+def qualification_plan_cmd(config_path, output_format, json_out, md_out):
+    """Generate a concrete, secret-free Mac qualification plan.
+
+    Derives an ordered, runnable plan from the current completeness report,
+    release scope and host capabilities: host prerequisites, required repo /
+    product SHAs, required devices/credentials (by SOURCE category, never a
+    value), which dimensions each command can advance, which steps mutate the
+    fixture vs are read-only, which need manual guided evidence / kiosk
+    authorisation / an Android device, and the evidence-bundle export to run
+    afterwards. Distinguishes focused DIAGNOSTIC verification from full release
+    CERTIFICATION, and never silently narrows the release scope. Read-only.
+    """
+    import json as _json
+
+    from . import qualification_plan as qp
+
+    plan = qp.build_plan(config_path=config_path)
+    json_text = _json.dumps(plan, indent=2) + "\n"
+    md_text = qp.render_markdown(plan)
+    if json_out:
+        Path(json_out).write_text(json_text, encoding="utf-8")
+    if md_out:
+        Path(md_out).write_text(md_text, encoding="utf-8")
+
+    if output_format in ("json", "both"):
+        click.echo(json_text, nl=False)
+    if output_format == "both":
+        click.echo("")
+    if output_format in ("markdown", "both"):
+        click.echo(md_text, nl=False)
+    raise SystemExit(EXIT_SUCCESS)
+
+
 def _write_installer_report(report_path: "Path | None", payload: dict) -> None:
     """Write an installer/inspection report JSON, best-effort. A missing
     --report just means the result is printed, never a hard failure."""
